@@ -39,7 +39,7 @@ func TestRunGoalEndToEnd(t *testing.T) {
 	planner := planFileCmd(t, mustJSON(t, plan))
 
 	var buf bytes.Buffer
-	err := runRun(&buf, []string{
+	code, err := runRun(&buf, []string{
 		"-repo", repo,
 		"-goal", "add alpha and beta helpers in their own files",
 		"-planner", planner,
@@ -50,6 +50,9 @@ func TestRunGoalEndToEnd(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("runRun code=%d, want exitOK on a clean landed+verified run", code)
 	}
 
 	var rep runReport
@@ -94,7 +97,7 @@ func TestRunGoalBadPlanFailsSafe(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	err = runRun(&buf, []string{
+	code, err := runRun(&buf, []string{
 		"-repo", repo,
 		"-goal", "whatever",
 		"-planner", "echo not-json",
@@ -103,6 +106,9 @@ func TestRunGoalBadPlanFailsSafe(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected an error on a bad plan, got nil")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("runRun code=%d, want exitOperationalError on a bad plan", code)
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("no report should be written for a bad plan, got:\n%s", buf.String())
@@ -123,7 +129,7 @@ func TestRunGoalFlagValidation(t *testing.T) {
 	agent := buildTestAgent(t)
 
 	var buf bytes.Buffer
-	if err := runRun(&buf, []string{"-repo", repo, "-goal", "x", "-agent", agent}); err == nil {
+	if _, err := runRun(&buf, []string{"-repo", repo, "-goal", "x", "-agent", agent}); err == nil {
 		t.Error("-goal without -planner: want error, got nil")
 	}
 
@@ -132,7 +138,7 @@ func TestRunGoalFlagValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	buf.Reset()
-	if err := runRun(&buf, []string{"-repo", repo, "-tasks", tasksFile, "-goal", "x", "-planner", "echo", "-agent", agent}); err == nil {
+	if _, err := runRun(&buf, []string{"-repo", repo, "-tasks", tasksFile, "-goal", "x", "-planner", "echo", "-agent", agent}); err == nil {
 		t.Error("-tasks + -goal together: want error, got nil")
 	}
 }

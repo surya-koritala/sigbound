@@ -122,6 +122,46 @@ type runReport struct {
 	Verify    verifyJSON     `json:"verify"`
 }
 
+// sig run exit codes. An operational error (bad flags, a git/integrate
+// failure, etc. — returned as err from runRun) always wins and exits 1.
+// Among report-level outcomes (err == nil, the run completed), runExitCode
+// applies this precedence, most to least severe: -verify failed beats no
+// agent succeeded beats some branches flagged as conflicts; a clean
+// landed+verified run (or -verify unset entirely) is 0. Usage errors from the
+// top-level CLI invocation (unknown subcommand, missing args) exit 2 — see
+// main.go — and never reach runRun. Documented in `sig run -h`.
+const (
+	exitOK               = 0
+	exitOperationalError = 1
+	// 2 is reserved for top-level CLI usage errors; see main.go.
+	exitVerifyFailed     = 3
+	exitFlagged          = 4
+	exitNoAgentSucceeded = 5
+)
+
+// runExitCode maps a completed run's report to its exit code. It is the only
+// place the report -> exit code mapping lives; see the exit-code constants
+// above for the precedence it implements.
+func runExitCode(rep runReport) int {
+	if rep.Verify.Ran && !rep.Verify.OK {
+		return exitVerifyFailed
+	}
+	anyAgentOK := false
+	for _, a := range rep.PerAgent {
+		if a.OK {
+			anyAgentOK = true
+			break
+		}
+	}
+	if !anyAgentOK {
+		return exitNoAgentSucceeded
+	}
+	if len(rep.Integrate.Flagged) > 0 {
+		return exitFlagged
+	}
+	return exitOK
+}
+
 // runParams is the resolved configuration for one driver run.
 type runParams struct {
 	Repo            string
@@ -171,11 +211,24 @@ func validateLaneMode(m string) error {
 	}
 }
 
-func runRun(w io.Writer, argv []string) error {
+// runRun parses flags, drives the run, and returns the process exit code
+// alongside an error. err is non-nil only for operational failures (bad
+// flags, a git/integrate failure, etc.); the caller (main) prints it and the
+// returned code is exitOperationalError. When err is nil, code is either
+// exitOK (including `-h`, which just prints usage) or one of the
+// report-level codes from runExitCode.
+func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-resolver CMD] [-verify CMD [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-json]")
 		fs.PrintDefaults()
+		fmt.Fprintln(fs.Output(), "\nexit codes:")
+		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
+		fmt.Fprintln(fs.Output(), "  1  operational error (bad flags, a git/integrate failure, etc.)")
+		fmt.Fprintln(fs.Output(), "  2  usage error (bad top-level sig invocation)")
+		fmt.Fprintln(fs.Output(), "  3  -verify failed; nothing landed")
+		fmt.Fprintln(fs.Output(), "  4  one or more branches flagged as conflicts (the rest landed)")
+		fmt.Fprintln(fs.Output(), "  5  no agent succeeded")
 	}
 	repo := fs.String("repo", "", "path to the target git repository")
 	base := fs.String("base", "main", "base branch the agents fork from and the result lands onto")
@@ -199,21 +252,21 @@ func runRun(w io.Writer, argv []string) error {
 
 	if err := fs.Parse(argv); err != nil {
 		if err == flag.ErrHelp {
-			return nil
+			return exitOK, nil
 		}
-		return err
+		return exitOperationalError, err
 	}
 	if *repo == "" {
-		return errors.New("-repo is required")
+		return exitOperationalError, errors.New("-repo is required")
 	}
 	if strings.TrimSpace(*agentCmd) == "" {
-		return errors.New("-agent is required")
+		return exitOperationalError, errors.New("-agent is required")
 	}
 	if err := validateStrategy(*strategy); err != nil {
-		return err
+		return exitOperationalError, err
 	}
 	if err := validateLaneMode(*lanes); err != nil {
-		return err
+		return exitOperationalError, err
 	}
 
 	// Task source: exactly one of -tasks (explicit) or -goal (planned). If both
@@ -222,9 +275,9 @@ func runRun(w io.Writer, argv []string) error {
 	haveGoal := strings.TrimSpace(*goal) != ""
 	switch {
 	case haveTasks && haveGoal:
-		return errors.New("-tasks and -goal are mutually exclusive; pass exactly one")
+		return exitOperationalError, errors.New("-tasks and -goal are mutually exclusive; pass exactly one")
 	case !haveTasks && !haveGoal:
-		return errors.New("one of -tasks or -goal is required")
+		return exitOperationalError, errors.New("one of -tasks or -goal is required")
 	}
 
 	var tasks []taskSpec
@@ -232,17 +285,17 @@ func runRun(w io.Writer, argv []string) error {
 	if haveTasks {
 		tasks, err = loadTasks(*tasksFile)
 		if err != nil {
-			return err
+			return exitOperationalError, err
 		}
 		if len(tasks) == 0 {
-			return errors.New("no tasks in -tasks file")
+			return exitOperationalError, errors.New("no tasks in -tasks file")
 		}
 	} else {
 		// Plan from the goal. A bad plan returns an error here — before any agent
 		// runs — so a broken plan never launches a broken run (fail-safe).
 		tasks, err = planTasks(context.Background(), *repo, *goal, *plannerCmd, *n, *plannerTimeout)
 		if err != nil {
-			return err
+			return exitOperationalError, err
 		}
 	}
 
@@ -261,14 +314,21 @@ func runRun(w io.Writer, argv []string) error {
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
 	if err != nil {
-		return err
+		return exitOperationalError, err
 	}
+	code := runExitCode(rep)
 	if *asJSON {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		return enc.Encode(rep)
+		if err := enc.Encode(rep); err != nil {
+			return exitOperationalError, err
+		}
+		return code, nil
 	}
-	return writeRunSummary(w, rep)
+	if err := writeRunSummary(w, rep); err != nil {
+		return exitOperationalError, err
+	}
+	return code, nil
 }
 
 // loadTasks reads and validates the -tasks JSON array.

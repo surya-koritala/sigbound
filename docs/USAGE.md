@@ -73,6 +73,23 @@ Ids must be unique and non-empty. Tasks with disjoint `files` integrate in
 parallel; overlapping ones are serialized. When `files` is omitted, the task's
 write-set is computed from what the agent actually changed.
 
+### Exit codes
+
+`sig run` exits with a code that reflects the actual outcome, so CI can gate
+on it instead of parsing stdout:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Landed and verified (or `-verify` was not set). |
+| `1` | Operational error (bad flags, a git/integrate failure, etc.). |
+| `2` | Usage error (bad top-level `sig` invocation). |
+| `3` | `-verify` failed; nothing landed. |
+| `4` | One or more branches flagged as conflicts (the rest landed). |
+| `5` | No agent succeeded. |
+
+When a run matches more than one of these, the most severe wins, in this
+order: `1` > `3` > `5` > `4`.
+
 ---
 
 ## `sig integrate`

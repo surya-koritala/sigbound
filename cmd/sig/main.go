@@ -36,9 +36,12 @@ func main() {
 			os.Exit(1)
 		}
 	case "run":
-		if err := runRun(os.Stdout, os.Args[2:]); err != nil {
+		code, err := runRun(os.Stdout, os.Args[2:])
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "sig run:", err)
-			os.Exit(1)
+		}
+		if code != 0 {
+			os.Exit(code)
 		}
 	case "version", "-v", "--version":
 		runVersion(os.Stdout)
