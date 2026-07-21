@@ -8,9 +8,9 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
-## [0.1.0] - TBD
+## [0.1.0] - 2026-07-21
 
-Initial public release. Date to be set when the release is tagged.
+Initial public release.
 
 ### Added
 
