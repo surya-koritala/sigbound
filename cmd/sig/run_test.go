@@ -296,6 +296,82 @@ func TestDriveRunLaneEnforcement(t *testing.T) {
 	}
 }
 
+// TestRunExitCode exercises the outcome->exit-code mapping directly (the
+// seam runRun uses), including the override precedence when a report matches
+// more than one failure class: verify-failed > no-agent-succeeded > flagged.
+func TestRunExitCode(t *testing.T) {
+	cases := []struct {
+		name string
+		rep  runReport
+		want int
+	}{
+		{
+			name: "clean landed, verify unset",
+			rep:  runReport{PerAgent: []perAgentJSON{{OK: true}}},
+			want: exitOK,
+		},
+		{
+			name: "clean landed, verify passed",
+			rep: runReport{
+				PerAgent: []perAgentJSON{{OK: true}},
+				Verify:   verifyJSON{Ran: true, OK: true},
+			},
+			want: exitOK,
+		},
+		{
+			name: "verify failed wins over flagged",
+			rep: runReport{
+				PerAgent:  []perAgentJSON{{OK: true}},
+				Integrate: integrateJSON{Flagged: []flaggedJSON{{Branch: "agent/x"}}},
+				Verify:    verifyJSON{Ran: true, OK: false},
+			},
+			want: exitVerifyFailed,
+		},
+		{
+			name: "verify failed wins over no-agent-succeeded",
+			rep: runReport{
+				PerAgent: []perAgentJSON{{OK: false}},
+				Verify:   verifyJSON{Ran: true, OK: false},
+			},
+			want: exitVerifyFailed,
+		},
+		{
+			name: "no agent succeeded, verify never ran",
+			rep:  runReport{PerAgent: []perAgentJSON{{OK: false}, {OK: false}}},
+			want: exitNoAgentSucceeded,
+		},
+		{
+			name: "no agent succeeded, verify trivially passed",
+			rep: runReport{
+				PerAgent: []perAgentJSON{{OK: false}},
+				Verify:   verifyJSON{Ran: true, OK: true},
+			},
+			want: exitNoAgentSucceeded,
+		},
+		{
+			name: "no-agent-succeeded wins over flagged",
+			rep: runReport{
+				PerAgent:  []perAgentJSON{{OK: false}},
+				Integrate: integrateJSON{Flagged: []flaggedJSON{{Branch: "agent/x"}}},
+			},
+			want: exitNoAgentSucceeded,
+		},
+		{
+			name: "flagged only",
+			rep: runReport{
+				PerAgent:  []perAgentJSON{{OK: true}, {OK: true}},
+				Integrate: integrateJSON{Flagged: []flaggedJSON{{Branch: "agent/x"}}},
+			},
+			want: exitFlagged,
+		},
+	}
+	for _, c := range cases {
+		if got := runExitCode(c.rep); got != c.want {
+			t.Errorf("%s: runExitCode=%d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {
@@ -431,6 +507,10 @@ func TestDriveRunVerifyFailLandsNothing(t *testing.T) {
 	}
 	if after != before {
 		t.Fatalf("base ref advanced to %s on verify failure; must stay at %s (land nothing)", after, before)
+	}
+	// This is the exact bug issue #4 fixes: verify.ok=false must not exit 0.
+	if code := runExitCode(rep); code != exitVerifyFailed {
+		t.Fatalf("runExitCode=%d, want exitVerifyFailed(%d) on a verify failure", code, exitVerifyFailed)
 	}
 }
 
