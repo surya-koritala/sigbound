@@ -1,0 +1,17 @@
+[
+  {
+    "id": "add-search",
+    "prompt": "Add a Search(substr string) []Todo method to model/todo.go that returns todos whose title contains substr (case-insensitive).",
+    "files": ["model/todo.go"]
+  },
+  {
+    "id": "add-csv-export",
+    "prompt": "Create a new package export/ with WriteCSV(w io.Writer, todos []model.Todo) error that writes the todos as CSV.",
+    "files": ["export/export.go"]
+  },
+  {
+    "id": "add-stats",
+    "prompt": "Create a new package stats/ with Summary(todos []model.Todo) string returning a one-line count of total and completed todos.",
+    "files": ["stats/stats.go"]
+  }
+]

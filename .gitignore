@@ -1,0 +1,4 @@
+/sig
+*.test
+*.out
+.DS_Store

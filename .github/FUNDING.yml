@@ -1,0 +1,11 @@
+# Sigbound funding configuration.
+#
+# This is a stub — uncomment and fill in a platform to show a "Sponsor" button
+# on the repository. See:
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+#
+# github: [octocat]                # GitHub Sponsors username(s)
+# open_collective: sigbound        # Open Collective slug
+# ko_fi: sigbound                  # Ko-fi username
+# liberapay: sigbound              # Liberapay username
+# custom: ["https://example.com/donate"]
