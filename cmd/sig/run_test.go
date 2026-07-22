@@ -1716,6 +1716,184 @@ func TestDriveRunVerifyBisectAfterRepair(t *testing.T) {
 	}
 }
 
+// TestDriveRunVerifyBisectBinarySplitPath: 7 disjoint groups (k=7 >
+// bisectAloneMax, so bisectGoodGroups takes the k>6 binary-split path, never
+// each-alone) with exactly 2 broken groups — g5 and g6, both in the second half
+// of the k=7 split. Drives the split path through a real driveRun: the salvage
+// must land exactly the 5 green groups' union, report g5/g6 as DroppedByBisect
+// (never Flagged), and exit 0.
+//
+// It also pins the exact bisect_attempt count this layout takes, traced
+// straight from splitGood (k=7, mid=k/2=3):
+//
+//	splitGood([0,1,2])   -> whole subset green (no recursion)     : 1 probe
+//	splitGood([3,4,5,6]) -> whole subset red, mid=2, recurse:
+//	  splitGood([3,4])   -> whole subset green (no recursion)     : 1 probe
+//	  splitGood([5,6])   -> whole subset red, mid=1, recurse:
+//	    splitGood([5])   -> red leaf (len==1, no recursion)       : 1 probe
+//	    splitGood([6])   -> red leaf (len==1, no recursion)       : 1 probe
+//	                                                        (+1 for [5,6] itself)
+//	                                                    (+1 for [3,4,5,6] itself)
+//
+// = 6 probes for the search itself — already fewer than the 7 an each-alone
+// scan of 7 groups would need — plus 1 mandatory union re-verify of the final
+// good set {0,1,2,3,4} = 7 bisect_attempt events overall.
+func TestDriveRunVerifyBisectBinarySplitPath(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	eventsPath := filepath.Join(t.TempDir(), "events.ndjson")
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		// Broken iff g5.txt or g6.txt is present in the candidate checkout.
+		VerifyCmd:    `if [ -f g5.txt ] || [ -f g6.txt ]; then exit 1; fi; exit 0`,
+		VerifyBisect: true,
+		EventsPath:   eventsPath,
+	}
+	rep, err := driveRun(ctx, p, disjointGroupTasks(t, 7))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false; bisect should have salvaged a green subset: %q", rep.Verify.Output)
+	}
+	b := rep.Verify.Bisect
+	if b == nil || !b.Ran {
+		t.Fatal("verify.bisect missing; expected a bisect record")
+	}
+	if len(b.LandedGroups) != 5 || len(b.DroppedGroups) != 2 {
+		t.Fatalf("bisect landed=%v dropped=%v, want 5 landed / 2 dropped", b.LandedGroups, b.DroppedGroups)
+	}
+	wantDropped := []string{"agent/g5", "agent/g6"}
+	for i, grp := range b.DroppedGroups {
+		if len(grp) != 1 || grp[0] != wantDropped[i] {
+			t.Fatalf("bisect.droppedGroups=%v, want %v as singleton groups in order", b.DroppedGroups, wantDropped)
+		}
+	}
+	// Landed/flagged accounting reflects the FINAL subset; g5/g6 are dropped, not flagged.
+	wantLanded := []string{"agent/g0", "agent/g1", "agent/g2", "agent/g3", "agent/g4"}
+	if got := rep.Integrate.Landed; len(got) != len(wantLanded) {
+		t.Fatalf("integrate.landed=%v, want %v", got, wantLanded)
+	}
+	for _, want := range wantLanded {
+		if !contains(rep.Integrate.Landed, want) {
+			t.Fatalf("integrate.landed=%v missing %s", rep.Integrate.Landed, want)
+		}
+	}
+	if got := rep.Integrate.DroppedByBisect; len(got) != 2 || got[0] != "agent/g5" || got[1] != "agent/g6" {
+		t.Fatalf("integrate.droppedByBisect=%v, want [agent/g5 agent/g6]", got)
+	}
+	if len(rep.Integrate.Flagged) != 0 {
+		t.Fatalf("integrate.flagged=%v, want none (a dropped group is not a conflict)", rep.Integrate.Flagged)
+	}
+	// Base advanced to the verified union tree: g0..g4 present, g5/g6 absent.
+	mainSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("main=%s not advanced to bisected finalSHA=%s", mainSHA, rep.Integrate.FinalSHA)
+	}
+	paths, err := g.LsTree(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"g0.txt", "g1.txt", "g2.txt", "g3.txt", "g4.txt"} {
+		if !contains(paths, f) {
+			t.Fatalf("landed tree missing green group file %s (have %v)", f, paths)
+		}
+	}
+	for _, f := range []string{"g5.txt", "g6.txt"} {
+		if contains(paths, f) {
+			t.Fatalf("landed tree contains dropped group file %s (have %v)", f, paths)
+		}
+	}
+	if code := runExitCode(rep); code != exitOK {
+		t.Fatalf("runExitCode=%d, want exitOK(0) on a bisect that landed a green subset", code)
+	}
+
+	// bisect_attempt count pins the split path actually ran (see the trace in
+	// the doc comment above) — 6 search probes + 1 final union re-verify.
+	names, _ := readEvents(t, eventsPath)
+	if got, want := countOf(names, "bisect_attempt"), 7; got != want {
+		t.Fatalf("bisect_attempt count=%d, want %d (6 split-search probes + 1 union re-verify)", got, want)
+	}
+}
+
+// TestDriveRunVerifyBisectMergetreeStrategy: the same 3-disjoint-groups/1-broken
+// shape as TestDriveRunVerifyBisectLandsGreenSubset, but with -strategy
+// mergetree (IntegrateOCC) instead of the default overlay. mergetree's combine
+// phase is entirely different (a parallel pairwise merge-tree reduction instead
+// of an object-store overlay), but its GroupHeads/GroupBranches bookkeeping is
+// meant to be strategy-agnostic — this pins that bisect salvages identically
+// under it: same landed/dropped accounting, same landed tree, same exit code.
+func TestDriveRunVerifyBisectMergetreeStrategy(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "mergetree", AgentCmd: agent,
+		// Broken iff g2.txt is present in the candidate checkout.
+		VerifyCmd:    `if [ -f g2.txt ]; then exit 1; fi; exit 0`,
+		VerifyBisect: true,
+	}
+	rep, err := driveRun(ctx, p, disjointGroupTasks(t, 3))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+
+	if rep.Integrate.Strategy != "mergetree" {
+		t.Fatalf("integrate.strategy=%q, want mergetree (sanity check that this test actually exercised it)", rep.Integrate.Strategy)
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false; bisect should have salvaged a green subset: %q", rep.Verify.Output)
+	}
+	b := rep.Verify.Bisect
+	if b == nil || !b.Ran {
+		t.Fatal("verify.bisect missing; expected a bisect record")
+	}
+	if len(b.LandedGroups) != 2 || len(b.DroppedGroups) != 1 {
+		t.Fatalf("bisect landed=%v dropped=%v, want 2 landed / 1 dropped", b.LandedGroups, b.DroppedGroups)
+	}
+	if len(b.DroppedGroups[0]) != 1 || b.DroppedGroups[0][0] != "agent/g2" {
+		t.Fatalf("dropped group=%v, want [agent/g2]", b.DroppedGroups)
+	}
+	// Landed/flagged accounting reflects the FINAL subset; g2 is dropped, not flagged.
+	if got := rep.Integrate.Landed; len(got) != 2 || !contains(got, "agent/g0") || !contains(got, "agent/g1") {
+		t.Fatalf("integrate.landed=%v, want [agent/g0 agent/g1]", got)
+	}
+	if got := rep.Integrate.DroppedByBisect; len(got) != 1 || got[0] != "agent/g2" {
+		t.Fatalf("integrate.droppedByBisect=%v, want [agent/g2]", got)
+	}
+	if len(rep.Integrate.Flagged) != 0 {
+		t.Fatalf("integrate.flagged=%v, want none (a dropped group is not a conflict)", rep.Integrate.Flagged)
+	}
+	// Base advanced to the verified union tree: g0.txt+g1.txt present, g2.txt absent.
+	mainSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("main=%s not advanced to bisected finalSHA=%s", mainSHA, rep.Integrate.FinalSHA)
+	}
+	paths, err := g.LsTree(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(paths, "g0.txt") || !contains(paths, "g1.txt") {
+		t.Fatalf("landed tree missing a green group's file (have %v)", paths)
+	}
+	if contains(paths, "g2.txt") {
+		t.Fatalf("landed tree contains the dropped group's g2.txt (have %v)", paths)
+	}
+	if code := runExitCode(rep); code != exitOK {
+		t.Fatalf("runExitCode=%d, want exitOK(0) on a bisect that landed a green subset", code)
+	}
+}
+
 // TestSplitGood exercises the k>6 binary-split search in isolation with a fake
 // eval: groups whose index is in the `bad` set fail alone, and any subset
 // containing a bad group fails (the additive-failure model — a broken file stays
