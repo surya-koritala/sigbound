@@ -25,7 +25,8 @@ Splits work into tasks, runs an agent on each in its own worktree, integrates
 the results, and optionally verifies and repairs the merged tree.
 
 ```
-sig run -repo PATH -base BRANCH
+sig run [-config PATH]
+        -repo PATH -base BRANCH
         (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N])
         -agent CMD [-agent-timeout D] [-agent-retries N]
         [-strategy overlay] [-assert]
@@ -45,6 +46,7 @@ sig run -repo PATH -base BRANCH
 
 | Flag | Default | Meaning |
 |------|---------|---------|
+| `-config` | — | Path to a flags file supplying defaults for the other flags below (see [Config file](#config-file)). `""` (unset): look for `./sig.conf` in the current directory. `none`: disable that discovery. Anything else: read that exact file. |
 | `-repo` | *(required)* | Path to the target git repository. |
 | `-base` | `main` | Branch the agents fork from and the result lands onto. |
 | `-tasks` | — | JSON file describing the tasks (see below). Mutually exclusive with `-goal`. |
@@ -151,6 +153,76 @@ optional `files` list — the lane the task is allowed to touch:
 Ids must be unique and non-empty. Tasks with disjoint `files` integrate in
 parallel; overlapping ones are serialized. When `files` is omitted, the task's
 write-set is computed from what the agent actually changed.
+
+### Config file
+
+A real project's `sig run` invocation is long and stable from one run to the
+next — the same `-agent`/`-verify`/`-repair`/`-lanes` every time. `-config`
+lets you park those standing flags in a file instead of retyping them.
+
+**This is a flags file, not TOML**, despite `sig.toml` being issue #13's
+working title: sigbound is stdlib-only (no third-party dependencies, ever),
+and the standard library doesn't include a TOML parser. `sig.conf` is instead
+the simplest thing that actually works — one flag per line:
+
+```
+# sig.conf — standing flags for this project. Comments start with '#'.
+# key = the flag's name, without its leading dash.
+# value = exactly what you'd type after that flag on the command line.
+
+repo     = .
+strategy = overlay
+agent    = claude -p --permission-mode acceptEdits "$SIGBOUND_TASK"
+resolver = git merge-file -p --union "$SIGBOUND_OURS" "$SIGBOUND_BASE" "$SIGBOUND_THEIRS"
+verify   = go build ./... && go test ./...
+repair   = claude -p --permission-mode acceptEdits "Fix this build failure: $SIGBOUND_FAILURE"
+lanes    = strict
+json     = true
+```
+
+With that file next to where you run `sig` from:
+
+```bash
+sig run -config sig.conf -tasks examples/tasks.json
+```
+
+`-tasks` here is still required on the command line (or could equally live in
+`sig.conf` itself) — `-config` supplies *defaults*, it doesn't replace normal
+flag validation. Every other run flag is allowed in the file **except**
+`-config` itself (self-referential, so it's a hard error, not silently
+ignored).
+
+**Discovery.** Leave `-config` unset and `sig run` looks for `./sig.conf` in
+the directory you ran it from — no home-directory fallback, no walking up
+toward a repo root. Nothing there is not an error; the run just proceeds on
+flags and defaults alone. Pass `-config /path/to/file` to use a specific file
+by name (it must exist and be readable), or `-config none` to turn discovery
+off even when a `sig.conf` is sitting right there.
+
+**Precedence.** Command-line flag > config file > flag's built-in default. A
+flag you pass on the command line always wins over the same key in the config
+file; a key the config file sets always wins over the flag's plain default.
+Concretely: `-config sig.conf -strategy overlay` uses `overlay` even if
+`sig.conf` says `strategy = mergetree`, but drop `-strategy` from the command
+line and the config file's `mergetree` takes over.
+
+One consequence of that precedence is worth calling out: [`-lanes`'s
+strict-by-default rule for planned (`-goal`) runs](#file-lanes) treats a
+config-file `lanes = ...` the same as a command-line `-lanes` — both count as
+"the caller chose this explicitly," so either one overrides the strict
+default, not just a command-line flag.
+
+**Format.** Blank lines and lines starting with `#` (after leading
+whitespace) are ignored. Otherwise a line must be `key=value`; only the
+*first* `=` on the line is the delimiter, so a value may itself contain `=`
+(a shell command like `verify = FOO=bar go test ./...` works as expected).
+Whitespace around the key and around the value is trimmed; whitespace inside
+the value is not. A line with no `=` at all, or an empty key, is a hard
+parse error naming the file and the 1-based line number, same as an unknown
+key (`fs.Set` rejects it) or a value the flag's own type can't parse (e.g. a
+non-boolean for `-assert`). `sig run` fails before touching git or spawning
+any agent in every one of these cases — a bad config file behaves like any
+other bad flag.
 
 ### Exit codes
 
