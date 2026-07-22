@@ -2,14 +2,17 @@ package main
 
 // Native-fuzzing targets for the parsers of UNTRUSTED input in the sig command:
 // the auto-planner's plan JSON (parsePlan — arbitrary model output, the highest
-// value target here) and the path-validation predicates it depends on (relSafe,
-// slugSafe). parsePlan is the gate that decides whether a run ever starts, so it
-// must reject every malformed/hostile plan without panicking; relSafe/slugSafe are
-// the safety predicates that keep a declared path from escaping the repo or a slug
-// from becoming an unsafe branch/dir name. Each target asserts "did not panic"
-// plus the invariant the parser is supposed to guarantee on the accept path.
+// value target here), the path-validation predicates it depends on (relSafe,
+// slugSafe), and the -config flags-file parser (parseConfigFile — an external
+// text file, hand-edited or generated). parsePlan is the gate that decides
+// whether a run ever starts, so it must reject every malformed/hostile plan
+// without panicking; relSafe/slugSafe are the safety predicates that keep a
+// declared path from escaping the repo or a slug from becoming an unsafe
+// branch/dir name. Each target asserts "did not panic" plus the invariant the
+// parser is supposed to guarantee on the accept path.
 
 import (
+	"bytes"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -149,6 +152,48 @@ func FuzzSlugSafe(f *testing.F) {
 		// A slug-safe string must also be a single clean path component.
 		if strings.ContainsAny(s, "/\\") {
 			t.Fatalf("slugSafe accepted path separator in %q", s)
+		}
+	})
+}
+
+// FuzzParseConfigFile fuzzes the -config flags-file parser with arbitrary
+// bytes as the file content. On the ACCEPT path it re-checks the invariants
+// parseConfigFile documents: every entry has a non-empty key and a 1-based
+// line number, and no entry can come from a blank or '#'-comment line. A
+// crasher (panic) here is a real bug — this file is meant to be hand-edited,
+// so it will see malformed lines, weird whitespace, and stray characters in
+// practice, not just well-formed KEY=VALUE pairs.
+func FuzzParseConfigFile(f *testing.F) {
+	f.Add([]byte("agent=./my-agent\n"))
+	f.Add([]byte("# a standing config\nagent=./my-agent\nverify=go build ./... && go test ./...\n"))
+	f.Add([]byte("lanes = strict\n")) // spaces around '='
+	f.Add([]byte(""))
+	f.Add([]byte("\n\n\n"))
+	f.Add([]byte("# only a comment\n"))
+	f.Add([]byte("notakeyvalueline\n"))                                // malformed: no '='
+	f.Add([]byte("=novalue\n"))                                        // empty key
+	f.Add([]byte("key=\n"))                                            // empty value is fine
+	f.Add([]byte("verify=X=1; echo $X=1\n"))                           // '=' inside the value
+	f.Add([]byte("agent=./a\r\nlanes=warn\r\n"))                       // CRLF
+	f.Add([]byte("agent=./a\rlanes=warn\r"))                           // bare CR, no LF (not a line ending sigbound recognizes)
+	f.Add(bytes.Repeat([]byte("k"), 10000))                            // huge key, no '=' at all
+	f.Add(append(bytes.Repeat([]byte("k"), 10000), []byte("=v\n")...)) // huge key with a value
+	f.Add([]byte("a\x00b=c\n"))                                        // embedded NUL in the key
+	f.Add([]byte("emoji😀=🚀\n"))                                        // non-ASCII key and value
+	f.Add([]byte("  key with spaces  =  value with spaces  \n"))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		entries, err := parseConfigFile(data)
+		if err != nil {
+			return // rejecting a malformed file is fine, as long as it did not panic
+		}
+		for _, e := range entries {
+			if e.Key == "" {
+				t.Fatalf("accepted entry with empty key: %+v", e)
+			}
+			if e.Line < 1 {
+				t.Fatalf("accepted entry with non-positive line number: %+v", e)
+			}
 		}
 	})
 }

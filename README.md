@@ -78,6 +78,8 @@ Or start from a goal and let a model plan the tasks:
 
 `-agent`, `-resolver`, `-repair`, and `-planner` are shell commands you supply; the examples use the `claude` CLI, but anything that edits files in the working directory works. Each command receives the relevant `SIGBOUND_*` environment variables.
 
+That invocation is long and doesn't change much run to run — put your standing flags in `sig.conf` (one `key=value` per line; see [Config file](docs/USAGE.md#config-file)) and just pass `-config sig.conf -tasks ...` from then on.
+
 ## Documentation
 
 [`docs/USAGE.md`](docs/USAGE.md) is the complete reference: every `sig run`, `sig integrate`, and `sigbench` flag, the full set of `SIGBOUND_*` environment variables passed to each command, and the JSON report shape. [`examples/`](examples/) has a runnable quickstart.

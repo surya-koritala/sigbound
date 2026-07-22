@@ -246,7 +246,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -256,6 +256,11 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		fmt.Fprintln(fs.Output(), "  4  one or more branches flagged as conflicts (the rest landed)")
 		fmt.Fprintln(fs.Output(), "  5  no agent succeeded")
 	}
+	configFlag := fs.String("config", "", "path to a flat KEY=VALUE flags file supplying defaults for the OTHER run flags (key = flag name without its leading dash, "+
+		"value = exactly what would follow it on the command line; NOT TOML despite issue #13's working title — see docs/USAGE.md's Config file section). "+
+		"Precedence is command-line flag > config file > flag default. Default \"\": look for ./sig.conf in the current working directory (discovery is silent "+
+		"if nothing is there); \""+configDisableSentinel+"\": disable discovery entirely; any other value: read that exact file, failing loudly if it can't be read. "+
+		"\"-config\" is never itself allowed as a key inside the file")
 	repo := fs.String("repo", "", "path to the target git repository")
 	base := fs.String("base", "main", "base branch the agents fork from and the result lands onto")
 	tasksFile := fs.String("tasks", "", `path to a JSON file: [{"id":"..","prompt":".."}] (mutually exclusive with -goal)`)
@@ -304,16 +309,24 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		}
 		return exitOperationalError, err
 	}
-	// lanesExplicit tracks whether the caller passed -lanes (vs. relying on its
-	// zero-value default), via fs.Visit (only visits flags actually set on the
-	// command line). Needed below: a planned run defaults to strict UNLESS the
-	// caller set -lanes explicitly, in which case that choice always wins.
-	lanesExplicit := false
+	// explicitFlags tracks every flag actually set on the command line (fs.Visit
+	// only visits those), used both for -config's precedence below (a
+	// command-line flag always wins over a config-file value for the same key)
+	// and for the -lanes strict-default logic further down. applyConfigFile
+	// also ADDS to this set every key it successfully applies from the config
+	// file, so a config-chosen -lanes counts as explicit too — the user chose
+	// it deliberately either way, just not via argv.
+	explicitFlags := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "lanes" {
-			lanesExplicit = true
-		}
+		explicitFlags[f.Name] = true
 	})
+	if err := applyConfigFile(fs, *configFlag, explicitFlags); err != nil {
+		return exitOperationalError, err
+	}
+	// lanesExplicit: a planned run (-goal) defaults -lanes to strict UNLESS the
+	// caller set -lanes explicitly (command line OR config file — see
+	// explicitFlags above), in which case that choice always wins.
+	lanesExplicit := explicitFlags["lanes"]
 	if *repo == "" {
 		return exitOperationalError, errors.New("-repo is required")
 	}
