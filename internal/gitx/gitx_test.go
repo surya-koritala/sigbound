@@ -48,6 +48,43 @@ func TestInitCommitHead(t *testing.T) {
 	}
 }
 
+// TestGitCommonDir proves the property -verify-cache storage relies on: a
+// linked worktree's GitCommonDir resolves to the SAME shared .git as the
+// main repo it was created from, not the worktree's own per-worktree
+// admin dir — so cache entries written from either location land in one
+// shared place.
+func TestGitCommonDir(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+	// EvalSymlinks: on macOS t.TempDir() lives under a symlinked /var, and
+	// --path-format=absolute resolves it — compare against the same
+	// resolved form rather than asserting byte-identical strings, which
+	// would be a host quirk, not a real behavior difference.
+	want, err := filepath.EvalSymlinks(filepath.Join(g.Dir(), ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := g.GitCommonDir(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("GitCommonDir=%s, want %s", got, want)
+	}
+
+	wtDir := filepath.Join(t.TempDir(), "wt")
+	if err := g.WorktreeAdd(ctx, wtDir, "feature", base); err != nil {
+		t.Fatal(err)
+	}
+	gotWT, err := g.At(wtDir).GitCommonDir(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotWT != want {
+		t.Fatalf("worktree GitCommonDir=%s, want %s (same as main repo)", gotWT, want)
+	}
+}
+
 func TestWorktreeAddDiffRemove(t *testing.T) {
 	ctx := context.Background()
 	g, base := newRepo(t)

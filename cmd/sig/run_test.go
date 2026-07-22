@@ -1654,6 +1654,336 @@ func TestDriveRunRepairSkippedWhenVerifyPasses(t *testing.T) {
 	}
 }
 
+// countingVerifyCmd returns a -verify command that APPENDS a line to marker
+// every time it actually runs, then exits with exit — so a test can prove a
+// command ran (or, just as importantly, did NOT run because -verify-cache
+// served a cached verdict instead) by counting marker's lines, independent
+// of whether the invocation itself passed or failed.
+func countingVerifyCmd(marker string, exit int) string {
+	return fmt.Sprintf("echo ran >> '%s'; exit %d", marker, exit)
+}
+
+// countLines returns the number of newline-terminated lines in path, or 0 if
+// it doesn't exist yet (a command that never ran leaves no marker at all).
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	if len(data) == 0 {
+		return 0
+	}
+	return len(strings.Split(strings.TrimRight(string(data), "\n"), "\n"))
+}
+
+// pinBranch creates ref, pointing at sha, alongside "main" — used below to
+// give a second driveRun call the exact same starting tree as the first
+// without reusing "main" itself (which the first run already advanced), so a
+// differently-named task can independently reproduce a byte-identical
+// landed tree via a different agent branch/commit.
+func pinBranch(t *testing.T, ctx context.Context, g *gitx.Git, ref, sha string) {
+	t.Helper()
+	if err := g.UpdateRef(ctx, "refs/heads/"+ref, sha); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDriveRunVerifyCacheHitsOnIdenticalTree proves the whole point of
+// -verify-cache (issue #18): two driveRun calls that land the EXACT SAME
+// tree content via DIFFERENT agent branches/commits (a resume/replay
+// scenario — main2 pins the same starting commit as main, and t2 writes the
+// identical bytes t1 did) share one cache entry. The second run's -verify
+// command must never even be spawned — proven by countingVerifyCmd's marker
+// staying at one append, not two.
+func TestDriveRunVerifyCacheHitsOnIdenticalTree(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	baseSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinBranch(t, ctx, g, "main2", baseSHA)
+
+	write := map[string]string{"good.go": "package main\n\nfunc good() int { return 1 }\n"}
+	marker := filepath.Join(t.TempDir(), "marker")
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:   countingVerifyCmd(marker, 0),
+		VerifyCache: true,
+	}
+	rep1, err := driveRun(ctx, p, []taskSpec{{ID: "t1", Prompt: mustJSON(t, map[string]any{"write": write})}})
+	if err != nil {
+		t.Fatalf("driveRun #1: %v", err)
+	}
+	if !rep1.Verify.OK || rep1.Verify.Cached {
+		t.Fatalf("run #1: ok=%v cached=%v, want a real (uncached) pass", rep1.Verify.OK, rep1.Verify.Cached)
+	}
+	if n := countLines(t, marker); n != 1 {
+		t.Fatalf("verify command ran %d time(s) after run #1, want 1", n)
+	}
+
+	p2 := p
+	p2.Base = "main2"
+	rep2, err := driveRun(ctx, p2, []taskSpec{{ID: "t2", Prompt: mustJSON(t, map[string]any{"write": write})}})
+	if err != nil {
+		t.Fatalf("driveRun #2: %v", err)
+	}
+	if !rep2.Verify.OK || !rep2.Verify.Cached {
+		t.Fatalf("run #2: ok=%v cached=%v, want a CACHED pass (identical tree+command already verified by run #1)", rep2.Verify.OK, rep2.Verify.Cached)
+	}
+	if n := countLines(t, marker); n != 1 {
+		t.Fatalf("verify command ran %d time(s) after run #2, want still 1 (a cache hit must skip the command entirely)", n)
+	}
+
+	// Confirm the premise the whole test rests on: the two runs really did
+	// land byte-identical trees, from different branches/commits.
+	tree1, err := g.TreeOID(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree2, err := g.TreeOID(ctx, "main2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tree1 != tree2 {
+		t.Fatalf("premise broken: main tree=%s, main2 tree=%s, want identical", tree1, tree2)
+	}
+}
+
+// TestDriveRunVerifyCacheNeverCachesAFailure proves the fail-safe half of
+// -verify-cache: a FAILING verdict is never written to the cache, so a
+// second run over the identical (tree, command) pair still re-executes the
+// command in full — never a false green, and never a stale red once
+// whatever caused the failure might have been fixed out-of-band.
+func TestDriveRunVerifyCacheNeverCachesAFailure(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	baseSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinBranch(t, ctx, g, "main2", baseSHA)
+
+	write := map[string]string{"good.go": "package main\n\nfunc good() int { return 1 }\n"}
+	marker := filepath.Join(t.TempDir(), "marker")
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:   countingVerifyCmd(marker, 1), // always fails
+		VerifyCache: true,
+	}
+	rep1, err := driveRun(ctx, p, []taskSpec{{ID: "t1", Prompt: mustJSON(t, map[string]any{"write": write})}})
+	if err != nil {
+		t.Fatalf("driveRun #1: %v", err)
+	}
+	if rep1.Verify.OK {
+		t.Fatal("run #1 unexpectedly passed")
+	}
+	if n := countLines(t, marker); n != 1 {
+		t.Fatalf("verify command ran %d time(s) after run #1, want 1", n)
+	}
+
+	p2 := p
+	p2.Base = "main2"
+	rep2, err := driveRun(ctx, p2, []taskSpec{{ID: "t2", Prompt: mustJSON(t, map[string]any{"write": write})}})
+	if err != nil {
+		t.Fatalf("driveRun #2: %v", err)
+	}
+	if rep2.Verify.OK || rep2.Verify.Cached {
+		t.Fatalf("run #2: ok=%v cached=%v, want a real (uncached) failure", rep2.Verify.OK, rep2.Verify.Cached)
+	}
+	if n := countLines(t, marker); n != 2 {
+		t.Fatalf("verify command ran %d time(s) after run #2, want 2 (a failure must NEVER be served from cache)", n)
+	}
+}
+
+// TestDriveRunVerifyCacheMissOnDifferentCommand proves the cache key folds
+// in the resolved command: the exact same tree verified with a DIFFERENT
+// -verify command must miss and actually run, never reuse another
+// command's cache entry for that tree.
+func TestDriveRunVerifyCacheMissOnDifferentCommand(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	baseSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinBranch(t, ctx, g, "main2", baseSHA)
+
+	write := map[string]string{"good.go": "package main\n\nfunc good() int { return 1 }\n"}
+	markerA := filepath.Join(t.TempDir(), "markerA")
+	markerB := filepath.Join(t.TempDir(), "markerB")
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:   countingVerifyCmd(markerA, 0),
+		VerifyCache: true,
+	}
+	rep1, err := driveRun(ctx, p, []taskSpec{{ID: "t1", Prompt: mustJSON(t, map[string]any{"write": write})}})
+	if err != nil {
+		t.Fatalf("driveRun #1: %v", err)
+	}
+	if !rep1.Verify.OK {
+		t.Fatalf("run #1 failed: %s", rep1.Verify.Output)
+	}
+
+	p2 := p
+	p2.Base = "main2"
+	p2.VerifyCmd = countingVerifyCmd(markerB, 0) // same tree, DIFFERENT command string
+	rep2, err := driveRun(ctx, p2, []taskSpec{{ID: "t2", Prompt: mustJSON(t, map[string]any{"write": write})}})
+	if err != nil {
+		t.Fatalf("driveRun #2: %v", err)
+	}
+	if !rep2.Verify.OK || rep2.Verify.Cached {
+		t.Fatalf("run #2: ok=%v cached=%v, want a real (uncached) pass (a different command must never hit another command's cache entry)", rep2.Verify.OK, rep2.Verify.Cached)
+	}
+	if n := countLines(t, markerB); n != 1 {
+		t.Fatalf("command B ran %d time(s), want 1", n)
+	}
+}
+
+// TestDriveRunVerifyCacheMissOnDifferentTree proves the other half of the
+// key: the SAME command over a DIFFERENT tree must also miss.
+func TestDriveRunVerifyCacheMissOnDifferentTree(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	marker := filepath.Join(t.TempDir(), "marker")
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:   countingVerifyCmd(marker, 0),
+		VerifyCache: true,
+	}
+	rep1, err := driveRun(ctx, p, []taskSpec{{ID: "t1", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}})
+	if err != nil {
+		t.Fatalf("driveRun #1: %v", err)
+	}
+	if !rep1.Verify.OK {
+		t.Fatalf("run #1 failed: %s", rep1.Verify.Output)
+	}
+
+	// Run #2 lands on top of run #1's already-advanced main, with DIFFERENT
+	// file content: a genuinely different tree, same -verify command.
+	rep2, err := driveRun(ctx, p, []taskSpec{{ID: "t2", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"b.go": "package main\n\nfunc b() int { return 2 }\n"},
+	})}})
+	if err != nil {
+		t.Fatalf("driveRun #2: %v", err)
+	}
+	if !rep2.Verify.OK || rep2.Verify.Cached {
+		t.Fatalf("run #2: ok=%v cached=%v, want a real (uncached) pass (a different tree must never hit run #1's entry)", rep2.Verify.OK, rep2.Verify.Cached)
+	}
+	if n := countLines(t, marker); n != 2 {
+		t.Fatalf("verify command ran %d time(s), want 2", n)
+	}
+}
+
+// TestDriveRunVerifyCacheOffNeverConsulted proves -verify-cache defaults off
+// and, while off, the cache is consulted NOT AT ALL: two runs over the
+// identical (tree, command) pair both execute the command for real, and no
+// cache directory is ever created.
+func TestDriveRunVerifyCacheOffNeverConsulted(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	baseSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinBranch(t, ctx, g, "main2", baseSHA)
+
+	write := map[string]string{"good.go": "package main\n\nfunc good() int { return 1 }\n"}
+	marker := filepath.Join(t.TempDir(), "marker")
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd: countingVerifyCmd(marker, 0),
+		// VerifyCache deliberately left at its zero value (false, the default).
+	}
+	rep1, err := driveRun(ctx, p, []taskSpec{{ID: "t1", Prompt: mustJSON(t, map[string]any{"write": write})}})
+	if err != nil {
+		t.Fatalf("driveRun #1: %v", err)
+	}
+	if !rep1.Verify.OK || rep1.Verify.Cached {
+		t.Fatalf("run #1: ok=%v cached=%v", rep1.Verify.OK, rep1.Verify.Cached)
+	}
+
+	p2 := p
+	p2.Base = "main2"
+	rep2, err := driveRun(ctx, p2, []taskSpec{{ID: "t2", Prompt: mustJSON(t, map[string]any{"write": write})}})
+	if err != nil {
+		t.Fatalf("driveRun #2: %v", err)
+	}
+	if !rep2.Verify.OK || rep2.Verify.Cached {
+		t.Fatalf("run #2: ok=%v cached=%v, want a real pass with -verify-cache off, never cached=true", rep2.Verify.OK, rep2.Verify.Cached)
+	}
+	if n := countLines(t, marker); n != 2 {
+		t.Fatalf("verify command ran %d time(s), want 2 (an identical tree+command must never be skipped with -verify-cache off)", n)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "sigbound")); !os.IsNotExist(err) {
+		t.Fatalf(".git/sigbound exists with -verify-cache off (err=%v), want no cache directory ever created", err)
+	}
+}
+
+// TestDriveRunVerifyCacheMissAfterRepairAdvancesTree proves a repair round's
+// NEW head is naturally a different cache key (a different tree), never
+// mistaken for the pre-repair tree it grew from: with -verify-cache on, the
+// initial (broken) attempt and the post-repair re-verify BOTH actually
+// execute -verify — the repaired tree has never been seen before, so it can
+// only ever be a miss, and the report must not claim it was cached.
+func TestDriveRunVerifyCacheMissAfterRepairAdvancesTree(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	marker := filepath.Join(t.TempDir(), "marker")
+
+	p := runParams{
+		Repo:        repo,
+		Base:        "main",
+		Strategy:    "overlay",
+		AgentCmd:    agent,
+		VerifyCmd:   fmt.Sprintf("echo ran >> '%s'; go build ./...", marker),
+		RepairCmd:   `printf 'package main\n\nfunc helper() int { return helperX() }\n' > repair_fix.go`,
+		RepairMax:   2,
+		VerifyCache: true,
+	}
+
+	rep, err := driveRun(ctx, p, brokenBuildTasks(t))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false after repair; output=%q", rep.Verify.Output)
+	}
+	if !rep.Verify.Repaired {
+		t.Fatal("repaired=false; expected the repair loop to have fixed the initial build failure")
+	}
+	if rep.Verify.Cached {
+		t.Fatal("cached=true on a tree never seen before (the repaired tree); a repair-advanced tree must always miss")
+	}
+	if n := countLines(t, marker); n != 2 {
+		t.Fatalf("-verify command ran %d time(s), want 2 (pre-repair attempt + post-repair re-verify, neither served from cache)", n)
+	}
+	mainSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("main=%s not advanced to repaired finalSHA=%s", mainSHA, rep.Integrate.FinalSHA)
+	}
+}
+
 // openReadOnly creates an empty file at path and reopens it O_RDONLY, so every
 // Write() to the returned handle fails immediately (EBADF) — a real,
 // portable, permission-independent way to make an already-successfully-opened
