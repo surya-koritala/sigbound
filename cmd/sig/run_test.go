@@ -1839,6 +1839,28 @@ func TestDriveRunEventsNDJSON(t *testing.T) {
 		}
 	}
 
+	// ---- agent_done carries files + inLane, matching the report ----
+	perAgentByID := make(map[string]perAgentJSON, len(rep.PerAgent))
+	for _, a := range rep.PerAgent {
+		perAgentByID[a.ID] = a
+	}
+	for _, task := range tasks {
+		rec := recs[done[task.ID]]
+		a := perAgentByID[task.ID]
+		gotFiles, _ := rec["files"].([]any)
+		if len(gotFiles) != len(a.Files) {
+			t.Fatalf("task %s: agent_done.files=%v, want %v (rep.PerAgent[%s].Files)", task.ID, gotFiles, a.Files, task.ID)
+		}
+		for i, f := range a.Files {
+			if s, _ := gotFiles[i].(string); s != f {
+				t.Fatalf("task %s: agent_done.files[%d]=%q, want %q", task.ID, i, s, f)
+			}
+		}
+		if inLane, _ := rec["inLane"].(bool); inLane != a.InLane {
+			t.Fatalf("task %s: agent_done.inLane=%v, want %v (rep.PerAgent[%s].InLane)", task.ID, inLane, a.InLane, task.ID)
+		}
+	}
+
 	// ---- counts match the report ----
 	if got, want := countOf(names, "agent_start"), len(rep.PerAgent); got != want {
 		t.Fatalf("agent_start count=%d, want %d (len(rep.PerAgent))", got, want)

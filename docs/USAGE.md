@@ -324,7 +324,7 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 |-------|--------|------|
 | `run_start` | `repo`, `base`, `baseSHA`, `tasks` | Once, right after the base ref resolves. |
 | `agent_start` | `id`, `branch` | Once per task, right before that agent's worktree/command starts. |
-| `agent_done` | `id`, `ok`, `exit`, `attempts`, `wallMs` | Once per task, after all of that task's attempts (including `-agent-retries`) finish. |
+| `agent_done` | `id`, `ok`, `exit`, `attempts`, `files`, `inLane`, `wallMs` | Once per task, after all of that task's attempts (including `-agent-retries`) finish. |
 | `integrate_start` | `branches` | Once, before the successfully-committed branches are folded together. |
 | `integrate_done` | `landed`, `flagged`, `resolved`, `finalSHA`, `wallMs` | Once, after integration (before landing). |
 | `verify_start` | `attempt` | Before each `-verify` invocation. `attempt` is `0` pre-repair, `N` after repair round `N` (matches `-logdir`'s `verify-<n>.log`). |

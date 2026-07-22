@@ -612,7 +612,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			agentStart := time.Now()
 			agents[i] = runAgentWithRetries(ctx, g, &admin, wtRoot, baseSHA, p, tasks[i])
 			a := agents[i]
-			emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "exit": a.Exit, "attempts": a.Attempts, "wallMs": time.Since(agentStart).Milliseconds()})
+			emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "wallMs": time.Since(agentStart).Milliseconds()})
 		}(i)
 	}
 	wg.Wait()
