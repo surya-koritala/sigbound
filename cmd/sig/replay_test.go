@@ -198,6 +198,50 @@ func TestReplayDetectsTamperedManifest(t *testing.T) {
 	}
 }
 
+// TestReplayReproducesVerifyBisectSalvage: a -verify-bisect run that salvages
+// 2 of 3 groups (g2 dropped, same fixture as
+// TestDriveRunVerifyBisectLandsGreenSubset) records integrate.finalSHA for
+// the LANDED SUBSET only. Replay must exclude the dropped branch from
+// re-integration too — the exact same subset — and report REPRODUCED, exit
+// 0. Before the DroppedByBisect exclusion this re-integrated the full
+// 3-branch set and falsely reported DIVERGED.
+func TestReplayReproducesVerifyBisectSalvage(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:    `if [ -f g2.txt ]; then exit 1; fi; exit 0`,
+		VerifyBisect: true,
+	}
+	rep, err := driveRun(ctx, p, disjointGroupTasks(t, 3))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false; bisect should have salvaged a green subset: %q", rep.Verify.Output)
+	}
+	if len(rep.Integrate.DroppedByBisect) != 1 || rep.Integrate.DroppedByBisect[0] != "agent/g2" {
+		t.Fatalf("integrate.droppedByBisect=%v, want [agent/g2]", rep.Integrate.DroppedByBisect)
+	}
+
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	writeManifest(manifestPath, rep)
+
+	var replayBuf bytes.Buffer
+	rcode, rerr := runReplay(&replayBuf, []string{"-manifest", manifestPath})
+	if rerr != nil {
+		t.Fatalf("runReplay: %v\n%s", rerr, replayBuf.String())
+	}
+	if rcode != exitReplayReproduced {
+		t.Fatalf("code=%d, want exitReplayReproduced (dropped-by-bisect branch must be excluded from re-integration)\n%s", rcode, replayBuf.String())
+	}
+	if !strings.Contains(replayBuf.String(), "REPRODUCED") {
+		t.Fatalf("output=%q, want it to report REPRODUCED", replayBuf.String())
+	}
+}
+
 // TestReplayManifestFlagRequired: `sig replay` with no -manifest at all is a
 // usage error, exit exitReplayRepoState, before touching git.
 func TestReplayManifestFlagRequired(t *testing.T) {

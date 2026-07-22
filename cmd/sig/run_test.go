@@ -4262,3 +4262,36 @@ func TestRunRunPublishFlagWired(t *testing.T) {
 		t.Fatalf("SIGBOUND_FINAL_SHA=%q, want %q", got, rep.Integrate.FinalSHA)
 	}
 }
+
+// TestWriteRunSummaryShowsResumed: the human -json=false summary marks a
+// -resume'd agent's status line RESUMED, same visibility as the existing
+// TIMEOUT annotation, and leaves a normal agent's line untouched.
+func TestWriteRunSummaryShowsResumed(t *testing.T) {
+	rep := runReport{
+		Repo: "/repo", Base: "main",
+		PerAgent: []perAgentJSON{
+			{ID: "a", Branch: "agent/a", OK: true, Resumed: true},
+			{ID: "b", Branch: "agent/b", OK: true},
+		},
+	}
+	var buf bytes.Buffer
+	if err := writeRunSummary(&buf, rep); err != nil {
+		t.Fatalf("writeRunSummary: %v", err)
+	}
+	out := buf.String()
+	aLine, bLine := "", ""
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.Contains(line, "agent/a"):
+			aLine = line
+		case strings.Contains(line, "agent/b"):
+			bLine = line
+		}
+	}
+	if !strings.Contains(aLine, "RESUMED") {
+		t.Fatalf("resumed agent's line = %q, want it to contain RESUMED", aLine)
+	}
+	if strings.Contains(bLine, "RESUMED") {
+		t.Fatalf("non-resumed agent's line = %q, want no RESUMED", bLine)
+	}
+}
