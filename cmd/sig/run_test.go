@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -369,6 +370,121 @@ func TestRunExitCode(t *testing.T) {
 		if got := runExitCode(c.rep); got != c.want {
 			t.Errorf("%s: runExitCode=%d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// TestDriveRunIntegrateFailureKeepsPerAgent: a REAL integrate failure (an
+// unknown strategy name — driveRun itself doesn't validate it, unlike runRun's
+// flag parsing) after two agents have genuinely committed. driveRun must
+// return the error AND a report whose PerAgent already names the branches
+// those agents landed — the exact data runRun needs to still emit on a
+// mid-run failure. Regression test for issue #5: this data used to be
+// silently discarded by runRun's caller.
+func TestDriveRunIntegrateFailureKeepsPerAgent(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	tasks := []taskSpec{
+		{ID: "t1", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"},
+		})},
+		{ID: "t2", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"beta.go": "package main\n\nfunc beta() int { return 2 }\n"},
+		})},
+	}
+	p := runParams{Repo: repo, Base: "main", Strategy: "not-a-real-strategy", AgentCmd: agent}
+
+	rep, err := driveRun(ctx, p, tasks)
+	if err == nil {
+		t.Fatal("expected an integrate error for an unknown strategy")
+	}
+	if !strings.Contains(err.Error(), "integrate:") {
+		t.Fatalf("err=%q, want it to name the integrate stage", err)
+	}
+
+	if len(rep.PerAgent) != 2 {
+		t.Fatalf("perAgent=%d, want 2 (both agents ran before the integrate error)", len(rep.PerAgent))
+	}
+	for _, a := range rep.PerAgent {
+		if !a.OK {
+			t.Fatalf("agent %s not ok: exit=%d stderr=%q", a.ID, a.Exit, a.Stderr)
+		}
+		if a.SHA == "" || a.SHA == rep.BaseSHA {
+			t.Fatalf("agent %s did not advance its branch (sha=%q)", a.ID, a.SHA)
+		}
+		if a.Branch != "agent/"+a.ID {
+			t.Fatalf("agent %s branch=%q, want agent/%s", a.ID, a.Branch, a.ID)
+		}
+	}
+	// Nothing integrated: the report's integrate section stays zero-valued.
+	if len(rep.Integrate.Landed) != 0 {
+		t.Fatalf("landed=%v, want none (integrate itself errored)", rep.Integrate.Landed)
+	}
+}
+
+// TestEmitReport is a direct test of the seam runRun calls to render the
+// report (on both the success path and the new mid-run-error path): given a
+// report with PerAgent already filled in, it must write valid JSON in -json
+// mode and the terse summary otherwise — the exact two code paths runRun used
+// to have inlined before driveRun's error path needed the same rendering.
+func TestEmitReport(t *testing.T) {
+	rep := runReport{
+		Repo: "/tmp/repo", Base: "main", BaseSHA: "abc123",
+		PerAgent: []perAgentJSON{
+			{ID: "t1", Branch: "agent/t1", SHA: "deadbeef", OK: true, Files: []string{"alpha.go"}},
+		},
+	}
+
+	var jsonBuf bytes.Buffer
+	if err := emitReport(&jsonBuf, rep, true); err != nil {
+		t.Fatalf("emitReport(json): %v", err)
+	}
+	var got runReport
+	if err := json.Unmarshal(jsonBuf.Bytes(), &got); err != nil {
+		t.Fatalf("parse emitted JSON: %v\n%s", err, jsonBuf.String())
+	}
+	if len(got.PerAgent) != 1 || got.PerAgent[0].Branch != "agent/t1" || got.PerAgent[0].SHA != "deadbeef" {
+		t.Fatalf("round-tripped report perAgent=%+v, want the agent/t1 branch preserved", got.PerAgent)
+	}
+
+	var sumBuf bytes.Buffer
+	if err := emitReport(&sumBuf, rep, false); err != nil {
+		t.Fatalf("emitReport(summary): %v", err)
+	}
+	summary := sumBuf.String()
+	if !strings.Contains(summary, "agent/t1") || !strings.Contains(summary, "t1") {
+		t.Fatalf("summary missing the surviving agent branch:\n%s", summary)
+	}
+}
+
+// TestRunRunNoReportWhenNoAgentsRan: when driveRun fails before any agent ran
+// (here: -base names a branch that doesn't exist, so RevParse fails first),
+// runRun must print nothing — an empty PerAgent means there is nothing worth
+// recovering, same as before this change.
+func TestRunRunNoReportWhenNoAgentsRan(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	tasksFile := filepath.Join(t.TempDir(), "tasks.json")
+	if err := os.WriteFile(tasksFile, []byte(`[{"id":"a","prompt":"x"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-base", "does-not-exist",
+		"-tasks", tasksFile,
+		"-agent", agent,
+	})
+	if err == nil {
+		t.Fatal("expected an error resolving a nonexistent base")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("no report should be written when no agents ran, got:\n%s", buf.String())
 	}
 }
 

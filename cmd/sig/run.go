@@ -314,21 +314,37 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
 	if err != nil {
+		// A mid-run failure (e.g. integrate) can still leave real work behind: every
+		// agent that finished has a committed agent/<id> branch, and rep already
+		// names them. Emit what driveRun assembled before surfacing the error, so
+		// the operator can recover it instead of losing it to a discarded report
+		// (this is also the precondition for -resume to find prior branches). A
+		// report with no agents (e.g. the base ref itself never resolved) has
+		// nothing worth printing, so stays silent, same as before. Any write error
+		// here is swallowed on purpose: err is the operational failure that matters
+		// and must reach stderr unchanged.
+		if len(rep.PerAgent) > 0 {
+			_ = emitReport(w, rep, *asJSON)
+		}
 		return exitOperationalError, err
 	}
 	code := runExitCode(rep)
-	if *asJSON {
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(rep); err != nil {
-			return exitOperationalError, err
-		}
-		return code, nil
-	}
-	if err := writeRunSummary(w, rep); err != nil {
+	if err := emitReport(w, rep, *asJSON); err != nil {
 		return exitOperationalError, err
 	}
 	return code, nil
+}
+
+// emitReport writes rep to w as the full JSON report (asJSON) or the terse
+// human summary — the one place `sig run`'s stdout contract is rendered, used
+// both for a completed run and for the partial report on a mid-run error.
+func emitReport(w io.Writer, rep runReport, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rep)
+	}
+	return writeRunSummary(w, rep)
 }
 
 // loadTasks reads and validates the -tasks JSON array.
