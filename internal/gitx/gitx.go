@@ -171,13 +171,27 @@ func (g *Git) TreeOID(ctx context.Context, rev string) (string, error) {
 	return g.run(ctx, "rev-parse", "--verify", rev+"^{tree}")
 }
 
-// WorktreeAdd creates a new worktree at path on branch, (re)created fresh off
-// base. Runs in the main repo; the new worktree shares this repo's object
-// store. Uses `-B` (force create-or-reset), not `-b`, so a caller retrying a
-// failed attempt on the same branch name (see cmd/sig's -agent-retries) can
-// just call this again — the branch is reset to base rather than erroring
-// because it already exists.
+// WorktreeAdd creates a new worktree at path on a NEW branch off base. Runs in
+// the main repo; the new worktree shares this repo's object store. Uses `-b`
+// (create, error if branch already exists) so this can never silently reset a
+// pre-existing branch — including a leftover agent/<id> branch from a prior
+// run that still holds a user's committed work; that must fail loudly, not
+// vanish. A caller that needs to re-create a branch THIS SAME RUN already
+// made (e.g. an -agent-retries attempt) wants WorktreeAddReset instead.
 func (g *Git) WorktreeAdd(ctx context.Context, path, branch, base string) error {
+	_, err := g.run(ctx, "worktree", "add", "-q", "-b", branch, "--", path, base)
+	return err
+}
+
+// WorktreeAddReset creates a new worktree at path on branch, resetting branch
+// to base if it already exists (`git worktree add -B`). ONLY safe when branch
+// is one THIS SAME RUN already created earlier — e.g. cmd/sig's
+// -agent-retries re-creating attempt N+1's worktree after tearing down
+// attempt N's failed one on the same agent/<id> branch. Never call this on a
+// branch name that might pre-exist from outside the current run: -B silently
+// discards whatever commits it already pointed at, which is exactly what
+// WorktreeAdd's loud-fail `-b` protects against.
+func (g *Git) WorktreeAddReset(ctx context.Context, path, branch, base string) error {
 	_, err := g.run(ctx, "worktree", "add", "-q", "-B", branch, "--", path, base)
 	return err
 }

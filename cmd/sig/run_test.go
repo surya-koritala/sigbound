@@ -551,11 +551,14 @@ func TestDriveRunAgentTimeout(t *testing.T) {
 
 // TestDriveRunAgentRetries: -agent-retries re-runs a FAILED agent in a fresh
 // worktree off the same base, up to N more times, and Attempts reports the
-// total number of tries made. Four cases: succeeds on the retry; the
-// existing no-retries behavior is unchanged; a lane-strict out-of-lane
-// failure is never retried (it's a plan violation, not a timing fluke a
-// retry could fix); and -keep-failed keeps only the LAST failed attempt's
-// worktree, tearing every earlier one down.
+// total number of tries made. Cases: succeeds on the retry; the existing
+// no-retries behavior is unchanged; a lane-strict out-of-lane failure is
+// never retried (it's a plan violation, not a timing fluke a retry could
+// fix) — both alone and combined with -keep-failed, where the stray's
+// worktree must still be kept even though it stops on attempt 1 (the attempt
+// that ends the loop, not the one -agent-retries would have predicted as
+// "last"); and -keep-failed keeps only the LAST failed attempt's worktree,
+// tearing every earlier one down.
 func TestDriveRunAgentRetries(t *testing.T) {
 	ctx := context.Background()
 	badTask := taskSpec{ID: "bad", Prompt: "x"}
@@ -621,6 +624,40 @@ func TestDriveRunAgentRetries(t *testing.T) {
 	}
 	if aStray.Attempts != 1 {
 		t.Fatalf("attempts=%d, want 1 (a lane-strict stray is never retried)", aStray.Attempts)
+	}
+
+	// ---- -keep-failed + -agent-retries>0 + lane-strict stray: the stray stops
+	// the retry loop on attempt 1, which IS the attempt that ends the loop, so
+	// -keep-failed must still keep its worktree — even though a naive
+	// "attempt > AgentRetries" check would (wrongly) call attempt 1 "not the
+	// last attempt" since AgentRetries is 3 ----
+	_, repoStrayKF := makeGoRepo(t)
+	tmpStrayKF := t.TempDir()
+	t.Setenv("TMPDIR", tmpStrayKF)
+	strayAgentKF := buildTestAgent(t)
+	strayTaskKF := taskSpec{ID: "stray", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{
+			"a.go": "package main\n\nfunc a() int { return 1 }\n",
+			"b.go": "package main\n\nfunc b() int { return 2 }\n",
+		},
+	}), Files: []string{"a.go"}}
+	pStrayKF := runParams{Repo: repoStrayKF, Base: "main", Strategy: "overlay", AgentCmd: strayAgentKF, LaneMode: laneStrict, AgentRetries: 3, KeepFailed: true}
+	repStrayKF, err := driveRun(ctx, pStrayKF, []taskSpec{strayTaskKF})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	aStrayKF := repStrayKF.PerAgent[0]
+	if aStrayKF.OK {
+		t.Fatal("strict+keep-failed: out-of-lane agent must not be OK")
+	}
+	if aStrayKF.Attempts != 1 {
+		t.Fatalf("attempts=%d, want 1 (a lane-strict stray is never retried)", aStrayKF.Attempts)
+	}
+	if aStrayKF.WorktreeKept == "" {
+		t.Fatal("strict+keep-failed+agent-retries: want worktreeKept set on the attempt that actually ends the loop")
+	}
+	if fi, err := os.Stat(aStrayKF.WorktreeKept); err != nil || !fi.IsDir() {
+		t.Fatalf("kept worktree %s should still exist as a dir: %v", aStrayKF.WorktreeKept, err)
 	}
 
 	// ---- -keep-failed + -agent-retries: only the LAST failed attempt's
@@ -722,6 +759,38 @@ func TestDriveRunBudgetExhausted(t *testing.T) {
 	}
 	if mainSHA != rep.BaseSHA {
 		t.Fatalf("main=%s advanced past baseSHA=%s despite the budget failing the run", mainSHA, rep.BaseSHA)
+	}
+}
+
+// TestDriveRunVerifyKilledByBudget: when -budget expires while -verify itself
+// is running (agent phase + integrate already finished, unlike
+// TestDriveRunBudgetExhausted above where the budget kills an agent), verify
+// naturally fails because its command gets killed along with ctx — but
+// without help that reads as an ordinary verify failure, hiding the real
+// cause. driveRun must name the exhausted budget in the verify output.
+func TestDriveRunVerifyKilledByBudget(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	task := taskSpec{ID: "noop", Prompt: "x"} // agent does nothing; nothing needs to land for verify to run
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: "exit 0",
+		VerifyCmd: "sleep 5", Budget: 700 * time.Millisecond,
+	}
+	start := time.Now()
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("driveRun: %v (verify failing is a report-level outcome, not an operational error)", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("driveRun took %s; -budget 700ms should have cut the 5s verify sleep short", elapsed)
+	}
+	if !rep.Verify.Ran || rep.Verify.OK {
+		t.Fatalf("want verify to have run and failed once the budget killed it, got %+v", rep.Verify)
+	}
+	if !strings.Contains(rep.Verify.Output, "budget") {
+		t.Fatalf("verify output should name the exhausted budget instead of reading as a plain failure, got: %q", rep.Verify.Output)
 	}
 }
 

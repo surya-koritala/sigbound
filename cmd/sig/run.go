@@ -588,6 +588,13 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 		rep.Verify, landSHA = verifyWithRepair(ctx, g, p, res.FinalSHA)
 		rep.Integrate.FinalSHA = landSHA
 		if !rep.Verify.OK {
+			// A -budget expiry can kill -verify mid-run (its command context is a
+			// child of ctx); left alone that reads as an ordinary verify failure,
+			// which is misleading — the tree may never have gotten a real run. Name
+			// the real cause up front when it applies.
+			if p.Budget > 0 && ctx.Err() != nil {
+				rep.Verify.Output = fmt.Sprintf("run budget (%s) exhausted before verify could complete\n%s", p.Budget, rep.Verify.Output)
+			}
 			return rep, nil // verify failed, no repair fixed it: land nothing
 		}
 	}
@@ -779,21 +786,30 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 //   - ctx already done (e.g. -budget exhausted) — every further attempt would
 //     just fail the same way, so retrying only burns worktree churn.
 //
-// Only the LAST attempt's worktree is kept under -keep-failed; every earlier
-// failed attempt is torn down regardless (attemptParams.KeepFailed is only
-// ever true on that final call). a.Attempts records the total number of
-// tries actually made (1 when the first try succeeded or no retries were
-// configured, matching today's report shape).
+// Only the attempt that actually ENDS the loop keeps its worktree under
+// -keep-failed — whether that's because retries are exhausted, a lane-strict
+// stray stopped early, or a -budget cancellation stopped early. Which of
+// those applies is only known AFTER an attempt runs, so every attempt is
+// allowed to keep its worktree on failure; when the loop decides to retry
+// instead, that discarded attempt's worktree is torn down immediately below.
+// a.Attempts records the total number of tries actually made (1 when the
+// first try succeeded or no retries were configured, matching today's report
+// shape).
 func runAgentWithRetries(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec) perAgentJSON {
 	var a perAgentJSON
 	for attempt := 1; ; attempt++ {
-		last := attempt > p.AgentRetries
-		attemptParams := p
-		attemptParams.KeepFailed = p.KeepFailed && last
-		a = runAgent(ctx, g, admin, wtRoot, baseSHA, attemptParams, t)
+		a = runAgent(ctx, g, admin, wtRoot, baseSHA, p, t, attempt)
 		a.Attempts = attempt
+		last := attempt > p.AgentRetries
 		if a.OK || last || !a.InLane || ctx.Err() != nil {
 			return a
+		}
+		// Retrying: this attempt didn't end the loop, so its kept worktree (if
+		// any) isn't the final answer — remove it instead of leaking it.
+		if a.WorktreeKept != "" {
+			admin.Lock()
+			_ = g.WorktreeRemove(context.WithoutCancel(ctx), a.WorktreeKept)
+			admin.Unlock()
 		}
 	}
 }
@@ -805,7 +821,14 @@ func runAgentWithRetries(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wt
 // teardown is skipped and the path is recorded in a.WorktreeKept so it can be
 // inspected. The branch (with the agent's commit, if any) survives for
 // integration either way.
-func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec) (a perAgentJSON) {
+//
+// attempt is this call's 1-based try number from runAgentWithRetries. attempt
+// 1 always creates the branch with WorktreeAdd (loud-fail if agent/<id>
+// somehow already exists — e.g. a leftover branch from a prior run — rather
+// than silently resetting someone else's work). attempt >= 2 is THIS SAME RUN
+// re-creating a branch it made itself on the previous, now-torn-down attempt,
+// so it uses WorktreeAddReset instead.
+func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec, attempt int) (a perAgentJSON) {
 	branch := "agent/" + t.ID
 	// InLane defaults true (not the zero value) so a failure that never reaches
 	// the lane-enforcement block below — e.g. WorktreeAdd itself failing —
@@ -814,7 +837,12 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 	dir := filepath.Join(wtRoot, "wt-"+sanitizeID(t.ID))
 
 	admin.Lock()
-	err := g.WorktreeAdd(ctx, dir, branch, baseSHA)
+	var err error
+	if attempt >= 2 {
+		err = g.WorktreeAddReset(ctx, dir, branch, baseSHA)
+	} else {
+		err = g.WorktreeAdd(ctx, dir, branch, baseSHA)
+	}
 	admin.Unlock()
 	if err != nil {
 		a.Exit = -1
