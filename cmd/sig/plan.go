@@ -20,6 +20,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -64,6 +65,10 @@ type CommandPlanner struct {
 	// Timeout bounds the invocation. Zero means no explicit timeout (the
 	// caller's context still applies).
 	Timeout time.Duration
+	// LogDir, when set, gets the planner command's full stdout+stderr for
+	// every invocation (the first attempt and, on an overlap, the automatic
+	// re-plan) appended to <LogDir>/planner.log. See openLog (run.go).
+	LogDir string
 }
 
 // Plan runs the configured command and parses+validates its plan. See
@@ -129,6 +134,13 @@ func (p *CommandPlanner) attempt(ctx context.Context, goal, repoMap string, n in
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
+	// With -logdir, both streams ALSO stream to a full log file (io.MultiWriter)
+	// while out/errBuf keep parsing the plan / reporting failures as before.
+	if logf := openLog(p.LogDir, "planner.log"); logf != nil {
+		defer logf.Close()
+		cmd.Stdout = io.MultiWriter(&out, logf)
+		cmd.Stderr = io.MultiWriter(&errBuf, logf)
+	}
 	if err := cmd.Run(); err != nil {
 		// Non-zero exit, timeout, or spawn failure. Fail safe: no plan, no run.
 		return nil, fmt.Errorf("planner command failed: %w: %s", err, tail(errBuf.String(), 400))
@@ -329,8 +341,9 @@ REPO MAP:
 
 // planTasks is the run-command entry point: scan the repo map, build a
 // CommandPlanner from plannerCmd, and return its validated plan. Any failure
-// (missing planner, scan error, bad plan) returns an error and NO run is started.
-func planTasks(ctx context.Context, repo, goal, plannerCmd string, n int, timeout time.Duration) ([]taskSpec, error) {
+// (missing planner, scan error, bad plan) returns an error and NO run is
+// started. logDir (may be empty) is forwarded to CommandPlanner.LogDir.
+func planTasks(ctx context.Context, repo, goal, plannerCmd string, n int, timeout time.Duration, logDir string) ([]taskSpec, error) {
 	if strings.TrimSpace(plannerCmd) == "" {
 		return nil, errors.New("-goal requires -planner (the command that produces the plan)")
 	}
@@ -341,7 +354,7 @@ func planTasks(ctx context.Context, repo, goal, plannerCmd string, n int, timeou
 	if err != nil {
 		return nil, fmt.Errorf("scan repo map: %w", err)
 	}
-	planner := &CommandPlanner{Args: []string{"sh", "-c", plannerCmd}, Timeout: timeout}
+	planner := &CommandPlanner{Args: []string{"sh", "-c", plannerCmd}, Timeout: timeout, LogDir: logDir}
 	return planner.Plan(ctx, goal, repoMap, n)
 }
 

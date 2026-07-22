@@ -88,6 +88,55 @@ func TestRunGoalEndToEnd(t *testing.T) {
 	}
 }
 
+// TestRunGoalLogDirWritesPlannerLog: with -logdir, the planner command's full
+// stdout+stderr lands in <logdir>/planner.log, alongside each agent's log —
+// the same -goal->plan->agents->verify path as TestRunGoalEndToEnd, plus -logdir.
+func TestRunGoalLogDirWritesPlannerLog(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	logDir := t.TempDir()
+
+	plan := []taskSpec{
+		{ID: "p1", Files: []string{"alpha.go"}, Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"},
+		})},
+	}
+	// A planner that also writes to stderr, so planner.log has content beyond
+	// the plan JSON itself.
+	plannerCmd := "echo planner-stderr-marker >&2; " + planFileCmd(t, mustJSON(t, plan))
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-goal", "add alpha helper",
+		"-planner", plannerCmd,
+		"-n", "1",
+		"-agent", agent,
+		"-logdir", logDir,
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("runRun code=%d, want exitOK", code)
+	}
+
+	plannerLog, err := os.ReadFile(filepath.Join(logDir, "planner.log"))
+	if err != nil {
+		t.Fatalf("read planner.log: %v", err)
+	}
+	if !strings.Contains(string(plannerLog), "planner-stderr-marker") {
+		t.Fatalf("planner.log missing stderr content:\n%s", plannerLog)
+	}
+	if !strings.Contains(string(plannerLog), "alpha.go") {
+		t.Fatalf("planner.log missing stdout (the plan JSON):\n%s", plannerLog)
+	}
+	if _, err := os.Stat(filepath.Join(logDir, "agent-p1.log")); err != nil {
+		t.Fatalf("expected agent-p1.log alongside planner.log: %v", err)
+	}
+}
+
 // TestRunGoalBadPlanFailsSafe: a planner that emits garbage makes runRun return
 // an error and start NO run — the base ref must not move and no report is written.
 func TestRunGoalBadPlanFailsSafe(t *testing.T) {
