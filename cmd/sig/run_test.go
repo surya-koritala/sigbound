@@ -1656,3 +1656,412 @@ func TestDriveRunAgentSurvivesLogWriteFailure(t *testing.T) {
 		t.Fatalf("agent.Files=%v, want [landed.go]", a.Files)
 	}
 }
+
+// readEvents reads an -events NDJSON file, asserting every line is valid
+// JSON (the core -events contract) and returning each line decoded plus its
+// "event" name, in file order (== emission order, since eventEmitter holds a
+// single mutex-guarded encoder).
+func readEvents(t *testing.T, path string) (names []string, recs []map[string]any) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read events file: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("events line %d is not valid JSON: %s", i, line)
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("unmarshal events line %d: %v", i, err)
+		}
+		name, _ := rec["event"].(string)
+		if name == "" {
+			t.Fatalf("events line %d has no \"event\" field: %s", i, line)
+		}
+		if _, ok := rec["ts"]; !ok {
+			t.Fatalf("events line %d has no \"ts\" field: %s", i, line)
+		}
+		names = append(names, name)
+		recs = append(recs, rec)
+	}
+	return names, recs
+}
+
+// indexOf returns the first index of want in ss, or -1.
+func indexOf(ss []string, want string) int {
+	for i, s := range ss {
+		if s == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// countOf returns how many times want appears in ss.
+func countOf(ss []string, want string) int {
+	n := 0
+	for _, s := range ss {
+		if s == want {
+			n++
+		}
+	}
+	return n
+}
+
+// TestNewEventEmitterModes exercises newEventEmitter's three path modes
+// directly (below driveRun, which only ever drives it through -events): ""
+// disables (nil emitter, safe no-op emit), "-" streams to stderr, a real
+// path is opened fresh (truncated, not appended like -logdir) and usable,
+// and an unopenable path fails loudly instead of silently dropping events.
+func TestNewEventEmitterModes(t *testing.T) {
+	var nilEmit *eventEmitter
+	nilEmit.emit("x", map[string]any{"a": 1}) // must not panic
+
+	e, closeFn, err := newEventEmitter("")
+	if err != nil || e != nil {
+		t.Fatalf(`newEventEmitter("") = (%v, _, %v), want (nil, _, nil)`, e, err)
+	}
+	closeFn()
+
+	e, closeFn, err = newEventEmitter("-")
+	if err != nil || e == nil {
+		t.Fatalf(`newEventEmitter("-") = (%v, _, %v), want (non-nil, _, nil)`, e, err)
+	}
+	closeFn() // stderr must not be closed; a second use elsewhere in the test binary must stay usable
+
+	path := filepath.Join(t.TempDir(), "events.ndjson")
+	if err := os.WriteFile(path, []byte("stale content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e, closeFn, err = newEventEmitter(path)
+	if err != nil || e == nil {
+		t.Fatalf("newEventEmitter(%q) = (%v, _, %v), want (non-nil, _, nil)", path, e, err)
+	}
+	e.emit("probe", map[string]any{"x": 1})
+	closeFn()
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if strings.Contains(string(data), "stale content") {
+		t.Fatalf("events file not truncated fresh: %s", data)
+	}
+	if !strings.Contains(string(data), `"probe"`) {
+		t.Fatalf("events file missing emitted line: %s", data)
+	}
+
+	if _, _, err := newEventEmitter(filepath.Join(path, "nested", "cant-create-under-a-file")); err == nil {
+		t.Fatal("newEventEmitter with an unopenable path: want error, got nil")
+	}
+}
+
+// TestDriveRunEventsNDJSON drives a real run (agents + resolver + verify)
+// with -events to a temp file and checks the whole -events contract: every
+// line is parseable NDJSON (via readEvents), events appear in the documented
+// causal order (run_start first, run_done last, each agent's start before
+// its done, integrate_done before verify_start), an agent_start/agent_done
+// pair for every task, and the event counts/fields line up with the final
+// report — events are progress, not a second report, so they must never
+// disagree with it.
+func TestDriveRunEventsNDJSON(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	eventsPath := filepath.Join(t.TempDir(), "events.ndjson")
+
+	tasks := []taskSpec{
+		{ID: "t1", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"},
+		})},
+		{ID: "t2", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"beta.go": "package main\n\nfunc beta() int { return 2 }\n"},
+		})},
+	}
+	p := runParams{
+		Repo:       repo,
+		Base:       "main",
+		Strategy:   "overlay",
+		AgentCmd:   agent,
+		VerifyCmd:  "go build ./...",
+		EventsPath: eventsPath,
+	}
+
+	rep, err := driveRun(ctx, p, tasks)
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify failed, want a clean landing: %q", rep.Verify.Output)
+	}
+
+	names, recs := readEvents(t, eventsPath)
+	if len(names) == 0 {
+		t.Fatal("no events written")
+	}
+
+	// ---- causal order ----
+	if names[0] != "run_start" {
+		t.Fatalf("first event=%q, want run_start", names[0])
+	}
+	if last := names[len(names)-1]; last != "run_done" {
+		t.Fatalf("last event=%q, want run_done", last)
+	}
+	if id, vd := indexOf(names, "integrate_done"), indexOf(names, "verify_start"); id == -1 || vd == -1 || id >= vd {
+		t.Fatalf("integrate_done (idx %d) must precede verify_start (idx %d)", id, vd)
+	}
+
+	// ---- an agent_start/agent_done pair for every task, start before done ----
+	started := map[string]int{}
+	done := map[string]int{}
+	for i, name := range names {
+		switch name {
+		case "agent_start":
+			id, _ := recs[i]["id"].(string)
+			started[id] = i
+		case "agent_done":
+			id, _ := recs[i]["id"].(string)
+			done[id] = i
+		}
+	}
+	for _, task := range tasks {
+		si, sok := started[task.ID]
+		di, dok := done[task.ID]
+		if !sok || !dok {
+			t.Fatalf("task %s missing agent_start/agent_done (start=%v done=%v)", task.ID, sok, dok)
+		}
+		if si >= di {
+			t.Fatalf("task %s: agent_start (idx %d) must precede agent_done (idx %d)", task.ID, si, di)
+		}
+	}
+
+	// ---- agent_done carries files + inLane, matching the report ----
+	perAgentByID := make(map[string]perAgentJSON, len(rep.PerAgent))
+	for _, a := range rep.PerAgent {
+		perAgentByID[a.ID] = a
+	}
+	for _, task := range tasks {
+		rec := recs[done[task.ID]]
+		a := perAgentByID[task.ID]
+		gotFiles, _ := rec["files"].([]any)
+		if len(gotFiles) != len(a.Files) {
+			t.Fatalf("task %s: agent_done.files=%v, want %v (rep.PerAgent[%s].Files)", task.ID, gotFiles, a.Files, task.ID)
+		}
+		for i, f := range a.Files {
+			if s, _ := gotFiles[i].(string); s != f {
+				t.Fatalf("task %s: agent_done.files[%d]=%q, want %q", task.ID, i, s, f)
+			}
+		}
+		if inLane, _ := rec["inLane"].(bool); inLane != a.InLane {
+			t.Fatalf("task %s: agent_done.inLane=%v, want %v (rep.PerAgent[%s].InLane)", task.ID, inLane, a.InLane, task.ID)
+		}
+	}
+
+	// ---- counts match the report ----
+	if got, want := countOf(names, "agent_start"), len(rep.PerAgent); got != want {
+		t.Fatalf("agent_start count=%d, want %d (len(rep.PerAgent))", got, want)
+	}
+	if got, want := countOf(names, "agent_done"), len(rep.PerAgent); got != want {
+		t.Fatalf("agent_done count=%d, want %d (len(rep.PerAgent))", got, want)
+	}
+	if got := countOf(names, "run_start"); got != 1 {
+		t.Fatalf("run_start count=%d, want 1", got)
+	}
+	if got := countOf(names, "run_done"); got != 1 {
+		t.Fatalf("run_done count=%d, want 1", got)
+	}
+	if got := countOf(names, "land"); got != 1 {
+		t.Fatalf("land count=%d, want 1 (verify passed, must land)", got)
+	}
+
+	// ---- spot-check fields on a few events against the report ----
+	landRec := recs[indexOf(names, "land")]
+	if sha, _ := landRec["sha"].(string); sha != rep.Integrate.FinalSHA {
+		t.Fatalf("land.sha=%q, want rep.Integrate.FinalSHA=%q", sha, rep.Integrate.FinalSHA)
+	}
+	runStartRec := recs[0]
+	if repoField, _ := runStartRec["repo"].(string); repoField != repo {
+		t.Fatalf("run_start.repo=%q, want %q", repoField, repo)
+	}
+	if baseSHA, _ := runStartRec["baseSHA"].(string); baseSHA != rep.BaseSHA {
+		t.Fatalf("run_start.baseSHA=%q, want %q", baseSHA, rep.BaseSHA)
+	}
+	runDoneRec := recs[len(recs)-1]
+	if ok, _ := runDoneRec["ok"].(bool); !ok {
+		t.Fatalf("run_done.ok=%v, want true (clean landed+verified run)", runDoneRec["ok"])
+	}
+	if code, _ := runDoneRec["exitCode"].(float64); int(code) != runExitCode(rep) {
+		t.Fatalf("run_done.exitCode=%v, want %d (runExitCode(rep))", runDoneRec["exitCode"], runExitCode(rep))
+	}
+}
+
+// TestDriveRunEventsRepairOrder exercises the repair loop's events: the
+// initial verify_start/verify_done (attempt 0), then a
+// repair_start/repair_done + verify_start/verify_done (attempt 1) round that
+// fixes the build, in that exact order — the causal chain -events promises
+// for a run that needed self-healing.
+func TestDriveRunEventsRepairOrder(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	eventsPath := filepath.Join(t.TempDir(), "events.ndjson")
+
+	p := runParams{
+		Repo:       repo,
+		Base:       "main",
+		Strategy:   "overlay",
+		AgentCmd:   agent,
+		VerifyCmd:  "go build ./...",
+		RepairCmd:  `printf 'package main\n\nfunc helper() int { return helperX() }\n' > repair_fix.go`,
+		RepairMax:  2,
+		EventsPath: eventsPath,
+	}
+
+	rep, err := driveRun(ctx, p, brokenBuildTasks(t))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.OK || !rep.Verify.Repaired {
+		t.Fatalf("verify ok=%v repaired=%v, want the repair loop to fix it", rep.Verify.OK, rep.Verify.Repaired)
+	}
+
+	names, recs := readEvents(t, eventsPath)
+	// repair_done reports verifyOk for ITS round's verify, so it can only be
+	// emitted once that verify (the second verify_start/verify_done pair
+	// below) has actually completed — hence repair_done trails, not leads,
+	// the verify pair it summarizes.
+	wantOrder := []string{"verify_start", "verify_done", "repair_start", "verify_start", "verify_done", "repair_done"}
+	firstVS := indexOf(names, "verify_start")
+	if firstVS == -1 || firstVS+len(wantOrder) > len(names) {
+		t.Fatalf("events %v missing the expected verify/repair sequence %v", names, wantOrder)
+	}
+	got := names[firstVS : firstVS+len(wantOrder)]
+	for i, want := range wantOrder {
+		if got[i] != want {
+			t.Fatalf("verify/repair sequence = %v, want %v (mismatch at %d)", got, wantOrder, i)
+		}
+	}
+	// attempt 0 (pre-repair, failing) then attempt 1 (post-repair, passing).
+	if a, ok := recs[firstVS]["attempt"].(float64); !ok || a != 0 {
+		t.Fatalf("first verify_start.attempt=%v, want 0", recs[firstVS]["attempt"])
+	}
+	if ok, _ := recs[firstVS+1]["ok"].(bool); ok {
+		t.Fatal("first verify_done.ok=true, want false (build is broken before repair)")
+	}
+	repairStart := recs[firstVS+2]
+	if a, ok := repairStart["attempt"].(float64); !ok || a != 1 {
+		t.Fatalf("repair_start.attempt=%v, want 1", repairStart["attempt"])
+	}
+	lastVD := recs[firstVS+4]
+	if ok, _ := lastVD["ok"].(bool); !ok {
+		t.Fatal("post-repair verify_done.ok=false, want true (repair fixed the build)")
+	}
+	repairDone := recs[firstVS+5]
+	if a, ok := repairDone["attempt"].(float64); !ok || a != 1 {
+		t.Fatalf("repair_done.attempt=%v, want 1", repairDone["attempt"])
+	}
+	if ok, _ := repairDone["verifyOk"].(bool); !ok {
+		t.Fatal("repair_done.verifyOk=false, want true (this round's verify passed)")
+	}
+}
+
+// TestDriveRunEventsOff: with -events unset (the default, EventsPath=""),
+// driveRun must behave exactly as it did before this feature existed — no
+// events file, no panics, a normal report. eventEmitter's nil-receiver no-op
+// is what makes every emit call site in driveRun safe to call unconditionally;
+// this is the regression test for that path.
+func TestDriveRunEventsOff(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	// A path under a directory that's never created: if driveRun tried to open
+	// it despite EventsPath=="", that open would fail loudly.
+	untouched := filepath.Join(t.TempDir(), "never-created-dir", "events.ndjson")
+
+	task := taskSpec{ID: "solo", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"solo.go": "package main\n\nfunc solo() int { return 1 }\n"},
+	})}
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent}
+
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if len(rep.PerAgent) != 1 || !rep.PerAgent[0].OK {
+		t.Fatalf("agent did not land: %+v", rep.PerAgent)
+	}
+	if _, err := os.Stat(untouched); !os.IsNotExist(err) {
+		t.Fatalf("no file should exist at %s when -events is unset", untouched)
+	}
+}
+
+// TestRunRunEventsFlagWired proves the -events flag actually reaches
+// driveRun through runRun's normal flag-parsing path (every other -events
+// test above drives driveRun directly, bypassing flag parsing entirely).
+func TestRunRunEventsFlagWired(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	agentBin := buildTestAgent(t)
+	eventsPath := filepath.Join(t.TempDir(), "events.ndjson")
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-base", "main",
+		"-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+		})}}),
+		"-agent", agentBin,
+		"-events", eventsPath,
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v", err)
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK", code)
+	}
+	names, _ := readEvents(t, eventsPath)
+	if names[0] != "run_start" || names[len(names)-1] != "run_done" {
+		t.Fatalf("events=%v, want run_start..run_done", names)
+	}
+	if countOf(names, "land") != 1 {
+		t.Fatalf("events=%v missing land", names)
+	}
+}
+
+// TestRunRunEventsUnwritableFailsBeforeAgents: an -events path driveRun
+// cannot open must fail the run before any agent runs — same fail-early
+// policy as -logdir (see TestRunRunLogDirUnwritableFailsBeforeAgents, which
+// this mirrors).
+func TestRunRunEventsUnwritableFailsBeforeAgents(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	marker := filepath.Join(t.TempDir(), "agent-ran")
+	agentCmd := "touch " + marker
+
+	blocked := filepath.Join(t.TempDir(), "blocked")
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	eventsPath := filepath.Join(blocked, "events.ndjson") // parent "blocked" is a file, not a dir
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-base", "main",
+		"-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent", agentCmd,
+		"-events", eventsPath,
+	})
+	if err == nil {
+		t.Fatal("unwritable -events: want error, got nil")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("agent ran despite an unwritable -events path; must fail before any agent runs")
+	}
+}
