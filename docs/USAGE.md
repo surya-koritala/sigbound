@@ -331,6 +331,12 @@ config-file `lanes = ...` the same as a command-line `-lanes` — both count as
 "the caller chose this explicitly," so either one overrides the strict
 default, not just a command-line flag.
 
+**Raw vs. preset resolves first.** The precedence above is per-flag (`-agent`
+vs. `agent = ...`); [raw-vs-preset resolution](#presets) — a raw command
+always wins over its preset name — happens afterward, on whichever value each
+flag ended up with, so a `sig.conf` `agent = ...` raw command still overrides
+an `-agent-preset` passed on the command line.
+
 **Format.** Blank lines and lines starting with `#` (after leading
 whitespace) are ignored. Otherwise a line must be `key=value`; only the
 *first* `=` on the line is the delimiter, so a value may itself contain `=`

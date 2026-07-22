@@ -379,9 +379,6 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	if err := validateLaneMode(*lanes); err != nil {
 		return exitOperationalError, err
 	}
-	if *minTasks > *n {
-		return exitOperationalError, fmt.Errorf("-min-tasks %d exceeds -n %d", *minTasks, *n)
-	}
 	// Cheap preflight: git present + version >= 2.38, before touching the repo
 	// or spawning any agent. The engine hard-depends on merge-tree/overlay
 	// plumbing that only exists from 2.38 onward; catching that here turns a
@@ -425,6 +422,14 @@ func runRun(w io.Writer, argv []string) (int, error) {
 			return exitOperationalError, errors.New("no tasks in -tasks file")
 		}
 	} else {
+		// -min-tasks/-n are -goal-only concepts (a -tasks run has neither a
+		// planner-requested count nor a floor to check), so this validation lives
+		// here instead of the flag checks above. Caught before the planner even
+		// runs, same fail-safe-before-any-agent posture as everything else in
+		// this branch.
+		if *minTasks > *n {
+			return exitOperationalError, fmt.Errorf("-min-tasks %d exceeds -n %d", *minTasks, *n)
+		}
 		// Plan from the goal. A bad plan returns an error here — before any agent
 		// runs — so a broken plan never launches a broken run (fail-safe).
 		tasks, err = planTasks(context.Background(), *repo, *goal, *plannerCmd, *n, *plannerTimeout, logDirAbs)

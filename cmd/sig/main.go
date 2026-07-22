@@ -64,8 +64,8 @@ func main() {
 
 func usage(w *os.File) {
 	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-assert] [-no-land]")
-	fmt.Fprintln(w, "  sig run       -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-impact CMD] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-json]")
+	fmt.Fprintln(w, "  sig integrate -repo PATH -base BRANCH -branches b1,b2,..  (see 'sig integrate -h' for all flags)")
+	fmt.Fprintln(w, "  sig run       -repo PATH -base BRANCH (-tasks FILE | -goal STRING) -agent CMD  (see 'sig run -h' for all flags)")
 	fmt.Fprintln(w, "  sig doctor    [-repo PATH]")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))

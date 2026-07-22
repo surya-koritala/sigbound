@@ -47,9 +47,6 @@ type Config struct {
 	// "overlay" to measure the tree-overlay fast path.
 	Baseline  string
 	Candidate string
-
-	// StorePath, if set, persists run metadata via cell.Store (off hot path).
-	StorePath string
 }
 
 // withDefaults fills unset knobs.
@@ -101,8 +98,6 @@ type agent struct {
 	hotFile  string // "" if disjoint
 	hotLine  int
 	branch   string
-	sha      string
-	change   cell.BranchChange
 }
 
 // harness is a built base repo with N agents already committed to their own
@@ -181,17 +176,7 @@ func setup(ctx context.Context, cfg Config) (*harness, func(), error) {
 		if agents[i].hotFile != "" {
 			paths = append(paths, agents[i].hotFile)
 		}
-		agents[i].change = cell.BranchChange{Branch: agents[i].branch, WriteSet: cell.NewWriteSet(paths...)}
-		changes[i] = agents[i].change
-	}
-
-	// Commit SHAs are only needed to persist run metadata (cfg.StorePath); resolve
-	// them all through ONE cat-file --batch process, off the measured path.
-	if cfg.StorePath != "" {
-		if err := resolveAgentSHAs(ctx, g, agents); err != nil {
-			cleanupRoot()
-			return nil, nil, err
-		}
+		changes[i] = cell.BranchChange{Branch: agents[i].branch, WriteSet: cell.NewWriteSet(paths...)}
 	}
 
 	branchToPriv := make(map[string]string, cfg.Agents)
@@ -206,24 +191,6 @@ func setup(ctx context.Context, cfg Config) (*harness, func(), error) {
 		commitsPerSec: float64(cfg.Agents) / commitWall.Seconds(),
 	}
 	return h, cleanupRoot, nil
-}
-
-// resolveAgentSHAs fills each agent's commit SHA via one `git cat-file
-// --batch-check` process (used only when persisting run metadata).
-func resolveAgentSHAs(ctx context.Context, g *gitx.Git, agents []agent) error {
-	br, err := g.NewBatchReader(ctx)
-	if err != nil {
-		return err
-	}
-	defer br.Close()
-	for i := range agents {
-		sha, err := br.ResolveCommit(agents[i].branch)
-		if err != nil {
-			return fmt.Errorf("resolve sha %s: %w", agents[i].branch, err)
-		}
-		agents[i].sha = sha
-	}
-	return nil
 }
 
 // Run executes one full benchmark (single measurement per strategy) and returns
@@ -282,12 +249,6 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		res.TreesEqual = nt == ot
 	}
 
-	// ---- Optional: persist to the coordination store (off hot path) ------
-	if cfg.StorePath != "" {
-		if err := persist(ctx, cfg.StorePath, h.base, h.agents, res); err != nil {
-			return res, fmt.Errorf("store persist: %w", err)
-		}
-	}
 	return res, nil
 }
 
@@ -431,24 +392,4 @@ func treeHasAllLanded(ctx context.Context, g *gitx.Git, r cell.IntegrationResult
 		}
 	}
 	return true, nil
-}
-
-// persist writes run metadata to the coordination store. Kept strictly off the
-// measured path — it runs after all timing is done.
-func persist(ctx context.Context, storePath, base string, agents []agent, res Result) error {
-	s, err := cell.OpenStore(ctx, storePath)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	runID, err := s.StartRun(ctx, base, res.OCC.Strategy)
-	if err != nil {
-		return err
-	}
-	for i := range agents {
-		if err := s.RecordBranch(ctx, runID, agents[i].branch, agents[i].sha, agents[i].change.WriteSet.Paths()); err != nil {
-			return err
-		}
-	}
-	return s.FinishRun(ctx, runID, res.OCC)
 }
