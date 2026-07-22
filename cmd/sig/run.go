@@ -887,14 +887,18 @@ func budgetAwareErr(p runParams, ctx context.Context, op string, err error) erro
 // WorktreeAddDetached + WorktreeRemove per attempt (up to ~5 full O(repo)
 // checkouts with -repair-max=2, even when the delta each round touches is a
 // handful of files). Retries on an unchanged head just re-run in place
-// (runVerify cleans first); when a repair round advances head, the worktree
-// is advanced in place too via CheckoutDetach, which — unlike a fresh
-// checkout — only touches the paths that actually differ. It's torn down
-// once, when this function returns. runRepair still gets its OWN fresh
-// worktree per round: it needs a genuinely clean tree for its `git add -A`
-// auto-commit, never one that might carry a verify command's leftover build
-// artifacts (see runVerify's clean-on-entry, which is what makes reusing the
-// verify worktree safe instead of a hermeticity bug).
+// (runVerify resets+cleans first, see its doc); when a repair round advances
+// head, this loop resets+cleans the worktree BEFORE advancing it, then
+// advances it in place via CheckoutDetach — which, unlike a fresh checkout,
+// only touches the paths that actually differ, so it must start from a
+// pristine tree or a stale tracked-file edit / untracked leftover from the
+// PRIOR head can ride straight through (see the reset+clean block right
+// before each CheckoutDetach call below). It's torn down once, when this
+// function returns. runRepair still gets its OWN fresh worktree per round: it
+// needs a genuinely clean tree for its `git add -A` auto-commit, never one
+// that might carry a verify command's leftover build artifacts (see
+// runVerify's reset+clean-on-entry, which is what makes reusing the verify
+// worktree safe instead of a hermeticity bug).
 //
 // changedFiles is the run's landed write-set — -verify-impact's input for
 // computeImpact (see runVerify). Each repair round folds that round's
@@ -948,6 +952,30 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 			break
 		}
 		head = newHead
+		// Reset + clean the reused worktree BEFORE advancing it onto the
+		// repaired head. The verify invocation that just ran (above, or this
+		// loop's previous round) may have left tracked-file edits or
+		// untracked leftovers in place — CheckoutDetach only touches paths
+		// that differ between the OLD and NEW commit, so any tracked-file
+		// mutation on a path repair never touched would otherwise ride
+		// straight through unreverted, and an untracked leftover could
+		// collide with a path the new head is about to add and abort the
+		// checkout outright. Order matters: this must run BEFORE
+		// CheckoutDetach, not after (that's what runVerify's own
+		// reset+clean-on-entry guards against retries on an UNCHANGED head;
+		// it can't undo damage from before a checkout onto a NEW head).
+		if cerr := g.At(wtPath).ResetHard(ctx); cerr != nil {
+			lastOutput = tail(lastOutput+"\n[repair attempt "+fmt.Sprintf("%d", attempt)+" reset error] "+cerr.Error(), 2000)
+			repairs = append(repairs, rec)
+			emit.emit("repair_done", map[string]any{"attempt": attempt, "verifyOk": rec.VerifyOK, "wallMs": repairWallMs})
+			break
+		}
+		if cerr := g.At(wtPath).Clean(ctx); cerr != nil {
+			lastOutput = tail(lastOutput+"\n[repair attempt "+fmt.Sprintf("%d", attempt)+" clean error] "+cerr.Error(), 2000)
+			repairs = append(repairs, rec)
+			emit.emit("repair_done", map[string]any{"attempt": attempt, "verifyOk": rec.VerifyOK, "wallMs": repairWallMs})
+			break
+		}
 		// Advance the persistent verify worktree onto the repaired head in
 		// place — touches only the paths that differ — instead of tearing it
 		// down and re-materializing the whole tree with a fresh
@@ -1359,13 +1387,20 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 // isn't configured at all, so a run without it behaves byte-identically to
 // before -verify-impact existed.
 //
-// Every invocation starts by cleaning wtPath (git clean -fdx, see gitx.Clean)
-// so a build artifact left by a PRIOR invocation reusing this same worktree
-// (a retry, or an earlier repair round's re-verify) can never leak into this
-// one — the hermeticity guarantee that makes worktree reuse safe. The main
-// working tree is never touched. logAttempt names the -logdir log file
+// Every invocation starts by resetting wtPath back to HEAD (git reset --hard,
+// see gitx.ResetHard) and cleaning it (git clean -fdx, see gitx.Clean) so
+// EITHER a modification to a tracked file OR an untracked build artifact left
+// by a PRIOR invocation reusing this same worktree (a retry, or an earlier
+// repair round's re-verify) can never leak into this one — the hermeticity
+// guarantee that makes worktree reuse safe. Reset alone would leave stray
+// untracked files, and clean alone would leave tracked-file edits in place
+// (see both functions' docs); this needs both. The main working tree is
+// never touched. logAttempt names the -logdir log file
 // (verify-<logAttempt>.log); see runVerifyRetry.
 func runVerify(ctx context.Context, g *gitx.Git, wtPath string, p runParams, changedFiles []string, logDir string, logAttempt int) verifyJSON {
+	if err := g.At(wtPath).ResetHard(ctx); err != nil {
+		return verifyJSON{Ran: true, OK: false, Output: "reset worktree: " + err.Error()}
+	}
 	if err := g.At(wtPath).Clean(ctx); err != nil {
 		return verifyJSON{Ran: true, OK: false, Output: "clean worktree: " + err.Error()}
 	}

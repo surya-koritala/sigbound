@@ -258,8 +258,30 @@ func (g *Git) CheckoutDetach(ctx context.Context, commit string) error {
 // performance win for a hermeticity bug. Toolchain/module caches (GOCACHE,
 // GOMODCACHE, and the like) live outside the worktree, so this never touches
 // them.
+//
+// Clean alone is NOT enough to make a worktree pristine: it only ever deletes
+// untracked/ignored paths, so a command under test that instead MODIFIES a
+// file git already tracks leaves that edit in place — pair Clean with
+// ResetHard wherever reuse needs a fully pristine tree.
 func (g *Git) Clean(ctx context.Context) error {
 	_, err := g.run(ctx, "clean", "-q", "-fdx")
+	return err
+}
+
+// ResetHard restores every tracked file in the working tree to HEAD's
+// committed content (`git reset --hard`), discarding any staged or unstaged
+// modification a prior command made to a file git already tracks. This is
+// Clean's complement, not a replacement for it: Clean deletes untracked
+// leftovers, ResetHard reverts tracked-file edits, and reusing a worktree for
+// another verify/repair invocation needs BOTH to guarantee the next
+// invocation sees the exact tree HEAD names — a command under test that edits
+// a tracked file (a config, a fixture, a generated-but-committed file) would
+// otherwise leak that edit into the next invocation, and — because `git
+// checkout --detach` (see CheckoutDetach) only touches paths that differ
+// between the old and new commit — straight through a later checkout too if
+// the mutated path happens to be identical in both commits' trees.
+func (g *Git) ResetHard(ctx context.Context) error {
+	_, err := g.run(ctx, "reset", "-q", "--hard")
 	return err
 }
 

@@ -217,14 +217,17 @@ func TestWorktreeAddDetached(t *testing.T) {
 	}
 }
 
-// --- CheckoutDetach + Clean: reusing one detached worktree ------------------
+// --- CheckoutDetach + Clean + ResetHard: reusing one detached worktree -----
 
-// TestCheckoutDetachAndClean covers the two primitives -verify/-repair use to
-// reuse ONE detached worktree across attempts instead of a fresh
-// WorktreeAddDetached + WorktreeRemove per attempt: CheckoutDetach advances
-// the SAME worktree onto a new commit in place, and Clean removes whatever an
-// invocation left behind so the next reuse starts hermetic.
-func TestCheckoutDetachAndClean(t *testing.T) {
+// TestCheckoutDetachCleanAndResetHard covers the three primitives
+// -verify/-repair use to reuse ONE detached worktree across attempts instead
+// of a fresh WorktreeAddDetached + WorktreeRemove per attempt: CheckoutDetach
+// advances the SAME worktree onto a new commit in place, Clean removes
+// whatever untracked an invocation left behind, and ResetHard reverts
+// whatever tracked-file edit it left behind — Clean and ResetHard together
+// are what let the next reuse start hermetic (Clean alone only covers half of
+// that; see gitx.go's docs on both).
+func TestCheckoutDetachCleanAndResetHard(t *testing.T) {
 	ctx := context.Background()
 	g, base := newRepo(t)
 	c := branchFrom(t, g, base, "feat", func(d string) { write(t, d, "f.txt", "f\n") })
@@ -268,6 +271,22 @@ func TestCheckoutDetachAndClean(t *testing.T) {
 		t.Fatalf("Clean removed a tracked file: %v", err)
 	}
 
+	// ResetHard reverts a MODIFICATION to a tracked file — the case Clean
+	// explicitly does not cover (Clean only deletes untracked/ignored paths).
+	if err := os.WriteFile(filepath.Join(wt, "f.txt"), []byte("mutated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := wg.ResetHard(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(wt, "f.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "f\n" {
+		t.Fatalf("f.txt after ResetHard = %q, want original tracked content %q", got, "f\n")
+	}
+
 	// Error paths.
 	if err := wg.CheckoutDetach(ctx, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"); err == nil {
 		t.Fatal("expected error for bad commit")
@@ -275,6 +294,9 @@ func TestCheckoutDetachAndClean(t *testing.T) {
 	bad := New(filepath.Join(t.TempDir(), "not-a-repo"))
 	if err := bad.Clean(ctx); err == nil {
 		t.Fatal("expected error cleaning a non-repo directory")
+	}
+	if err := bad.ResetHard(ctx); err == nil {
+		t.Fatal("expected error resetting a non-repo directory")
 	}
 }
 
