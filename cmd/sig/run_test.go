@@ -729,7 +729,10 @@ func TestDriveRunAgentRetriesPreExistingBranchSurvives(t *testing.T) {
 	tree := gitOut(t, repo, "rev-parse", baseSHA+"^{tree}")
 	// A distinct commit (new SHA, same tree) simulating a prior run's landed
 	// work, reachable only through agent/collide.
-	userSHA := gitOut(t, repo, "commit-tree", tree, "-p", baseSHA, "-m", "user work from a prior run")
+	// -c ident flags: commit-tree needs an identity, and CI runners have no
+	// global git config (gitx sets ident via env, but this is a raw git call).
+	userSHA := gitOut(t, repo, "-c", "user.name=test", "-c", "user.email=test@local",
+		"commit-tree", tree, "-p", baseSHA, "-m", "user work from a prior run")
 	gitOut(t, repo, "update-ref", "refs/heads/agent/collide", userSHA)
 
 	task := taskSpec{ID: "collide", Prompt: "x"}
