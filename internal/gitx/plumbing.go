@@ -439,6 +439,27 @@ func (g *Git) HashObject(ctx context.Context, body []byte) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// NoteAdd attaches content as a git note to commit under a NAMESPACED ref
+// (`git notes --ref=<ref> add -f -F - <commit>`), overwriting any note
+// already there for that commit. Notes ride with the objects on any host —
+// they're an ordinary ref plus commits, just like a branch — which is why
+// this is how sigbound attaches structured provenance to a landed commit
+// instead of stuffing it into the commit message. ref is a bare name (e.g.
+// "sigbound"), never "refs/notes/..." itself; the caller decides the
+// namespace, which the caller MUST keep separate from git's own default
+// (refs/notes/commits) so a repo's own note usage is never disturbed by
+// sigbound's.
+func (g *Git) NoteAdd(ctx context.Context, ref, commit string, content []byte) error {
+	_, se, code, err := g.runWith(ctx, nil, content, "notes", "--ref="+ref, "add", "-f", "-F", "-", commit)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("notes --ref=%s add %s: exit %d: %s", ref, commit, code, strings.TrimSpace(se))
+	}
+	return nil
+}
+
 // BlobAt returns the contents of path at tree-ish rev (`git cat-file blob
 // rev:path`). present is false when the path is absent at rev (e.g. one side of
 // an add/add or delete/modify conflict) — NOT an error; the caller treats it as

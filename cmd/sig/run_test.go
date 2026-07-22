@@ -3055,3 +3055,203 @@ func TestRunRunVerifyImpactRequiresVerify(t *testing.T) {
 		t.Fatalf("report=%q, want no report written (nothing should have run)", buf.String())
 	}
 }
+
+// TestRunRunManifestWritesCommandsVersionTimestamp: -manifest FILE writes the
+// full report to disk, independent of -json (not passed here at all — stdout
+// stays the terse human summary), and the report carries the new provenance
+// fields: the resolved agent/resolver/verify commands, the sigbound version,
+// an RFC3339 start timestamp, and the top-level strategy.
+func TestRunRunManifestWritesCommandsVersionTimestamp(t *testing.T) {
+	agent := buildTestAgent(t)
+	_, repo := makeGoRepo(t)
+	tasks := []taskSpec{{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	resolverCmd := `cat "$SIGBOUND_OURS"`
+
+	before := time.Now().Add(-time.Second)
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", agent,
+		"-resolver", resolverCmd,
+		"-verify", "go build ./...",
+		"-manifest", manifestPath,
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code, buf.String())
+	}
+	if strings.Contains(buf.String(), "\"agentCmd\"") {
+		t.Fatalf("-manifest without -json still printed JSON to stdout: %s", buf.String())
+	}
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read -manifest: %v", err)
+	}
+	var rep runReport
+	if err := json.Unmarshal(data, &rep); err != nil {
+		t.Fatalf("parse manifest: %v\n%s", err, data)
+	}
+	if rep.AgentCmd != agent {
+		t.Fatalf("manifest agentCmd=%q, want %q", rep.AgentCmd, agent)
+	}
+	if rep.ResolverCmd != resolverCmd {
+		t.Fatalf("manifest resolverCmd=%q, want %q", rep.ResolverCmd, resolverCmd)
+	}
+	if rep.VerifyCmd != "go build ./..." {
+		t.Fatalf("manifest verifyCmd=%q, want %q", rep.VerifyCmd, "go build ./...")
+	}
+	if rep.RepairCmd != "" {
+		t.Fatalf("manifest repairCmd=%q, want empty (no -repair configured)", rep.RepairCmd)
+	}
+	if rep.PlannerCmd != "" {
+		t.Fatalf("manifest plannerCmd=%q, want empty (-tasks run, no -goal/-planner)", rep.PlannerCmd)
+	}
+	if rep.Strategy != "overlay" {
+		t.Fatalf("manifest strategy=%q, want overlay (the default)", rep.Strategy)
+	}
+	if rep.Version != Version {
+		t.Fatalf("manifest version=%q, want %q", rep.Version, Version)
+	}
+	started, err := time.Parse(time.RFC3339, rep.StartedAt)
+	if err != nil {
+		t.Fatalf("manifest startedAt=%q is not RFC3339: %v", rep.StartedAt, err)
+	}
+	if started.Before(before) || started.After(time.Now().Add(time.Second)) {
+		t.Fatalf("manifest startedAt=%v outside this test's wall-clock window", started)
+	}
+	if rep.Integrate.FinalSHA == "" {
+		t.Fatal("manifest missing integrate.finalSHA")
+	}
+}
+
+// TestRunRunManifestUnwritableFailsBeforeAgents: an unwritable -manifest path
+// must fail the run before any agent runs, the same fail-fast policy as
+// -logdir (see TestRunRunLogDirUnwritableFailsBeforeAgents) — provenance that
+// can never be written is caught up front, not discovered after paying for
+// the run.
+func TestRunRunManifestUnwritableFailsBeforeAgents(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	marker := filepath.Join(t.TempDir(), "agent-ran")
+	agentCmd := "touch " + marker
+
+	blocked := filepath.Join(t.TempDir(), "blocked")
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(blocked, "manifest.json") // parent "blocked" is a file, not a dir
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-base", "main",
+		"-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent", agentCmd,
+		"-manifest", manifestPath,
+	})
+	if err == nil {
+		t.Fatal("unwritable -manifest: want error, got nil")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("no report should be written when -manifest fails before any agent runs, got:\n%s", buf.String())
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("agent ran despite an unwritable -manifest; must fail before any agent runs")
+	}
+}
+
+// TestRunRunNotesAttachesReadableNoteToLandedCommit: -notes attaches the full
+// JSON report as a git note under the NAMESPACED refs/notes/sigbound (never
+// git's default refs/notes/commits) on the commit the run actually landed —
+// read back with the plain `git notes --ref=sigbound show <sha>` porcelain
+// docs/USAGE.md documents, proving the note is genuinely readable that way,
+// not just written by NoteAdd and never verified independently.
+func TestRunRunNotesAttachesReadableNoteToLandedCommit(t *testing.T) {
+	agent := buildTestAgent(t)
+	g, repo := makeGoRepo(t)
+	tasks := []taskSpec{{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}}
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", agent,
+		"-notes",
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code, buf.String())
+	}
+	var rep runReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse report: %v", err)
+	}
+
+	mainSHA, err := g.RevParse(context.Background(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("main=%s, want it advanced to the landed finalSHA=%s", mainSHA, rep.Integrate.FinalSHA)
+	}
+
+	out, err := exec.Command("git", "-C", repo, "notes", "--ref=sigbound", "show", mainSHA).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git notes --ref=sigbound show %s: %v\n%s", mainSHA, err, out)
+	}
+	var noted runReport
+	if err := json.Unmarshal(out, &noted); err != nil {
+		t.Fatalf("note body is not the JSON report: %v\n%s", err, out)
+	}
+	if noted.Integrate.FinalSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("noted report finalSHA=%s, want %s", noted.Integrate.FinalSHA, rep.Integrate.FinalSHA)
+	}
+	if noted.AgentCmd != agent {
+		t.Fatalf("noted report agentCmd=%q, want %q", noted.AgentCmd, agent)
+	}
+}
+
+// TestRunRunNotesOffByDefaultAttachesNothing: -notes is opt-in — a plain run
+// with no -notes must leave the landed commit with no sigbound note at all.
+func TestRunRunNotesOffByDefaultAttachesNothing(t *testing.T) {
+	agent := buildTestAgent(t)
+	_, repo := makeGoRepo(t)
+	tasks := []taskSpec{{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}}
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", agent,
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code, buf.String())
+	}
+	var rep runReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "notes", "--ref=sigbound", "show", rep.Integrate.FinalSHA).CombinedOutput(); err == nil {
+		t.Fatalf("a sigbound note exists despite -notes never being passed: %s", out)
+	}
+}

@@ -51,6 +51,14 @@ func main() {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "replay":
+		code, err := runReplay(os.Stdout, os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sig replay:", err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "version", "-v", "--version":
 		runVersion(os.Stdout)
 	case "-h", "--help", "help":
@@ -66,6 +74,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  sig integrate -repo PATH -base BRANCH -branches b1,b2,..  (see 'sig integrate -h' for all flags)")
 	fmt.Fprintln(w, "  sig run       -repo PATH -base BRANCH (-tasks FILE | -goal STRING) -agent CMD  (see 'sig run -h' for all flags)")
+	fmt.Fprintln(w, "  sig replay    -manifest FILE  (deterministically re-integrate a prior run's recorded inputs; see 'sig replay -h')")
 	fmt.Fprintln(w, "  sig doctor    [-repo PATH]")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))

@@ -4,11 +4,12 @@ Complete reference for the `sig` CLI. For a five-minute walkthrough on your own
 repository, see [`examples/`](../examples/). For the shape of the whole
 pipeline, see the [README](../README.md#how-it-works).
 
-`sig` has four subcommands:
+`sig` has five subcommands:
 
 ```
 sig run        run agents on a repo and integrate their work (the driver)
 sig integrate  integrate a set of existing branches (the engine, standalone)
+sig replay     deterministically re-integrate a prior run's recorded inputs
 sig doctor     check that git is new enough and its plumbing actually works
 sig version    print the version, git commit, and build date
 ```
@@ -40,6 +41,8 @@ sig run [-config PATH]
         [-budget D]
         [-logdir DIR]
         [-events FILE]
+        [-manifest FILE]
+        [-notes]
         [-dry-run]
         [-json]
 ```
@@ -80,6 +83,8 @@ sig run [-config PATH]
 | `-budget` | `0` | Wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (`0` = none). On expiry, outstanding agents are cancelled and fail; integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial. |
 | `-logdir` | — | Write each agent/repair/verify/planner command's **full** stdout+stderr to `<logdir>/<name>.log` (`agent-<id>.log`, `repair-<n>.log`, `verify-<n>.log`, `planner.log`), on top of the truncated tails the report keeps in memory. The directory is created if needed and must be writable — checked before any agent runs, so a bad `-logdir` fails the whole run rather than silently dropping logs partway through. Repeated runs against the same `-logdir` **append** to the same files; there is no per-run rotation. A task's `id` is sanitized for use in the filename (non-alphanumeric characters become `-`), so two exotic ids that sanitize to the same string share one log file. |
 | `-events` | — | Stream one JSON object per line to FILE as the run progresses (see [Events](#events)); `-` writes to stderr. The file is truncated fresh each run. Opening it is checked before any agent runs, same fail-fast policy as `-logdir`; a write failure afterward is best-effort and never fails the run. |
+| `-manifest` | — | Write the full JSON report to FILE at the end of the run, independent of `-json` (see [Provenance](#provenance)). FILE's directory is created if needed and checked writable before any agent runs, same fail-fast policy as `-logdir`; a write failure AFTER the run completes is best-effort and warned on stderr — by then real work may already be landed. |
+| `-notes` | `false` | When the run LANDS, attach the full JSON report as a git note on the landed commit under the namespaced `refs/notes/sigbound` (see [Provenance](#provenance)). Best-effort: a failure is warned on stderr but never fails the run, since landing already happened. |
 | `-dry-run` | `false` | Load or plan the tasks, print them plus the predicted OCC partition, then exit — no worktree, agent, verify, or repair ever runs (see [Dry run](#dry-run)). |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
 
@@ -424,6 +429,65 @@ on it instead of parsing stdout:
 When a run matches more than one of these, the most severe wins, in this
 order: `1` > `3` > `5` > `4`.
 
+### Provenance
+
+`sig run` prints a report and advances a branch, but by default nothing else
+survives the process exiting — the exact inputs (which commit SHAs landed,
+what `-agent`/`-verify`/`-resolver` actually ran) live only in that one
+stdout capture. `-manifest` and `-notes` persist that same report as durable
+provenance, in two complementary places:
+
+- **`-manifest FILE`** writes the full JSON report (identical shape to
+  `-json`) to `FILE` at the end of the run — independent of `-json`, which
+  still only controls what's printed to *stdout*. `FILE`'s directory is
+  created if needed and checked writable **before any agent runs**, the same
+  fail-fast policy as `-logdir`: a manifest path that can never be written is
+  caught up front, not discovered after paying for the whole run. A write
+  failure *after* the run completes is different — by then real work may
+  already be landed on `-base`, so losing the manifest must never look like
+  losing the run itself. That failure is best-effort: a loud warning on
+  stderr, no change to the exit code.
+- **`-notes`** attaches that same report as a git note on the landed commit,
+  under the **namespaced** ref `refs/notes/sigbound` — never git's default
+  `refs/notes/commits`, so sigbound's provenance never collides with a
+  repo's own note usage. It only ever fires once the base ref has actually
+  advanced (a run that lands nothing attaches nothing); like a late
+  `-manifest` write, a note failure is best-effort and warned on stderr,
+  never a run failure — the landing already happened by the time it runs.
+
+The report's new top-level fields carry that provenance: `strategy` (the
+integration strategy, duplicated here even though `integrate.strategy`
+already has it, so it's readable without integrate having run at all),
+`agentCmd`/`resolverCmd`/`verifyCmd`/`repairCmd`/`plannerCmd` (the exact,
+RESOLVED command strings this run executed — after `-*-preset` expansion and
+`-config` merging), `version` (the sigbound version that produced this
+report), and `startedAt` (an RFC3339 timestamp for when the run began).
+
+**These commands are redacted NOTHING.** They're your own shell commands,
+recorded verbatim — if you baked a secret (an API key, a token) into
+`-verify` or `-resolver`, that secret is now sitting in the manifest file and
+in the git note on the landed commit. Treat both accordingly: don't commit a
+`-manifest` file to a public repo, and remember `-notes` writes into the
+target repo's own object store.
+
+**Reading a note back:**
+
+```bash
+git notes --ref=sigbound show <sha>
+```
+
+**Notes don't push by default.** `git push` never sends `refs/notes/*`
+unless you ask it to; push the namespace explicitly when you want the
+provenance to travel with the branch:
+
+```bash
+git push origin refs/notes/sigbound
+```
+
+See [`sig replay`](#sig-replay) below for what a `-manifest` file (or a
+`-notes` note, since the shape is identical) is actually *for*: feeding it
+back in to deterministically reproduce the integration it recorded.
+
 ---
 
 ## `sig integrate`
@@ -447,6 +511,79 @@ sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-a
 | `-resolver` | — | Per-conflict resolver command. |
 | `-resolver-timeout` | `30s` | Per-conflict timeout for `-resolver` (`0` = none). |
 | `-no-land` | `false` | Integrate without moving the base ref; leave the result as a detached commit. |
+
+---
+
+## `sig replay`
+
+Deterministic replay: given a `-manifest` file (or any `-json` report — same
+shape), re-run **only** the integration + verify portion of that recorded
+run and check whether the repo still reproduces it.
+
+```
+sig replay -manifest FILE
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-manifest` | *(required)* | Path to a JSON report written by `sig run`'s `-manifest` flag (or `-json`). |
+
+**Why this works at all.** Integration is already deterministic —
+`cell.Partition` is order-stable and `combineDisjoint` is a fixed reduction —
+so capturing a run's inputs and re-feeding them is the *only* missing piece
+for reproducible debugging. `sig replay`:
+
+1. Resolves the recorded `baseSHA` and, for every agent the manifest marked
+   `ok: true`, the recorded per-agent `sha` — **the exact commit, never the
+   branch's current tip**, since a branch can move or be deleted after the
+   run that produced the manifest. If any of these no longer resolve in the
+   repo (a branch was deleted and the commit was eventually garbage
+   collected, say), replay fails clearly instead of guessing.
+2. Re-integrates those exact SHAs with the recorded `strategy` and
+   `resolverCmd`, via the same `integrateBranches` path `sig run`/`sig
+   integrate` use — with `land=false` (like `sig integrate -no-land`).
+   Replay is **read-only**: it never moves any ref.
+3. If the manifest recorded a `verifyCmd`, re-runs it against the recomputed
+   tree and prints whether it still passes — informational only; see below.
+4. Compares the recomputed tree's OID against the recorded
+   `integrate.finalSHA`'s tree OID (not the raw commit SHA — commit
+   timestamps differ between the original run and replay even when the tree
+   is byte-identical, so tree equality is the actual claim being checked).
+
+```bash
+sig run   -repo . -base main -tasks tasks.json -agent '...' -manifest run.json
+sig replay -manifest run.json
+```
+
+```
+REPRODUCED tree=3f9a2c…
+```
+
+or, when the repo no longer produces the recorded result:
+
+```
+DIVERGED recorded=3f9a2c… recomputed=a01de4…
+```
+
+**Exit codes** are their own scale, distinct from `sig run`'s:
+
+| Code | Meaning |
+|------|---------|
+| `0` | `REPRODUCED` — the recomputed tree is byte-identical to the recorded one. |
+| `1` | `DIVERGED` — both recomputed cleanly, but the trees differ; both OIDs are printed. |
+| `2` | Replay itself could not run: a bad/unreadable `-manifest`, a recorded SHA no longer resolvable, or an integrate/checkout failure. |
+
+**What replay does NOT do.** It never re-runs `-agent` or `-repair` — those
+are non-deterministic by nature (an LLM, a fixer), so "replaying" them
+wouldn't prove anything about the DETERMINISTIC part of the pipeline. If the
+original run's `integrate.finalSHA` reflects a `-repair` round, replay's
+pure re-integration (no repair) will legitimately `DIVERGE` from it — that's
+an honest signal that the recorded result depended on a repair step, not a
+replay bug. The recorded `-verify` command IS re-run (step 3 above), but its
+pass/fail is reported alongside the result, not folded into
+`REPRODUCED`/`DIVERGED`: `-verify` is only deterministic *by convention* (see
+[Determinism](#determinism)), while the tree comparison is the one claim
+integration's own determinism actually backs.
 
 ---
 
@@ -558,6 +695,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
     "inLane": true, "strayed": [], "stderr": "",
     "worktreeKept": "", "timedOut": false, "attempts": 1
   } ],
+  "strategy": "overlay",
   "integrate": {
     "strategy": "overlay", "groups": 3,
     "landed": ["…"], "flagged": [], "resolved": 0,
@@ -569,7 +707,10 @@ With `-json`, `sig run` prints a full report. Top-level shape:
     "output": "…",
     "repairs": [ { "n": 1, "filesTouched": ["…"], "verifyOk": true } ]
   },
-  "logDir": "…"
+  "logDir": "…",
+  "agentCmd": "…", "resolverCmd": "…", "verifyCmd": "…", "repairCmd": "…", "plannerCmd": "…",
+  "version": "0.2.0",
+  "startedAt": "2025-01-01T00:00:00Z"
 }
 ```
 
@@ -587,6 +728,13 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   failing verdict.
 - `logDir` is present iff `-logdir` was set; it names the directory holding
   each command's full stdout+stderr log (see `-logdir` above).
+- `strategy`, `agentCmd`/`resolverCmd`/`verifyCmd`/`repairCmd`/`plannerCmd`,
+  `version`, and `startedAt` are the [provenance](#provenance) fields —
+  always populated (`resolverCmd`/`verifyCmd`/`repairCmd`/`plannerCmd` are
+  `omitempty` and simply absent when that slot wasn't configured for this
+  run), whether or not `-manifest`/`-notes` were passed: they're part of the
+  ordinary report: `-manifest`/`-notes` just persist it. This is also the
+  exact shape `sig replay -manifest FILE` expects.
 
 Without `-json`, the same run prints a short human summary.
 
