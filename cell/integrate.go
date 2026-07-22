@@ -205,6 +205,20 @@ func (in *Integrator) IntegrateOCC(ctx context.Context, base string, changes []B
 		}
 	}
 
+	// Resolve every branch tip to a commit OID once through a single batched
+	// process (the same helper IntegrateOverlay uses). GroupHeads must carry a
+	// real commit OID even for a singleton group, per IntegrationResult's doc
+	// comment: -verify-bisect's overlayCandidate re-overlays a SUBSET of these
+	// heads via OverlayTrees, whose diff-tree --stdin batching requires a full
+	// OID on both sides of its two-tree lines — an unresolved ref name (what
+	// used to land here) silently breaks that parse instead of erroring
+	// loudly, so this can't be left to the ref-accepting call sites inside
+	// this function (MergeTree/CommitTree, which tolerate refs fine).
+	tips, err := in.resolveTips(ctx, changes)
+	if err != nil {
+		return res, err
+	}
+
 	// ---- parallel phase: fold each group -> a group head ----
 	heads := make([]string, len(groups))
 	landedByGroup := make([][]string, len(groups))
@@ -219,10 +233,8 @@ func (in *Integrator) IntegrateOCC(ctx context.Context, base string, changes []B
 	for gi := range groups {
 		g := groups[gi]
 		if len(g) == 1 {
-			// Singleton: the branch is already its own head. Use the ref name
-			// directly (git resolves it) — no per-branch RevParse spawn, which
-			// would otherwise serialize N singletons and negate the parallelism.
-			heads[gi] = g[0].Branch
+			// Singleton: the branch tip is already the group head. No merge.
+			heads[gi] = tips[g[0].Branch]
 			landedByGroup[gi] = []string{g[0].Branch}
 			continue
 		}
