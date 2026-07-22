@@ -699,6 +699,60 @@ func TestDriveRunAgentRetries(t *testing.T) {
 	}
 }
 
+// gitOut runs a git plumbing command directly against repo (bypassing gitx,
+// which has no exported branch-creation call) and returns trimmed stdout.
+func gitOut(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestDriveRunAgentRetriesPreExistingBranchSurvives: a foreign agent/<id>
+// branch left over from a PRIOR run (holding a real, committed user commit)
+// must survive a run that reuses that same task ID with -agent-retries set.
+// Attempt 1's WorktreeAdd loud-fails on the collision (see WorktreeAdd's
+// doc comment); that must be terminal — never retried into a
+// WorktreeAddReset that would -B-reset the foreign branch and silently
+// destroy the prior commit. This is the regression case for the bug where
+// the retry gate was keyed off `attempt >= 2` instead of "did THIS run
+// create the branch": that condition can't tell a foreign pre-existing
+// branch apart from one this run made itself on an earlier attempt.
+func TestDriveRunAgentRetriesPreExistingBranchSurvives(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+
+	baseSHA := gitOut(t, repo, "rev-parse", "HEAD")
+	tree := gitOut(t, repo, "rev-parse", baseSHA+"^{tree}")
+	// A distinct commit (new SHA, same tree) simulating a prior run's landed
+	// work, reachable only through agent/collide.
+	userSHA := gitOut(t, repo, "commit-tree", tree, "-p", baseSHA, "-m", "user work from a prior run")
+	gitOut(t, repo, "update-ref", "refs/heads/agent/collide", userSHA)
+
+	task := taskSpec{ID: "collide", Prompt: "x"}
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: "exit 0", AgentRetries: 2}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	a := rep.PerAgent[0]
+	if a.OK {
+		t.Fatal("want the agent to fail: agent/collide collides with a foreign branch")
+	}
+	if a.Attempts != 1 {
+		t.Fatalf("attempts=%d, want 1 (a WorktreeAdd collision is terminal, never retried)", a.Attempts)
+	}
+	if !strings.Contains(a.Stderr, "worktree add") {
+		t.Fatalf("want the worktree-add failure reported in stderr, got %q", a.Stderr)
+	}
+	if got := gitOut(t, repo, "rev-parse", "refs/heads/agent/collide"); got != userSHA {
+		t.Fatalf("agent/collide moved from %s to %s: the foreign branch's commit was destroyed", userSHA, got)
+	}
+}
+
 // TestDriveRunBudgetExhausted: -budget caps the whole run (agent phase +
 // integrate + verify) with one wall-clock ceiling. Two tasks share one -agent
 // command that routes on SIGBOUND_TASK_ID: "fast" commits immediately via the

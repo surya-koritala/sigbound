@@ -778,13 +778,26 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 // runAgentWithRetries wraps runAgent with -agent-retries: on a FAILED attempt
 // (bad exit or an -agent-timeout expiry) it tears down that attempt's
 // worktree and retries in a FRESH one off the same base, up to
-// p.AgentRetries more times. Two cases stop the retry loop early, before
+// p.AgentRetries more times. Three cases stop the retry loop early, before
 // attempts are exhausted:
 //
 //   - a lane-strict out-of-lane failure (a.InLane false) — that's a plan
 //     violation, not a timing fluke a retry could fix;
 //   - ctx already done (e.g. -budget exhausted) — every further attempt would
-//     just fail the same way, so retrying only burns worktree churn.
+//     just fail the same way, so retrying only burns worktree churn;
+//   - the worktree/branch itself couldn't be created (wtCreated false) — a
+//     pre-existing agent/<id> branch collision can never succeed by retrying
+//     (WorktreeAdd loud-fails every time), and any other add failure is
+//     environmental; treated like a stray rather than burning retries on it.
+//
+// created tracks, across this call's own attempts, whether THIS RUN has
+// already created agent/<id>'s worktree once before — only then is it safe to
+// hand runAgent's next attempt WorktreeAddReset instead of the loud-failing
+// WorktreeAdd (see runAgent's doc comment). It starts false and latches true
+// the first time runAgent reports wtCreated, and never resets, so a run that
+// fails attempt 1 at WorktreeAdd (e.g. a foreign agent/<id> left by a prior
+// run) can never reach a reset on some later attempt — there is no later
+// attempt, since that failure is terminal (see above).
 //
 // Only the attempt that actually ENDS the loop keeps its worktree under
 // -keep-failed — whether that's because retries are exhausted, a lane-strict
@@ -793,15 +806,20 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 // allowed to keep its worktree on failure; when the loop decides to retry
 // instead, that discarded attempt's worktree is torn down immediately below.
 // a.Attempts records the total number of tries actually made (1 when the
-// first try succeeded or no retries were configured, matching today's report
-// shape).
+// first try succeeded, failed terminally, or no retries were configured,
+// matching today's report shape).
 func runAgentWithRetries(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec) perAgentJSON {
 	var a perAgentJSON
+	created := false
 	for attempt := 1; ; attempt++ {
-		a = runAgent(ctx, g, admin, wtRoot, baseSHA, p, t, attempt)
+		var wtCreated bool
+		a, wtCreated = runAgent(ctx, g, admin, wtRoot, baseSHA, p, t, created)
 		a.Attempts = attempt
+		if wtCreated {
+			created = true
+		}
 		last := attempt > p.AgentRetries
-		if a.OK || last || !a.InLane || ctx.Err() != nil {
+		if a.OK || last || !a.InLane || ctx.Err() != nil || !wtCreated {
 			return a
 		}
 		// Retrying: this attempt didn't end the loop, so its kept worktree (if
@@ -822,13 +840,20 @@ func runAgentWithRetries(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wt
 // inspected. The branch (with the agent's commit, if any) survives for
 // integration either way.
 //
-// attempt is this call's 1-based try number from runAgentWithRetries. attempt
-// 1 always creates the branch with WorktreeAdd (loud-fail if agent/<id>
-// somehow already exists — e.g. a leftover branch from a prior run — rather
-// than silently resetting someone else's work). attempt >= 2 is THIS SAME RUN
-// re-creating a branch it made itself on the previous, now-torn-down attempt,
-// so it uses WorktreeAddReset instead.
-func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec, attempt int) (a perAgentJSON) {
+// created is true iff a PRIOR attempt in THIS RUN (from runAgentWithRetries'
+// own retry loop) already succeeded at creating agent/<id>'s worktree —
+// i.e. this call is re-creating a branch this run made itself on a previous,
+// now-torn-down attempt. Only then is it safe to use WorktreeAddReset.
+// created false (attempt 1, or any run that has never yet created this
+// branch) always uses WorktreeAdd, which loud-fails if agent/<id> somehow
+// already exists — e.g. a leftover branch from a prior run — rather than
+// silently resetting someone else's committed work.
+//
+// The second return value, wtCreated, reports whether WorktreeAdd/
+// WorktreeAddReset succeeded THIS call; runAgentWithRetries latches it into
+// its own created for the next attempt, and also treats wtCreated==false as
+// terminal (never retried) since a failed add can't be fixed by retrying.
+func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec, created bool) (a perAgentJSON, wtCreated bool) {
 	branch := "agent/" + t.ID
 	// InLane defaults true (not the zero value) so a failure that never reaches
 	// the lane-enforcement block below — e.g. WorktreeAdd itself failing —
@@ -838,7 +863,7 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 
 	admin.Lock()
 	var err error
-	if attempt >= 2 {
+	if created {
 		err = g.WorktreeAddReset(ctx, dir, branch, baseSHA)
 	} else {
 		err = g.WorktreeAdd(ctx, dir, branch, baseSHA)
@@ -847,7 +872,7 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 	if err != nil {
 		a.Exit = -1
 		a.Stderr = "worktree add: " + err.Error()
-		return a
+		return a, false
 	}
 	// a is a named return: this defer runs after every downstream update to a
 	// (including lane enforcement), so it sees the FINAL OK verdict.
@@ -999,7 +1024,7 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 			}
 		}
 	}
-	return a
+	return a, true
 }
 
 // runVerify materializes finalSHA into a detached worktree and runs verifyCmd
