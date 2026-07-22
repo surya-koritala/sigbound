@@ -240,6 +240,29 @@ func (g *Git) WorktreeRemove(ctx context.Context, path string) error {
 	return err
 }
 
+// CheckoutDetach switches an ALREADY-detached worktree to commit — `git
+// checkout --detach <commit>` — touching only the paths that differ from
+// whatever the worktree currently has checked out. Used to advance a verify
+// worktree onto a repair-advanced head instead of tearing it down and running
+// a fresh WorktreeAddDetached, which re-materializes the whole tree.
+func (g *Git) CheckoutDetach(ctx context.Context, commit string) error {
+	_, err := g.run(ctx, "checkout", "-q", "--detach", commit)
+	return err
+}
+
+// Clean removes every untracked and ignored file/directory from the working
+// tree (`git clean -fdx`). Required before reusing a worktree for another
+// verify/repair invocation: a command under test can leave build artifacts
+// (binaries, coverage files, generated code) that must not leak into the next
+// invocation's view of the tree — without this, reuse would trade a real
+// performance win for a hermeticity bug. Toolchain/module caches (GOCACHE,
+// GOMODCACHE, and the like) live outside the worktree, so this never touches
+// them.
+func (g *Git) Clean(ctx context.Context) error {
+	_, err := g.run(ctx, "clean", "-q", "-fdx")
+	return err
+}
+
 // CheckoutB creates or resets branch to start and checks it out (`git checkout
 // -B`). Used to rewind an integration worktree back to base between groups; only
 // the paths that differ from the current state are touched, so it's cheap.

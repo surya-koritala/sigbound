@@ -1044,10 +1044,13 @@ func TestRunRunNoReportWhenNoAgentsRan(t *testing.T) {
 }
 
 // TestDriveRunVerifyRetries covers -verify-retries against a verify command
-// that fails on its first invocation and passes on every one after. Each
-// invocation runs in a FRESH detached worktree (see runVerify), so the
-// fail-once state has to live outside the checkout: a marker file at a fixed
-// path, created by the command itself on its first (failing) run.
+// that fails on its first invocation and passes on every one after. Retries
+// reuse the SAME detached worktree (see runVerify/verifyWithRepair), only
+// cleaned between invocations, so the fail-once state has to live outside the
+// checkout: a marker file at a fixed path, created by the command itself on
+// its first (failing) run — a marker written INSIDE the checkout would be
+// removed by the between-attempt clean, defeating this fixture on purpose
+// (see TestDriveRunVerifyRetriesCleansWorktreeBetweenAttempts for that case).
 func TestDriveRunVerifyRetries(t *testing.T) {
 	ctx := context.Background()
 	agent := buildTestAgent(t)
@@ -1099,6 +1102,51 @@ func TestDriveRunVerifyRetries(t *testing.T) {
 	}
 	if code := runExitCode(rep0); code != exitVerifyFailed {
 		t.Fatalf("runExitCode=%d, want exitVerifyFailed", code)
+	}
+}
+
+// TestDriveRunVerifyRetriesCleansWorktreeBetweenAttempts proves the
+// hermeticity guarantee that makes worktree reuse across -verify-retries safe
+// (see runVerify's clean-on-entry): an UNTRACKED file the verify command
+// writes INSIDE the checkout on its first (failing) invocation must be gone
+// by the second (retried) invocation — if the worktree were reused WITHOUT a
+// clean between attempts, it would still be there and the command reports
+// LEAKED-ARTIFACT and fails; since it isn't, the retry sees a hermetic tree
+// and passes.
+func TestDriveRunVerifyRetriesCleansWorktreeBetweenAttempts(t *testing.T) {
+	ctx := context.Background()
+	agent := buildTestAgent(t)
+	task := taskSpec{ID: "ok", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"good.go": "package main\n\nfunc good() int { return 1 }\n"},
+	})}
+
+	// counter (outside the worktree) distinguishes the first invocation from
+	// the retry; leftover.txt (inside the worktree, untracked) is the artifact
+	// whose survival would prove a leak.
+	counter := filepath.Join(t.TempDir(), "counter")
+	verifyCmd := `n=$(cat '` + counter + `' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '` + counter + `'
+if [ "$n" = "1" ]; then touch leftover.txt; exit 1; fi
+if [ -f leftover.txt ]; then echo LEAKED-ARTIFACT; exit 1; fi
+exit 0`
+
+	_, repo := makeGoRepo(t)
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:     verifyCmd,
+		VerifyRetries: 1,
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if strings.Contains(rep.Verify.Output, "LEAKED-ARTIFACT") {
+		t.Fatalf("worktree reuse leaked an untracked artifact across -verify-retries: %q", rep.Verify.Output)
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false, want true (retry should see a cleaned, hermetic worktree): %q", rep.Verify.Output)
+	}
+	if !rep.Verify.Flaky {
+		t.Fatal("verify.flaky=false, want true (passed only on the 2nd invocation)")
 	}
 }
 

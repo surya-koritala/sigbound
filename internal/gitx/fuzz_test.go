@@ -3,8 +3,8 @@ package gitx
 // Native-fuzzing targets for every parser of git command OUTPUT in this package.
 // A parser of untrusted plumbing output must NEVER panic on malformed input — a
 // crasher here would be a real bug. Each target refactors the parse into a pure
-// helper (parseDiffRawZ, parseMergeTreeZ, parseBatchCheckLine, parseLsTreeModeZ)
-// so it can be exercised without shelling git, and asserts the parser's own
+// helper (parseDiffRawZ, parseMergeTreeZ, parseBatchCheckLine, parseLsTreeZ,
+// parseCatFileBatch) so it can be exercised without shelling git, and asserts the parser's own
 // structural invariants in addition to "did not panic". The seed corpora carry
 // real valid outputs plus known-tricky inputs (empty, truncated, embedded NULs,
 // missing/extra fields, non-UTF8) and any crasher found is committed under
@@ -190,27 +190,70 @@ func FuzzParseGitVersion(f *testing.F) {
 	})
 }
 
-// FuzzParseLsTreeModeZ fuzzes the single-record `git ls-tree -z` mode decoder.
-func FuzzParseLsTreeModeZ(f *testing.F) {
+// FuzzParseLsTreeZ fuzzes the MULTI-record `git ls-tree -z <tree> --
+// <paths...>` decoder that entryModesBatch uses to collapse SpliceBlobs'
+// per-path mode lookups into one spawn.
+func FuzzParseLsTreeZ(f *testing.F) {
 	f.Add("")
 	f.Add("\x00")
 	f.Add("100644 blob " + sha1a + "\ta.go\x00")
-	f.Add("100755 blob " + sha1a + "\tx\x00")
-	f.Add("040000 tree " + sha1a + "\tsub")
-	f.Add("no-tab-at-all record")
-	f.Add("\t")                                      // tab only -> empty fields before tab
-	f.Add("  \tpath")                                // whitespace-only mode field
-	f.Add("120000 blob " + sha1a + "\t\xff\xfe\x00") // non-UTF8 path
+	f.Add("100644 blob " + sha1a + "\ta.go\x00100755 blob " + sha1b + "\tb.sh\x00")
+	f.Add("040000 tree " + sha1a + "\tsub\x00")
+	f.Add("no-tab-at-all record\x00")
+	f.Add("\t\x00")                                                               // tab only -> empty fields before tab
+	f.Add("  \tpath\x00")                                                         // whitespace-only mode field
+	f.Add("120000 blob " + sha1a + "\t\xff\xfe\x00")                              // non-UTF8 path
+	f.Add("100644 blob " + sha1a + "\tdup\x00100644 blob " + sha1b + "\tdup\x00") // duplicate path
 
 	f.Fuzz(func(t *testing.T, out string) {
-		mode, err := parseLsTreeModeZ(out)
+		modes, err := parseLsTreeZ(out)
 		if err != nil {
-			return
+			return // a rejected malformed record is fine, as long as it did not panic
 		}
-		// On success mode is either "" (path absent) or the first whitespace-split
-		// field before the tab: it can never contain whitespace or a NUL.
-		if strings.ContainsAny(mode, " \t\n\x00") {
-			t.Fatalf("mode carries whitespace/NUL: %q", mode)
+		for path, mode := range modes {
+			if mode == "" {
+				t.Fatalf("path %q carries an empty mode (should have been rejected)", path)
+			}
+			if strings.ContainsAny(mode, " \t\n\x00") {
+				t.Fatalf("mode for %q carries whitespace/NUL: %q", path, mode)
+			}
+		}
+	})
+}
+
+// FuzzParseCatFileBatch fuzzes the `git cat-file --batch` decoder that
+// BlobsBatch uses to collapse the resolver's per-conflict blob reads (3
+// `cat-file blob` forks per path) into one spawn for a whole branch.
+func FuzzParseCatFileBatch(f *testing.F) {
+	f.Add("")
+	f.Add(sha1a + " blob 5\nhello\n")
+	f.Add(sha1a + " blob 0\n\n") // empty blob
+	f.Add("HEAD:missing.txt missing\n")
+	f.Add(sha1a + " blob 5\nhello\n" + "HEAD:missing.txt missing\n" + sha1b + " blob 3\nfoo\n")
+	f.Add(sha1a + " blob 5\nhel\x00o\n")     // embedded NUL in content
+	f.Add(sha1a + " blob notanumber\nx\n")   // bad size
+	f.Add(sha1a + " blob 999999999999\nx\n") // size far exceeds remaining data
+	f.Add(sha1a + " blob 5\nhello")          // missing trailing newline after content
+	f.Add(sha1a + " blob 5")                 // truncated: header only, no content
+	f.Add(sha1a + " blob -1\nx\n")           // negative size
+	f.Add(sha1a + " tree 9\nnottext\n")      // non-blob type (caller filters, parser must still decode)
+	f.Add("only two\n")                      // malformed header
+
+	f.Fuzz(func(t *testing.T, out string) {
+		entries, err := parseCatFileBatch(out)
+		if err != nil {
+			return // a rejected malformed record is fine, as long as it did not panic
+		}
+		for _, e := range entries {
+			if e.Missing {
+				if e.OID != "" || e.Type != "" || e.Content != "" {
+					t.Fatalf("missing entry carries data: %+v", e)
+				}
+				continue
+			}
+			if e.OID == "" || e.Type == "" {
+				t.Fatalf("present entry missing oid/type: %+v", e)
+			}
 		}
 	})
 }

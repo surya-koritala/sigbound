@@ -16,6 +16,11 @@ package gitx
 //                    per branch.
 //   - UpdateRefs   : one `git update-ref --stdin` applying every ref move
 //                    atomically in a single process (the final landing).
+//   - BlobsBatch   : every conflict's base/ours/theirs blob CONTENT in ONE `git
+//                    cat-file --batch` process instead of a `cat-file blob` fork
+//                    per side per path (the resolver seam's blob reads).
+//   - entryModesBatch : every resolved path's file mode in ONE `git ls-tree`
+//                    call instead of a spawn per path (SpliceBlobs).
 
 import (
 	"bufio"
@@ -26,6 +31,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -448,47 +454,159 @@ func (g *Git) BlobAt(ctx context.Context, rev, path string) (content string, pre
 	return out, true, nil
 }
 
-// entryMode returns the file mode of path within tree ("" when absent), so a
-// spliced blob keeps the conflicted file's original mode (regular/executable/
-// symlink) instead of being forced to 100644.
-func (g *Git) entryMode(ctx context.Context, tree, path string) (string, error) {
-	out, se, code, err := g.runWith(ctx, nil, nil, "ls-tree", "-z", tree, "--", path)
+// BlobsBatch resolves multiple object specs — each anything `git cat-file`
+// accepts, most usefully a "<rev>:<path>" spec (exactly what BlobAt builds as
+// rev+":"+path) — to their content, in ONE `git cat-file --batch` process
+// instead of one `git cat-file blob <spec>` fork per spec. This is what turns
+// the resolver's per-conflicted-path blob reads (3 forks per path: base, ours,
+// theirs) into a single spawn for a whole branch's conflicts.
+//
+// The returned map is keyed by the exact spec string passed in. A spec that
+// doesn't resolve (missing object) or resolves to something other than a blob
+// (e.g. a tree) is simply absent from the map — result[spec], ok := ...; !ok
+// means "absent", the same not-an-error contract as BlobAt's present bool.
+func (g *Git) BlobsBatch(ctx context.Context, specs []string) (map[string]string, error) {
+	result := make(map[string]string, len(specs))
+	if len(specs) == 0 {
+		return result, nil
+	}
+	var in strings.Builder
+	for _, s := range specs {
+		// cat-file --batch reads one spec per line; a literal newline in a spec
+		// would desync the request stream from the response stream. Reject it
+		// loudly rather than silently misattribute one path's content to another.
+		if strings.Contains(s, "\n") {
+			return nil, fmt.Errorf("cat-file --batch: illegal newline in spec %q", s)
+		}
+		in.WriteString(s)
+		in.WriteByte('\n')
+	}
+	out, se, code, err := g.runWith(ctx, nil, []byte(in.String()), "cat-file", "--batch")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if code != 0 {
-		return "", fmt.Errorf("ls-tree %s -- %s: exit %d: %s", tree, path, code, strings.TrimSpace(se))
+		return nil, fmt.Errorf("cat-file --batch: exit %d: %s", code, strings.TrimSpace(se))
 	}
-	return parseLsTreeModeZ(out)
+	entries, err := parseCatFileBatch(out)
+	if err != nil {
+		return nil, err
+	}
+	// The output is always exactly one record per input line, in order (never
+	// a subsequence, unlike --batch-check's missing-only echo) — so a count
+	// mismatch means the response desynced from the request; treat that as a
+	// loud failure rather than silently returning wrong content for a spec.
+	if len(entries) != len(specs) {
+		return nil, fmt.Errorf("cat-file --batch: got %d record(s) for %d spec(s)", len(entries), len(specs))
+	}
+	for i, e := range entries {
+		if e.Missing || e.Type != "blob" {
+			continue
+		}
+		result[specs[i]] = e.Content
+	}
+	return result, nil
 }
 
-// parseLsTreeModeZ extracts the file mode from a single-record `git ls-tree -z
-// <tree> -- <path>` output. The record is "<mode> <type> <oid>\t<path>" with a
-// trailing NUL; an empty result means the path is absent in the tree. It is a
-// pure function of untrusted git output and must never panic on malformed input.
-// Fuzzed by FuzzParseLsTreeModeZ.
-func parseLsTreeModeZ(out string) (string, error) {
-	rec := strings.TrimRight(out, "\x00")
-	if rec == "" {
-		return "", nil // path not present in tree
+// catFileBatchEntry is one object's record from `git cat-file --batch`: either
+// present (OID/Type/Content filled) or Missing (git could not resolve the
+// input spec to an object).
+type catFileBatchEntry struct {
+	OID     string
+	Type    string
+	Content string
+	Missing bool
+}
+
+// parseCatFileBatch decodes `git cat-file --batch` output: one record per
+// input line, in the SAME order as the input. Unlike --batch-check, a present
+// record's header carries only the resolved OID (not the input spec), so
+// matching records back to requests is purely positional — safe here because
+// the output is always exactly 1:1 with the input, never a subsequence. A
+// present record is "<oid> <type> <size>\n" followed by exactly <size> raw
+// content bytes and one trailing '\n'; a missing record is "<input spec>
+// missing\n". It is a pure function of untrusted git output and must never
+// panic on malformed input (truncated header, bad size, content shorter than
+// declared, missing trailing newline). Fuzzed by FuzzParseCatFileBatch.
+func parseCatFileBatch(out string) ([]catFileBatchEntry, error) {
+	var entries []catFileBatchEntry
+	pos := 0
+	for pos < len(out) {
+		nl := strings.IndexByte(out[pos:], '\n')
+		if nl < 0 {
+			return nil, fmt.Errorf("cat-file --batch: truncated header %q", out[pos:])
+		}
+		line := out[pos : pos+nl]
+		pos += nl + 1
+		if strings.HasSuffix(line, " missing") {
+			entries = append(entries, catFileBatchEntry{Missing: true})
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("cat-file --batch: malformed header %q", line)
+		}
+		size, serr := strconv.ParseInt(fields[2], 10, 64)
+		if serr != nil || size < 0 || size > int64(len(out)-pos) {
+			return nil, fmt.Errorf("cat-file --batch: bad size in header %q", line)
+		}
+		n := int(size) // safe: bounded above by len(out)-pos, which fits in int
+		content := out[pos : pos+n]
+		pos += n
+		if pos >= len(out) || out[pos] != '\n' {
+			return nil, fmt.Errorf("cat-file --batch: missing trailing newline after content for %q", line)
+		}
+		pos++
+		entries = append(entries, catFileBatchEntry{OID: fields[0], Type: fields[1], Content: content})
 	}
-	// A single `ls-tree -z` record for one path carries NUL only as its terminator
-	// (trimmed above). An interior NUL means malformed or multi-record output whose
-	// "mode" would be garbage — reject it rather than return a NUL-laden mode that
-	// would later corrupt an `update-index --index-info` stream. (Found by fuzzing:
-	// input "\x00\t" previously yielded mode "\x00".)
-	if strings.IndexByte(rec, 0) >= 0 {
-		return "", fmt.Errorf("ls-tree: embedded NUL in record %q", rec)
+	return entries, nil
+}
+
+// entryModesBatch returns the file mode of every path in paths within tree, in
+// ONE `git ls-tree -z` call instead of one spawn per path — the batched
+// replacement for a per-path entryMode loop (SpliceBlobs used to fork one
+// `ls-tree` per resolved blob). A path absent from tree is simply missing from
+// the returned map, same "" convention as a single entryMode lookup.
+func (g *Git) entryModesBatch(ctx context.Context, tree string, paths []string) (map[string]string, error) {
+	result := make(map[string]string, len(paths))
+	if len(paths) == 0 {
+		return result, nil
 	}
-	tab := strings.IndexByte(rec, '\t')
-	if tab < 0 {
-		return "", fmt.Errorf("ls-tree: malformed record %q", rec)
+	args := append([]string{"ls-tree", "-z", tree, "--"}, paths...)
+	out, se, code, err := g.runWith(ctx, nil, nil, args...)
+	if err != nil {
+		return nil, err
 	}
-	fields := strings.Fields(rec[:tab])
-	if len(fields) < 1 {
-		return "", fmt.Errorf("ls-tree: malformed record %q", rec)
+	if code != 0 {
+		return nil, fmt.Errorf("ls-tree %s -- %s: exit %d: %s", tree, strings.Join(paths, " "), code, strings.TrimSpace(se))
 	}
-	return fields[0], nil
+	return parseLsTreeZ(out)
+}
+
+// parseLsTreeZ decodes MULTI-record `git ls-tree -z <tree> -- <paths...>`
+// output into a path -> mode map. Unlike a single-path lookup, git does not
+// echo back paths it can't find (a missing path just contributes no record),
+// and returns records in TREE order rather than the order paths were
+// requested in — so records are matched to callers by the path each record
+// itself carries, not by position. It is a pure function of untrusted git
+// output and must never panic on malformed input. Fuzzed by FuzzParseLsTreeZ.
+func parseLsTreeZ(out string) (map[string]string, error) {
+	result := map[string]string{}
+	for _, rec := range strings.Split(out, "\x00") {
+		if rec == "" { // trailing empty after final NUL
+			continue
+		}
+		tab := strings.IndexByte(rec, '\t')
+		if tab < 0 {
+			return nil, fmt.Errorf("ls-tree: malformed record %q", rec)
+		}
+		fields := strings.Fields(rec[:tab])
+		if len(fields) < 1 {
+			return nil, fmt.Errorf("ls-tree: malformed record %q", rec)
+		}
+		result[rec[tab+1:]] = fields[0]
+	}
+	return result, nil
 }
 
 // ResolvedBlob is a conflict resolver's output for one path: the new file body.
@@ -525,18 +643,26 @@ func (g *Git) SpliceBlobs(ctx context.Context, baseTree string, blobs []Resolved
 		return "", fmt.Errorf("splice read-tree %s: %s", baseTree, strings.TrimSpace(se))
 	}
 
-	var b strings.Builder
-	for _, rb := range blobs {
+	paths := make([]string, len(blobs))
+	for i, rb := range blobs {
 		// update-index --index-info is line-oriented (mode SP oid TAB path) with
 		// no NUL variant, so a tab/newline in a path would corrupt the stream.
 		// Reject it loudly rather than write a wrong tree.
 		if strings.ContainsAny(rb.Path, "\t\n") {
 			return "", fmt.Errorf("splice: path %q contains tab/newline (unsupported by update-index --index-info)", rb.Path)
 		}
-		mode, err := g.entryMode(ctx, baseTree, rb.Path)
-		if err != nil {
-			return "", err
-		}
+		paths[i] = rb.Path
+	}
+	// One `ls-tree` call for every resolved path's mode instead of a spawn per
+	// path (see entryModesBatch).
+	modes, err := g.entryModesBatch(ctx, baseTree, paths)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	for _, rb := range blobs {
+		mode := modes[rb.Path]
 		if mode == "" {
 			mode = "100644" // path absent in baseTree (e.g. delete/modify): add as a regular file
 		}

@@ -217,6 +217,67 @@ func TestWorktreeAddDetached(t *testing.T) {
 	}
 }
 
+// --- CheckoutDetach + Clean: reusing one detached worktree ------------------
+
+// TestCheckoutDetachAndClean covers the two primitives -verify/-repair use to
+// reuse ONE detached worktree across attempts instead of a fresh
+// WorktreeAddDetached + WorktreeRemove per attempt: CheckoutDetach advances
+// the SAME worktree onto a new commit in place, and Clean removes whatever an
+// invocation left behind so the next reuse starts hermetic.
+func TestCheckoutDetachAndClean(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+	c := branchFrom(t, g, base, "feat", func(d string) { write(t, d, "f.txt", "f\n") })
+
+	wt := filepath.Join(t.TempDir(), "det")
+	if err := g.WorktreeAddDetached(ctx, wt, base); err != nil {
+		t.Fatal(err)
+	}
+	wg := g.At(wt)
+
+	// CheckoutDetach advances the SAME worktree onto a different commit —
+	// no fresh worktree add.
+	if err := wg.CheckoutDetach(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	head, err := wg.HeadSHA(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != c {
+		t.Fatalf("HEAD after CheckoutDetach = %s, want %s", head, c)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "f.txt")); err != nil {
+		t.Fatalf("checked-out file missing after CheckoutDetach: %v", err)
+	}
+	// Still detached (no branch).
+	if _, err := wg.run(ctx, "symbolic-ref", "-q", "HEAD"); err == nil {
+		t.Fatal("expected detached HEAD after CheckoutDetach")
+	}
+
+	// Clean removes an untracked file (e.g. a build artifact a verify command
+	// left behind) but leaves tracked files alone.
+	writeFile(t, wt, "leftover.txt", "artifact\n")
+	if err := wg.Clean(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "leftover.txt")); !os.IsNotExist(err) {
+		t.Fatalf("Clean did not remove the untracked leftover: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "f.txt")); err != nil {
+		t.Fatalf("Clean removed a tracked file: %v", err)
+	}
+
+	// Error paths.
+	if err := wg.CheckoutDetach(ctx, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"); err == nil {
+		t.Fatal("expected error for bad commit")
+	}
+	bad := New(filepath.Join(t.TempDir(), "not-a-repo"))
+	if err := bad.Clean(ctx); err == nil {
+		t.Fatal("expected error cleaning a non-repo directory")
+	}
+}
+
 // --- CheckoutB --------------------------------------------------------------
 
 func TestCheckoutB(t *testing.T) {
@@ -443,6 +504,74 @@ func TestHashObjectAndBlobAt(t *testing.T) {
 	}
 }
 
+// --- BlobsBatch: equality vs BlobAt, binary content, empty blob, non-blob ---
+
+// TestBlobsBatch proves the batched resolver-blob-read path (one `git
+// cat-file --batch` for every conflicted path's base/ours/theirs specs)
+// returns byte-identical content to the per-spec BlobAt calls it replaces —
+// including a binary-ish body (embedded NUL and a non-UTF8 byte, no trailing
+// newline) and an empty blob, both hashed directly so they never touch a
+// working tree.
+func TestBlobsBatch(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+
+	binBody := "bin\x00ary\xffdata"
+	binOID, err := g.HashObject(ctx, []byte(binBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyOID, err := g.HashObject(ctx, []byte(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	specs := []string{
+		base + ":base.txt",    // present, ordinary text, rev:path spec
+		base + ":no-such.txt", // absent path
+		binOID,                // present, binary content, bare OID
+		emptyOID,              // present, empty content, bare OID
+		base,                  // present but NOT a blob (a commit) -> excluded
+	}
+	got, err := g.BlobsBatch(ctx, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Equality against BlobAt for the rev:path spec — the exact contract
+	// attemptResolve relied on before it moved to this batched call.
+	wantBase, present, err := g.BlobAt(ctx, base, "base.txt")
+	if err != nil || !present {
+		t.Fatalf("BlobAt base.txt: present=%v err=%v", present, err)
+	}
+	if got[base+":base.txt"] != wantBase {
+		t.Fatalf("BlobsBatch base.txt = %q, want %q", got[base+":base.txt"], wantBase)
+	}
+	if c, ok := got[base+":no-such.txt"]; ok {
+		t.Fatalf("BlobsBatch: absent path present in map: %q", c)
+	}
+	if got[binOID] != binBody {
+		t.Fatalf("BlobsBatch binary content = %q, want %q", got[binOID], binBody)
+	}
+	if c, ok := got[emptyOID]; !ok || c != "" {
+		t.Fatalf("BlobsBatch empty blob = %q ok=%v, want \"\"/true", c, ok)
+	}
+	if _, ok := got[base]; ok {
+		t.Fatal("BlobsBatch: a commit OID (non-blob) must be excluded from the map")
+	}
+
+	// Empty input -> empty, non-nil map, no process spawned.
+	if m, err := g.BlobsBatch(ctx, nil); err != nil || len(m) != 0 {
+		t.Fatalf("BlobsBatch(nil) = %v err=%v, want empty", m, err)
+	}
+
+	// Error path: a spec containing a newline would desync the request stream
+	// from the response stream (one spec per line).
+	if _, err := g.BlobsBatch(ctx, []string{"bad\nspec"}); err == nil {
+		t.Fatal("expected error for newline in spec")
+	}
+}
+
 // --- SpliceBlobs: mode-preserving resolution + errors -----------------------
 
 func TestSpliceBlobs(t *testing.T) {
@@ -498,22 +627,32 @@ func TestSpliceBlobs(t *testing.T) {
 		}
 	}
 	// Modes: regular stays 100644, executable stays 100755, new is 100644.
+	// One entryModesBatch call resolves all three paths' modes.
+	modes, err := g.entryModesBatch(ctx, newTree, []string{"reg.txt", "exec.sh", "added.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for path, want := range map[string]string{
 		"reg.txt":   "100644",
 		"exec.sh":   "100755",
 		"added.txt": "100644",
 	} {
-		mode, err := g.entryMode(ctx, newTree, path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if mode != want {
-			t.Fatalf("%s mode = %q, want %q", path, mode, want)
+		if got := modes[path]; got != want {
+			t.Fatalf("%s mode = %q, want %q", path, got, want)
 		}
 	}
-	// entryMode of an absent path returns "" (not an error).
-	if mode, err := g.entryMode(ctx, baseTree, "totally-absent.xyz"); err != nil || mode != "" {
-		t.Fatalf("entryMode absent = %q err=%v, want empty", mode, err)
+	// entryModesBatch: empty input -> empty map, no process spawned.
+	if m, err := g.entryModesBatch(ctx, baseTree, nil); err != nil || len(m) != 0 {
+		t.Fatalf("entryModesBatch(nil) = %v err=%v, want empty", m, err)
+	}
+	// entryModesBatch: an absent path is simply missing from the map (not an
+	// error, no zero-value entry).
+	absentModes, err := g.entryModesBatch(ctx, baseTree, []string{"totally-absent.xyz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode, ok := absentModes["totally-absent.xyz"]; ok {
+		t.Fatalf("entryModesBatch absent path present in map: %q", mode)
 	}
 
 	// Error: a path containing a tab is rejected (update-index --index-info is
