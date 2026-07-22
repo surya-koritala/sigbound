@@ -27,7 +27,7 @@ the results, and optionally verifies and repairs the merged tree.
 sig run -repo PATH -base BRANCH
         (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N])
         -agent CMD
-        [-strategy overlay]
+        [-strategy overlay] [-assert]
         [-resolver CMD] [-resolver-timeout D]
         [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]]
         [-lanes off|warn|strict]
@@ -50,6 +50,7 @@ sig run -repo PATH -base BRANCH
 | `-planner-timeout` | `120s` | Timeout for the planner command (`0` = none). |
 | `-agent` | *(required)* | Command (run once per task, via `sh -c`) that edits files in the task's worktree. |
 | `-strategy` | `overlay` | Integration strategy: `overlay`, `mergetree`, `naive`, `porcelain` (see [Strategies](#strategies)). |
+| `-assert` | `false` | Paranoid cross-check for `-strategy overlay`: independently recompute the combine via `merge-tree` and error out (nothing lands) on any tree mismatch. Roughly doubles integration cost (it re-merges everything); for paranoia/CI, not routine use. |
 | `-resolver` | — | Conflict-resolver command; low-confidence cases are flagged, never guessed. |
 | `-resolver-timeout` | `30s` | Per-conflict timeout for `-resolver` (`0` = none). |
 | `-verify` | — | Command run in a detached checkout of the integrated tree; non-zero exit = merge fails and does not land. |
@@ -132,7 +133,7 @@ finish — useful for integrating branches you produced some other way, or for
 benchmarking.
 
 ```
-sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-resolver CMD] [-no-land]
+sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-assert] [-resolver CMD] [-no-land]
 ```
 
 | Flag | Default | Meaning |
@@ -141,6 +142,7 @@ sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-r
 | `-base` | `main` | Branch to land the integrated result onto. |
 | `-branches` | *(required)* | Comma-separated branch names to integrate. |
 | `-strategy` | `overlay` | Integration strategy (see below). |
+| `-assert` | `false` | Paranoid cross-check for `-strategy overlay`: independently recompute the combine via `merge-tree` and error out (nothing lands) on any tree mismatch. Roughly doubles integration cost (it re-merges everything); for paranoia/CI, not routine use. |
 | `-resolver` | — | Per-conflict resolver command. |
 | `-resolver-timeout` | `30s` | Per-conflict timeout for `-resolver` (`0` = none). |
 | `-no-land` | `false` | Integrate without moving the base ref; leave the result as a detached commit. |
@@ -159,6 +161,8 @@ benchmark cleanly against each other.
 | `mergetree` | OCC on `git merge-tree` everywhere: partition into disjoint groups, fold each in parallel, combine group heads with `merge-tree`. |
 | `naive` | Serial fold with in-object-store `merge-tree`, no worktree. |
 | `porcelain` | The working-tree baseline: `git merge` on an integration worktree. Correct, but pays the working-tree, index-lock, and per-merge process cost this project exists to eliminate. |
+
+`overlay`'s combine has no runtime cross-check by default (unlike `mergetree`'s, which self-guards); pass `-assert` to have it independently recompute the combine via `merge-tree` and error out on any tree mismatch.
 
 ---
 

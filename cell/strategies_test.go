@@ -2,6 +2,7 @@ package cell
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -44,6 +45,54 @@ func TestOverlayMatchesMergeTreeStrategy(t *testing.T) {
 	}
 	if got, want := treeOID(t, in, ov.FinalSHA), treeOID(t, in, mt.FinalSHA); got != want {
 		t.Fatalf("overlay tree %s != mergetree tree %s", got, want)
+	}
+}
+
+// TestIntegrateOverlayAssertHealthy verifies -assert (WithAssert) is a pure
+// paranoia check: on a healthy fully-disjoint batch it must not change the
+// outcome. The union tree it computes must equal what the SAME batch produces
+// with assert off.
+func TestIntegrateOverlayAssertHealthy(t *testing.T) {
+	ctx := context.Background()
+	_, pool, base := scenario(t, 16)
+	const n = 10
+	changes := spawnAgents(t, pool, base, n, nil) // fully disjoint
+
+	plain := NewIntegrator(pool.Git())
+	want, err := plain.IntegrateOverlay(ctx, base, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	asserted := NewIntegrator(pool.Git()).WithAssert()
+	got, err := asserted.IntegrateOverlay(ctx, base, changes)
+	if err != nil {
+		t.Fatalf("assert-on overlay: %v", err)
+	}
+	if len(got.Landed) != n || len(got.Flagged) != 0 {
+		t.Fatalf("assert-on landed=%d flagged=%d, want %d/0", len(got.Landed), len(got.Flagged), n)
+	}
+	if gotTree, wantTree := treeOID(t, asserted, got.FinalSHA), treeOID(t, plain, want.FinalSHA); gotTree != wantTree {
+		t.Fatalf("assert-on tree %s != assert-off tree %s", gotTree, wantTree)
+	}
+}
+
+// TestOverlayAssertMismatchErrors exercises the comparison seam directly: a
+// real overlay/merge-tree divergence would mean the partition invariant is
+// broken (a bug that, by construction, doesn't exist in this codebase), so
+// there's no honest way to trigger it end-to-end without faking a bug that
+// isn't there. Testing overlayAssertErr itself proves the check actually
+// fires on a mismatch and stays silent on a match.
+func TestOverlayAssertMismatchErrors(t *testing.T) {
+	if err := overlayAssertErr("aaaa", "aaaa"); err != nil {
+		t.Fatalf("equal OIDs: unexpected error: %v", err)
+	}
+	err := overlayAssertErr("aaaa", "bbbb")
+	if err == nil {
+		t.Fatal("expected error on mismatched tree OIDs")
+	}
+	if !strings.Contains(err.Error(), "aaaa") || !strings.Contains(err.Error(), "bbbb") {
+		t.Fatalf("error %q must name both OIDs", err.Error())
 	}
 }
 

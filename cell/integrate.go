@@ -75,6 +75,7 @@ type Integrator struct {
 	landRef  string   // if set, the final commit is published here via update-ref
 	seq      int64    // unique suffix for scratch porcelain worktrees
 	resolver Resolver // optional conflict resolver; nil => flag on conflict (default)
+	assert   bool     // opt-in overlay-vs-merge-tree cross-check; see WithAssert
 }
 
 // NewIntegrator builds an Integrator over the main repo's git handle.
@@ -101,6 +102,21 @@ func (in *Integrator) WithLandRef(ref string) *Integrator {
 // resolver (the default) leaves the flag-on-conflict behavior unchanged.
 func (in *Integrator) WithResolver(r Resolver) *Integrator {
 	in.resolver = r
+	return in
+}
+
+// WithAssert turns on the overlay-vs-merge-tree cross-check for
+// IntegrateOverlay: after the overlay fast path builds its union tree, the
+// SAME group heads are independently recombined via the merge-tree path
+// (combineDisjoint — the exact combiner the mergetree strategy uses) and the
+// two tree OIDs are compared. A mismatch means the overlay path unioned trees
+// it should never have unioned (a partition-invariant bug), and is reported
+// as an error naming both OIDs; nothing lands. This roughly doubles
+// integration cost (every disjoint combine now runs twice), so it is opt-in —
+// paranoia/CI, not the default. combineDisjoint already self-guards for the
+// mergetree/occ strategies, so only overlay needs this.
+func (in *Integrator) WithAssert() *Integrator {
+	in.assert = true
 	return in
 }
 
@@ -383,6 +399,18 @@ func (in *Integrator) combineDisjoint(ctx context.Context, base string, heads []
 	return cur[0], nil
 }
 
+// overlayAssertErr is the -assert comparison itself, pulled out as a small
+// pure function so the mismatch path is directly testable (see WithAssert):
+// nil when the overlay combine's tree OID matches the independently
+// recomputed merge-tree combine's tree OID, a loud error naming both
+// otherwise.
+func overlayAssertErr(overlayTree, mergeTreeTree string) error {
+	if overlayTree == mergeTreeTree {
+		return nil
+	}
+	return fmt.Errorf("overlay assert: tree mismatch — overlay=%s mergetree=%s (partition invariant violated)", overlayTree, mergeTreeTree)
+}
+
 func recordErr(mu *sync.Mutex, dst *error, err error) {
 	mu.Lock()
 	if *dst == nil {
@@ -403,7 +431,9 @@ func recordErr(mu *sync.Mutex, dst *error, err error) {
 //     entries onto base in a scratch object-store index — no 3-way merge at all.
 //     This is byte-for-byte identical to the merge-tree combine for disjoint
 //     inputs (proven in gitx.TestOverlayTreesEqualsMergeTree and
-//     TestOverlayMatchesMergeTreeStrategy).
+//     TestOverlayMatchesMergeTreeStrategy). Unlike combineDisjoint (mergetree's
+//     combiner), this path has no runtime cross-check by default — WithAssert
+//     opts into one, at roughly double the cost.
 func (in *Integrator) IntegrateOverlay(ctx context.Context, base string, changes []BranchChange) (IntegrationResult, error) {
 	start := time.Now()
 	groups := Partition(changes)
@@ -481,6 +511,25 @@ func (in *Integrator) IntegrateOverlay(ctx context.Context, base string, changes
 	if err != nil {
 		return res, fmt.Errorf("overlay combine: %w", err)
 	}
+
+	// Opt-in paranoia check (see WithAssert): independently recompute the SAME
+	// group heads' combine via merge-tree and require byte-for-byte the same
+	// tree. Checked before the final commit-tree below, so a mismatch never
+	// lands anything.
+	if in.assert {
+		mtHead, err := in.combineDisjoint(ctx, base, overlayHeads)
+		if err != nil {
+			return res, fmt.Errorf("overlay assert: merge-tree recompute: %w", err)
+		}
+		mtTree, err := in.g.TreeOID(ctx, mtHead)
+		if err != nil {
+			return res, fmt.Errorf("overlay assert: tree oid of %s: %w", mtHead, err)
+		}
+		if aerr := overlayAssertErr(unionTree, mtTree); aerr != nil {
+			return res, aerr
+		}
+	}
+
 	final, err := in.g.CommitTree(ctx, unionTree, parents, "sigbound: overlay combine")
 	if err != nil {
 		return res, err

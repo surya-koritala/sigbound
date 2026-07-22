@@ -6,7 +6,7 @@
 // optionally verifies the integrated tree in a throwaway detached checkout.
 //
 //	sig run -repo PATH -base main -tasks tasks.json -agent './my-agent' \
-//	          -strategy overlay [-resolver 'CMD'] [-verify 'go build ./...'] [-json]
+//	          -strategy overlay [-assert] [-resolver 'CMD'] [-verify 'go build ./...'] [-json]
 //
 // The agent command is run once per task via `sh -c`, with cwd set to that
 // task's worktree and these env vars exported:
@@ -176,6 +176,7 @@ type runParams struct {
 	Repo            string
 	Base            string
 	Strategy        string
+	Assert          bool // paranoid overlay-vs-merge-tree cross-check (see cell.WithAssert)
 	AgentCmd        string
 	ResolverCmd     string
 	ResolverTimeout time.Duration
@@ -231,7 +232,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-strategy overlay] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -252,6 +253,8 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	agentCmd := fs.String("agent", "", "shell command (run via `sh -c`, once per task) that edits files (and optionally commits) in the task's worktree; "+
 		"receives SIGBOUND_TASK, SIGBOUND_TASK_ID, SIGBOUND_REPO, SIGBOUND_BRANCH env vars with cwd=the worktree")
 	strategy := fs.String("strategy", cell.StrategyOverlay, "integration strategy: "+strings.Join(cell.AvailableStrategies(), ", "))
+	assert := fs.Bool("assert", false, "paranoid cross-check for -strategy overlay: independently recompute the combine via merge-tree and error (never land) on any tree mismatch. "+
+		"Roughly doubles integration cost (it re-merges everything); for paranoia/CI, not routine use")
 	resolverCmd := fs.String("resolver", "", "optional conflict resolver command (see `sig integrate -h`); reads SIGBOUND_BASE/SIGBOUND_OURS/SIGBOUND_THEIRS/SIGBOUND_PATH, writes the resolved body to stdout")
 	resolverTimeout := fs.Duration("resolver-timeout", 30*time.Second, "per-conflict timeout for -resolver (0 = none)")
 	verifyCmd := fs.String("verify", "", "optional command run (via `sh -c`) in a detached checkout of the integrated tree; non-zero exit => verify failed")
@@ -355,6 +358,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Repo:            *repo,
 		Base:            *base,
 		Strategy:        *strategy,
+		Assert:          *assert,
 		AgentCmd:        *agentCmd,
 		ResolverCmd:     *resolverCmd,
 		ResolverTimeout: *resolverTimeout,
@@ -488,7 +492,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 	// The integrated commit is computed detached; the base ref is advanced only
 	// after -verify passes (below), so a failing verify never lands a broken tree.
 	start := time.Now()
-	res, err := integrateBranches(ctx, g, p.Base, baseSHA, branches, p.Strategy, p.ResolverCmd, p.ResolverTimeout, false)
+	res, err := integrateBranches(ctx, g, p.Base, baseSHA, branches, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false)
 	if err != nil {
 		return rep, fmt.Errorf("integrate: %w", err)
 	}
