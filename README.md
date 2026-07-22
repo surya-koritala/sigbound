@@ -78,6 +78,14 @@ Or start from a goal and let a model plan the tasks:
 
 `-agent`, `-resolver`, `-repair`, and `-planner` are shell commands you supply; the examples use the `claude` CLI, but anything that edits files in the working directory works. Each command receives the relevant `SIGBOUND_*` environment variables.
 
+Typing that `sh -c` wiring by hand is the fiddliest part of a first run, so `-agent-preset`/`-repair-preset`/`-planner-preset` (`claude`, `codex`, `aider`) and `-verify-preset` (`go`, `node`, `python`, `rust`) expand a short name into the known-good command above — an explicit `-agent`/`-verify`/etc. always overrides its preset. The first example collapses to:
+
+```bash
+./sig run -repo /path/to/your/repo -tasks examples/tasks.json -agent-preset claude -verify-preset go
+```
+
+See [Presets](docs/USAGE.md#presets) for every preset's exact expansion.
+
 That invocation is long and doesn't change much run to run — put your standing flags in `sig.conf` (one `key=value` per line; see [Config file](docs/USAGE.md#config-file)) and just pass `-config sig.conf -tasks ...` from then on.
 
 ## Documentation

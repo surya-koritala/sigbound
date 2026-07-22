@@ -2190,3 +2190,110 @@ func TestRunDryRunJSON(t *testing.T) {
 		}
 	}
 }
+
+// TestRunRunVerifyPresetThreadsIntoVerifyCmd proves -verify-preset go isn't
+// just parsed and dropped: runRun expands it (via applyPresets) into
+// runParams.VerifyCmd, driveRun actually invokes it in the detached
+// checkout, and it runs the real `go build ./... && go test ./...` against
+// the integrated tree — makeGoRepo's fixture builds and has no test files
+// (so `go test ./...` is a clean, fast "no test files" pass), giving an
+// honest verify.ok=true rather than a stubbed one.
+func TestRunRunVerifyPresetThreadsIntoVerifyCmd(t *testing.T) {
+	agent := buildTestAgent(t)
+	_, repo := makeGoRepo(t)
+	tasks := []taskSpec{{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}}
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", agent,
+		"-verify-preset", "go",
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code, buf.String())
+	}
+
+	var rep runReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse report: %v\n%s", err, buf.String())
+	}
+	if !rep.Verify.Ran {
+		t.Fatal("verify.ran=false, want true: -verify-preset go should have set runParams.VerifyCmd")
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false, want true (go build+test on a clean fixture): %s", rep.Verify.Output)
+	}
+}
+
+// TestRunRunVerifyBeatsVerifyPreset: an explicit -verify always overrides
+// -verify-preset (raw wins), proven end-to-end through runRun/driveRun by
+// pointing -verify at a command that FAILS while -verify-preset names a
+// preset ("go build ./... && go test ./...") that would otherwise pass on
+// this fixture — if the preset won, this run would report verify.ok=true.
+func TestRunRunVerifyBeatsVerifyPreset(t *testing.T) {
+	agent := buildTestAgent(t)
+	_, repo := makeGoRepo(t)
+	tasks := []taskSpec{{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}}
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", agent,
+		"-verify", "exit 1",
+		"-verify-preset", "go",
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitVerifyFailed {
+		t.Fatalf("code=%d, want exitVerifyFailed (raw -verify should have overridden -verify-preset go)\n%s", code, buf.String())
+	}
+
+	var rep runReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse report: %v\n%s", err, buf.String())
+	}
+	if !rep.Verify.Ran || rep.Verify.OK {
+		t.Fatalf("verify.ran=%v ok=%v, want ran=true ok=false (raw -verify 'exit 1' should have run, not the go preset)", rep.Verify.Ran, rep.Verify.OK)
+	}
+}
+
+// TestRunRunUnknownAgentPresetFailsBeforeAnyAgent: an unknown -agent-preset
+// name fails loudly, naming valid names, before any worktree/agent runs —
+// same fail-fast policy as a bad -config file or -logdir (see
+// TestConfigUnknownKeyFailsWithLineNumber).
+func TestRunRunUnknownAgentPresetFailsBeforeAnyAgent(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent-preset", "gpt",
+	})
+	if err == nil {
+		t.Fatal("want an error for an unknown -agent-preset name")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	got := err.Error()
+	for _, want := range []string{"-agent-preset", `"gpt"`, "claude", "codex", "aider"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("error=%q, want it to contain %q", got, want)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("report=%q, want no report written (nothing should have run)", buf.String())
+	}
+}

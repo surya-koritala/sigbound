@@ -27,11 +27,12 @@ the results, and optionally verifies and repairs the merged tree.
 ```
 sig run [-config PATH]
         -repo PATH -base BRANCH
-        (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N])
-        -agent CMD [-agent-timeout D] [-agent-retries N]
+        (-tasks FILE | -goal STRING (-planner CMD | -planner-preset NAME) [-n N] [-min-tasks N])
+        (-agent CMD | -agent-preset NAME) [-agent-timeout D] [-agent-retries N]
         [-strategy overlay] [-assert]
         [-resolver CMD] [-resolver-timeout D]
-        [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]]
+        [(-verify CMD | -verify-preset NAME) [-verify-retries N]
+          [(-repair CMD | -repair-preset NAME) [-repair-max N]]]
         [-lanes off|warn|strict]
         [-no-autocommit]
         [-keep-failed]
@@ -51,11 +52,13 @@ sig run [-config PATH]
 | `-base` | `main` | Branch the agents fork from and the result lands onto. |
 | `-tasks` | — | JSON file describing the tasks (see below). Mutually exclusive with `-goal`. |
 | `-goal` | — | Natural-language goal; the `-planner` turns it into disjoint tasks. Mutually exclusive with `-tasks`. |
-| `-planner` | — | Planner command (run via `sh -c`). Required with `-goal`. |
+| `-planner` | — | Planner command (run via `sh -c`). Required with `-goal`, unless `-planner-preset` supplies one. |
+| `-planner-preset` | — | Expand a named planner-harness preset (`claude`, `codex`, `aider`) into `-planner`'s command (see [Presets](#presets)). An explicit `-planner` always overrides its preset. |
 | `-n` | `4` | Number of parallel tasks the planner should produce from `-goal`. |
 | `-min-tasks` | `0` | Minimum tasks a `-goal` plan must produce; fewer fails **before any agent runs** (`0` = no floor). Must be `<= -n`. |
 | `-planner-timeout` | `120s` | Timeout for the planner command (`0` = none). |
-| `-agent` | *(required)* | Command (run once per task, via `sh -c`) that edits files in the task's worktree. |
+| `-agent` | *(required, unless `-agent-preset` supplies one)* | Command (run once per task, via `sh -c`) that edits files in the task's worktree. |
+| `-agent-preset` | — | Expand a named agent-harness preset (`claude`, `codex`, `aider`) into `-agent`'s command (see [Presets](#presets)). An explicit `-agent` always overrides its preset. |
 | `-agent-timeout` | `0` | Timeout for each `-agent` command (`0` = none). On expiry the agent fails (`exit=-1`) and the report marks `timedOut=true`. |
 | `-agent-retries` | `0` | Retry a FAILED agent (bad exit or `-agent-timeout`) up to N more times, each in a fresh worktree off the same base. A lane-strict out-of-lane failure is never retried — that's a plan violation, not a timing fluke. |
 | `-strategy` | `overlay` | Integration strategy: `overlay`, `mergetree`, `naive`, `porcelain` (see [Strategies](#strategies)). |
@@ -63,8 +66,10 @@ sig run [-config PATH]
 | `-resolver` | — | Conflict-resolver command; low-confidence cases are flagged, never guessed. |
 | `-resolver-timeout` | `30s` | Per-conflict timeout for `-resolver` (`0` = none). |
 | `-verify` | — | Command run in a detached checkout of the integrated tree; non-zero exit = merge fails and does not land. |
+| `-verify-preset` | — | Expand a named per-language build+test preset (`go`, `node`, `python`, `rust`) into `-verify`'s command (see [Presets](#presets)). An explicit `-verify` always overrides its preset. |
 | `-verify-retries` | `0` | After a FAILING `-verify` invocation, re-run it up to N more times on the same tree; passes on any green. A pass on a retry marks the report `flaky=true`. `0` = today's behavior. |
 | `-repair` | — | Fixer command invoked when `-verify` fails; edits are committed and `-verify` re-runs. |
+| `-repair-preset` | — | Expand a named repair-harness preset (`claude`, `codex`, `aider`) into `-repair`'s command (see [Presets](#presets)). An explicit `-repair` always overrides its preset. |
 | `-repair-max` | `2` | Max repair attempts before reporting `verify.ok=false` honestly. |
 | `-lanes` | `warn`* | Lane enforcement: `off`, `warn`, or `strict` (see [File lanes](#file-lanes)). *`-goal` runs default to `strict` instead unless `-lanes` is set explicitly. |
 | `-no-autocommit` | `false` | Do **not** commit edits an agent left uncommitted. By default the driver stages and commits them, so edit-only agents still land. |
@@ -153,6 +158,71 @@ optional `files` list — the lane the task is allowed to touch:
 Ids must be unique and non-empty. Tasks with disjoint `files` integrate in
 parallel; overlapping ones are serialized. When `files` is omitted, the task's
 write-set is computed from what the agent actually changed.
+
+### Presets
+
+Hand-writing the `sh -c` wiring for `-agent`/`-repair`/`-planner` (the
+`SIGBOUND_TASK`/`SIGBOUND_FAILURE`/`SIGBOUND_PROMPT` env plumbing) and the
+idiomatic build+test command for `-verify` is the fiddliest part of a first
+`sig run` — especially off Go, where there's no worked example to copy.
+`-agent-preset`, `-repair-preset`, and `-planner-preset` (`claude` | `codex` |
+`aider`) and `-verify-preset` (`go` | `node` | `python` | `rust`) expand a
+short name into that exact command, so you start from a known-good invocation
+instead of typing it by hand.
+
+A preset encodes only the harness's CLI shape (how to invoke it
+non-interactively) or the ecosystem's build+test command — never the model —
+so bring-your-own-model is unaffected: `claude`/`codex`/`aider` here are just
+those CLIs invoked in their standard non-interactive mode, using whatever
+model each is configured for elsewhere.
+
+**Precedence.** An explicit `-agent`/`-repair`/`-planner`/`-verify` always
+overrides its preset — raw wins, unconditionally, even when a preset name is
+also set (an overridden preset name is never looked up, so a bogus one there
+is not an error). Every expansion is printed once to stderr, so you can see
+and copy exactly what will run.
+
+**From `sig.conf` too.** Preset flags are ordinary flags: they're read from a
+`-config` file exactly like `-agent` or `-verify` (see [Config
+file](#config-file) below) — nothing about them is special-cased.
+
+There is no `-resolver-preset`: the `-resolver` wiring in the [Config
+file](#config-file) example below (`git merge-file -p --union ...`) is a
+plain git command with no harness involved, and a real conflict resolver
+worth presetting is repo-specific — out of scope here.
+
+Exact expansions:
+
+| Flag | Name | Expands to |
+|------|------|------------|
+| `-agent-preset` | `claude` | `claude -p --permission-mode acceptEdits "$SIGBOUND_TASK"` |
+| `-agent-preset` | `codex` | `codex exec --full-auto "$SIGBOUND_TASK"` |
+| `-agent-preset` | `aider` | `aider --yes --message "$SIGBOUND_TASK"` |
+| `-repair-preset` | `claude` | `claude -p --permission-mode acceptEdits "Fix this build failure: $SIGBOUND_FAILURE"` |
+| `-repair-preset` | `codex` | `codex exec --full-auto "Fix this build failure: $SIGBOUND_FAILURE"` |
+| `-repair-preset` | `aider` | `aider --yes --message "Fix this build failure: $SIGBOUND_FAILURE"` |
+| `-planner-preset` | `claude` | `claude -p "$SIGBOUND_PROMPT"` |
+| `-planner-preset` | `codex` | `codex exec "$SIGBOUND_PROMPT"` |
+| `-planner-preset` | `aider` | `aider --yes --message "$SIGBOUND_PROMPT"` |
+| `-verify-preset` | `go` | `go build ./... && go test ./...` |
+| `-verify-preset` | `node` | `npm test` |
+| `-verify-preset` | `python` | `python -m pytest` |
+| `-verify-preset` | `rust` | `cargo build && cargo test` |
+
+For example, this long-form invocation (see [Usage](../README.md#usage) in
+the README):
+
+```bash
+./sig run -repo /path/to/your/repo -tasks examples/tasks.json \
+  -agent  'claude -p --permission-mode acceptEdits "$SIGBOUND_TASK"' \
+  -verify 'go build ./... && go test ./...'
+```
+
+is equivalent to:
+
+```bash
+./sig run -repo /path/to/your/repo -tasks examples/tasks.json -agent-preset claude -verify-preset go
+```
 
 ### Config file
 

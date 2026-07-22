@@ -246,7 +246,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N]) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -266,11 +266,15 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	tasksFile := fs.String("tasks", "", `path to a JSON file: [{"id":"..","prompt":".."}] (mutually exclusive with -goal)`)
 	goal := fs.String("goal", "", "natural-language goal; the -planner turns it into parallel disjoint tasks (mutually exclusive with -tasks)")
 	plannerCmd := fs.String("planner", "", "planner command (run via `sh -c`), required with -goal: reads SIGBOUND_GOAL/SIGBOUND_REPOMAP/SIGBOUND_N/SIGBOUND_PROMPT and writes a JSON task array [{\"id\",\"prompt\"}] to stdout")
+	plannerPreset := fs.String("planner-preset", "", "expand a known planner-harness preset (claude|codex|aider) into -planner's sh -c command; an explicit -planner always overrides its preset. "+
+		"See docs/USAGE.md's Presets section for the exact expansion of each name")
 	n := fs.Int("n", 4, "number of parallel tasks the -planner should produce from -goal")
 	minTasks := fs.Int("min-tasks", 0, "minimum number of tasks a -goal plan must produce; fewer fails before any agent runs (fail-safe; 0 = no floor). Must be <= -n")
 	plannerTimeout := fs.Duration("planner-timeout", 120*time.Second, "timeout for the -planner command (0 = none)")
 	agentCmd := fs.String("agent", "", "shell command (run via `sh -c`, once per task) that edits files (and optionally commits) in the task's worktree; "+
 		"receives SIGBOUND_TASK, SIGBOUND_TASK_ID, SIGBOUND_REPO, SIGBOUND_BRANCH env vars with cwd=the worktree")
+	agentPreset := fs.String("agent-preset", "", "expand a known agent-harness preset (claude|codex|aider) into -agent's sh -c command; an explicit -agent always overrides its preset. "+
+		"See docs/USAGE.md's Presets section for the exact expansion of each name")
 	agentTimeout := fs.Duration("agent-timeout", 0, "timeout for each -agent command (0 = none); on expiry the agent fails (exit=-1) and the report marks timedOut=true")
 	agentRetries := fs.Int("agent-retries", 0, "retry a FAILED agent (bad exit or -agent-timeout) up to N more times, each in a fresh worktree off the same base. "+
 		"A lane-strict out-of-lane failure is never retried — that's a plan violation, not a timing fluke. 0 = no retries")
@@ -280,11 +284,15 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	resolverCmd := fs.String("resolver", "", "optional conflict resolver command (see `sig integrate -h`); reads SIGBOUND_BASE/SIGBOUND_OURS/SIGBOUND_THEIRS/SIGBOUND_PATH, writes the resolved body to stdout")
 	resolverTimeout := fs.Duration("resolver-timeout", 30*time.Second, "per-conflict timeout for -resolver (0 = none)")
 	verifyCmd := fs.String("verify", "", "optional command run (via `sh -c`) in a detached checkout of the integrated tree; non-zero exit => verify failed")
+	verifyPreset := fs.String("verify-preset", "", "expand a known per-language build+test preset (go|node|python|rust) into -verify's sh -c command; an explicit -verify always overrides its preset. "+
+		"See docs/USAGE.md's Presets section for the exact expansion of each name")
 	verifyRetries := fs.Int("verify-retries", 0, "after a FAILING -verify invocation, re-run it up to N more times on the same tree; passes on any green. "+
 		"A pass on a retry marks the report flaky=true (the passing run's output is reported). 0 = today's behavior: a single failing invocation fails verify. "+
 		"-verify must still be deterministic — retries mitigate flaky suites, not a license to skip that")
 	repairCmd := fs.String("repair", "", "optional self-healing fixer command (run via `sh -c`) invoked in a worktree at the integrated head when -verify FAILS; "+
 		"receives SIGBOUND_FAILURE (captured verify output) + SIGBOUND_REPO, edits files to fix the failure (the driver auto-commits them), then -verify re-runs. Looped up to -repair-max times")
+	repairPreset := fs.String("repair-preset", "", "expand a known repair-harness preset (claude|codex|aider) into -repair's sh -c command; an explicit -repair always overrides its preset. "+
+		"See docs/USAGE.md's Presets section for the exact expansion of each name")
 	repairMax := fs.Int("repair-max", 2, "max -repair attempts before reporting verify.ok=false honestly (only used with -repair)")
 	noAutocommit := fs.Bool("no-autocommit", false, "do NOT commit an agent's uncommitted edits; by default the driver stages+commits edits an agent left uncommitted so edit-only agents still land")
 	lanes := fs.String("lanes", laneWarn, "lane enforcement for declared file-sets: off (ignore) | warn (record out-of-lane writes, still land) | strict (out-of-lane => failed agent, not landed). warn is best-effort; strict is the real disjointness guarantee. "+
@@ -323,6 +331,19 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	if err := applyConfigFile(fs, *configFlag, explicitFlags); err != nil {
 		return exitOperationalError, err
 	}
+	// Expand -agent-preset/-repair-preset/-planner-preset/-verify-preset into
+	// their known-good commands BEFORE anything below consumes *agentCmd et
+	// al. — so e.g. -agent-preset alone satisfies the "-agent is required"
+	// check right after this, exactly like a hand-written -agent would. Runs
+	// after applyConfigFile: preset flags are ordinary flags, so a preset
+	// chosen via sig.conf is expanded here too, no special-casing needed. Raw
+	// wins over its preset either way (see applyPresets/presetSlot).
+	newAgentCmd, newRepairCmd, newPlannerCmd, newVerifyCmd, presetErr := applyPresets(os.Stderr,
+		*agentCmd, *agentPreset, *repairCmd, *repairPreset, *plannerCmd, *plannerPreset, *verifyCmd, *verifyPreset)
+	if presetErr != nil {
+		return exitOperationalError, presetErr
+	}
+	*agentCmd, *repairCmd, *plannerCmd, *verifyCmd = newAgentCmd, newRepairCmd, newPlannerCmd, newVerifyCmd
 	// lanesExplicit: a planned run (-goal) defaults -lanes to strict UNLESS the
 	// caller set -lanes explicitly (command line OR config file — see
 	// explicitFlags above), in which case that choice always wins.
