@@ -114,6 +114,11 @@ type integrateJSON struct {
 //     -verify command instead. Both stay zero-valued — and so vanish from the
 //     JSON report via omitempty — when -verify-impact isn't set at all, so a
 //     run without it reports byte-identical to before this field existed.
+//   - Cached is true iff -verify-cache is set AND this verdict was served
+//     from a prior PASS on the exact same (tree OID, resolved verify
+//     command) instead of actually running -verify — see runVerify and
+//     verifycache.go. Always false when -verify-cache isn't set, and never
+//     true for a failing verdict (only passes are ever cached).
 //   - Repairs details each attempt (see repairAttemptJSON).
 type verifyJSON struct {
 	Ran          bool                `json:"ran"`
@@ -123,6 +128,7 @@ type verifyJSON struct {
 	Flaky        bool                `json:"flaky,omitempty"`
 	Scope        string              `json:"scope,omitempty"`
 	ImpactedPkgs []string            `json:"impactedPkgs,omitempty"`
+	Cached       bool                `json:"cached,omitempty"`
 	Output       string              `json:"output"`
 	Repairs      []repairAttemptJSON `json:"repairs,omitempty"`
 }
@@ -201,6 +207,7 @@ type runParams struct {
 	VerifyCmd       string
 	VerifyImpactCmd string        // optional command run INSTEAD of -verify when computeImpact can confidently scope to the impacted Go packages; requires VerifyCmd, which stays the fallback on any doubt (see runVerify)
 	VerifyRetries   int           // re-run a FAILING -verify up to this many more times on the same tree before giving up (0 = today's behavior)
+	VerifyCache     bool          // skip -verify when its exact (tree OID, resolved command) pair already has a cached PASS; see verifycache.go. Off by default (opt-in)
 	RepairCmd       string        // fixer-agent command run when -verify fails (empty => no repair loop)
 	RepairMax       int           // max repair attempts before giving up honestly (default via flag)
 	Autocommit      bool          // commit an agent's uncommitted edits when it made no commit itself
@@ -256,7 +263,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N]) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N]) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -305,6 +312,16 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		"impact scoping trades confidence for speed, and -verify remains the source of truth. Requires -verify (or -verify-preset): it composes WITH -verify rather than replacing "+
 		"it. Receives SIGBOUND_IMPACTED_PKGS (space-separated ./relative package paths, transitively expanded to reverse-dependents) and SIGBOUND_CHANGED_FILES (space-separated "+
 		"changed paths) in addition to the usual environment. See docs/USAGE.md's Scoped verification section")
+	// NOTE: no backtick pairs in this description — flag.PrintDefaults treats
+	// the first backtick-quoted substring in a Usage string as the flag's
+	// printed type placeholder (see -agent's "sh -c" above, used
+	// deliberately); an incidental pair here would replace this bool flag's
+	// normal no-placeholder rendering with stray command text.
+	verifyCache := fs.Bool("verify-cache", false, "cache a PASSING -verify (or -verify-impact) verdict keyed by the tree OID of the integrated commit, a hash of the exact resolved verify command "+
+		"(the impacted-package list too, when -verify-impact scoped it), and the sigbound version; an exact repeat skips re-running the command entirely and the report marks verify.cached=true. "+
+		"A FAILING verify is NEVER cached (fail-safe: a flaky environment must never pin a red, and a miss only ever costs a redundant re-run, never risks a wrong green) -- see docs/USAGE.md's Cache "+
+		"section. Entries live under .git/sigbound/verify-cache in the TARGET repo, never the working tree; 'rm -rf .git/sigbound' resets it. Off by default: -verify's rawness is the trust anchor, "+
+		"caching is opt-in")
 	repairCmd := fs.String("repair", "", "optional self-healing fixer command (run via `sh -c`) invoked in a worktree at the integrated head when -verify FAILS; "+
 		"receives SIGBOUND_FAILURE (captured verify output) + SIGBOUND_REPO, edits files to fix the failure (the driver auto-commits them), then -verify re-runs. Looped up to -repair-max times")
 	repairPreset := fs.String("repair-preset", "", "expand a known repair-harness preset (claude|codex|aider) into -repair's sh -c command; an explicit -repair always overrides its preset. "+
@@ -485,6 +502,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		VerifyCmd:       *verifyCmd,
 		VerifyImpactCmd: *verifyImpactCmd,
 		VerifyRetries:   *verifyRetries,
+		VerifyCache:     *verifyCache,
 		RepairCmd:       *repairCmd,
 		RepairMax:       *repairMax,
 		Autocommit:      !*noAutocommit,
@@ -922,9 +940,10 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 	emit.emit("verify_start", map[string]any{"attempt": 0})
 	vStart := time.Now()
 	v := runVerifyRetry(ctx, g, wtPath, p, changedFiles, p.VerifyRetries, p.LogDir, 0)
-	emit.emit("verify_done", map[string]any{"ok": v.OK, "flaky": v.Flaky, "attempt": 0, "wallMs": time.Since(vStart).Milliseconds()})
-	// Green first try (possibly after a retry), or no repair configured/allowed
-	// => done, loop never runs. v already carries Flaky, so it survives here.
+	emit.emit("verify_done", map[string]any{"ok": v.OK, "flaky": v.Flaky, "cached": v.Cached, "attempt": 0, "wallMs": time.Since(vStart).Milliseconds()})
+	// Green first try (possibly after a retry, or served from -verify-cache),
+	// or no repair configured/allowed => done, loop never runs. v already
+	// carries Flaky/Cached, so both survive here.
 	if v.OK || strings.TrimSpace(p.RepairCmd) == "" || p.RepairMax < 1 {
 		return v, head
 	}
@@ -935,6 +954,7 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 	lastImpacted := v.ImpactedPkgs
 	ok := false
 	flaky := false
+	cached := false
 	for attempt := 1; attempt <= p.RepairMax; attempt++ {
 		emit.emit("repair_start", map[string]any{"attempt": attempt})
 		rStart := time.Now()
@@ -994,7 +1014,7 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 		emit.emit("verify_start", map[string]any{"attempt": attempt})
 		vStart = time.Now()
 		rv := runVerifyRetry(ctx, g, wtPath, p, changedFiles, p.VerifyRetries, p.LogDir, attempt)
-		emit.emit("verify_done", map[string]any{"ok": rv.OK, "flaky": rv.Flaky, "attempt": attempt, "wallMs": time.Since(vStart).Milliseconds()})
+		emit.emit("verify_done", map[string]any{"ok": rv.OK, "flaky": rv.Flaky, "cached": rv.Cached, "attempt": attempt, "wallMs": time.Since(vStart).Milliseconds()})
 		lastOutput = rv.Output
 		lastScope = rv.Scope
 		lastImpacted = rv.ImpactedPkgs
@@ -1004,6 +1024,7 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 		if rv.OK {
 			ok = true
 			flaky = rv.Flaky
+			cached = rv.Cached
 			break
 		}
 	}
@@ -1018,6 +1039,7 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 		Flaky:        flaky,
 		Scope:        lastScope,
 		ImpactedPkgs: lastImpacted,
+		Cached:       cached,
 		Output:       lastOutput,
 		Repairs:      repairs,
 	}, head
@@ -1397,6 +1419,16 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 // (see both functions' docs); this needs both. The main working tree is
 // never touched. logAttempt names the -logdir log file
 // (verify-<logAttempt>.log); see runVerifyRetry.
+//
+// -verify-cache (p.VerifyCache): once the command to run is resolved (full
+// -verify or the -verify-impact scoped command above — the cache key must
+// see the SAME command a cache miss would actually execute, so this check
+// runs after that decision, never before), a cache hit short-circuits
+// straight to a green verdict without spawning verifyCmd at all. A miss
+// falls through to the real invocation below and, only on a genuine pass,
+// writes the entry. -verify-cache off means none of this runs — no git call
+// to resolve a tree OID, no filesystem read — so a run without it is
+// unaffected. See verifycache.go for the key/storage design.
 func runVerify(ctx context.Context, g *gitx.Git, wtPath string, p runParams, changedFiles []string, logDir string, logAttempt int) verifyJSON {
 	if err := g.At(wtPath).ResetHard(ctx); err != nil {
 		return verifyJSON{Ran: true, OK: false, Output: "reset worktree: " + err.Error()}
@@ -1422,6 +1454,20 @@ func runVerify(ctx context.Context, g *gitx.Git, wtPath string, p runParams, cha
 		}
 	}
 
+	var treeOID string
+	if p.VerifyCache {
+		if oid, err := g.At(wtPath).TreeOID(ctx, "HEAD"); err == nil {
+			treeOID = oid
+			if verifyCacheLookup(ctx, g, treeOID, verifyCmd, impacted) {
+				return verifyJSON{Ran: true, OK: true, Cached: true, Scope: scope, ImpactedPkgs: impacted,
+					Output: "(cached: -verify already passed on this tree; command not run)"}
+			}
+		}
+		// treeOID resolution failing is not itself fatal to verify — it just
+		// means this invocation can neither be served from nor written to the
+		// cache; the real command below still runs and decides OK honestly.
+	}
+
 	cmd := exec.CommandContext(ctx, "sh", "-c", verifyCmd)
 	cmd.Dir = wtPath
 	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
@@ -1440,7 +1486,11 @@ func runVerify(ctx context.Context, g *gitx.Git, wtPath string, p runParams, cha
 		cmd.Stderr = cmd.Stdout
 	}
 	err := cmd.Run()
-	return verifyJSON{Ran: true, OK: err == nil, Scope: scope, ImpactedPkgs: impacted, Output: tail(outBuf.String(), 2000)}
+	ok := err == nil
+	if p.VerifyCache && ok && treeOID != "" {
+		verifyCacheStore(ctx, g, treeOID, verifyCmd, impacted)
+	}
+	return verifyJSON{Ran: true, OK: ok, Scope: scope, ImpactedPkgs: impacted, Output: tail(outBuf.String(), 2000)}
 }
 
 func writeRunSummary(w io.Writer, r runReport) error {
@@ -1479,6 +1529,9 @@ func writeRunSummary(w io.Writer, r runReport) error {
 			v = "FAIL"
 		}
 		fmt.Fprintf(w, "verify: %s", v)
+		if r.Verify.Cached {
+			fmt.Fprint(w, "  cached")
+		}
 		if r.Verify.Scope != "" {
 			fmt.Fprintf(w, "  scope=%s", r.Verify.Scope)
 			if r.Verify.Scope == "impact" {

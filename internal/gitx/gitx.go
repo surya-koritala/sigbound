@@ -171,6 +171,18 @@ func (g *Git) TreeOID(ctx context.Context, rev string) (string, error) {
 	return g.run(ctx, "rev-parse", "--verify", rev+"^{tree}")
 }
 
+// GitCommonDir returns the absolute path of the repo's SHARED git directory
+// (`git rev-parse --path-format=absolute --git-common-dir`) — the main
+// repo's .git, even when g points at a linked worktree (a worktree's own
+// .git is a per-worktree file pointing at a subdirectory of this one; every
+// worktree off the same repo resolves to the SAME common dir). Used to
+// locate storage that must live with the repo itself and survive across
+// worktrees/clones being reused, e.g. -verify-cache's on-disk entries (see
+// cmd/sig's verifyCacheDir).
+func (g *Git) GitCommonDir(ctx context.Context) (string, error) {
+	return g.run(ctx, "rev-parse", "--path-format=absolute", "--git-common-dir")
+}
+
 // WorktreeAdd creates a new worktree at path on a NEW branch off base. Runs in
 // the main repo; the new worktree shares this repo's object store. Uses `-b`
 // (create, error if branch already exists) so this can never silently reset a

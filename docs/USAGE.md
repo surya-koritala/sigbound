@@ -32,6 +32,7 @@ sig run [-config PATH]
         [-strategy overlay] [-assert]
         [-resolver CMD] [-resolver-timeout D]
         [(-verify CMD | -verify-preset NAME) [-verify-retries N] [-verify-impact CMD]
+          [-verify-cache]
           [(-repair CMD | -repair-preset NAME) [-repair-max N]]]
         [-lanes off|warn|strict]
         [-no-autocommit]
@@ -69,6 +70,7 @@ sig run [-config PATH]
 | `-verify-preset` | — | Expand a named per-language build+test preset (`go`, `node`, `python`, `rust`) into `-verify`'s command (see [Presets](#presets)). An explicit `-verify` always overrides its preset. |
 | `-verify-retries` | `0` | After a FAILING `-verify` invocation, re-run it up to N more times on the same tree; passes on any green. A pass on a retry marks the report `flaky=true`. `0` = today's behavior. |
 | `-verify-impact` | — | Command run INSTEAD of `-verify` when Sigbound can confidently scope it to the impacted Go packages (see [Scoped verification](#scoped-verification)). Requires `-verify` (or `-verify-preset`), which stays the fallback on any doubt. |
+| `-verify-cache` | `false` | Cache a PASSING verify verdict and skip re-running the command on an exact repeat (see [Cache](#cache)). A FAILING verdict is never cached. Off by default. |
 | `-repair` | — | Fixer command invoked when `-verify` fails; edits are committed and `-verify` re-runs. |
 | `-repair-preset` | — | Expand a named repair-harness preset (`claude`, `codex`, `aider`) into `-repair`'s command (see [Presets](#presets)). An explicit `-repair` always overrides its preset. |
 | `-repair-max` | `2` | Max repair attempts before reporting `verify.ok=false` honestly. |
@@ -146,6 +148,61 @@ runs through the same seam, RECOMPUTING impact after each repair attempt (a
 fixer's own edits are new changes on top of the original write-set, so the
 scope decision is re-made from scratch every time, never memoized).
 
+### Cache
+
+Integration is deterministic and `-verify` is usually the dominant per-run
+cost, yet by default every run re-verifies from scratch even when it lands a
+tree that was already proven to pass — e.g. a `-resume`/replay that
+reproduces an earlier result exactly. `-verify-cache` lets a run skip that
+redundant work:
+
+```bash
+sig run ... -verify 'go test ./...' -verify-cache
+```
+
+**Key composition.** An entry is keyed on three things together:
+
+1. The **tree OID** of the verified commit (`HEAD^{tree}` in the verify
+   checkout) — NOT the commit SHA. Git trees are content-addressed, so two
+   different commits (a fresh integration and a later resume/replay) that
+   land byte-identical content share one entry; two commits with different
+   content never collide.
+2. A hash of the **exact command that would run** — the resolved `-verify`
+   or (when scoped) `-verify-impact` command plus its impacted-package list.
+   A full run and a scoped run over the same tree, or two different scoped
+   runs with different impacted packages, are different keys, never the
+   same entry.
+3. The running **sigbound version**, so a rebuilt or upgraded binary never
+   trusts a verdict computed under different semantics.
+
+**Only a PASS is ever cached.** A failing `-verify` invocation is never
+written to the cache: a flaky environment must never pin a red as
+permanently cached, and any doubt about whether a cached NO-verdict is still
+accurate costs nothing to re-check for real. A cache hit therefore always
+means "this exact tree, with this exact command, already passed" — never a
+weaker guarantee — and the report marks it `verify.cached: true`
+(`verify.ok` stays `true`, and the command is not spawned at all). The
+human summary notes it too: `verify: PASS  cached  ...`.
+
+**Storage.** Entries live at `.git/sigbound/verify-cache/<key>` under the
+TARGET repo's own git directory (resolved via `git rev-parse
+--git-common-dir`, so it's correct even when `-repo` is itself a linked
+worktree) — never inside the working tree, so it never shows up in `git
+status` and survives worktrees/clones being reused. One small JSON file per
+entry, no eviction (entries are a few hundred bytes each). Reset the whole
+cache with:
+
+```bash
+rm -rf .git/sigbound
+```
+
+**The trade-off.** `-verify` is the gate that decides what lands — its
+rawness (a real command running against a real checked-out tree, every
+time) is the whole trust anchor. `-verify-cache` is therefore off by
+default: turning it on is a deliberate choice to trust "this exact tree
+already passed this exact command" instead of re-proving it, in exchange for
+skipping genuinely redundant work.
+
 ### Determinism
 
 `-verify` **must be deterministic**: the same tree should produce the same
@@ -154,7 +211,8 @@ a transient failure re-runs on the exact same commit, never a different one —
 not a license to ship a nondeterministic check. Every retried pass is surfaced
 honestly: the report's `verify.flaky` is `true` whenever a passing run needed
 a retry, so a flaky suite stays visible even though the run goes green.
-`verify-bisect` and `verify-cache` (planned) both assume `-verify` is
+`verify-bisect` (planned) and `-verify-cache` (see [Cache](#cache)) both
+assume `-verify` is
 deterministic; an undocumented flaky command will confuse them.
 
 ### Planning
@@ -507,7 +565,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   },
   "verify": {
     "ran": true, "ok": true, "attempts": 1, "repaired": false, "flaky": false,
-    "scope": "impact", "impactedPkgs": ["./a", "./b"],
+    "scope": "impact", "impactedPkgs": ["./a", "./b"], "cached": false,
     "output": "…",
     "repairs": [ { "n": 1, "filesTouched": ["…"], "verifyOk": true } ]
   },
@@ -523,6 +581,10 @@ With `-json`, `sig run` prints a full report. Top-level shape:
 - `verify.scope`/`verify.impactedPkgs` are present iff `-verify-impact` was
   set (see [Scoped verification](#scoped-verification)); `scope` is `"full"`
   on any doubt, `"impact"` when the scoped command ran.
+- `verify.cached` is `true` iff `-verify-cache` served this verdict from a
+  prior pass instead of actually running the command (see [Cache](#cache));
+  always `false` when `-verify-cache` isn't set, and never `true` for a
+  failing verdict.
 - `logDir` is present iff `-logdir` was set; it names the directory holding
   each command's full stdout+stderr log (see `-logdir` above).
 
@@ -551,7 +613,7 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 | `integrate_start` | `branches` | Once, before the successfully-committed branches are folded together. |
 | `integrate_done` | `landed`, `flagged`, `resolved`, `finalSHA`, `wallMs` | Once, after integration (before landing). |
 | `verify_start` | `attempt` | Before each `-verify` invocation. `attempt` is `0` pre-repair, `N` after repair round `N` (matches `-logdir`'s `verify-<n>.log`). |
-| `verify_done` | `ok`, `flaky`, `attempt`, `wallMs` | After each `-verify` invocation (including `-verify-retries`). |
+| `verify_done` | `ok`, `flaky`, `cached`, `attempt`, `wallMs` | After each `-verify` invocation (including `-verify-retries`). `cached` is `true` on a `-verify-cache` hit, and `wallMs` is near-zero since the command never ran. |
 | `repair_start` | `attempt` | Before each `-repair` fixer invocation. |
 | `repair_done` | `attempt`, `verifyOk`, `wallMs` | After that round's fixer AND its follow-up `-verify` both finish; `wallMs` covers the fixer only. |
 | `land` | `sha` | Once, right after the base ref advances (never emitted when nothing lands). |
