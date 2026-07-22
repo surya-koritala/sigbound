@@ -246,7 +246,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -293,6 +293,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	events := fs.String("events", "", `when set, stream one JSON object per line to FILE as the run progresses ("-" = stderr), one line per lifecycle event `+
 		`(run_start, agent_start/agent_done, integrate_start/integrate_done, verify_start/verify_done, repair_start/repair_done, land, run_done). `+
 		`The report printed at the end remains the source of truth; events are progress, not a second report. Default "" = off`)
+	dryRun := fs.Bool("dry-run", false, "load/plan the tasks, print them plus the predicted OCC partition (group count, per-group tasks and files), then exit "+
+		"without creating any worktree or running any agent, verify, or repair command. With -goal the planner still runs (that's the point: see the plan before spending agent calls). "+
+		"-agent (and any other run flag) is still required but is never invoked. Exit code 0 on a valid plan; a bad plan or an unmet -min-tasks floor fails exactly as it would without -dry-run")
 	asJSON := fs.Bool("json", false, "emit the full JSON report (default: a terse human summary)")
 
 	if err := fs.Parse(argv); err != nil {
@@ -399,6 +402,18 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		laneMode = laneStrict
 	}
 
+	// -dry-run: the plan is already loaded/validated above (planTasks already
+	// ran for -goal — that's the point, seeing the plan costs nothing further
+	// once you've paid for it). Preview the predicted partition and stop here:
+	// no worktree, no agent, no verify, no git mutation beyond what planning
+	// itself already did.
+	if *dryRun {
+		if err := emitDryRun(w, buildDryRunReport(tasks, laneMode), *asJSON); err != nil {
+			return exitOperationalError, err
+		}
+		return exitOK, nil
+	}
+
 	p := runParams{
 		Repo:            *repo,
 		Base:            *base,
@@ -453,6 +468,84 @@ func emitReport(w io.Writer, rep runReport, asJSON bool) error {
 		return enc.Encode(rep)
 	}
 	return writeRunSummary(w, rep)
+}
+
+// dryRunGroupJSON is one predicted OCC group in -dry-run's machine report:
+// the task ids whose declared files put them in the same group (union-find
+// over shared paths, transitively — see cell.Partition), and the union of
+// every file the group touches.
+type dryRunGroupJSON struct {
+	Tasks []string `json:"tasks"`
+	Files []string `json:"files"`
+}
+
+// dryRunReport is -dry-run's stdout contract: the loaded/planned tasks plus
+// the predicted partition, computed via the SAME cell.Partition code
+// integration uses — no agent runs to produce this.
+type dryRunReport struct {
+	Tasks       []taskSpec        `json:"tasks"`
+	Groups      []dryRunGroupJSON `json:"groups"`
+	Parallelism int               `json:"parallelism"` // number of groups: independent branches that could land in parallel
+	LaneMode    string            `json:"laneMode"`
+}
+
+// buildDryRunReport predicts how tasks would partition without running any
+// agent: each task's DECLARED Files stand in for the write-set cell.Partition
+// normally computes from a real `git diff`, reusing the exact same grouping
+// code the live integrator uses (see cell.Partition, integrateBranches). A
+// task with no declared Files contributes an empty write-set, which never
+// overlaps anything, so it lands alone in its own group — "unknown" in the
+// human summary (writeDryRunSummary), an empty Files list in JSON.
+func buildDryRunReport(tasks []taskSpec, laneMode string) dryRunReport {
+	changes := make([]cell.BranchChange, len(tasks))
+	for i, t := range tasks {
+		changes[i] = cell.BranchChange{Branch: t.ID, WriteSet: cell.NewWriteSet(t.Files...)}
+	}
+	groups := cell.Partition(changes)
+	out := make([]dryRunGroupJSON, len(groups))
+	for i, g := range groups {
+		ids := make([]string, len(g))
+		files := cell.NewWriteSet()
+		for j, bc := range g {
+			ids[j] = bc.Branch
+			for _, p := range bc.WriteSet.Paths() {
+				files.Add(p)
+			}
+		}
+		out[i] = dryRunGroupJSON{Tasks: ids, Files: files.Paths()}
+	}
+	return dryRunReport{Tasks: tasks, Groups: out, Parallelism: len(out), LaneMode: laneMode}
+}
+
+// emitDryRun writes rep to w as the full JSON report (asJSON) or the terse
+// human summary — -dry-run's counterpart to emitReport.
+func emitDryRun(w io.Writer, rep dryRunReport, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rep)
+	}
+	return writeDryRunSummary(w, rep)
+}
+
+// writeDryRunSummary prints -dry-run's human-readable preview: every loaded/
+// planned task, the predicted OCC groups, and the resulting parallelism
+// (independent groups land in parallel; tasks sharing a group must be
+// serialized by the integrator).
+func writeDryRunSummary(w io.Writer, rep dryRunReport) error {
+	fmt.Fprintf(w, "%d task(s), lanes=%s\n", len(rep.Tasks), rep.LaneMode)
+	for _, t := range rep.Tasks {
+		fmt.Fprintf(w, "  task %-12s files=%v\n", t.ID, t.Files)
+	}
+	fmt.Fprintf(w, "predicted partition: %d group(s) (parallelism=%d)\n", len(rep.Groups), rep.Parallelism)
+	for i, g := range rep.Groups {
+		files := "unknown (no declared files)"
+		if len(g.Files) > 0 {
+			files = fmt.Sprintf("%v", g.Files)
+		}
+		fmt.Fprintf(w, "  group %d: tasks=%v files=%s\n", i+1, g.Tasks, files)
+	}
+	return nil
 }
 
 // loadTasks reads and validates the -tasks JSON array.

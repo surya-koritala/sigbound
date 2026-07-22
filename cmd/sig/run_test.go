@@ -2065,3 +2065,128 @@ func TestRunRunEventsUnwritableFailsBeforeAgents(t *testing.T) {
 		t.Fatal("agent ran despite an unwritable -events path; must fail before any agent runs")
 	}
 }
+
+// TestRunDryRunPredictsPartition: -dry-run with a -tasks file prints the
+// predicted OCC groups computed from each task's DECLARED files via the real
+// cell.Partition — two tasks sharing a declared file land in the same
+// predicted group, a third disjoint task gets its own — and creates NO
+// worktree (neither a fresh worktree root nor any entry under the repo's own
+// .git/worktrees admin state) and leaves the base ref untouched. -agent is
+// still required (no validation changes) but must never actually run.
+func TestRunDryRunPredictsPartition(t *testing.T) {
+	g, repo := makeGoRepo(t)
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp) // pin: a real run would create its worktree root here
+
+	marker := filepath.Join(t.TempDir(), "agent-ran")
+	agentCmd := "touch " + marker
+
+	tasks := []taskSpec{
+		{ID: "t1", Prompt: "x", Files: []string{"a.go", "shared.go"}},
+		{ID: "t2", Prompt: "x", Files: []string{"b.go", "shared.go"}}, // overlaps t1 on shared.go
+		{ID: "t3", Prompt: "x", Files: []string{"c.go"}},              // disjoint
+	}
+
+	before, err := g.RevParse(context.Background(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", agentCmd,
+		"-dry-run",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK on a valid plan", code)
+	}
+
+	out := buf.String()
+	for _, id := range []string{"t1", "t2", "t3"} {
+		if !strings.Contains(out, id) {
+			t.Fatalf("summary should name task %q, got:\n%s", id, out)
+		}
+	}
+	if !strings.Contains(out, "2 group") {
+		t.Fatalf("want 2 predicted groups (t1+t2 share shared.go, t3 is disjoint), got:\n%s", out)
+	}
+
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("agent marker exists: -dry-run must never run the agent")
+	}
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("want no worktree root created under %s, found %v", tmp, entries)
+	}
+	if wtAdmin, err := os.ReadDir(filepath.Join(repo, ".git", "worktrees")); err == nil {
+		if len(wtAdmin) != 0 {
+			t.Fatalf("want no entries under .git/worktrees, found %v", wtAdmin)
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+
+	after, err := g.RevParse(context.Background(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("main advanced (%s -> %s); -dry-run must not touch the base ref", before, after)
+	}
+}
+
+// TestRunDryRunJSON: -dry-run -json parses as the documented shape
+// {tasks, groups:[{tasks,files}], parallelism, laneMode}. A task with no
+// declared files is unknown to the partitioner and gets its own group.
+func TestRunDryRunJSON(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	tasks := []taskSpec{
+		{ID: "t1", Prompt: "x", Files: []string{"a.go"}},
+		{ID: "t2", Prompt: "x"}, // no declared files -> unknown, own group
+	}
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", "exit 1",
+		"-dry-run",
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK", code)
+	}
+
+	var rep dryRunReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse -dry-run -json report: %v\n%s", err, buf.String())
+	}
+	if len(rep.Tasks) != 2 {
+		t.Fatalf("tasks=%d, want 2", len(rep.Tasks))
+	}
+	if len(rep.Groups) != 2 {
+		t.Fatalf("groups=%d, want 2 (disjoint declared files), got %+v", len(rep.Groups), rep.Groups)
+	}
+	if rep.Parallelism != len(rep.Groups) {
+		t.Fatalf("parallelism=%d != len(groups)=%d", rep.Parallelism, len(rep.Groups))
+	}
+	if rep.LaneMode != laneWarn {
+		t.Fatalf("laneMode=%q, want %q (a -tasks run keeps the warn default)", rep.LaneMode, laneWarn)
+	}
+	for _, gr := range rep.Groups {
+		if gr.Files == nil {
+			t.Fatalf("group %+v: Files should be [] not null", gr)
+		}
+	}
+}
