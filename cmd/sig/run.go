@@ -69,6 +69,10 @@ type perAgentJSON struct {
 	InLane        bool     `json:"inLane"`
 	Strayed       []string `json:"strayed,omitempty"`
 	Stderr        string   `json:"stderr,omitempty"`
+	// WorktreeKept is the absolute path to the agent's worktree, set only when
+	// -keep-failed retained it (i.e. the agent failed and teardown was skipped).
+	// Empty for every successful agent, and for a failed one without -keep-failed.
+	WorktreeKept string `json:"worktreeKept,omitempty"`
 }
 
 // integrateJSON is the cell integrator's result, projected for the report.
@@ -181,6 +185,7 @@ type runParams struct {
 	RepairMax       int    // max repair attempts before giving up honestly (default via flag)
 	Autocommit      bool   // commit an agent's uncommitted edits when it made no commit itself
 	LaneMode        string // lane enforcement: laneOff | laneWarn | laneStrict
+	KeepFailed      bool   // keep a FAILED agent's worktree on disk instead of removing it
 }
 
 // repairFailureMax bounds the captured verify output handed to the fixer agent
@@ -226,7 +231,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -257,6 +262,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	repairMax := fs.Int("repair-max", 2, "max -repair attempts before reporting verify.ok=false honestly (only used with -repair)")
 	noAutocommit := fs.Bool("no-autocommit", false, "do NOT commit an agent's uncommitted edits; by default the driver stages+commits edits an agent left uncommitted so edit-only agents still land")
 	lanes := fs.String("lanes", laneWarn, "lane enforcement for declared file-sets: off (ignore) | warn (default; record out-of-lane writes, still land) | strict (out-of-lane => failed agent, not landed). warn is best-effort; strict is the real disjointness guarantee")
+	keepFailed := fs.Bool("keep-failed", false, "keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected; the path is printed and recorded in the report. Successful agents' worktrees are always removed")
 	asJSON := fs.Bool("json", false, "emit the full JSON report (default: a terse human summary)")
 
 	if err := fs.Parse(argv); err != nil {
@@ -321,6 +327,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		RepairMax:       *repairMax,
 		Autocommit:      !*noAutocommit,
 		LaneMode:        *lanes,
+		KeepFailed:      *keepFailed,
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
 	if err != nil {
@@ -396,12 +403,23 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 	if err != nil {
 		return runReport{}, err
 	}
-	defer os.RemoveAll(wtRoot)
 
 	if p.LaneMode == "" {
 		p.LaneMode = laneWarn // default when driven in-process without flag parsing
 	}
 	rep := runReport{Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks}
+	// Normally wtRoot (and every per-agent worktree under it) is torn down when
+	// the run ends. -keep-failed retains individual failed agents' worktrees
+	// (see runAgent); when any survive, leave wtRoot itself in place too, or
+	// this blanket cleanup would delete the very thing -keep-failed kept.
+	defer func() {
+		for _, a := range rep.PerAgent {
+			if a.WorktreeKept != "" {
+				return
+			}
+		}
+		os.RemoveAll(wtRoot)
+	}()
 
 	// ---- fan out: one agent per task, each in its own isolated worktree ----
 	agents := make([]perAgentJSON, len(tasks))
@@ -618,11 +636,15 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 }
 
 // runAgent creates a worktree on branch agent/<id> off base, runs the agent
-// command there, and reports what it committed. The worktree is torn down after;
-// the branch (with the agent's commit) survives for integration.
-func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec) perAgentJSON {
+// command there, and reports what it committed. The worktree is torn down
+// after, UNLESS the agent ultimately FAILED (see the lane-enforcement block
+// below, which can flip a.OK to false) and p.KeepFailed is set, in which case
+// teardown is skipped and the path is recorded in a.WorktreeKept so it can be
+// inspected. The branch (with the agent's commit, if any) survives for
+// integration either way.
+func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec) (a perAgentJSON) {
 	branch := "agent/" + t.ID
-	a := perAgentJSON{ID: t.ID, Branch: branch, Files: []string{}}
+	a = perAgentJSON{ID: t.ID, Branch: branch, Files: []string{}}
 	dir := filepath.Join(wtRoot, "wt-"+sanitizeID(t.ID))
 
 	admin.Lock()
@@ -633,7 +655,13 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 		a.Stderr = "worktree add: " + err.Error()
 		return a
 	}
+	// a is a named return: this defer runs after every downstream update to a
+	// (including lane enforcement), so it sees the FINAL OK verdict.
 	defer func() {
+		if p.KeepFailed && !a.OK {
+			a.WorktreeKept = dir
+			return
+		}
 		admin.Lock()
 		_ = g.WorktreeRemove(ctx, dir)
 		admin.Unlock()
@@ -761,6 +789,9 @@ func writeRunSummary(w io.Writer, r runReport) error {
 		fmt.Fprintf(w, "  agent %-12s %-16s %-16s files=%v\n", a.ID, a.Branch, status, a.Files)
 		if len(a.Strayed) > 0 {
 			fmt.Fprintf(w, "    out-of-lane: wrote %v outside declared %v\n", a.Strayed, a.DeclaredFiles)
+		}
+		if a.WorktreeKept != "" {
+			fmt.Fprintf(w, "    kept worktree: %s\n", a.WorktreeKept)
 		}
 	}
 	fmt.Fprintf(w, "integrate: strategy=%s groups=%d landed=%d flagged=%d resolved=%d final=%s (%dms)\n",
