@@ -150,6 +150,16 @@ type repairAttemptJSON struct {
 	VerifyOK     bool     `json:"verifyOk"`
 }
 
+// publishJSON records the outcome of the -publish command (see runPublish).
+// A pointer field on runReport (below), left nil when -publish isn't set, so
+// a run without it serializes byte-identical to before -publish existed.
+type publishJSON struct {
+	Ran    bool   `json:"ran"`
+	OK     bool   `json:"ok"`
+	Exit   int    `json:"exit"`
+	Output string `json:"output"`
+}
+
 // runReport is the full stdout contract of `sig run` AND the manifest -manifest
 // writes to disk (see -manifest below) — one format, not two: the manifest is
 // simply this same report persisted, so a `sig replay` fed a -manifest file or
@@ -184,6 +194,14 @@ type runReport struct {
 	VerifyCmd   string `json:"verifyCmd,omitempty"`
 	RepairCmd   string `json:"repairCmd,omitempty"`
 	PlannerCmd  string `json:"plannerCmd,omitempty"`
+	// Publish is the -publish command's outcome (see runPublish), set only
+	// when the run LANDED (base ref advanced; -verify green or unset) AND
+	// -publish was configured — nil (omitted from JSON) otherwise, so a run
+	// without -publish, or one that never landed, reports byte-identical to
+	// before -publish existed. A publish FAILURE never flips Verify or
+	// unlands the work; it only surfaces here and in the exit code (see
+	// exitPublishFailed).
+	Publish *publishJSON `json:"publish,omitempty"`
 	// Version is the sigbound version (see main.Version) that produced this
 	// report — a manifest replayed under a different version is still
 	// readable, but a version mismatch is a hint that strategy/verify
@@ -199,10 +217,11 @@ type runReport struct {
 // failure, etc. — returned as err from runRun) always wins and exits 1.
 // Among report-level outcomes (err == nil, the run completed), runExitCode
 // applies this precedence, most to least severe: -verify failed beats no
-// agent succeeded beats some branches flagged as conflicts; a clean
-// landed+verified run (or -verify unset entirely) is 0. Usage errors from the
-// top-level CLI invocation (unknown subcommand, missing args) exit 2 — see
-// main.go — and never reach runRun. Documented in `sig run -h`.
+// agent succeeded beats some branches flagged as conflicts beats a landed
+// run whose -publish command failed; a clean landed+verified+published (or
+// -verify/-publish unset) run is 0. Usage errors from the top-level CLI
+// invocation (unknown subcommand, missing args) exit 2 — see main.go — and
+// never reach runRun. Documented in `sig run -h`.
 const (
 	exitOK               = 0
 	exitOperationalError = 1
@@ -210,6 +229,7 @@ const (
 	exitVerifyFailed     = 3
 	exitFlagged          = 4
 	exitNoAgentSucceeded = 5
+	exitPublishFailed    = 6
 )
 
 // runExitCode maps a completed run's report to its exit code. It is the only
@@ -231,6 +251,9 @@ func runExitCode(rep runReport) int {
 	}
 	if len(rep.Integrate.Flagged) > 0 {
 		return exitFlagged
+	}
+	if rep.Publish != nil && !rep.Publish.OK {
+		return exitPublishFailed
 	}
 	return exitOK
 }
@@ -260,6 +283,18 @@ type runParams struct {
 	AgentRetries    int           // retry a FAILED agent (bad exit or -agent-timeout, never a lane-strict stray) up to this many more times; see runAgentWithRetries
 	Budget          time.Duration // wall-clock ceiling for the agent phase + integrate + verify (0 = none); see driveRun
 	Notes           bool          // when the run LANDS, attach the report as a git note under refs/notes/sigbound on the landed commit; see -notes and attachNote
+	// PublishCmd, when non-empty, is run ONCE via runPublish after the run
+	// LANDS (base ref advanced; -verify green or unset) — never on a run
+	// that didn't land. cwd = Repo itself (unlike -agent/-verify/-repair,
+	// which each get a throwaway worktree): publishing acts on the repo
+	// (push a ref, open a PR/MR), not on its content. PublishTimeout bounds
+	// it (0 = none). See -publish and runPublish.
+	PublishCmd     string
+	PublishTimeout time.Duration
+	// Manifest is the resolved -manifest path (empty when unset), threaded
+	// through only so runPublish can export it as SIGBOUND_MANIFEST — driveRun
+	// itself never reads or writes this file (see writeManifest in runRun).
+	Manifest string
 	// Resume and ResumeBaseSHA implement -resume (see resumeAgent): when
 	// Resume is set, driveRun refuses to run at all unless the base branch's
 	// CURRENT head is still exactly ResumeBaseSHA (the baseSHA the prior run
@@ -314,15 +349,16 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
-		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
+		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset); -publish succeeded or was unset")
 		fmt.Fprintln(fs.Output(), "  1  operational error (bad flags, a git/integrate failure, etc.)")
 		fmt.Fprintln(fs.Output(), "  2  usage error (bad top-level sig invocation)")
 		fmt.Fprintln(fs.Output(), "  3  -verify failed; nothing landed")
 		fmt.Fprintln(fs.Output(), "  4  one or more branches flagged as conflicts (the rest landed)")
 		fmt.Fprintln(fs.Output(), "  5  no agent succeeded")
+		fmt.Fprintln(fs.Output(), "  6  landed (and verified), but -publish failed (see report.publish)")
 	}
 	configFlag := fs.String("config", "", "path to a flat KEY=VALUE flags file supplying defaults for the OTHER run flags (key = flag name without its leading dash, "+
 		"value = exactly what would follow it on the command line; NOT TOML despite issue #13's working title — see docs/USAGE.md's Config file section). "+
@@ -407,6 +443,13 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		"ref refs/notes/sigbound (never git's default refs/notes/commits). Best-effort: a failure here is warned on stderr but never fails the run or changes its exit code, since "+
 		"landing has already happened by the time this runs. See docs/USAGE.md's Provenance section for how to read the note back and how to push it (notes do not push by default). "+
 		"Off by default")
+	publishCmd := fs.String("publish", "", "optional command (run via `sh -c`, cwd = the TARGET REPO itself — unlike -agent/-verify/-repair, which each run in a throwaway worktree) run "+
+		"EXACTLY ONCE, after the run LANDS (base ref advanced; -verify green or unset) — never on a run that failed verify, had no agent succeed, or landed nothing (every branch "+
+		"flagged). Sigbound stays host-agnostic: this is a BYO seam for pushing the landed branch and opening a PR/MR with whatever host CLI the repo already uses (gh, glab, ...); "+
+		"sigbound never calls one itself. Receives SIGBOUND_FINAL_SHA (the landed commit), SIGBOUND_BASE (the base branch name), SIGBOUND_BASE_SHA (the base commit BEFORE this run), "+
+		"SIGBOUND_REPO, SIGBOUND_LANDED (space-separated landed branch names), and SIGBOUND_MANIFEST (the -manifest path when set, else empty). A publish FAILURE does NOT unland the "+
+		"work or flip verify's verdict — it's reported as its own report.publish field and the run exits 6 instead of 0. See docs/USAGE.md's Publish section. Default \"\": off")
+	publishTimeout := fs.Duration("publish-timeout", 120*time.Second, "timeout for the -publish command (0 = none)")
 	asJSON := fs.Bool("json", false, "emit the full JSON report (default: a terse human summary)")
 
 	if err := fs.Parse(argv); err != nil {
@@ -623,6 +666,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		LogDir:          logDirAbs,
 		EventsPath:      *events,
 		Notes:           *notes,
+		PublishCmd:      *publishCmd,
+		PublishTimeout:  *publishTimeout,
+		Manifest:        manifestPath,
 		Resume:          *resume,
 		ResumeBaseSHA:   resumeBaseSHA,
 	}
@@ -1074,12 +1120,78 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	}
 	rep.Integrate.FinalSHA = landSHA
 	emit.emit("land", map[string]any{"sha": landSHA})
+	// -publish: the run has now LANDED (base ref advanced past baseSHA;
+	// -verify green or unset — a verify failure already returned above,
+	// before ever reaching UpdateRef). landSHA == baseSHA here means nothing
+	// actually landed (no agent succeeded, or every branch got flagged), so
+	// the guard below skips -publish for that case too — "landed" is exactly
+	// "the ref moved", nothing more to check. A publish FAILURE never
+	// unlands the work or touches rep.Verify; it's recorded in its own
+	// rep.Publish field and only changes the process exit code (see
+	// runExitCode). Runs before -notes so a note (if also requested) still
+	// captures the publish outcome.
+	if strings.TrimSpace(p.PublishCmd) != "" && landSHA != baseSHA {
+		emit.emit("publish_start", map[string]any{})
+		pubStart := time.Now()
+		pub := runPublish(ctx, p, landSHA, baseSHA, rep.Integrate.Landed)
+		rep.Publish = &pub
+		emit.emit("publish_done", map[string]any{"ok": pub.OK, "exit": pub.Exit, "wallMs": time.Since(pubStart).Milliseconds()})
+	}
 	// -notes: the landing already happened above, so a note failure below must
 	// never look like the run itself failed — see attachNote's doc.
 	if p.Notes {
 		attachNote(ctx, g, landSHA, rep)
 	}
 	return rep, nil
+}
+
+// runPublish runs the user-supplied -publish command exactly once, cwd = the
+// TARGET REPO itself (never a throwaway worktree — publishing acts ON the
+// repo, e.g. `git push`, rather than editing its content the way -agent/
+// -verify/-repair do). Called only after the run has genuinely landed (see
+// driveRun's call site). finalSHA/baseSHA/landed populate the SIGBOUND_*
+// env vars documented on -publish; p.Manifest supplies SIGBOUND_MANIFEST
+// (empty when -manifest wasn't set). Mirrors runAgent/runRepair/runVerify's
+// exec pattern: WaitDelay so a hung command can't block the run past
+// -publish-timeout, full output tail-bounded for the report, and streamed to
+// -logdir's publish.log when set.
+func runPublish(ctx context.Context, p runParams, finalSHA, baseSHA string, landed []string) publishJSON {
+	pctx := ctx
+	if p.PublishTimeout > 0 {
+		var cancel context.CancelFunc
+		pctx, cancel = context.WithTimeout(ctx, p.PublishTimeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(pctx, "sh", "-c", p.PublishCmd)
+	cmd.Dir = p.Repo
+	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
+	cmd.Env = append(os.Environ(),
+		"SIGBOUND_FINAL_SHA="+finalSHA,
+		"SIGBOUND_BASE="+p.Base,
+		"SIGBOUND_BASE_SHA="+baseSHA,
+		"SIGBOUND_REPO="+p.Repo,
+		"SIGBOUND_LANDED="+strings.Join(landed, " "),
+		"SIGBOUND_MANIFEST="+p.Manifest,
+	)
+	var outBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &outBuf
+	if logf := openLog(p.LogDir, "publish.log"); logf != nil {
+		defer logf.Close()
+		blog := bestEffortWriter{logf}
+		cmd.Stdout = io.MultiWriter(&outBuf, blog)
+		cmd.Stderr = cmd.Stdout
+	}
+	runErr := cmd.Run()
+	exit := 0
+	if runErr != nil {
+		if ee, ok := runErr.(*exec.ExitError); ok {
+			exit = ee.ExitCode()
+		} else {
+			exit = -1 // could not spawn, or killed on timeout/cancel
+		}
+	}
+	return publishJSON{Ran: true, OK: runErr == nil, Exit: exit, Output: tail(outBuf.String(), 2000)}
 }
 
 // attachNote records rep as a git note on the landed commit, namespaced under

@@ -920,6 +920,41 @@ func TestRunExitCode(t *testing.T) {
 			},
 			want: exitFlagged,
 		},
+		{
+			name: "clean landed, publish succeeded",
+			rep: runReport{
+				PerAgent: []perAgentJSON{{OK: true}},
+				Publish:  &publishJSON{Ran: true, OK: true},
+			},
+			want: exitOK,
+		},
+		{
+			name: "publish failed, otherwise clean",
+			rep: runReport{
+				PerAgent: []perAgentJSON{{OK: true}},
+				Verify:   verifyJSON{Ran: true, OK: true},
+				Publish:  &publishJSON{Ran: true, OK: false, Exit: 1},
+			},
+			want: exitPublishFailed,
+		},
+		{
+			name: "flagged wins over publish failed",
+			rep: runReport{
+				PerAgent:  []perAgentJSON{{OK: true}, {OK: true}},
+				Integrate: integrateJSON{Flagged: []flaggedJSON{{Branch: "agent/x"}}},
+				Publish:   &publishJSON{Ran: true, OK: false},
+			},
+			want: exitFlagged,
+		},
+		{
+			name: "verify failed wins over publish failed",
+			rep: runReport{
+				PerAgent: []perAgentJSON{{OK: true}},
+				Verify:   verifyJSON{Ran: true, OK: false},
+				Publish:  &publishJSON{Ran: true, OK: false},
+			},
+			want: exitVerifyFailed,
+		},
 	}
 	for _, c := range cases {
 		if got := runExitCode(c.rep); got != c.want {
@@ -3558,5 +3593,340 @@ func TestRunRunResumeWithTasksErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "-tasks") {
 		t.Fatalf("error should mention -tasks: %v", err)
+	}
+}
+
+// parseEnvFile reads the output of `env > path` into a map, so a -publish (or
+// similar) test can assert on individual SIGBOUND_* values without caring
+// about the rest of the process environment or key ordering.
+func parseEnvFile(t *testing.T, path string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read env dump %s: %v", path, err)
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// TestDriveRunPublishRunsOnceWithFullEnvOnGreenLand is issue #20's central
+// case: on a clean landed run, -publish runs EXACTLY ONCE (proven by a
+// marker file appended to on every invocation), with cwd = the repo itself
+// and every documented SIGBOUND_* var set to the value the report itself
+// records — SIGBOUND_FINAL_SHA/BASE/BASE_SHA/REPO/LANDED/MANIFEST.
+func TestDriveRunPublishRunsOnceWithFullEnvOnGreenLand(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	task := taskSpec{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}
+
+	marker := filepath.Join(t.TempDir(), "publish.count")
+	envOut := filepath.Join(t.TempDir(), "publish.env")
+	publishCmd := fmt.Sprintf(`echo ran >> %q; pwd > %q.cwd; env > %q`, marker, marker, envOut)
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		PublishCmd: publishCmd, PublishTimeout: 5 * time.Second,
+		Manifest: "/tmp/some-manifest.json", // driveRun never reads/writes this file, only threads the path through as SIGBOUND_MANIFEST
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep.Publish == nil {
+		t.Fatal("rep.Publish is nil, want it populated: -publish was set and the run landed")
+	}
+	if !rep.Publish.Ran || !rep.Publish.OK || rep.Publish.Exit != 0 {
+		t.Fatalf("rep.Publish=%+v, want ran=true ok=true exit=0", rep.Publish)
+	}
+
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 || lines[0] != "ran" {
+		t.Fatalf("publish marker=%q, want exactly one \"ran\" line (publish must run exactly once)", data)
+	}
+
+	cwd, err := os.ReadFile(marker + ".cwd")
+	if err != nil {
+		t.Fatalf("read cwd marker: %v", err)
+	}
+	// EvalSymlinks on both sides: macOS resolves $TMPDIR through a /private
+	// symlink, so `pwd` (which resolves symlinks) and repo (which doesn't)
+	// can differ textually while naming the same directory.
+	wantCwd, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCwd, err := filepath.EvalSymlinks(strings.TrimSpace(string(cwd)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotCwd != wantCwd {
+		t.Fatalf("publish cwd=%q, want the target repo %q", gotCwd, wantCwd)
+	}
+
+	env := parseEnvFile(t, envOut)
+	want := map[string]string{
+		"SIGBOUND_FINAL_SHA": rep.Integrate.FinalSHA,
+		"SIGBOUND_BASE":      "main",
+		"SIGBOUND_BASE_SHA":  rep.BaseSHA,
+		"SIGBOUND_REPO":      repo,
+		"SIGBOUND_LANDED":    strings.Join(rep.Integrate.Landed, " "),
+		"SIGBOUND_MANIFEST":  "/tmp/some-manifest.json",
+	}
+	for k, wantV := range want {
+		if got, ok := env[k]; !ok || got != wantV {
+			t.Fatalf("%s=%q (present=%v), want %q", k, got, ok, wantV)
+		}
+	}
+	if rep.Integrate.FinalSHA == rep.BaseSHA {
+		t.Fatal("test setup: finalSHA == baseSHA, SIGBOUND_FINAL_SHA/SIGBOUND_BASE_SHA distinctness wouldn't be exercised")
+	}
+}
+
+// TestDriveRunPublishNeverRunsOnVerifyFailure: -publish is gated strictly on
+// the run having LANDED. A failing -verify returns before the base ref ever
+// advances (driveRun's early return), so -publish must never run at all —
+// not even to report a skip; rep.Publish stays nil, same as -publish unset.
+func TestDriveRunPublishNeverRunsOnVerifyFailure(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	before, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	marker := filepath.Join(t.TempDir(), "publish.marker")
+	p := runParams{
+		Repo:       repo,
+		Base:       "main",
+		Strategy:   "overlay",
+		AgentCmd:   agent,
+		VerifyCmd:  "go build ./...", // fails: brokenBuildTasks references undefined helper()
+		PublishCmd: "touch " + marker,
+	}
+	rep, err := driveRun(ctx, p, brokenBuildTasks(t))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep.Verify.OK {
+		t.Fatal("test setup: verify.ok=true, want a broken build")
+	}
+	if rep.Publish != nil {
+		t.Fatalf("rep.Publish=%+v, want nil: -publish must never run on a failed verify", rep.Publish)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("the -publish command ran despite verify failing")
+	}
+	after, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("base ref advanced to %s on verify failure; must stay at %s", after, before)
+	}
+	if code := runExitCode(rep); code != exitVerifyFailed {
+		t.Fatalf("runExitCode=%d, want exitVerifyFailed(%d)", code, exitVerifyFailed)
+	}
+}
+
+// TestDriveRunPublishFailureStillLandsAndReportsExit6: a -publish command
+// that fails must NOT unland the work (the base ref has already advanced by
+// the time -publish runs) and must NOT flip verify's verdict — it's recorded
+// honestly in its own rep.Publish field, and the run's exit code becomes
+// exitPublishFailed(6) instead of exitOK, even though everything else about
+// the run succeeded.
+func TestDriveRunPublishFailureStillLandsAndReportsExit6(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	task := taskSpec{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:  "go build ./...", // passes: a.go alone compiles fine
+		PublishCmd: "echo boom >&2; exit 3",
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("test setup: verify failed: %s", rep.Verify.Output)
+	}
+	if rep.Publish == nil {
+		t.Fatal("rep.Publish is nil, want it populated (the run landed)")
+	}
+	if rep.Publish.OK {
+		t.Fatal("rep.Publish.OK=true, want false: the publish command exited 3")
+	}
+	if rep.Publish.Exit != 3 {
+		t.Fatalf("rep.Publish.Exit=%d, want 3", rep.Publish.Exit)
+	}
+	if !strings.Contains(rep.Publish.Output, "boom") {
+		t.Fatalf("rep.Publish.Output=%q, want it to contain the command's stderr", rep.Publish.Output)
+	}
+
+	mainSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("main=%s, want it still advanced to the landed finalSHA=%s despite the publish failure", mainSHA, rep.Integrate.FinalSHA)
+	}
+
+	if code := runExitCode(rep); code != exitPublishFailed {
+		t.Fatalf("runExitCode=%d, want exitPublishFailed(%d)", code, exitPublishFailed)
+	}
+}
+
+// TestDriveRunPublishOffReportsNoPublishField: -publish unset (the default,
+// empty PublishCmd) must leave rep.Publish nil on an otherwise clean landed
+// run — and since it's an omitempty pointer, that means the JSON report has
+// no "publish" key at all: a run without -publish is byte-identical to
+// before -publish existed.
+func TestDriveRunPublishOffReportsNoPublishField(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	task := taskSpec{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}
+
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep.Publish != nil {
+		t.Fatalf("rep.Publish=%+v, want nil when -publish was never set", rep.Publish)
+	}
+	data, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"publish"`) {
+		t.Fatalf("report JSON contains a \"publish\" key despite -publish being unset:\n%s", data)
+	}
+	if code := runExitCode(rep); code != exitOK {
+		t.Fatalf("runExitCode=%d, want exitOK", code)
+	}
+}
+
+// TestDriveRunPublishTimeoutKillsHungPublish: -publish-timeout bounds a
+// runaway publish command exactly like -agent-timeout bounds a runaway
+// agent — the run must not hang for anywhere near the hung command's actual
+// duration, and the failed publish must still be reported honestly (not
+// silently dropped) without unlanding the work.
+func TestDriveRunPublishTimeoutKillsHungPublish(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	task := taskSpec{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		PublishCmd: "sleep 5", PublishTimeout: 200 * time.Millisecond,
+	}
+	start := time.Now()
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("driveRun took %s; -publish-timeout 200ms should have cut the 5s sleep short", elapsed)
+	}
+	if rep.Publish == nil {
+		t.Fatal("rep.Publish is nil, want it populated")
+	}
+	if rep.Publish.OK {
+		t.Fatal("rep.Publish.OK=true, want false: the publish command was killed by -publish-timeout")
+	}
+
+	// Landing already happened before -publish ran; a timed-out publish must
+	// not unland the work.
+	mainSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("main=%s, want it still advanced to the landed finalSHA=%s despite the publish timeout", mainSHA, rep.Integrate.FinalSHA)
+	}
+	if code := runExitCode(rep); code != exitPublishFailed {
+		t.Fatalf("runExitCode=%d, want exitPublishFailed(%d)", code, exitPublishFailed)
+	}
+}
+
+// TestRunRunPublishFlagWired proves -publish/-publish-timeout are actually
+// threaded from the CLI flags through runParams into driveRun (the tests
+// above all drive runParams directly), and that -manifest's path — not its
+// contents, driveRun never waits for runRun's later writeManifest call —
+// reaches -publish as SIGBOUND_MANIFEST via the real flag-parsing path.
+func TestRunRunPublishFlagWired(t *testing.T) {
+	agent := buildTestAgent(t)
+	_, repo := makeGoRepo(t)
+	tasks := []taskSpec{{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}}
+
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	envOut := filepath.Join(t.TempDir(), "publish.env")
+	publishCmd := fmt.Sprintf(`env > %q`, envOut)
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", agent,
+		"-manifest", manifestPath,
+		"-publish", publishCmd,
+		"-publish-timeout", "5s",
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code, buf.String())
+	}
+	var rep runReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse report: %v", err)
+	}
+	if rep.Publish == nil || !rep.Publish.OK {
+		t.Fatalf("rep.Publish=%+v, want ran=true ok=true", rep.Publish)
+	}
+
+	env := parseEnvFile(t, envOut)
+	if got := env["SIGBOUND_MANIFEST"]; got != manifestPath {
+		t.Fatalf("SIGBOUND_MANIFEST=%q, want the -manifest flag's path %q", got, manifestPath)
+	}
+	if got := env["SIGBOUND_BASE"]; got != "main" {
+		t.Fatalf("SIGBOUND_BASE=%q, want %q", got, "main")
+	}
+	if got := env["SIGBOUND_FINAL_SHA"]; got != rep.Integrate.FinalSHA {
+		t.Fatalf("SIGBOUND_FINAL_SHA=%q, want %q", got, rep.Integrate.FinalSHA)
 	}
 }

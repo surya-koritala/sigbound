@@ -43,6 +43,7 @@ sig run [-config PATH]
         [-events FILE]
         [-manifest FILE]
         [-notes]
+        [-publish CMD [-publish-timeout D]]
         [-dry-run]
         [-json]
 ```
@@ -86,6 +87,8 @@ sig run [-config PATH]
 | `-manifest` | — | Write the full JSON report to FILE at the end of the run, independent of `-json` (see [Provenance](#provenance)). FILE's directory is created if needed and checked writable before any agent runs, same fail-fast policy as `-logdir`; a write failure AFTER the run completes is best-effort and warned on stderr — by then real work may already be landed. With `-resume`, this SAME flag also names the prior run's manifest to resume FROM (see [Resume](#resume)). |
 | `-resume` | `false` | Resume a prior run instead of planning/loading tasks fresh (see [Resume](#resume)). Requires `-manifest`; `-tasks`/`-goal` must not be passed. |
 | `-notes` | `false` | When the run LANDS, attach the full JSON report as a git note on the landed commit under the namespaced `refs/notes/sigbound` (see [Provenance](#provenance)). Best-effort: a failure is warned on stderr but never fails the run, since landing already happened. |
+| `-publish` | — | Command (run via `sh -c`, cwd = the TARGET REPO) run once, after the run LANDS (see [Publish](#publish)). A failure doesn't unland the work; it's reported in `publish` and the run exits `6`. Default `""`: off. |
+| `-publish-timeout` | `120s` | Timeout for the `-publish` command (`0` = none). |
 | `-dry-run` | `false` | Load or plan the tasks, print them plus the predicted OCC partition, then exit — no worktree, agent, verify, or repair ever runs (see [Dry run](#dry-run)). |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
 
@@ -420,15 +423,16 @@ on it instead of parsing stdout:
 
 | Code | Meaning |
 |------|---------|
-| `0` | Landed and verified (or `-verify` was not set). |
+| `0` | Landed and verified (or `-verify` was not set); `-publish` succeeded or was not set. |
 | `1` | Operational error (bad flags, a git/integrate failure, etc.). |
 | `2` | Usage error (bad top-level `sig` invocation). |
 | `3` | `-verify` failed; nothing landed. |
 | `4` | One or more branches flagged as conflicts (the rest landed). |
 | `5` | No agent succeeded. |
+| `6` | Landed (and verified), but `-publish` failed — see `publish` in the [JSON report](#json-report). |
 
 When a run matches more than one of these, the most severe wins, in this
-order: `1` > `3` > `5` > `4`.
+order: `1` > `3` > `5` > `4` > `6`.
 
 ### Provenance
 
@@ -551,6 +555,66 @@ any of them set EXPLICITLY on this command line (directly or via its
 `-*-preset`) overrides the manifest's recorded value — the same
 flag-beats-file precedence `-config` gives a command-line flag over a config
 file. Leave them unset to reuse the prior run's commands verbatim.
+
+---
+
+### Publish
+
+`sig run` advances a LOCAL branch and stops there — the integrated commit
+never leaves the repo it ran against. `-publish CMD` is the seam that gets it
+somewhere a team actually reviews: it runs `CMD` via `sh -c`, cwd = the
+**target repo itself** (not a throwaway worktree, unlike `-agent`/`-verify`/
+`-repair` — publishing acts *on* the repo, e.g. `git push`, rather than
+editing its content), exactly **once**, and only after the run has genuinely
+**LANDED**: the base ref actually advanced, which already implies `-verify`
+was green or never set. It never runs on a run that failed verify, had no
+agent succeed, or landed nothing (every branch flagged as a conflict).
+
+Sigbound stays host-agnostic on purpose — it never calls `gh`, `glab`, or any
+other host CLI itself (see the top-level [How it works](../README.md#how-it-works)
+guarantee that `sig` never starts a server or acts as a git host). `-publish`
+shells out to whatever your repo already uses instead.
+
+It receives the same `SIGBOUND_*` env-var pattern as every other slot (see
+[Environment variables](#environment-variables)): `SIGBOUND_FINAL_SHA` (the
+landed commit), `SIGBOUND_BASE` (the base branch name), `SIGBOUND_BASE_SHA`
+(the base commit BEFORE this run), `SIGBOUND_REPO`, `SIGBOUND_LANDED`
+(space-separated names of the branches that actually landed), and
+`SIGBOUND_MANIFEST` (the `-manifest` path when set, else empty — note this is
+the *path*, not a promise the file already exists: `-manifest` itself is
+written back to disk only after `driveRun` returns, same as always).
+
+Two common patterns, depending on whether `-base` is the branch you actually
+review against or a throwaway integration branch:
+
+```bash
+# Direct push: -base IS the branch reviewers look at.
+sig run ... -publish 'git push origin "$SIGBOUND_BASE"'
+
+# Push to a fresh branch + open a PR/MR against an upstream base — for when
+# -base is an internal integration branch, not what you review against.
+sig run ... -publish 'git push origin "$SIGBOUND_BASE:refs/heads/sigbound/$SIGBOUND_FINAL_SHA" \
+  && gh pr create --base main --head "sigbound/$SIGBOUND_FINAL_SHA" \
+       --title "sigbound: $SIGBOUND_LANDED" --fill'
+
+# GitLab equivalent of the second pattern:
+sig run ... -publish 'git push origin "$SIGBOUND_BASE:refs/heads/sigbound/$SIGBOUND_FINAL_SHA" \
+  && glab mr create --source-branch "sigbound/$SIGBOUND_FINAL_SHA" --target-branch main --fill'
+```
+
+**A `-publish` failure never unlands the work or flips `verify`'s verdict** —
+by the time `-publish` runs, the base ref has already advanced and the work
+is landed and good. It's recorded honestly in its own report field,
+`publish: {ran, ok, exit, output}` (a `null`/absent field when `-publish`
+was never set, or the run never landed — a run without it reports
+byte-identical to before `-publish` existed), and the process exits `6`
+instead of `0` (see [Exit codes](#exit-codes)) so CI can tell "landed but
+didn't publish" apart from a clean run without parsing output.
+
+`-publish-timeout D` (default `120s`, `0` = none) bounds the command the same
+way every other timeout in this tool does; with `-logdir`, its full output
+streams to `publish.log` alongside the truncated tail the report keeps in
+memory.
 
 ---
 
@@ -731,7 +795,7 @@ command **you** supply, run via `sh -c`. Sigbound passes context through
 | `SIGBOUND_PROMPT` | `-planner` | A ready-to-use prompt combining the above; write a JSON task array to stdout. |
 | `SIGBOUND_TASK` | `-agent` | The task prompt. cwd is the task's worktree. |
 | `SIGBOUND_TASK_ID` | `-agent` | The task id. |
-| `SIGBOUND_REPO` | `-agent`, `-repair` | Path to the repository. |
+| `SIGBOUND_REPO` | `-agent`, `-repair`, `-publish` | Path to the repository. cwd for `-publish` too (unlike `-agent`/`-repair`, which run in a throwaway worktree). |
 | `SIGBOUND_BRANCH` | `-agent` | The task's branch name. |
 | `SIGBOUND_BASE` | `-resolver` | Path to the base (common-ancestor) version of a conflicted file. |
 | `SIGBOUND_OURS` | `-resolver` | Path to the "ours" version. |
@@ -740,6 +804,11 @@ command **you** supply, run via `sh -c`. Sigbound passes context through
 | `SIGBOUND_FAILURE` | `-repair` | The captured `-verify` output to fix. Edit files to fix it; the driver commits the edits and re-runs `-verify`. |
 | `SIGBOUND_IMPACTED_PKGS` | `-verify-impact` | Space-separated `./relative` package paths: the changed packages plus every transitive reverse dependent (see [Scoped verification](#scoped-verification)). |
 | `SIGBOUND_CHANGED_FILES` | `-verify-impact` | Space-separated repo-relative paths this run's landed write-set touched. |
+| `SIGBOUND_FINAL_SHA` | `-publish` | The commit `-base` was advanced to (see [Publish](#publish)). |
+| `SIGBOUND_BASE` | `-publish` | The base branch NAME (e.g. `main`) — note this is a different meaning than the `-resolver` row above with the same variable name; each slot documents its own. |
+| `SIGBOUND_BASE_SHA` | `-publish` | The base commit BEFORE this run (i.e. this run's `baseSHA`). |
+| `SIGBOUND_LANDED` | `-publish` | Space-separated `agent/<id>` branch names that actually landed. |
+| `SIGBOUND_MANIFEST` | `-publish` | The `-manifest` path, when set; empty otherwise. Just the path — `-manifest` itself is written after the run returns. |
 
 ---
 
@@ -773,6 +842,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   },
   "logDir": "…",
   "agentCmd": "…", "resolverCmd": "…", "verifyCmd": "…", "repairCmd": "…", "plannerCmd": "…",
+  "publish": { "ran": true, "ok": true, "exit": 0, "output": "…" },
   "version": "0.2.0",
   "startedAt": "2025-01-01T00:00:00Z"
 }
@@ -796,6 +866,12 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   failing verdict.
 - `logDir` is present iff `-logdir` was set; it names the directory holding
   each command's full stdout+stderr log (see `-logdir` above).
+- `publish` is present iff `-publish` was set AND the run LANDED (see
+  [Publish](#publish)); absent (not `null`, just omitted) on any run without
+  `-publish`, or one that never landed — so a run without `-publish` reports
+  byte-identical to before it existed. `publish.ok=false` means the run still
+  landed successfully; it's `publish` that failed, reflected in the exit code
+  (`6`) rather than `verify.ok`.
 - `strategy`, `agentCmd`/`resolverCmd`/`verifyCmd`/`repairCmd`/`plannerCmd`,
   `version`, and `startedAt` are the [provenance](#provenance) fields —
   always populated (`resolverCmd`/`verifyCmd`/`repairCmd`/`plannerCmd` are
@@ -833,6 +909,8 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 | `repair_start` | `attempt` | Before each `-repair` fixer invocation. |
 | `repair_done` | `attempt`, `verifyOk`, `wallMs` | After that round's fixer AND its follow-up `-verify` both finish; `wallMs` covers the fixer only. |
 | `land` | `sha` | Once, right after the base ref advances (never emitted when nothing lands). |
+| `publish_start` | — | Once, right before the `-publish` command runs. Only emitted when `-publish` is set AND the run landed. |
+| `publish_done` | `ok`, `exit`, `wallMs` | Once, right after the `-publish` command finishes. |
 | `run_done` | `ok`, `exitCode`, `wallMs` | Once, always last — even on a mid-run operational error. |
 
 `-events` off (the default, empty `-events`) emits nothing at all.
