@@ -1438,6 +1438,315 @@ func TestDriveRunVerifyFailLandsNothing(t *testing.T) {
 	}
 }
 
+// disjointGroupTasks returns n tasks each writing its OWN distinct file
+// (g0.txt..g{n-1}.txt), so the integrator partitions them into n disjoint
+// groups — the fixture -verify-bisect operates on. The verify command in these
+// tests keys purely on which of those files are present in the candidate
+// checkout, so a group is "broken" exactly when its file is present.
+func disjointGroupTasks(t *testing.T, n int) []taskSpec {
+	t.Helper()
+	tasks := make([]taskSpec, n)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("g%d", i)
+		tasks[i] = taskSpec{ID: name, Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{name + ".txt": name + "\n"},
+		})}
+	}
+	return tasks
+}
+
+// TestDriveRunVerifyBisectLandsGreenSubset: three disjoint groups, one of which
+// (g2) breaks verify. With -verify-bisect the driver must land the two green
+// groups' union (base advances to a tree with g0.txt+g1.txt but NOT g2.txt),
+// report g2 as dropped-by-bisect (never flagged), and exit 0.
+func TestDriveRunVerifyBisectLandsGreenSubset(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		// Broken iff g2.txt is present in the candidate checkout.
+		VerifyCmd:    `if [ -f g2.txt ]; then exit 1; fi; exit 0`,
+		VerifyBisect: true,
+	}
+	rep, err := driveRun(ctx, p, disjointGroupTasks(t, 3))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false; bisect should have salvaged a green subset: %q", rep.Verify.Output)
+	}
+	b := rep.Verify.Bisect
+	if b == nil || !b.Ran {
+		t.Fatal("verify.bisect missing; expected a bisect record")
+	}
+	if len(b.LandedGroups) != 2 || len(b.DroppedGroups) != 1 {
+		t.Fatalf("bisect landed=%v dropped=%v, want 2 landed / 1 dropped", b.LandedGroups, b.DroppedGroups)
+	}
+	if len(b.DroppedGroups[0]) != 1 || b.DroppedGroups[0][0] != "agent/g2" {
+		t.Fatalf("dropped group=%v, want [agent/g2]", b.DroppedGroups)
+	}
+	// Landed/flagged accounting reflects the FINAL subset; g2 is dropped, not flagged.
+	if got := rep.Integrate.Landed; len(got) != 2 || !contains(got, "agent/g0") || !contains(got, "agent/g1") {
+		t.Fatalf("integrate.landed=%v, want [agent/g0 agent/g1]", got)
+	}
+	if got := rep.Integrate.DroppedByBisect; len(got) != 1 || got[0] != "agent/g2" {
+		t.Fatalf("integrate.droppedByBisect=%v, want [agent/g2]", got)
+	}
+	if len(rep.Integrate.Flagged) != 0 {
+		t.Fatalf("integrate.flagged=%v, want none (a dropped group is not a conflict)", rep.Integrate.Flagged)
+	}
+	// Base advanced to the verified union tree: g0.txt+g1.txt present, g2.txt absent.
+	mainSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("main=%s not advanced to bisected finalSHA=%s", mainSHA, rep.Integrate.FinalSHA)
+	}
+	paths, err := g.LsTree(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(paths, "g0.txt") || !contains(paths, "g1.txt") {
+		t.Fatalf("landed tree missing a green group's file (have %v)", paths)
+	}
+	if contains(paths, "g2.txt") {
+		t.Fatalf("landed tree contains the dropped group's g2.txt (have %v)", paths)
+	}
+	if code := runExitCode(rep); code != exitOK {
+		t.Fatalf("runExitCode=%d, want exitOK(0) on a bisect that landed a green subset", code)
+	}
+}
+
+// TestDriveRunVerifyBisectLandsNothingWhenAllBroken: every group fails verify on
+// its own, so bisect can salvage NOTHING — the base must not advance and the run
+// keeps exit 3.
+func TestDriveRunVerifyBisectLandsNothingWhenAllBroken(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	before, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:    `exit 1`, // every candidate tree fails
+		VerifyBisect: true,
+	}
+	rep, err := driveRun(ctx, p, disjointGroupTasks(t, 3))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep.Verify.OK {
+		t.Fatal("verify.ok=true, want false: no subset can pass when every group is broken")
+	}
+	b := rep.Verify.Bisect
+	if b == nil || !b.Ran {
+		t.Fatal("verify.bisect missing; bisect should still have run and reported nothing landable")
+	}
+	if len(b.LandedGroups) != 0 || len(b.DroppedGroups) != 3 {
+		t.Fatalf("bisect landed=%v dropped=%v, want 0 landed / 3 dropped", b.LandedGroups, b.DroppedGroups)
+	}
+	if len(rep.Integrate.Landed) != 0 {
+		t.Fatalf("integrate.landed=%v, want empty (nothing salvaged)", rep.Integrate.Landed)
+	}
+	if len(rep.Integrate.DroppedByBisect) != 3 {
+		t.Fatalf("integrate.droppedByBisect=%v, want all 3 branches", rep.Integrate.DroppedByBisect)
+	}
+	after, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("base ref advanced to %s; must stay at %s (bisect salvaged nothing)", after, before)
+	}
+	if code := runExitCode(rep); code != exitVerifyFailed {
+		t.Fatalf("runExitCode=%d, want exitVerifyFailed(%d)", code, exitVerifyFailed)
+	}
+}
+
+// TestDriveRunVerifyBisectInteractionFailureLandsNothing: two groups each pass
+// ALONE but their combined tree fails (verify fails iff BOTH files are present).
+// The union re-verify — the exact tree that would land — catches it, so bisect
+// honestly lands NOTHING rather than a subset it never verified green together.
+func TestDriveRunVerifyBisectInteractionFailureLandsNothing(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	before, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		// Green with either file alone; red only when BOTH are present together.
+		VerifyCmd:    `if [ -f g0.txt ] && [ -f g1.txt ]; then exit 1; fi; exit 0`,
+		VerifyBisect: true,
+	}
+	rep, err := driveRun(ctx, p, disjointGroupTasks(t, 2))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep.Verify.OK {
+		t.Fatalf("verify.ok=true; the union of the two groups fails, so nothing should land: %q", rep.Verify.Output)
+	}
+	b := rep.Verify.Bisect
+	if b == nil || !b.Ran {
+		t.Fatal("verify.bisect missing")
+	}
+	if len(b.LandedGroups) != 0 {
+		t.Fatalf("bisect landed=%v, want none (individually-green groups still fail together)", b.LandedGroups)
+	}
+	if len(b.DroppedGroups) != 2 {
+		t.Fatalf("bisect dropped=%v, want both groups", b.DroppedGroups)
+	}
+	after, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("base ref advanced to %s; must stay at %s (interaction failure lands nothing)", after, before)
+	}
+	if code := runExitCode(rep); code != exitVerifyFailed {
+		t.Fatalf("runExitCode=%d, want exitVerifyFailed(%d)", code, exitVerifyFailed)
+	}
+}
+
+// TestDriveRunVerifyBisectOffKeepsTodaysBehavior: the same broken batch as the
+// salvage test but with -verify-bisect OFF — verify fails, nothing lands, no
+// bisect record, exit 3. Guards that the seam is inert unless opted into.
+func TestDriveRunVerifyBisectOffKeepsTodaysBehavior(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	before, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:    `if [ -f g2.txt ]; then exit 1; fi; exit 0`,
+		VerifyBisect: false,
+	}
+	rep, err := driveRun(ctx, p, disjointGroupTasks(t, 3))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep.Verify.OK {
+		t.Fatal("verify.ok=true on a broken batch with bisect off")
+	}
+	if rep.Verify.Bisect != nil {
+		t.Fatalf("verify.bisect=%+v, want nil with -verify-bisect off", rep.Verify.Bisect)
+	}
+	if len(rep.Integrate.DroppedByBisect) != 0 {
+		t.Fatalf("integrate.droppedByBisect=%v, want empty with bisect off", rep.Integrate.DroppedByBisect)
+	}
+	after, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("base ref advanced to %s; must stay at %s (bisect off, verify failed)", after, before)
+	}
+	if code := runExitCode(rep); code != exitVerifyFailed {
+		t.Fatalf("runExitCode=%d, want exitVerifyFailed(%d)", code, exitVerifyFailed)
+	}
+}
+
+// TestDriveRunVerifyBisectAfterRepair: -repair gets FIRST shot at the whole
+// broken tree (it can't fix it — g2.txt stays present), THEN bisect salvages the
+// two green groups. A marker file the fixer touches proves repair ran before
+// bisect landed the subset.
+func TestDriveRunVerifyBisectAfterRepair(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	marker := filepath.Join(t.TempDir(), "repair-ran")
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd: `if [ -f g2.txt ]; then exit 1; fi; exit 0`,
+		// The fixer proves it ran (touches an out-of-checkout marker) and edits a
+		// file, but cannot remove g2.txt, so verify stays red and the loop gives up.
+		RepairCmd:    `touch '` + marker + `'; printf 'x' > repair_note.txt`,
+		RepairMax:    1,
+		VerifyBisect: true,
+	}
+	rep, err := driveRun(ctx, p, disjointGroupTasks(t, 3))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("repair marker missing: repair must run BEFORE bisect: %v", err)
+	}
+	if len(rep.Verify.Repairs) == 0 {
+		t.Fatal("no repair attempts recorded; -repair must get first shot at the whole tree")
+	}
+	b := rep.Verify.Bisect
+	if b == nil || !b.Ran {
+		t.Fatal("verify.bisect missing; bisect must run after repair exhausts")
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false; bisect should have salvaged the green subset after repair failed: %q", rep.Verify.Output)
+	}
+	if len(b.LandedGroups) != 2 || len(b.DroppedGroups) != 1 {
+		t.Fatalf("bisect landed=%v dropped=%v, want 2 landed / 1 dropped", b.LandedGroups, b.DroppedGroups)
+	}
+	// The landed tree is the ORIGINAL green group heads' union — the repair's
+	// throwaway edits are discarded, g2.txt dropped.
+	paths, err := g.LsTree(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(paths, "g0.txt") || !contains(paths, "g1.txt") {
+		t.Fatalf("landed tree missing a green group's file (have %v)", paths)
+	}
+	if contains(paths, "g2.txt") || contains(paths, "repair_note.txt") {
+		t.Fatalf("landed tree leaked dropped/repair content (have %v)", paths)
+	}
+	if code := runExitCode(rep); code != exitOK {
+		t.Fatalf("runExitCode=%d, want exitOK(0)", code)
+	}
+}
+
+// TestSplitGood exercises the k>6 binary-split search in isolation with a fake
+// eval: groups whose index is in the `bad` set fail alone, and any subset
+// containing a bad group fails (the additive-failure model — a broken file stays
+// broken in any superset). splitGood must return exactly the good indices.
+func TestSplitGood(t *testing.T) {
+	cases := []struct {
+		k    int
+		bad  map[int]bool
+		want []int
+	}{
+		{k: 8, bad: map[int]bool{3: true}, want: []int{0, 1, 2, 4, 5, 6, 7}},
+		{k: 8, bad: map[int]bool{}, want: []int{0, 1, 2, 3, 4, 5, 6, 7}},
+		{k: 8, bad: map[int]bool{0: true, 1: true, 2: true, 3: true, 4: true, 5: true, 6: true, 7: true}, want: nil},
+		{k: 10, bad: map[int]bool{2: true, 7: true}, want: []int{0, 1, 3, 4, 5, 6, 8, 9}},
+	}
+	for _, tc := range cases {
+		eval := func(subset []int) bool {
+			for _, i := range subset {
+				if tc.bad[i] {
+					return false
+				}
+			}
+			return true
+		}
+		got := bisectGoodGroups(eval, tc.k)
+		if fmt.Sprintf("%v", got) != fmt.Sprintf("%v", tc.want) {
+			t.Errorf("bisectGoodGroups(k=%d, bad=%v)=%v, want %v", tc.k, tc.bad, got, tc.want)
+		}
+	}
+}
+
 // TestDriveRunRepairFailsHonestly: the same broken build, but the fixer does NOT
 // fix it and -repair-max=1. The loop must run exactly once and then report
 // verify.ok=false HONESTLY (no false green), repaired=false, with the per-attempt

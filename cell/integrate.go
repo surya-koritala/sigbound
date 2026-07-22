@@ -59,6 +59,18 @@ type IntegrationResult struct {
 	MaxBatch     int // branches landable in parallel == number of groups
 	LargestGroup int // serialization depth == largest group size
 
+	// GroupHeads/GroupBranches expose the per-group folded heads for the groups
+	// that LANDED at least one branch — exactly the disjoint heads combined into
+	// FinalSHA. GroupHeads[i] is that group's head commit OID (or tip, for a
+	// singleton), and GroupBranches[i] names the branches it landed. They let a
+	// caller cheaply re-overlay a SUBSET of the heads (OverlayTrees) without
+	// re-folding — the seam -verify-bisect uses to land a passing subset when
+	// the full combined tree fails verify. Populated only by the OCC strategies
+	// (overlay, mergetree); the serial baselines (naive, porcelain) leave them
+	// nil, since they never partition.
+	GroupHeads    []string
+	GroupBranches [][]string
+
 	Duration time.Duration
 }
 
@@ -243,6 +255,10 @@ func (in *Integrator) IntegrateOCC(ctx context.Context, base string, changes []B
 		res.Landed = append(res.Landed, landedByGroup[gi]...)
 		res.Flagged = append(res.Flagged, flaggedByGroup[gi]...)
 		res.AutoMerged += autoByGroup[gi]
+		if len(landedByGroup[gi]) > 0 {
+			res.GroupHeads = append(res.GroupHeads, heads[gi])
+			res.GroupBranches = append(res.GroupBranches, landedByGroup[gi])
+		}
 	}
 
 	// ---- combine phase: disjoint parallel reduction of the group heads ----
@@ -539,6 +555,8 @@ func (in *Integrator) IntegrateOverlay(ctx context.Context, base string, changes
 		res.AutoMerged += autoByGroup[gi]
 		if len(landedByGroup[gi]) > 0 {
 			parents = append(parents, heads[gi])
+			res.GroupHeads = append(res.GroupHeads, heads[gi])
+			res.GroupBranches = append(res.GroupBranches, landedByGroup[gi])
 		}
 	}
 
