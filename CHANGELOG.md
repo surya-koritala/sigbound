@@ -8,6 +8,20 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+### Added
+
+- **`-env-mode scoped`** — per-slot environment scoping: each command slot gets
+  a minimal base environment plus its own `SIGBOUND_*` vars, with per-slot
+  `-env-*` allowlists (exact names and `NAME_*` families) for anything extra.
+  Default `inherit` is unchanged.
+
+### Fixed
+
+- `-verify-bisect` under `-strategy mergetree` salvaged nothing on
+  fully-disjoint batches: singleton group heads were left as branch ref names
+  instead of commit OIDs, so every bisect candidate failed to build (fail-safe
+  — nothing wrong ever landed, but green subsets were never salvaged).
+
 ## [0.3.0] - 2026-07-22
 
 The differentiators: salvage landing, provenance and replay, resumable runs,
