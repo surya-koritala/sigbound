@@ -678,6 +678,13 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	// no worktree, no agent, no verify, no git mutation beyond what planning
 	// itself already did.
 	if *dryRun {
+		if manifestPath != "" {
+			// -dry-run never runs an agent, integrates, or verifies, so there is
+			// no report to write — say so explicitly rather than silently
+			// leaving a validated-but-unwritten -manifest path looking like it
+			// was honored.
+			fmt.Fprintln(os.Stderr, "dry-run: no manifest written")
+		}
 		if err := emitDryRun(w, buildDryRunReport(tasks, laneMode), *asJSON); err != nil {
 			return exitOperationalError, err
 		}
@@ -2171,6 +2178,11 @@ func runVerify(ctx context.Context, g *gitx.Git, wtPath string, p runParams, cha
 		if oid, err := g.At(wtPath).TreeOID(ctx, "HEAD"); err == nil {
 			treeOID = oid
 			if verifyCacheLookup(ctx, g, treeOID, verifyCmd, impacted) {
+				// Flaky is left false here even if the ORIGINAL pass that
+				// populated this entry needed a -verify-retries retry to go
+				// green — verifyCacheEntry only stores OK/version/cmdHash,
+				// never whether that pass was flaky, so a cache hit can't
+				// recover it. See docs/USAGE.md's Cache section.
 				return verifyJSON{Ran: true, OK: true, Cached: true, Scope: scope, ImpactedPkgs: impacted,
 					Output: "(cached: -verify already passed on this tree; command not run)"}
 			}
@@ -2217,6 +2229,9 @@ func writeRunSummary(w io.Writer, r runReport) error {
 		}
 		if a.TimedOut {
 			status += " TIMEOUT"
+		}
+		if a.Resumed {
+			status += " RESUMED"
 		}
 		fmt.Fprintf(w, "  agent %-12s %-16s %-16s files=%v\n", a.ID, a.Branch, status, a.Files)
 		if len(a.Strayed) > 0 {

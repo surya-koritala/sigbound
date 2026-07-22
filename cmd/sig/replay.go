@@ -105,6 +105,18 @@ func runReplay(w io.Writer, argv []string) (int, error) {
 	if _, err := g.RevParse(ctx, rep.BaseSHA); err != nil {
 		return exitReplayRepoState, fmt.Errorf("recorded baseSHA %s no longer resolves in %s (garbage collected?): %w", short(rep.BaseSHA), rep.Repo, err)
 	}
+	// A -verify-bisect run that salvaged a subset (see verifyBisect) records
+	// integrate.finalSHA as the LANDED SUBSET's tree, not the full agent set —
+	// the dropped groups' BRANCH NAMES (driveRun hands integrateBranches
+	// a.Branch, e.g. "agent/g2", never a.SHA — see driveRun) are named in
+	// DroppedByBisect. Re-integrating the full set would recompute a
+	// different (larger) tree and falsely DIVERGE, so exclude them here the
+	// same way the original run did before it ever reached verify.
+	dropped := make(map[string]bool, len(rep.Integrate.DroppedByBisect))
+	for _, branch := range rep.Integrate.DroppedByBisect {
+		dropped[branch] = true
+	}
+
 	var branches []string
 	writeSets := make(map[string][]string, len(rep.PerAgent))
 	for _, a := range rep.PerAgent {
@@ -112,7 +124,10 @@ func runReplay(w io.Writer, argv []string) (int, error) {
 		// original run recorded OK=true was handed to integrateBranches,
 		// regardless of whether it ultimately landed or was flagged — a
 		// flagged branch's SHA only replays correctly if it's included too.
-		if !a.OK {
+		// EXCEPT a branch -verify-bisect dropped (see dropped above): the
+		// recorded finalSHA never included it, so including it here would
+		// reproduce a tree that was never actually landed.
+		if !a.OK || dropped[a.Branch] {
 			continue
 		}
 		if strings.TrimSpace(a.SHA) == "" {

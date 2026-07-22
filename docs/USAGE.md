@@ -194,6 +194,10 @@ weaker guarantee — and the report marks it `verify.cached: true`
 (`verify.ok` stays `true`, and the command is not spawned at all). The
 human summary notes it too: `verify: PASS  cached  ...`.
 
+A cache hit always reports `verify.flaky: false`, even if the ORIGINAL run
+that populated the entry only passed after a `-verify-retries` retry — only
+the PASS itself is stored, not whether it was flaky getting there.
+
 **Storage.** Entries live at `.git/sigbound/verify-cache/<key>` under the
 TARGET repo's own git directory (resolved via `git rev-parse
 --git-common-dir`, so it's correct even when `-repo` is itself a linked
@@ -745,13 +749,20 @@ for reproducible debugging. `sig replay`:
    run that produced the manifest. If any of these no longer resolve in the
    repo (a branch was deleted and the commit was eventually garbage
    collected, say), replay fails clearly instead of guessing.
-2. Re-integrates those exact SHAs with the recorded `strategy` and
+2. Excludes any agent whose branch is listed in the manifest's
+   `integrate.droppedByBisect` (see [Verify bisect](#verify-bisect)) from
+   that set. A bisect run that salvaged a subset recorded
+   `integrate.finalSHA` for the LANDED SUBSET only, not the full agent set —
+   re-integrating the same subset reproduces it byte-identically (folding is
+   deterministic), while including the dropped branches would recompute a
+   different, larger tree and falsely `DIVERGE`.
+3. Re-integrates the remaining exact SHAs with the recorded `strategy` and
    `resolverCmd`, via the same `integrateBranches` path `sig run`/`sig
    integrate` use — with `land=false` (like `sig integrate -no-land`).
    Replay is **read-only**: it never moves any ref.
-3. If the manifest recorded a `verifyCmd`, re-runs it against the recomputed
+4. If the manifest recorded a `verifyCmd`, re-runs it against the recomputed
    tree and prints whether it still passes — informational only; see below.
-4. Compares the recomputed tree's OID against the recorded
+5. Compares the recomputed tree's OID against the recorded
    `integrate.finalSHA`'s tree OID (not the raw commit SHA — commit
    timestamps differ between the original run and replay even when the tree
    is byte-identical, so tree equality is the actual claim being checked).
