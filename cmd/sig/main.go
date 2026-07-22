@@ -80,6 +80,8 @@ func usage(w *os.File) {
 func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool) (cell.IntegrationResult, error) {
 	var need []string
 	for _, b := range branches {
+		// Contract: omit the key (or map it to nil) to request recompute; an
+		// empty non-nil slice is a positive assertion of no changes.
 		if ws := writeSets[b]; ws == nil {
 			need = append(need, b)
 		}

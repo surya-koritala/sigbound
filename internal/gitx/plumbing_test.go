@@ -419,6 +419,83 @@ func TestDiffNameOnlyBatchMatchesPerBranch(t *testing.T) {
 	}
 }
 
+// TestDiffNameOnlyBatchSupersetWhenBaseAdvanced covers the case
+// integrateBranches relies on: baseSHA has moved PAST a branch's fork point
+// (e.g. other branches already landed onto base before this one is diffed).
+// DiffNameOnlyBatch's two-tree diff (base tip vs branch tip) necessarily picks
+// up base's own post-fork changes too, so it must be a SUPERSET of the
+// three-dot DiffNameOnly(base, branch) result, which only shows the branch's
+// changes since the merge-base — the extra paths are exactly the conservative,
+// partition-safe behavior callers depend on. A path genuinely changed on both
+// sides must appear in both results.
+func TestDiffNameOnlyBatchSupersetWhenBaseAdvanced(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "a.txt", "1\n")
+	write(t, dir, "b.txt", "1\n")
+	write(t, dir, "c.txt", "1\n")
+	fork, err := g.CommitAll(ctx, "fork")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Branch forks here, changing a.txt (its own) and c.txt (base will ALSO
+	// change this one below — the genuine overlap).
+	branch := branchFrom(t, g, fork, "b1", func(d string) {
+		write(t, d, "a.txt", "branch-a\n")
+		write(t, d, "c.txt", "branch-c\n")
+	})
+
+	// Base advances past the fork point without the branch: b.txt is a
+	// base-only change (branch never touched it); c.txt is the genuine
+	// overlap (base changed it independently of the branch).
+	write(t, dir, "b.txt", "base-b\n")
+	write(t, dir, "c.txt", "base-c\n")
+	baseAdvanced, err := g.CommitAll(ctx, "base-advances")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	threeDot, err := g.DiffNameOnly(ctx, baseAdvanced, branch)
+	if err != nil {
+		t.Fatalf("DiffNameOnly: %v", err)
+	}
+	batch, err := g.DiffNameOnlyBatch(ctx, baseAdvanced, []string{branch})
+	if err != nil {
+		t.Fatalf("DiffNameOnlyBatch: %v", err)
+	}
+	twoTree := batch[branch]
+
+	got := map[string]bool{}
+	for _, p := range twoTree {
+		got[p] = true
+	}
+	for _, p := range threeDot {
+		if !got[p] {
+			t.Fatalf("two-tree result %v is missing three-dot path %q — not a superset", twoTree, p)
+		}
+	}
+	// The genuinely-overlapping path (changed on both sides) must be caught.
+	if !got["c.txt"] {
+		t.Fatalf("two-tree result %v missing genuinely-overlapping path c.txt", twoTree)
+	}
+	// The base-only path is exactly the extra conservatism: present in
+	// two-tree, absent from three-dot (which only looks at the branch's own
+	// changes since the merge-base).
+	if !got["b.txt"] {
+		t.Fatalf("two-tree result %v missing base-only path b.txt (conservatism)", twoTree)
+	}
+	for _, p := range threeDot {
+		if p == "b.txt" {
+			t.Fatalf("three-dot unexpectedly included base-only path b.txt: %v", threeDot)
+		}
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
