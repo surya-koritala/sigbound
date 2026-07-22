@@ -95,7 +95,12 @@ func usage(w *os.File) {
 // diff-tree call rather than a `git diff --name-only` fork per branch (see
 // gitx.DiffNameOnlyBatch). `sig integrate` has no precomputed data, so it
 // always passes nil and every branch goes through the batched path.
-func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool) (cell.IntegrationResult, error) {
+//
+// resolverEnv is forwarded to cell.CommandResolver.Env as-is: nil keeps that
+// type's own default (the full os.Environ(), today's behavior), non-nil is a
+// caller-scoped base environment (see `sig run`'s -env-mode). `sig integrate`
+// and `sig replay` always pass nil — -env-mode is a `sig run`-only flag.
+func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool, resolverEnv []string) (cell.IntegrationResult, error) {
 	var need []string
 	for _, b := range branches {
 		// Contract: omit the key (or map it to nil) to request recompute; an
@@ -135,6 +140,7 @@ func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string
 		in = in.WithResolver(&cell.CommandResolver{
 			Args:    []string{"sh", "-c", cmd},
 			Timeout: resolverTimeout,
+			Env:     resolverEnv,
 		})
 	}
 	return in.Integrate(ctx, baseSHA, changes, strategy)
@@ -216,7 +222,7 @@ func runIntegrate(argv []string) error {
 	// Hand the batch to the shared integrate path (partition, parallel folding,
 	// optional resolver, and landing are entirely the cell's job).
 	start := time.Now()
-	res, err := integrateBranches(ctx, g, *base, baseSHA, branches, nil, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand)
+	res, err := integrateBranches(ctx, g, *base, baseSHA, branches, nil, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand, nil)
 	if err != nil {
 		return err
 	}

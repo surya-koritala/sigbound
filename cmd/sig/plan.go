@@ -69,6 +69,13 @@ type CommandPlanner struct {
 	// every invocation (the first attempt and, on an overlap, the automatic
 	// re-plan) appended to <LogDir>/planner.log. See openLog (run.go).
 	LogDir string
+	// EnvMode/EnvAllow mirror -env-mode/-env-planner (see slotEnv, env.go):
+	// EnvMode == envModeScoped hands the command a minimal base environment
+	// plus EnvAllow's extra parent-env names/globs plus its own SIGBOUND_*
+	// vars, instead of the full parent environment. The zero value
+	// (EnvMode == "") is envModeInherit, today's behavior.
+	EnvMode  string
+	EnvAllow []string
 }
 
 // Plan runs the configured command and parses+validates its plan. See
@@ -124,13 +131,13 @@ func (p *CommandPlanner) attempt(ctx context.Context, goal, repoMap string, n in
 	// inherited our stdout pipe can't block past its timeout. See the note in
 	// cell.CommandResolver.Resolve.
 	cmd.WaitDelay = 2 * time.Second
-	cmd.Env = append(os.Environ(),
-		"SIGBOUND_GOAL="+goal,
-		"SIGBOUND_REPOMAP="+repoMap,
-		"SIGBOUND_N="+strconv.Itoa(n),
-		"SIGBOUND_PROMPT="+prompt,
-		"SIGBOUND_REPLAN="+feedback, // empty on the first attempt; set on a re-plan
-	)
+	cmd.Env = slotEnv(p.EnvMode, p.EnvAllow, []string{
+		"SIGBOUND_GOAL=" + goal,
+		"SIGBOUND_REPOMAP=" + repoMap,
+		"SIGBOUND_N=" + strconv.Itoa(n),
+		"SIGBOUND_PROMPT=" + prompt,
+		"SIGBOUND_REPLAN=" + feedback, // empty on the first attempt; set on a re-plan
+	})
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
@@ -346,7 +353,7 @@ REPO MAP:
 // CommandPlanner from plannerCmd, and return its validated plan. Any failure
 // (missing planner, scan error, bad plan) returns an error and NO run is
 // started. logDir (may be empty) is forwarded to CommandPlanner.LogDir.
-func planTasks(ctx context.Context, repo, goal, plannerCmd string, n int, timeout time.Duration, logDir string) ([]taskSpec, error) {
+func planTasks(ctx context.Context, repo, goal, plannerCmd string, n int, timeout time.Duration, logDir string, envMode string, envAllow []string) ([]taskSpec, error) {
 	if strings.TrimSpace(plannerCmd) == "" {
 		return nil, errors.New("-goal requires -planner (the command that produces the plan)")
 	}
@@ -357,7 +364,7 @@ func planTasks(ctx context.Context, repo, goal, plannerCmd string, n int, timeou
 	if err != nil {
 		return nil, fmt.Errorf("scan repo map: %w", err)
 	}
-	planner := &CommandPlanner{Args: []string{"sh", "-c", plannerCmd}, Timeout: timeout, LogDir: logDir}
+	planner := &CommandPlanner{Args: []string{"sh", "-c", plannerCmd}, Timeout: timeout, LogDir: logDir, EnvMode: envMode, EnvAllow: envAllow}
 	return planner.Plan(ctx, goal, repoMap, n)
 }
 

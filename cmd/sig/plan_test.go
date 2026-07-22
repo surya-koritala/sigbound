@@ -200,6 +200,78 @@ func TestCommandPlannerPassesEnv(t *testing.T) {
 	}
 }
 
+// TestCommandPlannerEnvScopedStripsCanary: -env-mode scoped (via
+// CommandPlanner.EnvMode) hides a variable set in this test process from the
+// planner command, while its own SIGBOUND_* vars still arrive.
+func TestCommandPlannerEnvScopedStripsCanary(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	p := &CommandPlanner{
+		Args:    []string{"sh", "-c", `printf '[{"id":"e","prompt":"canary=[%s] goal=%s","files":["e.go"]}]' "$SIGBOUND_TEST_CANARY" "$SIGBOUND_GOAL"`},
+		EnvMode: envModeScoped,
+	}
+	tasks, err := p.Plan(context.Background(), "my goal", "map", 4)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if got := tasks[0].Prompt; got != "canary=[] goal=my goal" {
+		t.Fatalf("prompt=%q, want the canary stripped but SIGBOUND_GOAL intact", got)
+	}
+}
+
+// TestCommandPlannerEnvInheritKeepsCanary: leaving EnvMode unset (its zero
+// value) is -env-mode inherit, today's behavior — the canary reaches the
+// planner command.
+func TestCommandPlannerEnvInheritKeepsCanary(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	p := &CommandPlanner{
+		Args: []string{"sh", "-c", `printf '[{"id":"e","prompt":"canary=[%s]","files":["e.go"]}]' "$SIGBOUND_TEST_CANARY"`},
+	}
+	tasks, err := p.Plan(context.Background(), "g", "m", 4)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if got := tasks[0].Prompt; got != "canary=[leak-me]" {
+		t.Fatalf("prompt=%q, want the canary present (inherit is byte-identical to today)", got)
+	}
+}
+
+// TestCommandPlannerEnvScopedAllowlistPassesGlob: EnvAllow's NAME_* glob
+// passes a matching parent var through in scoped mode.
+func TestCommandPlannerEnvScopedAllowlistPassesGlob(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	p := &CommandPlanner{
+		Args:     []string{"sh", "-c", `printf '[{"id":"e","prompt":"canary=[%s]","files":["e.go"]}]' "$SIGBOUND_TEST_CANARY"`},
+		EnvMode:  envModeScoped,
+		EnvAllow: []string{"SIGBOUND_TEST_*"},
+	}
+	tasks, err := p.Plan(context.Background(), "g", "m", 4)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if got := tasks[0].Prompt; got != "canary=[leak-me]" {
+		t.Fatalf("prompt=%q, want the glob-allowlisted canary present", got)
+	}
+}
+
+// TestPlanTasksThreadsEnvModeIntoCommandPlanner: planTasks (runRun's own
+// entry point into the planner) forwards its envMode/envAllow params onto
+// the CommandPlanner it builds — proven end-to-end the same way
+// TestCommandPlannerEnvScopedStripsCanary proves it at the CommandPlanner
+// level directly.
+func TestPlanTasksThreadsEnvModeIntoCommandPlanner(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	dir := t.TempDir()
+	writeRepoFile(t, dir, "main.go", "package main\n\nfunc main() {}\n")
+	cmd := `printf '[{"id":"e","prompt":"canary=[%s]","files":["e.go"]}]' "$SIGBOUND_TEST_CANARY"`
+	tasks, err := planTasks(context.Background(), dir, "goal", cmd, 4, 0, "", envModeScoped, nil)
+	if err != nil {
+		t.Fatalf("planTasks: %v", err)
+	}
+	if got := tasks[0].Prompt; got != "canary=[]" {
+		t.Fatalf("prompt=%q, want the canary stripped by the scoped mode planTasks was given", got)
+	}
+}
+
 // TestDefaultPlanPromptConflictAvoidance: the default wrapper instructs disjoint
 // splitting and carries the goal, repo map, and n.
 func TestDefaultPlanPromptConflictAvoidance(t *testing.T) {

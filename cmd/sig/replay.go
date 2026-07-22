@@ -142,7 +142,7 @@ func runReplay(w io.Writer, argv []string) (int, error) {
 
 	// Re-integrate the exact recorded inputs. land=false: replay is read-only
 	// and never moves any ref, matching `sig integrate -no-land`.
-	res, err := integrateBranches(ctx, g, rep.Base, rep.BaseSHA, branches, writeSets, strategy, rep.ResolverCmd, replayResolverTimeout, false, false)
+	res, err := integrateBranches(ctx, g, rep.Base, rep.BaseSHA, branches, writeSets, strategy, rep.ResolverCmd, replayResolverTimeout, false, false, nil)
 	if err != nil {
 		return exitReplayRepoState, fmt.Errorf("re-integrate: %w", err)
 	}
