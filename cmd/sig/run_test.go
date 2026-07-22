@@ -1044,10 +1044,13 @@ func TestRunRunNoReportWhenNoAgentsRan(t *testing.T) {
 }
 
 // TestDriveRunVerifyRetries covers -verify-retries against a verify command
-// that fails on its first invocation and passes on every one after. Each
-// invocation runs in a FRESH detached worktree (see runVerify), so the
-// fail-once state has to live outside the checkout: a marker file at a fixed
-// path, created by the command itself on its first (failing) run.
+// that fails on its first invocation and passes on every one after. Retries
+// reuse the SAME detached worktree (see runVerify/verifyWithRepair), only
+// cleaned between invocations, so the fail-once state has to live outside the
+// checkout: a marker file at a fixed path, created by the command itself on
+// its first (failing) run — a marker written INSIDE the checkout would be
+// removed by the between-attempt clean, defeating this fixture on purpose
+// (see TestDriveRunVerifyRetriesCleansWorktreeBetweenAttempts for that case).
 func TestDriveRunVerifyRetries(t *testing.T) {
 	ctx := context.Background()
 	agent := buildTestAgent(t)
@@ -1099,6 +1102,119 @@ func TestDriveRunVerifyRetries(t *testing.T) {
 	}
 	if code := runExitCode(rep0); code != exitVerifyFailed {
 		t.Fatalf("runExitCode=%d, want exitVerifyFailed", code)
+	}
+}
+
+// TestDriveRunVerifyRetriesCleansWorktreeBetweenAttempts proves the
+// hermeticity guarantee that makes worktree reuse across -verify-retries safe
+// (see runVerify's reset+clean-on-entry): an UNTRACKED file the verify
+// command writes INSIDE the checkout on its first (failing) invocation must
+// be gone by the second (retried) invocation, AND a MODIFICATION it makes to
+// a file git already TRACKS (shared.txt, part of makeGoRepo's base commit)
+// must be reverted to its committed content — if the worktree were reused
+// WITHOUT a clean+reset between attempts, both would still be there and the
+// command reports LEAKED-ARTIFACT / LEAKED-MUTATION and fails; since neither
+// is, the retry sees a fully hermetic tree and passes.
+func TestDriveRunVerifyRetriesCleansWorktreeBetweenAttempts(t *testing.T) {
+	ctx := context.Background()
+	agent := buildTestAgent(t)
+	task := taskSpec{ID: "ok", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"good.go": "package main\n\nfunc good() int { return 1 }\n"},
+	})}
+
+	// counter (outside the worktree) distinguishes the first invocation from
+	// the retry; leftover.txt (inside the worktree, untracked) is the
+	// artifact whose survival would prove an untracked leak, and the
+	// "MUTATED" line appended to the tracked shared.txt is what would prove a
+	// tracked-file leak.
+	counter := filepath.Join(t.TempDir(), "counter")
+	verifyCmd := `n=$(cat '` + counter + `' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '` + counter + `'
+if [ "$n" = "1" ]; then touch leftover.txt; echo MUTATED >> shared.txt; exit 1; fi
+if [ -f leftover.txt ]; then echo LEAKED-ARTIFACT; exit 1; fi
+if grep -q MUTATED shared.txt; then echo LEAKED-MUTATION; exit 1; fi
+exit 0`
+
+	_, repo := makeGoRepo(t)
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:     verifyCmd,
+		VerifyRetries: 1,
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if strings.Contains(rep.Verify.Output, "LEAKED-ARTIFACT") {
+		t.Fatalf("worktree reuse leaked an untracked artifact across -verify-retries: %q", rep.Verify.Output)
+	}
+	if strings.Contains(rep.Verify.Output, "LEAKED-MUTATION") {
+		t.Fatalf("worktree reuse leaked a tracked-file mutation across -verify-retries: %q", rep.Verify.Output)
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false, want true (retry should see a reset+cleaned, hermetic worktree): %q", rep.Verify.Output)
+	}
+	if !rep.Verify.Flaky {
+		t.Fatal("verify.flaky=false, want true (passed only on the 2nd invocation)")
+	}
+}
+
+// TestDriveRunRepairReVerifyStartsPristine proves the OTHER half of worktree-
+// reuse hermeticity, on the repair path: -verify's reset+clean-on-entry
+// guards retries on an UNCHANGED head, but when a repair round advances the
+// reused worktree onto a NEW head via CheckoutDetach — which only touches
+// paths that actually differ between the OLD and NEW commit (see its doc) —
+// a tracked-file mutation left on a path repair never touched would ride
+// straight through unreverted unless the worktree is reset+cleaned BEFORE
+// that checkout, not just before the next verify command runs. The verify
+// command here mutates a tracked file (shared.txt) and leaves an untracked
+// leftover only while the build itself is broken, then fails LOUDLY if that
+// mutation is still visible once the build is fixed — so a green re-verify
+// after repair proves the checkout started from a pristine tree.
+func TestDriveRunRepairReVerifyStartsPristine(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	verifyCmd := `if go build ./...; then
+  if grep -q MUTATED-SHARED shared.txt; then echo MUTATION-LEAKED; exit 1; fi
+  exit 0
+fi
+echo MUTATED-SHARED >> shared.txt
+touch leftover.txt
+exit 1`
+
+	p := runParams{
+		Repo:      repo,
+		Base:      "main",
+		Strategy:  "overlay",
+		AgentCmd:  agent,
+		VerifyCmd: verifyCmd,
+		// Deterministic fixer, same as TestDriveRunRepairSucceeds: defines the
+		// missing helper() so the SECOND (post-repair) invocation's `go build`
+		// passes and reaches the mutation check above.
+		RepairCmd: `printf 'package main\n\nfunc helper() int { return helperX() }\n' > repair_fix.go`,
+		RepairMax: 1,
+	}
+
+	rep, err := driveRun(ctx, p, brokenBuildTasks(t))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if strings.Contains(rep.Verify.Output, "MUTATION-LEAKED") {
+		t.Fatalf("re-verify after repair saw a tracked-file mutation left by the pre-repair attempt: %q", rep.Verify.Output)
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify.ok=false after repair, want true (re-verify should have started from a pristine tree): %q", rep.Verify.Output)
+	}
+	if !rep.Verify.Repaired {
+		t.Fatal("repaired=false; expected the repair loop to have fixed the initial build failure")
+	}
+	mainSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("main=%s not advanced to repaired finalSHA=%s", mainSHA, rep.Integrate.FinalSHA)
 	}
 }
 

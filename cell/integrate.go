@@ -333,6 +333,15 @@ func (in *Integrator) fold(ctx context.Context, mergeBase, acc string, changes [
 // current landed accumulator, Theirs from the branch — and calls the resolver.
 // A path missing on a side (add/add, delete/modify) is passed as empty content.
 //
+// All base/ours/theirs content for every conflicted path is fetched in ONE
+// `git cat-file --batch` process via BlobsBatch (gitx), instead of the 3
+// `git cat-file blob` forks per path this used to spawn — 3K processes for K
+// conflicts, serialized in fold's loop, collapsed to one. The resolver may
+// still decline on the FIRST conflicted path and never see the rest (same
+// fail-fast short-circuit as before); only the blob reads are batched ahead
+// of that, since they're cheap regardless of how many paths the resolver ends
+// up actually needing.
+//
 // It returns resolved=true only when the resolver resolves EVERY conflicted path;
 // then it rebuilds the tree by splicing the resolved blobs onto the conflicted
 // merge-tree output (which already carries git's clean auto-merges elsewhere). If
@@ -344,20 +353,23 @@ func (in *Integrator) attemptResolve(ctx context.Context, mergeBase, ours, their
 	if in.resolver == nil {
 		return "", false, nil
 	}
+	specs := make([]string, 0, len(mt.Conflicts)*3)
+	for _, path := range mt.Conflicts {
+		specs = append(specs, mergeBase+":"+path, ours+":"+path, theirs+":"+path)
+	}
+	contents, err := in.g.BlobsBatch(ctx, specs)
+	if err != nil {
+		return "", false, err
+	}
+
 	blobs := make([]gitx.ResolvedBlob, 0, len(mt.Conflicts))
 	for _, path := range mt.Conflicts {
-		baseC, _, err := in.g.BlobAt(ctx, mergeBase, path)
-		if err != nil {
-			return "", false, err
-		}
-		oursC, _, err := in.g.BlobAt(ctx, ours, path)
-		if err != nil {
-			return "", false, err
-		}
-		theirsC, _, err := in.g.BlobAt(ctx, theirs, path)
-		if err != nil {
-			return "", false, err
-		}
+		// A path absent on a side (add/add, delete/modify) is simply missing
+		// from the map — the zero value ("") matches BlobAt's old present=false
+		// => empty-content contract.
+		baseC := contents[mergeBase+":"+path]
+		oursC := contents[ours+":"+path]
+		theirsC := contents[theirs+":"+path]
 		out, ok, rerr := in.resolver.Resolve(ctx, Conflict{Path: path, Base: baseC, Ours: oursC, Theirs: theirsC})
 		if rerr != nil || !ok {
 			// Fail-safe: any decline or error on ANY path flags the whole branch.

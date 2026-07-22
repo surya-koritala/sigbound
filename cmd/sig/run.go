@@ -869,17 +869,36 @@ func budgetAwareErr(p runParams, ctx context.Context, op string, err error) erro
 
 // verifyWithRepair runs -verify (with -verify-retries applied, see
 // runVerifyRetry) on head and, when it fails and -repair is set, drives the
-// self-healing repair loop: up to p.RepairMax times it materializes the
-// current head in a worktree, runs the fixer agent there (SIGBOUND_FAILURE =
-// the last verify output, SIGBOUND_REPO = repo), auto-commits whatever the fixer
-// edited, advances head to that commit, and re-verifies (again with retries) —
-// stopping as soon as verify passes. It returns the verify verdict (green
-// either first-try or after repair; honestly false if never fixed) and the
+// self-healing repair loop: up to p.RepairMax times it runs the fixer agent
+// in a throwaway worktree (SIGBOUND_FAILURE = the last verify output,
+// SIGBOUND_REPO = repo), auto-commits whatever the fixer edited, advances
+// head to that commit, and re-verifies (again with retries) — stopping as
+// soon as verify passes. It returns the verify verdict (green either
+// first-try or after repair; honestly false if never fixed) and the
 // possibly-advanced head the base ref should point at. If -verify passes on
 // the first try, no repair runs. emit gets a verify_start/verify_done pair
 // around every -verify invocation this call makes (attempt 0 = pre-repair, N
 // = after repair round N, matching -logdir's verify-<n>.log numbering) and a
 // repair_start/repair_done pair around every fixer invocation.
+//
+// ONE detached worktree is materialized up front and reused for every verify
+// invocation this call makes — the initial attempt, its -verify-retries
+// retries, and every repair round's re-verify — instead of a fresh
+// WorktreeAddDetached + WorktreeRemove per attempt (up to ~5 full O(repo)
+// checkouts with -repair-max=2, even when the delta each round touches is a
+// handful of files). Retries on an unchanged head just re-run in place
+// (runVerify resets+cleans first, see its doc); when a repair round advances
+// head, this loop resets+cleans the worktree BEFORE advancing it, then
+// advances it in place via CheckoutDetach — which, unlike a fresh checkout,
+// only touches the paths that actually differ, so it must start from a
+// pristine tree or a stale tracked-file edit / untracked leftover from the
+// PRIOR head can ride straight through (see the reset+clean block right
+// before each CheckoutDetach call below). It's torn down once, when this
+// function returns. runRepair still gets its OWN fresh worktree per round: it
+// needs a genuinely clean tree for its `git add -A` auto-commit, never one
+// that might carry a verify command's leftover build artifacts (see
+// runVerify's reset+clean-on-entry, which is what makes reusing the verify
+// worktree safe instead of a hermeticity bug).
 //
 // changedFiles is the run's landed write-set — -verify-impact's input for
 // computeImpact (see runVerify). Each repair round folds that round's
@@ -889,9 +908,20 @@ func budgetAwareErr(p runParams, ctx context.Context, op string, err error) erro
 // changes the tree, so re-deciding scope from scratch, not memoizing the
 // first decision, is what keeps the fallback honest.
 func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string, changedFiles []string, emit *eventEmitter) (verifyJSON, string) {
+	dir, err := os.MkdirTemp("", "sig-verify-*")
+	if err != nil {
+		return verifyJSON{Ran: true, OK: false, Output: err.Error()}, head
+	}
+	defer os.RemoveAll(dir)
+	wtPath := filepath.Join(dir, "wt")
+	if err := g.WorktreeAddDetached(ctx, wtPath, head); err != nil {
+		return verifyJSON{Ran: true, OK: false, Output: "checkout " + head + ": " + err.Error()}, head
+	}
+	defer func() { _ = g.WorktreeRemove(ctx, wtPath) }()
+
 	emit.emit("verify_start", map[string]any{"attempt": 0})
 	vStart := time.Now()
-	v := runVerifyRetry(ctx, g, head, p, changedFiles, p.VerifyRetries, p.LogDir, 0)
+	v := runVerifyRetry(ctx, g, wtPath, p, changedFiles, p.VerifyRetries, p.LogDir, 0)
 	emit.emit("verify_done", map[string]any{"ok": v.OK, "flaky": v.Flaky, "attempt": 0, "wallMs": time.Since(vStart).Milliseconds()})
 	// Green first try (possibly after a retry), or no repair configured/allowed
 	// => done, loop never runs. v already carries Flaky, so it survives here.
@@ -922,6 +952,40 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 			break
 		}
 		head = newHead
+		// Reset + clean the reused worktree BEFORE advancing it onto the
+		// repaired head. The verify invocation that just ran (above, or this
+		// loop's previous round) may have left tracked-file edits or
+		// untracked leftovers in place — CheckoutDetach only touches paths
+		// that differ between the OLD and NEW commit, so any tracked-file
+		// mutation on a path repair never touched would otherwise ride
+		// straight through unreverted, and an untracked leftover could
+		// collide with a path the new head is about to add and abort the
+		// checkout outright. Order matters: this must run BEFORE
+		// CheckoutDetach, not after (that's what runVerify's own
+		// reset+clean-on-entry guards against retries on an UNCHANGED head;
+		// it can't undo damage from before a checkout onto a NEW head).
+		if cerr := g.At(wtPath).ResetHard(ctx); cerr != nil {
+			lastOutput = tail(lastOutput+"\n[repair attempt "+fmt.Sprintf("%d", attempt)+" reset error] "+cerr.Error(), 2000)
+			repairs = append(repairs, rec)
+			emit.emit("repair_done", map[string]any{"attempt": attempt, "verifyOk": rec.VerifyOK, "wallMs": repairWallMs})
+			break
+		}
+		if cerr := g.At(wtPath).Clean(ctx); cerr != nil {
+			lastOutput = tail(lastOutput+"\n[repair attempt "+fmt.Sprintf("%d", attempt)+" clean error] "+cerr.Error(), 2000)
+			repairs = append(repairs, rec)
+			emit.emit("repair_done", map[string]any{"attempt": attempt, "verifyOk": rec.VerifyOK, "wallMs": repairWallMs})
+			break
+		}
+		// Advance the persistent verify worktree onto the repaired head in
+		// place — touches only the paths that differ — instead of tearing it
+		// down and re-materializing the whole tree with a fresh
+		// WorktreeAddDetached.
+		if cerr := g.At(wtPath).CheckoutDetach(ctx, head); cerr != nil {
+			lastOutput = tail(lastOutput+"\n[repair attempt "+fmt.Sprintf("%d", attempt)+" checkout error] "+cerr.Error(), 2000)
+			repairs = append(repairs, rec)
+			emit.emit("repair_done", map[string]any{"attempt": attempt, "verifyOk": rec.VerifyOK, "wallMs": repairWallMs})
+			break
+		}
 		changedSet := cell.NewWriteSet(changedFiles...)
 		for _, f := range touched {
 			changedSet.Add(f)
@@ -929,7 +993,7 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 		changedFiles = changedSet.Paths()
 		emit.emit("verify_start", map[string]any{"attempt": attempt})
 		vStart = time.Now()
-		rv := runVerifyRetry(ctx, g, head, p, changedFiles, p.VerifyRetries, p.LogDir, attempt)
+		rv := runVerifyRetry(ctx, g, wtPath, p, changedFiles, p.VerifyRetries, p.LogDir, attempt)
 		emit.emit("verify_done", map[string]any{"ok": rv.OK, "flaky": rv.Flaky, "attempt": attempt, "wallMs": time.Since(vStart).Milliseconds()})
 		lastOutput = rv.Output
 		lastScope = rv.Scope
@@ -959,25 +1023,25 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 	}, head
 }
 
-// runVerifyRetry runs -verify (or -verify-impact) on head via runVerify and,
-// on FAILURE, re-runs it up to retries more times on the SAME tree (head is
-// never re-integrated or re-checked-out to a different commit — only
-// re-verified) — passing on any green invocation. A pass on an invocation
-// after the first is flaky: -verify is supposed to be deterministic, so
-// retries are a mitigation for flaky test suites, not a license to skip
-// that; the flaky pass is surfaced via verifyJSON.Flaky rather than silently
-// reported as a clean first-try green. retries=0 reproduces the pre-existing
-// behavior exactly: one invocation, no retry, never flaky. When all retries
-// are exhausted, the last (failing) invocation's result is returned, same as
-// today. changedFiles is passed straight through to runVerify unchanged
-// across retries (same tree, same scope decision every invocation).
-// logAttempt names this logical verify attempt (0 = pre-repair, N = after
-// repair round N) for -logdir's verify-<n>.log; every retry within this call
-// appends to the same file (see openLog).
-func runVerifyRetry(ctx context.Context, g *gitx.Git, head string, p runParams, changedFiles []string, retries int, logDir string, logAttempt int) verifyJSON {
-	v := runVerify(ctx, g, head, p, changedFiles, logDir, logAttempt)
+// runVerifyRetry runs -verify (or -verify-impact) in wtPath via runVerify and,
+// on FAILURE, re-runs it up to retries more times on the SAME tree (wtPath's
+// checked-out commit never changes within this call — only re-verified) —
+// passing on any green invocation. A pass on an invocation after the first is
+// flaky: -verify is supposed to be deterministic, so retries are a mitigation
+// for flaky test suites, not a license to skip that; the flaky pass is
+// surfaced via verifyJSON.Flaky rather than silently reported as a clean
+// first-try green. retries=0 reproduces the pre-existing behavior exactly:
+// one invocation, no retry, never flaky. When all retries are exhausted, the
+// last (failing) invocation's result is returned, same as today. changedFiles
+// is passed straight through to runVerify unchanged across retries (same
+// tree, same scope decision every invocation). logAttempt names this logical
+// verify attempt (0 = pre-repair, N = after repair round N) for -logdir's
+// verify-<n>.log; every retry within this call appends to the same file (see
+// openLog).
+func runVerifyRetry(ctx context.Context, g *gitx.Git, wtPath string, p runParams, changedFiles []string, retries int, logDir string, logAttempt int) verifyJSON {
+	v := runVerify(ctx, g, wtPath, p, changedFiles, logDir, logAttempt)
 	for attempt := 0; !v.OK && attempt < retries; attempt++ {
-		v = runVerify(ctx, g, head, p, changedFiles, logDir, logAttempt)
+		v = runVerify(ctx, g, wtPath, p, changedFiles, logDir, logAttempt)
 		if v.OK {
 			v.Flaky = true
 		}
@@ -1312,28 +1376,34 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 	return a, true
 }
 
-// runVerify materializes finalSHA into a detached worktree and runs -verify
-// there — or, when -verify-impact is set and computeImpact can confidently
-// scope changedFiles down to a set of impacted Go packages, -verify-impact
-// instead (with SIGBOUND_IMPACTED_PKGS/SIGBOUND_CHANGED_FILES set). ANY doubt
-// (see computeImpact) falls back to running -verify untouched — this whole
-// scoping decision is a no-op, and Scope stays "" (never "full"), when
-// -verify-impact isn't configured at all, so a run without it behaves
-// byte-identically to before -verify-impact existed. The main working tree is
+// runVerify runs -verify inside wtPath — an ALREADY checked-out detached
+// worktree prepared by the caller (verifyWithRepair reuses the same one
+// across every retry and repair round in a run; see its doc) — or, when
+// -verify-impact is set and computeImpact can confidently scope changedFiles
+// down to a set of impacted Go packages, -verify-impact instead (with
+// SIGBOUND_IMPACTED_PKGS/SIGBOUND_CHANGED_FILES set). ANY doubt (see
+// computeImpact) falls back to running -verify untouched — this whole scoping
+// decision is a no-op, and Scope stays "" (never "full"), when -verify-impact
+// isn't configured at all, so a run without it behaves byte-identically to
+// before -verify-impact existed.
+//
+// Every invocation starts by resetting wtPath back to HEAD (git reset --hard,
+// see gitx.ResetHard) and cleaning it (git clean -fdx, see gitx.Clean) so
+// EITHER a modification to a tracked file OR an untracked build artifact left
+// by a PRIOR invocation reusing this same worktree (a retry, or an earlier
+// repair round's re-verify) can never leak into this one — the hermeticity
+// guarantee that makes worktree reuse safe. Reset alone would leave stray
+// untracked files, and clean alone would leave tracked-file edits in place
+// (see both functions' docs); this needs both. The main working tree is
 // never touched. logAttempt names the -logdir log file
 // (verify-<logAttempt>.log); see runVerifyRetry.
-func runVerify(ctx context.Context, g *gitx.Git, finalSHA string, p runParams, changedFiles []string, logDir string, logAttempt int) verifyJSON {
-	dir, err := os.MkdirTemp("", "sig-verify-*")
-	if err != nil {
-		return verifyJSON{Ran: true, OK: false, Output: err.Error()}
+func runVerify(ctx context.Context, g *gitx.Git, wtPath string, p runParams, changedFiles []string, logDir string, logAttempt int) verifyJSON {
+	if err := g.At(wtPath).ResetHard(ctx); err != nil {
+		return verifyJSON{Ran: true, OK: false, Output: "reset worktree: " + err.Error()}
 	}
-	defer os.RemoveAll(dir)
-
-	checkout := filepath.Join(dir, "wt")
-	if err := g.WorktreeAddDetached(ctx, checkout, finalSHA); err != nil {
-		return verifyJSON{Ran: true, OK: false, Output: "checkout " + finalSHA + ": " + err.Error()}
+	if err := g.At(wtPath).Clean(ctx); err != nil {
+		return verifyJSON{Ran: true, OK: false, Output: "clean worktree: " + err.Error()}
 	}
-	defer func() { _ = g.WorktreeRemove(ctx, checkout) }()
 
 	verifyCmd := p.VerifyCmd
 	var scope string
@@ -1341,7 +1411,7 @@ func runVerify(ctx context.Context, g *gitx.Git, finalSHA string, p runParams, c
 	var extraEnv []string
 	if strings.TrimSpace(p.VerifyImpactCmd) != "" {
 		scope = "full"
-		if pkgs, ok := computeImpact(ctx, checkout, changedFiles); ok {
+		if pkgs, ok := computeImpact(ctx, wtPath, changedFiles); ok {
 			scope = "impact"
 			impacted = pkgs
 			verifyCmd = p.VerifyImpactCmd
@@ -1353,7 +1423,7 @@ func runVerify(ctx context.Context, g *gitx.Git, finalSHA string, p runParams, c
 	}
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", verifyCmd)
-	cmd.Dir = checkout
+	cmd.Dir = wtPath
 	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
 	cmd.Env = append(os.Environ(), extraEnv...)
 	// Combined output, same as CombinedOutput(): both streams into one buffer
@@ -1369,7 +1439,7 @@ func runVerify(ctx context.Context, g *gitx.Git, finalSHA string, p runParams, c
 		cmd.Stdout = io.MultiWriter(&outBuf, bestEffortWriter{logf})
 		cmd.Stderr = cmd.Stdout
 	}
-	err = cmd.Run()
+	err := cmd.Run()
 	return verifyJSON{Ran: true, OK: err == nil, Scope: scope, ImpactedPkgs: impacted, Output: tail(outBuf.String(), 2000)}
 }
 
