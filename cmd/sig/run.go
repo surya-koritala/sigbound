@@ -142,17 +142,49 @@ type repairAttemptJSON struct {
 	VerifyOK     bool     `json:"verifyOk"`
 }
 
-// runReport is the full stdout contract of `sig run`.
+// runReport is the full stdout contract of `sig run` AND the manifest -manifest
+// writes to disk (see -manifest below) — one format, not two: the manifest is
+// simply this same report persisted, so a `sig replay` fed a -manifest file or
+// a `-json` report has identical fields to work from.
 type runReport struct {
-	Repo      string         `json:"repo"`
-	Base      string         `json:"base"`
-	BaseSHA   string         `json:"baseSHA"`
-	LaneMode  string         `json:"laneMode"` // lane enforcement mode: off|warn|strict
-	Tasks     []taskSpec     `json:"tasks"`
-	PerAgent  []perAgentJSON `json:"perAgent"`
-	Integrate integrateJSON  `json:"integrate"`
-	Verify    verifyJSON     `json:"verify"`
-	LogDir    string         `json:"logDir,omitempty"` // set iff -logdir was given; full per-command logs live here
+	Repo     string         `json:"repo"`
+	Base     string         `json:"base"`
+	BaseSHA  string         `json:"baseSHA"`
+	LaneMode string         `json:"laneMode"` // lane enforcement mode: off|warn|strict
+	Tasks    []taskSpec     `json:"tasks"`
+	PerAgent []perAgentJSON `json:"perAgent"`
+	// Strategy is the integration strategy this run was configured with (see
+	// -strategy). Duplicated at the top level even though Integrate.Strategy
+	// already carries the strategy actually applied, so a manifest/replay can
+	// read it without depending on integrate having run at all — e.g. a
+	// mid-run operational error before integrate still leaves this populated.
+	Strategy  string        `json:"strategy"`
+	Integrate integrateJSON `json:"integrate"`
+	Verify    verifyJSON    `json:"verify"`
+	LogDir    string        `json:"logDir,omitempty"` // set iff -logdir was given; full per-command logs live here
+	// AgentCmd/ResolverCmd/VerifyCmd/RepairCmd/PlannerCmd are the RESOLVED
+	// command strings this run actually executed (after -*-preset expansion
+	// and -config merging) — provenance for `sig replay` and for a human
+	// asking "what actually ran". These are redacted NOTHING: they're the
+	// user's own commands, verbatim, which can embed secrets (an API key
+	// baked into a -verify command, say) — see docs/USAGE.md's Provenance
+	// section. ResolverCmd/VerifyCmd/RepairCmd/PlannerCmd are empty (and
+	// omitted from JSON) whenever that slot wasn't configured; AgentCmd is
+	// always set (-agent is required).
+	AgentCmd    string `json:"agentCmd"`
+	ResolverCmd string `json:"resolverCmd,omitempty"`
+	VerifyCmd   string `json:"verifyCmd,omitempty"`
+	RepairCmd   string `json:"repairCmd,omitempty"`
+	PlannerCmd  string `json:"plannerCmd,omitempty"`
+	// Version is the sigbound version (see main.Version) that produced this
+	// report — a manifest replayed under a different version is still
+	// readable, but a version mismatch is a hint that strategy/verify
+	// semantics may have drifted between the two.
+	Version string `json:"version"`
+	// StartedAt is when driveRun began, RFC3339 (UTC) — part of the
+	// manifest's provenance: WHEN this ran, alongside WHAT ran (the commands
+	// above) and WHERE it landed (BaseSHA / Integrate.FinalSHA).
+	StartedAt string `json:"startedAt"`
 }
 
 // sig run exit codes. An operational error (bad flags, a git/integrate
@@ -202,6 +234,7 @@ type runParams struct {
 	Strategy        string
 	Assert          bool // paranoid overlay-vs-merge-tree cross-check (see cell.WithAssert)
 	AgentCmd        string
+	PlannerCmd      string // recorded on the report for provenance only; driveRun itself never plans — planning already happened by the time it's called
 	ResolverCmd     string
 	ResolverTimeout time.Duration
 	VerifyCmd       string
@@ -218,6 +251,7 @@ type runParams struct {
 	AgentTimeout    time.Duration // per-agent command timeout (0 = none); see runAgent
 	AgentRetries    int           // retry a FAILED agent (bad exit or -agent-timeout, never a lane-strict stray) up to this many more times; see runAgentWithRetries
 	Budget          time.Duration // wall-clock ceiling for the agent phase + integrate + verify (0 = none); see driveRun
+	Notes           bool          // when the run LANDS, attach the report as a git note under refs/notes/sigbound on the landed commit; see -notes and attachNote
 }
 
 // repairFailureMax bounds the captured verify output handed to the fixer agent
@@ -263,7 +297,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N]) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N]) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -342,6 +376,14 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	dryRun := fs.Bool("dry-run", false, "load/plan the tasks, print them plus the predicted OCC partition (group count, per-group tasks and files), then exit "+
 		"without creating any worktree or running any agent, verify, or repair command. With -goal the planner still runs (that's the point: see the plan before spending agent calls). "+
 		"-agent (and any other run flag) is still required but is never invoked. Exit code 0 on a valid plan; a bad plan or an unmet -min-tasks floor fails exactly as it would without -dry-run")
+	manifest := fs.String("manifest", "", "write the full JSON report (same shape as -json, see docs/USAGE.md's Provenance section) to FILE at the end of the run, independent of -json "+
+		"(which prints to stdout instead — set both to get either or both). FILE's directory is created if needed and must be writable, checked before any agent runs, same fail-fast "+
+		"policy as -logdir. A write failure AFTER the run completes is different: by then real work may already be landed on -base, so losing the manifest must never look like losing "+
+		"the run — that failure is best-effort, warned loudly on stderr, and never changes the exit code. Feed the file straight to sig replay's own -manifest flag")
+	notes := fs.Bool("notes", false, "when the run LANDS (the base ref actually advances), attach the full JSON report as a git note on the landed commit under the NAMESPACED "+
+		"ref refs/notes/sigbound (never git's default refs/notes/commits). Best-effort: a failure here is warned on stderr but never fails the run or changes its exit code, since "+
+		"landing has already happened by the time this runs. See docs/USAGE.md's Provenance section for how to read the note back and how to push it (notes do not push by default). "+
+		"Off by default")
 	asJSON := fs.Bool("json", false, "emit the full JSON report (default: a terse human summary)")
 
 	if err := fs.Parse(argv); err != nil {
@@ -413,6 +455,18 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	logDirAbs := strings.TrimSpace(*logDir)
 	if logDirAbs != "" {
 		if err := prepareLogDir(logDirAbs); err != nil {
+			return exitOperationalError, err
+		}
+	}
+
+	// -manifest is provenance, not a log: an unwritable path must fail the
+	// same way -logdir's does — before any agent runs — rather than silently
+	// losing the run's manifest after the work is already done. See
+	// prepareManifestPath and the best-effort write at the end of this
+	// function (writeManifest) for the other half of that split posture.
+	manifestPath := strings.TrimSpace(*manifest)
+	if manifestPath != "" {
+		if err := prepareManifestPath(manifestPath); err != nil {
 			return exitOperationalError, err
 		}
 	}
@@ -495,6 +549,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Strategy:        *strategy,
 		Assert:          *assert,
 		AgentCmd:        *agentCmd,
+		PlannerCmd:      *plannerCmd,
 		AgentTimeout:    *agentTimeout,
 		AgentRetries:    *agentRetries,
 		ResolverCmd:     *resolverCmd,
@@ -511,6 +566,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Budget:          *budget,
 		LogDir:          logDirAbs,
 		EventsPath:      *events,
+		Notes:           *notes,
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
 	if err != nil {
@@ -525,12 +581,18 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		// and must reach stderr unchanged.
 		if len(rep.PerAgent) > 0 {
 			_ = emitReport(w, rep, *asJSON)
+			if manifestPath != "" {
+				writeManifest(manifestPath, rep)
+			}
 		}
 		return exitOperationalError, err
 	}
 	code := runExitCode(rep)
 	if err := emitReport(w, rep, *asJSON); err != nil {
 		return exitOperationalError, err
+	}
+	if manifestPath != "" {
+		writeManifest(manifestPath, rep)
 	}
 	return code, nil
 }
@@ -738,7 +800,17 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if p.LaneMode == "" {
 		p.LaneMode = laneWarn // default when driven in-process without flag parsing
 	}
-	rep = runReport{Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks, LogDir: p.LogDir}
+	rep = runReport{
+		Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks, LogDir: p.LogDir,
+		Strategy:    p.Strategy,
+		AgentCmd:    p.AgentCmd,
+		ResolverCmd: p.ResolverCmd,
+		VerifyCmd:   p.VerifyCmd,
+		RepairCmd:   p.RepairCmd,
+		PlannerCmd:  p.PlannerCmd,
+		Version:     Version,
+		StartedAt:   runStart.UTC().Format(time.RFC3339),
+	}
 	emit.emit("run_start", map[string]any{"repo": p.Repo, "base": p.Base, "baseSHA": baseSHA, "tasks": tasks})
 	// Normally wtRoot (and every per-agent worktree under it) is torn down when
 	// the run ends. -keep-failed retains individual failed agents' worktrees
@@ -870,7 +942,30 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	}
 	rep.Integrate.FinalSHA = landSHA
 	emit.emit("land", map[string]any{"sha": landSHA})
+	// -notes: the landing already happened above, so a note failure below must
+	// never look like the run itself failed — see attachNote's doc.
+	if p.Notes {
+		attachNote(ctx, g, landSHA, rep)
+	}
 	return rep, nil
+}
+
+// attachNote records rep as a git note on the landed commit, namespaced under
+// refs/notes/sigbound (see gitx.NoteAdd — never git's default
+// refs/notes/commits, so sigbound's provenance record never collides with a
+// repo's own note usage). -notes only ever fires AFTER landing has already
+// happened (see driveRun's call site): a failure here must never look like
+// the run itself failed, so it's best-effort with a loud stderr warning, the
+// same posture as a -manifest write failure (writeManifest).
+func attachNote(ctx context.Context, g *gitx.Git, commit string, rep runReport) {
+	data, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: -notes: encode report: %v\n", err)
+		return
+	}
+	if err := g.NoteAdd(ctx, "sigbound", commit, data); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: -notes: attach note to %s: %v\n", short(commit), err)
+	}
 }
 
 // budgetAwareErr wraps err from a driveRun phase (integrate, land), naming
@@ -1571,6 +1666,46 @@ func sanitizeID(id string) string {
 		return "task"
 	}
 	return b.String()
+}
+
+// prepareManifestPath validates that -manifest's target file can be written,
+// before any agent runs — the same fail-early posture as -logdir
+// (prepareLogDir): a bad -manifest path must fail the run up front, never
+// silently lose the run's provenance after the work is already done. Unlike
+// -logdir (a directory of many logs), -manifest names one file: this creates
+// its PARENT directory (if needed) and probes writability with a throwaway
+// file dropped there, without touching the manifest path itself — nothing
+// should exist at path until the run actually finishes (see writeManifest).
+func prepareManifestPath(path string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("-manifest %s: %w", path, err)
+	}
+	probe, err := os.CreateTemp(dir, ".sigbound-manifest-check-*")
+	if err != nil {
+		return fmt.Errorf("-manifest %s is not writable: %w", path, err)
+	}
+	probe.Close()
+	os.Remove(probe.Name())
+	return nil
+}
+
+// writeManifest serializes rep as JSON to path (-manifest), independent of
+// -json (which prints to stdout). Unlike prepareManifestPath's early check
+// (which fails the WHOLE run before any agent runs), a failure HERE is
+// best-effort: by the time driveRun has returned, real work may already be
+// landed on -base, and losing the provenance record must never look like
+// losing the run itself — so a failure is only ever warned, loudly, on
+// stderr; it never changes the process exit code.
+func writeManifest(path string, rep runReport) {
+	data, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: -manifest %s: encode report: %v\n", path, err)
+		return
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: -manifest %s: %v\n", path, err)
+	}
 }
 
 // prepareLogDir creates dir (and its parents) for -logdir and confirms it is

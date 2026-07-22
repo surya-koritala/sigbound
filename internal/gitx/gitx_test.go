@@ -353,6 +353,45 @@ func TestOctopusMergeDisjoint(t *testing.T) {
 	}
 }
 
+// TestNoteAdd proves NoteAdd attaches content under the NAMESPACED ref (never
+// git's default refs/notes/commits), that it's readable back via the ordinary
+// `git notes --ref=... show` porcelain, and that a second call on the same
+// commit OVERWRITES rather than erroring or appending (the `-f` flag).
+func TestNoteAdd(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+
+	if err := g.NoteAdd(ctx, "sigbound", base, []byte(`{"v":1}`)); err != nil {
+		t.Fatalf("NoteAdd: %v", err)
+	}
+	got, err := g.run(ctx, "notes", "--ref=sigbound", "show", base)
+	if err != nil {
+		t.Fatalf("notes show: %v", err)
+	}
+	if got != `{"v":1}` {
+		t.Fatalf("note body=%q, want {\"v\":1}", got)
+	}
+
+	// A note under git's DEFAULT namespace must be untouched — NoteAdd is
+	// namespaced, never refs/notes/commits.
+	if _, _, code, _ := g.runRaw(ctx, "notes", "show", base); code == 0 {
+		t.Fatal("a note exists under the default refs/notes/commits namespace; NoteAdd must never touch it")
+	}
+
+	// Overwrite: a second NoteAdd on the SAME commit replaces the note body
+	// instead of erroring (git notes add without -f refuses when one exists).
+	if err := g.NoteAdd(ctx, "sigbound", base, []byte(`{"v":2}`)); err != nil {
+		t.Fatalf("NoteAdd (overwrite): %v", err)
+	}
+	got, err = g.run(ctx, "notes", "--ref=sigbound", "show", base)
+	if err != nil {
+		t.Fatalf("notes show after overwrite: %v", err)
+	}
+	if got != `{"v":2}` {
+		t.Fatalf("note body after overwrite=%q, want {\"v\":2}", got)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (func() bool {
 		for i := 0; i+len(sub) <= len(s); i++ {
