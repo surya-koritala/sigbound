@@ -334,6 +334,91 @@ func TestOverlayManyDisjoint(t *testing.T) {
 	}
 }
 
+// TestDiffNameOnlyBatchMatchesPerBranch is the correctness anchor for
+// DiffNameOnlyBatch: its result for every branch must equal what a per-branch
+// DiffNameOnly loop (the code path it replaces) would have produced, including
+// a branch with NO changes vs base (contributes no diff-tree block at all) and
+// a path containing spaces (must survive the -z NUL-delimited decode intact).
+func TestDiffNameOnlyBatchMatchesPerBranch(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "keep.txt", "k\n")
+	write(t, dir, "mod.txt", "orig\n")
+	write(t, dir, "gone.txt", "g\n")
+	base, err := g.CommitAll(ctx, "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	branchFrom(t, g, base, "h1", func(d string) {
+		write(t, d, "mod.txt", "changed\n")
+		write(t, d, "new dir/file with spaces.txt", "space\n")
+	})
+	branchFrom(t, g, base, "h2", func(d string) {
+		_ = os.Remove(filepath.Join(d, "gone.txt"))
+		write(t, d, "added.txt", "new\n")
+	})
+	branchFrom(t, g, base, "h3-nochange", func(d string) {})
+	// h4 spans TWO commits, so its write-set only matches base...head (not
+	// head's single most recent commit vs its immediate parent).
+	h4wt := filepath.Join(t.TempDir(), "h4-multi")
+	if err := g.WorktreeAdd(ctx, h4wt, "h4-multi", base); err != nil {
+		t.Fatal(err)
+	}
+	write(t, h4wt, "c1.txt", "c1\n")
+	if _, err := g.At(h4wt).CommitAll(ctx, "c1"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, h4wt, "c2.txt", "c2\n")
+	if _, err := g.At(h4wt).CommitAll(ctx, "c2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.WorktreeRemove(ctx, h4wt); err != nil {
+		t.Fatal(err)
+	}
+
+	branches := []string{"h1", "h2", "h3-nochange", "h4-multi"}
+
+	want := map[string][]string{}
+	for _, b := range branches {
+		paths, err := g.DiffNameOnly(ctx, base, b)
+		if err != nil {
+			t.Fatalf("DiffNameOnly(%s): %v", b, err)
+		}
+		sort.Strings(paths)
+		want[b] = paths
+	}
+
+	got, err := g.DiffNameOnlyBatch(ctx, base, branches)
+	if err != nil {
+		t.Fatalf("DiffNameOnlyBatch: %v", err)
+	}
+	if len(got) != len(branches) {
+		t.Fatalf("DiffNameOnlyBatch returned %d entries, want %d", len(got), len(branches))
+	}
+	for _, b := range branches {
+		gotPaths := append([]string(nil), got[b]...)
+		sort.Strings(gotPaths)
+		wantPaths := want[b]
+		if len(gotPaths) != len(wantPaths) {
+			t.Fatalf("branch %q: batched=%v, per-branch=%v", b, gotPaths, wantPaths)
+		}
+		for i := range gotPaths {
+			if gotPaths[i] != wantPaths[i] {
+				t.Fatalf("branch %q: batched=%v, per-branch=%v", b, gotPaths, wantPaths)
+			}
+		}
+	}
+	// The no-change branch must come back empty, not merely "absent".
+	if len(got["h3-nochange"]) != 0 {
+		t.Fatalf("h3-nochange write-set = %v, want empty", got["h3-nochange"])
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

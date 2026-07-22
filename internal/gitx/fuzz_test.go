@@ -87,6 +87,43 @@ func FuzzParseMergeTreeZ(f *testing.F) {
 	})
 }
 
+// FuzzParseDiffTreeStdinRawZ fuzzes the `git diff-tree --stdin -z --raw`
+// decoder (commit-id headers kept) that DiffNameOnlyBatch uses to segment one
+// combined run back into one write-set per branch.
+func FuzzParseDiffTreeStdinRawZ(f *testing.F) {
+	f.Add("")
+	f.Add("\x00")
+	f.Add(sha1a + "\x00")                                                         // header, no changes recorded (shouldn't happen in practice, but must not panic)
+	f.Add(sha1a + "\x00:100644 100644 " + sha1a + " " + sha1b + " M\x00a.go\x00") // one header, one entry
+	f.Add(sha1a + "\x00:100644 100644 " + sha1a + " " + sha1b + " M\x00a.go\x00" +
+		sha1b + "\x00:100644 000000 " + sha1a + " " + zeroOID + " D\x00b.go\x00") // two headers back to back
+	f.Add(":100644 100644 " + sha1a + " " + sha1b + " M\x00dangling-meta-before-header")  // meta with no preceding header
+	f.Add(sha1a + "\x00:onlytwo fields\x00path\x00")                                      // header + malformed meta (still just a marker to us)
+	f.Add(sha1a + "\x00:100644 100644 " + sha1a + " " + sha1b + " M\x00dangling-no-path") // dangling record after header
+	f.Add("\x00\x00\x00\x00")                                                             // all NULs
+	f.Add(sha1a + "\x00:100644 100644 " + sha1a + " " + sha1b + " M\x00\xff\xfe\x00")     // non-UTF8 path
+
+	f.Fuzz(func(t *testing.T, out string) {
+		blocks, err := parseDiffTreeStdinRawZ(out)
+		if err != nil {
+			return // a rejected malformed record is fine, as long as it did not panic
+		}
+		seen := map[string]int{}
+		for _, b := range blocks {
+			// A header is whatever field started the block; the parser's only
+			// invariant on it is "did not start with ':'" (checked before it's
+			// ever stored), so re-check that here too.
+			if strings.HasPrefix(b.Header, ":") {
+				t.Fatalf("block header %q looks like a meta record, not a header", b.Header)
+			}
+			seen[b.Header]++
+			for _, p := range b.Paths {
+				_ = p // paths are whatever followed a ':' meta record; any string is valid, just must not panic downstream
+			}
+		}
+	})
+}
+
 // FuzzParseBatchCheckLine fuzzes the `git cat-file --batch-check` line decoder.
 func FuzzParseBatchCheckLine(f *testing.F) {
 	f.Add("")
