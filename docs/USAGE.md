@@ -57,7 +57,7 @@ sig run -repo PATH -base BRANCH
 | `-repair-max` | `2` | Max repair attempts before reporting `verify.ok=false` honestly. |
 | `-lanes` | `warn` | Lane enforcement: `off`, `warn`, or `strict` (see [File lanes](#file-lanes)). |
 | `-no-autocommit` | `false` | Do **not** commit edits an agent left uncommitted. By default the driver stages and commits them, so edit-only agents still land. |
-| `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. |
+| `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. A kept worktree stays registered with git until you remove it: `git worktree remove <path>` (or `git worktree prune` after deleting the directory yourself). |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
 
 ### Determinism

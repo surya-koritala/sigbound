@@ -371,6 +371,35 @@ func TestDriveRunKeepFailed(t *testing.T) {
 	if len(entries3) != 0 {
 		t.Fatalf("want the successful agent's worktree root cleaned up under %s, found %v", tmp3, entries3)
 	}
+
+	// ---- out-of-lane under -lanes strict, -keep-failed: strict turns the stray
+	// into a failure, so it must be kept too, same as any other failed agent ----
+	_, repo4 := makeGoRepo(t)
+	tmp4 := t.TempDir()
+	t.Setenv("TMPDIR", tmp4)
+	strayAgent := buildTestAgent(t)
+	strayTask := taskSpec{ID: "stray", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{
+			"a.go": "package main\n\nfunc a() int { return 1 }\n",
+			"b.go": "package main\n\nfunc b() int { return 2 }\n",
+		},
+	}), Files: []string{"a.go"}}
+	p4 := runParams{Repo: repo4, Base: "main", Strategy: "overlay", AgentCmd: strayAgent, LaneMode: laneStrict, KeepFailed: true}
+	rep4, err := driveRun(ctx, p4, []taskSpec{strayTask})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	a4 := rep4.PerAgent[0]
+	if a4.OK {
+		t.Fatal("strict+keep-failed: out-of-lane agent must not be OK")
+	}
+	kept4 := a4.WorktreeKept
+	if kept4 == "" {
+		t.Fatal("strict+keep-failed: want worktreeKept set for an out-of-lane agent under -lanes strict")
+	}
+	if fi, err := os.Stat(kept4); err != nil || !fi.IsDir() {
+		t.Fatalf("kept worktree %s should still exist as a dir: %v", kept4, err)
+	}
 }
 
 // TestRunExitCode exercises the outcome->exit-code mapping directly (the
