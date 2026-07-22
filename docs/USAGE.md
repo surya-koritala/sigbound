@@ -33,7 +33,7 @@ sig run [-config PATH]
         [-strategy overlay] [-assert]
         [-resolver CMD] [-resolver-timeout D]
         [(-verify CMD | -verify-preset NAME) [-verify-retries N] [-verify-impact CMD]
-          [-verify-cache]
+          [-verify-cache] [-verify-bisect]
           [(-repair CMD | -repair-preset NAME) [-repair-max N]]]
         [-lanes off|warn|strict]
         [-no-autocommit]
@@ -75,6 +75,7 @@ sig run [-config PATH]
 | `-verify-retries` | `0` | After a FAILING `-verify` invocation, re-run it up to N more times on the same tree; passes on any green. A pass on a retry marks the report `flaky=true`. `0` = today's behavior. |
 | `-verify-impact` | — | Command run INSTEAD of `-verify` when Sigbound can confidently scope it to the impacted Go packages (see [Scoped verification](#scoped-verification)). Requires `-verify` (or `-verify-preset`), which stays the fallback on any doubt. |
 | `-verify-cache` | `false` | Cache a PASSING verify verdict and skip re-running the command on an exact repeat (see [Cache](#cache)). A FAILING verdict is never cached. Off by default. |
+| `-verify-bisect` | `false` | When the FULL combined tree fails verify (after `-repair` exhausts, if set), bisect the integration groups and land the largest subset whose combined tree still verifies GREEN (see [Verify bisect](#verify-bisect)). Dropped groups go to `integrate.droppedByBisect`, never `flagged`. Requires `-verify`. Off by default. |
 | `-repair` | — | Fixer command invoked when `-verify` fails; edits are committed and `-verify` re-runs. |
 | `-repair-preset` | — | Expand a named repair-harness preset (`claude`, `codex`, `aider`) into `-repair`'s command (see [Presets](#presets)). An explicit `-repair` always overrides its preset. |
 | `-repair-max` | `2` | Max repair attempts before reporting `verify.ok=false` honestly. |
@@ -220,9 +221,72 @@ a transient failure re-runs on the exact same commit, never a different one —
 not a license to ship a nondeterministic check. Every retried pass is surfaced
 honestly: the report's `verify.flaky` is `true` whenever a passing run needed
 a retry, so a flaky suite stays visible even though the run goes green.
-`verify-bisect` (planned) and `-verify-cache` (see [Cache](#cache)) both
-assume `-verify` is
-deterministic; an undocumented flaky command will confuse them.
+`-verify-bisect` (see [Verify bisect](#verify-bisect)) and `-verify-cache`
+(see [Cache](#cache)) both assume `-verify` is deterministic; an undocumented
+flaky command will confuse them.
+
+### Verify bisect
+
+`-verify` is all-or-nothing on the fully-merged tree: one broken agent turns
+the whole batch red and lands nothing. `-verify-bisect` turns that into an
+honest **partial land** — when the full tree fails, it finds the largest subset
+of the run's work that still verifies green and lands just that, dropping the
+rest.
+
+```bash
+sig run ... -verify 'go build ./... && go test ./...' -verify-bisect
+```
+
+**The atomic unit is the integration GROUP, not the branch.** The OCC
+partition already splits branches into mutually-disjoint groups by write-set
+overlap (see [Strategies](#strategies)); branches within a group are entangled
+(they touch shared paths), so bisect keeps or drops a whole group at a time,
+never an individual branch inside one. Recombining a subset is cheap: the
+per-group folded heads were already computed during integration, so a candidate
+subset is just an object-store overlay of those heads onto the base — no
+re-folding, no worktree churn beyond the verify checkout itself.
+
+**Strategy.** With **≤ 6 groups** each group is verified ALONE (at most `k`
+runs — precise, and it finds every individually-green group). With **more than
+6**, bisect binary-splits instead, to keep the probe count low on a batch with
+only a handful of bad groups.
+
+**The union-must-verify rule.** After the individually-green groups are
+identified, their **combined tree is verified once more** — and only if THAT
+passes does it land. This is the whole safety contract: the `-verify` gate
+applies to the *exact tree that lands*, never to a subset merely *assumed* good
+from probing its parts in isolation. So two groups that each pass alone but
+fail *together* (an interaction failure) land **NOTHING** — honestly reported,
+never a subset that was never verified as a whole. Likewise a batch where no
+group passes alone lands nothing.
+
+**Interplay with the other verify knobs:**
+
+- **`-repair` gets first shot.** Bisect is the *last* resort: the repair loop
+  runs against the whole combined tree first, and only if it can't make the
+  full tree green does bisect start carving. (Repair's throwaway fix commits are
+  discarded when bisect falls back to the original group heads.)
+- **`-verify-retries`** apply per candidate verify — a flaky probe re-runs on
+  its own candidate tree, same as a normal verify.
+- **`-verify-cache`** composes naturally and is a big win here: every candidate
+  tree is its own cache key, so repeated bisects (or a group that reappears
+  unchanged across runs) skip re-verifying trees already proven green.
+- **`-verify-impact`** scopes per candidate: each subset's impacted-package set
+  is computed from just that subset's branches' changed files.
+- **`-budget`** still bounds the whole thing; a budget-cancelled bisect lands
+  nothing and reports the exhausted budget, same as any other cancelled phase.
+
+**Cost warning.** Bisect trades verify runs for salvaged work. The `≤ 6`
+path is at most `k + 1` verifies; the binary-split path is bounded but, on a
+large batch where nearly every group is broken, can approach ~2k verifies
+(each of which may itself be a full build+test). Reserve `-verify-bisect` for
+batches where salvaging the good work is worth the extra verify time —
+`-verify-cache` blunts the cost sharply on repeated runs.
+
+**Exit code.** A bisect that lands a nonempty green subset exits **`0`** — but
+the summary and JSON report show every dropped group, so a partial land is
+never silent. A bisect that salvages nothing keeps exit **`3`** (verify
+failed), exactly like an un-bisected red run.
 
 ### Planning
 
@@ -426,13 +490,19 @@ on it instead of parsing stdout:
 | `0` | Landed and verified (or `-verify` was not set); `-publish` succeeded or was not set. |
 | `1` | Operational error (bad flags, a git/integrate failure, etc.). |
 | `2` | Usage error (bad top-level `sig` invocation). |
-| `3` | `-verify` failed; nothing landed. |
+| `3` | `-verify` failed; nothing landed. With `-verify-bisect`, this means bisect salvaged no green subset either. |
 | `4` | One or more branches flagged as conflicts (the rest landed). |
 | `5` | No agent succeeded. |
 | `6` | Landed (and verified), but `-publish` failed — see `publish` in the [JSON report](#json-report). |
 
 When a run matches more than one of these, the most severe wins, in this
 order: `1` > `3` > `5` > `4` > `6`.
+
+With `-verify-bisect`, a run that lands a nonempty green subset counts as
+"landed and verified" and exits `0` — the dropped groups appear in the report
+(`verify.bisect` and `integrate.droppedByBisect`) but don't raise the code (a
+dropped group is not a flagged conflict). Only a bisect that salvages nothing
+keeps exit `3`. See [Verify bisect](#verify-bisect).
 
 ### Provenance
 
@@ -840,13 +910,20 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   "integrate": {
     "strategy": "overlay", "groups": 3,
     "landed": ["…"], "flagged": [], "resolved": 0,
-    "finalSHA": "…", "wallMs": 12
+    "finalSHA": "…", "wallMs": 12,
+    "droppedByBisect": ["agent/…"]
   },
   "verify": {
     "ran": true, "ok": true, "attempts": 1, "repaired": false, "flaky": false,
     "scope": "impact", "impactedPkgs": ["./a", "./b"], "cached": false,
     "output": "…",
-    "repairs": [ { "n": 1, "filesTouched": ["…"], "verifyOk": true } ]
+    "repairs": [ { "n": 1, "filesTouched": ["…"], "verifyOk": true } ],
+    "bisect": {
+      "ran": true, "attempts": 4,
+      "landedGroups": [ ["agent/g0"], ["agent/g1"] ],
+      "droppedGroups": [ ["agent/g2"] ],
+      "output": "…"
+    }
   },
   "logDir": "…",
   "agentCmd": "…", "resolverCmd": "…", "verifyCmd": "…", "repairCmd": "…", "plannerCmd": "…",
@@ -872,6 +949,15 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   prior pass instead of actually running the command (see [Cache](#cache));
   always `false` when `-verify-cache` isn't set, and never `true` for a
   failing verdict.
+- `verify.bisect` is present iff `-verify-bisect` ran (the full tree failed
+  and there were ≥ 2 groups to bisect — see [Verify bisect](#verify-bisect)).
+  `landedGroups`/`droppedGroups` list the branch names per group that landed
+  vs. were dropped; `attempts` is the number of candidate verifies bisect made.
+  When bisect lands a subset, `verify.ok` is `true` and `integrate.landed` is
+  narrowed to that subset while the dropped groups' branches appear in
+  `integrate.droppedByBisect` (they are **not** conflicts, so never in
+  `integrate.flagged`). When it salvages nothing, `verify.ok` stays `false`,
+  `landedGroups` is empty, and every group is in `droppedGroups`.
 - `logDir` is present iff `-logdir` was set; it names the directory holding
   each command's full stdout+stderr log (see `-logdir` above).
 - `publish` is present iff `-publish` was set AND the run LANDED (see
@@ -916,6 +1002,9 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 | `verify_done` | `ok`, `flaky`, `cached`, `attempt`, `wallMs` | After each `-verify` invocation (including `-verify-retries`). `cached` is `true` on a `-verify-cache` hit, and `wallMs` is near-zero since the command never ran. |
 | `repair_start` | `attempt` | Before each `-repair` fixer invocation. |
 | `repair_done` | `attempt`, `verifyOk`, `wallMs` | After that round's fixer AND its follow-up `-verify` both finish; `wallMs` covers the fixer only. |
+| `bisect_start` | `groups` | Once, when `-verify-bisect` starts (the full tree failed and there are ≥ 2 groups). `groups` is the group count being bisected. |
+| `bisect_attempt` | `groups`, `ok` | After each candidate-subset verify. `groups` is the branch names per group in that candidate; `ok` is its verdict. |
+| `bisect_done` | `landed`, `dropped` | Once, when bisect finishes. `landed`/`dropped` are the branch names per group that landed vs. were dropped (`landed` empty when nothing was salvaged). |
 | `land` | `sha` | Once, right after the base ref advances (never emitted when nothing lands). |
 | `publish_start` | — | Once, right before the `-publish` command runs. Only emitted when `-publish` is set AND the run landed. |
 | `publish_done` | `ok`, `exit`, `wallMs` | Once, right after the `-publish` command finishes. |

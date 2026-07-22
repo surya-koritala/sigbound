@@ -100,6 +100,13 @@ type integrateJSON struct {
 	Resolved int           `json:"resolved"` // overlapping branches that still landed (auto-merged or resolver-resolved)
 	FinalSHA string        `json:"finalSHA"`
 	WallMs   int64         `json:"wallMs"`
+	// DroppedByBisect names the branches that integrated cleanly but were
+	// dropped by -verify-bisect because their group broke the combined tree's
+	// verify (see verifyBisect). These are NOT conflicts — they never enter
+	// Flagged — and Landed above already excludes them: on a bisect run, Landed
+	// reflects the FINAL landed subset, not the full pre-bisect set. Empty (and
+	// omitted from JSON) on any run where bisect didn't drop anything.
+	DroppedByBisect []string `json:"droppedByBisect,omitempty"`
 }
 
 // verifyJSON records whether/-how the -verify command fared on the integrated
@@ -139,6 +146,29 @@ type verifyJSON struct {
 	Cached       bool                `json:"cached,omitempty"`
 	Output       string              `json:"output"`
 	Repairs      []repairAttemptJSON `json:"repairs,omitempty"`
+	// Bisect records -verify-bisect's outcome (see verifyBisect), set only when
+	// -verify-bisect was configured AND the full combined tree failed verify (so
+	// bisect actually ran) — nil (omitted) otherwise. When bisect lands a green
+	// subset, OK above is true and this explains WHICH groups landed vs. dropped;
+	// when it salvages nothing, OK stays false and this reports every group as
+	// dropped.
+	Bisect *bisectJSON `json:"bisect,omitempty"`
+}
+
+// bisectJSON records a -verify-bisect run (see verifyBisect). Ran is always
+// true on a populated record. Attempts is the number of candidate-subset verify
+// invocations bisect made (the per-group probes plus the final union verify).
+// LandedGroups/DroppedGroups list the BRANCH NAMES per group — one inner slice
+// per integration group — that landed vs. were dropped; a run that salvaged
+// nothing has an empty LandedGroups and every group in DroppedGroups. Output is
+// the tail of the verify output for the tree that ultimately decided the run
+// (the winning union verify, or the last failing probe when nothing landed).
+type bisectJSON struct {
+	Ran           bool       `json:"ran"`
+	Attempts      int        `json:"attempts"`
+	LandedGroups  [][]string `json:"landedGroups"`
+	DroppedGroups [][]string `json:"droppedGroups"`
+	Output        string     `json:"output"`
 }
 
 // repairAttemptJSON is one turn of the repair loop: the fixer agent ran, the
@@ -272,6 +302,7 @@ type runParams struct {
 	VerifyImpactCmd string        // optional command run INSTEAD of -verify when computeImpact can confidently scope to the impacted Go packages; requires VerifyCmd, which stays the fallback on any doubt (see runVerify)
 	VerifyRetries   int           // re-run a FAILING -verify up to this many more times on the same tree before giving up (0 = today's behavior)
 	VerifyCache     bool          // skip -verify when its exact (tree OID, resolved command) pair already has a cached PASS; see verifycache.go. Off by default (opt-in)
+	VerifyBisect    bool          // when the FULL combined tree fails -verify (after -repair, if set), bisect the integration groups and land the largest subset that verifies green; see verifyBisect. Requires VerifyCmd. Off by default
 	RepairCmd       string        // fixer-agent command run when -verify fails (empty => no repair loop)
 	RepairMax       int           // max repair attempts before giving up honestly (default via flag)
 	Autocommit      bool          // commit an agent's uncommitted edits when it made no commit itself
@@ -349,7 +380,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset); -publish succeeded or was unset")
@@ -409,6 +440,12 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		"A FAILING verify is NEVER cached (fail-safe: a flaky environment must never pin a red, and a miss only ever costs a redundant re-run, never risks a wrong green) -- see docs/USAGE.md's Cache "+
 		"section. Entries live under .git/sigbound/verify-cache in the TARGET repo, never the working tree; 'rm -rf .git/sigbound' resets it. Off by default: -verify's rawness is the trust anchor, "+
 		"caching is opt-in")
+	verifyBisect := fs.Bool("verify-bisect", false, "when the FULL combined tree fails -verify (after the -repair loop exhausts, if -repair is set — repair gets first shot at the whole tree, "+
+		"bisect is the last resort), bisect over the integration GROUPS and land the largest subset whose combined tree still verifies GREEN, flagging the rest as dropped (report.integrate.droppedByBisect). "+
+		"Groups are the atomic unit (a group's branches are entangled by write-set overlap); subsets are recombined cheaply by re-overlaying the already-computed group heads. Strategy: try each group alone "+
+		"when there are <=6, else binary-split. The chosen subset's combined tree is ALWAYS re-verified green before it lands — an interaction failure among individually-green groups lands NOTHING (honest). "+
+		"Requires -verify (or -verify-preset). Composes with -repair/-verify-retries/-verify-cache/-verify-impact. A landed nonempty subset exits 0 (dropped groups shown in the report); landing nothing keeps "+
+		"exit 3. Cost warning: up to ~2k verify invocations on a large, badly-broken batch. See docs/USAGE.md's Verify bisect section. Off by default")
 	repairCmd := fs.String("repair", "", "optional self-healing fixer command (run via `sh -c`) invoked in a worktree at the integrated head when -verify FAILS; "+
 		"receives SIGBOUND_FAILURE (captured verify output) + SIGBOUND_REPO, edits files to fix the failure (the driver auto-commits them), then -verify re-runs. Looped up to -repair-max times")
 	repairPreset := fs.String("repair-preset", "", "expand a known repair-harness preset (claude|codex|aider) into -repair's sh -c command; an explicit -repair always overrides its preset. "+
@@ -527,6 +564,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	}
 	if strings.TrimSpace(*verifyImpactCmd) != "" && strings.TrimSpace(*verifyCmd) == "" {
 		return exitOperationalError, errors.New("-verify-impact requires -verify (or -verify-preset): it composes WITH -verify, which stays required as the fallback")
+	}
+	if *verifyBisect && strings.TrimSpace(*verifyCmd) == "" {
+		return exitOperationalError, errors.New("-verify-bisect requires -verify (or -verify-preset): it bisects over -verify's verdict on the combined tree")
 	}
 	if err := validateStrategy(*strategy); err != nil {
 		return exitOperationalError, err
@@ -659,6 +699,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		VerifyImpactCmd: *verifyImpactCmd,
 		VerifyRetries:   *verifyRetries,
 		VerifyCache:     *verifyCache,
+		VerifyBisect:    *verifyBisect,
 		RepairCmd:       *repairCmd,
 		RepairMax:       *repairMax,
 		Autocommit:      !*noAutocommit,
@@ -1114,7 +1155,24 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			if p.Budget > 0 && ctx.Err() != nil {
 				rep.Verify.Output = fmt.Sprintf("run budget (%s) exhausted before verify could complete\n%s", p.Budget, rep.Verify.Output)
 			}
-			return rep, nil // verify failed, no repair fixed it: land nothing
+			// -verify-bisect: last resort. The full combined tree (and any -repair
+			// on it) failed; try to salvage the largest subset of integration
+			// groups whose combined tree still verifies GREEN. Skipped when the
+			// budget already expired (a cancelled bisect could only land nothing)
+			// or when there are fewer than two landed groups to bisect (one group
+			// IS the full tree that just failed). verifyBisect mutates rep (Verify
+			// + Integrate) in place and returns the salvaged subset's landing
+			// commit; ok==false means it salvaged nothing, so land nothing exactly
+			// as an un-bisected failure would.
+			if p.VerifyBisect && ctx.Err() == nil && len(res.GroupHeads) >= 2 {
+				bLand, ok := verifyBisect(ctx, g, p, baseSHA, res, writeSets, emit, &rep)
+				if !ok {
+					return rep, nil // bisect salvaged no green subset: land nothing
+				}
+				landSHA = bLand // fall through to land the salvaged subset
+			} else {
+				return rep, nil // verify failed, no repair/bisect fixed it: land nothing
+			}
 		}
 	}
 	if err := g.UpdateRef(ctx, "refs/heads/"+p.Base, landSHA); err != nil {
@@ -1398,6 +1456,242 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 		Output:       lastOutput,
 		Repairs:      repairs,
 	}, head
+}
+
+// bisectAloneMax is the group-count threshold at or below which -verify-bisect
+// probes each group ALONE (k verifies) instead of binary-splitting. At or below
+// it the linear scan is both cheaper and more precise (it finds every
+// individually-green group); above it the binary split trades that precision for
+// far fewer probes on a batch with only a handful of bad groups.
+const bisectAloneMax = 6
+
+// verifyBisect is -verify-bisect's last resort, reached only after the FULL
+// combined tree failed -verify and any -repair on it was already exhausted. The
+// integration groups (res.GroupHeads / res.GroupBranches — the disjoint folded
+// heads that combined into the failed tree) are the atomic unit: a group's
+// branches are entangled by write-set overlap, so a group is kept or dropped
+// WHOLE, never split down to individual branches. It re-overlays SUBSETS of the
+// already-computed group heads (a cheap object-store OverlayTrees, no re-fold)
+// and runs -verify on each candidate tree to find the individually-green groups,
+// then re-verifies their UNION exactly once — the precise tree that would land.
+// Only a green union lands; an interaction failure among individually-green
+// groups (or no green group at all) lands NOTHING, honestly — the -verify gate
+// still applies to the EXACT tree that lands, never a subset assumed good.
+//
+// It mutates rep in place: rep.Verify.Bisect is always set. On a successful
+// salvage it flips rep.Verify.OK true, narrows rep.Integrate.Landed to the
+// landed subset, routes the dropped groups' branches to
+// rep.Integrate.DroppedByBisect (never Flagged — a dropped group is not a
+// conflict), and sets rep.Integrate.FinalSHA to the subset commit — returning
+// that commit and true. On no salvage it returns ("", false) with rep.Verify.OK
+// left false (so the run keeps exit 3). base is the pinned base commit the heads
+// overlay onto; writeSets (branch -> paths) scopes -verify-impact per candidate.
+//
+// -verify-cache/-verify-retries/-verify-impact compose per candidate: each
+// candidate tree is its own cache key, its own retry unit, and its own impact
+// scope (unionWriteSet narrows -verify-impact's changed-file set to just the
+// subset's branches).
+func verifyBisect(ctx context.Context, g *gitx.Git, p runParams, base string, res cell.IntegrationResult, writeSets map[string][]string, emit *eventEmitter, rep *runReport) (string, bool) {
+	heads := res.GroupHeads
+	branches := res.GroupBranches
+	k := len(heads)
+
+	emit.emit("bisect_start", map[string]any{"groups": k})
+	bj := &bisectJSON{Ran: true, LandedGroups: [][]string{}, DroppedGroups: [][]string{}}
+	rep.Verify.Bisect = bj
+
+	// One reusable detached worktree, advanced onto each candidate in turn
+	// (reset+clean+CheckoutDetach between, exactly like verifyWithRepair's repair
+	// loop), instead of a fresh O(repo) checkout per probe.
+	dir, err := os.MkdirTemp("", "sig-bisect-*")
+	if err != nil {
+		return bisectSalvagedNothing(rep, branches, bj, "bisect worktree: "+err.Error(), emit)
+	}
+	defer os.RemoveAll(dir)
+	wtPath := filepath.Join(dir, "wt")
+	if err := g.WorktreeAddDetached(ctx, wtPath, base); err != nil {
+		return bisectSalvagedNothing(rep, branches, bj, "bisect checkout "+short(base)+": "+err.Error(), emit)
+	}
+	defer func() { _ = g.WorktreeRemove(ctx, wtPath) }()
+
+	// eval overlays a subset of group heads onto base, commits, and verifies that
+	// candidate tree, recording the attempt count, last commit, and last output
+	// for the report. It returns the candidate's green/red verdict for the search.
+	attempts := 0
+	var lastCommit, lastOutput string
+	eval := func(subset []int) bool {
+		attempts++
+		subHeads := make([]string, len(subset))
+		var subBranches []string
+		subGroups := make([][]string, len(subset))
+		for i, gi := range subset {
+			subHeads[i] = heads[gi]
+			subBranches = append(subBranches, branches[gi]...)
+			subGroups[i] = branches[gi]
+		}
+		commit, cerr := overlayCandidate(ctx, g, base, subHeads)
+		if cerr != nil {
+			lastOutput = "bisect overlay: " + cerr.Error()
+			emit.emit("bisect_attempt", map[string]any{"groups": subGroups, "ok": false})
+			return false
+		}
+		lastCommit = commit
+		v := verifyCandidate(ctx, g, wtPath, p, commit, unionWriteSet(subBranches, writeSets), attempts)
+		lastOutput = v.Output
+		emit.emit("bisect_attempt", map[string]any{"groups": subGroups, "ok": v.OK})
+		return v.OK
+	}
+
+	good := bisectGoodGroups(eval, k)
+	// Re-verify the union of the individually-green groups — the EXACT tree that
+	// would land — before landing anything. Short-circuits when nothing was green.
+	unionOK := len(good) > 0 && eval(good)
+	bj.Attempts = attempts
+
+	if !unionOK {
+		return bisectSalvagedNothing(rep, branches, bj, lastOutput, emit)
+	}
+
+	// Salvage: land the union subset. Narrow the report to the landed subset and
+	// route the dropped groups' branches to DroppedByBisect (never Flagged).
+	goodSet := make(map[int]bool, len(good))
+	for _, gi := range good {
+		goodSet[gi] = true
+	}
+	var landedBranches, droppedBranches []string
+	for gi := range branches {
+		if goodSet[gi] {
+			bj.LandedGroups = append(bj.LandedGroups, branches[gi])
+			landedBranches = append(landedBranches, branches[gi]...)
+		} else {
+			bj.DroppedGroups = append(bj.DroppedGroups, branches[gi])
+			droppedBranches = append(droppedBranches, branches[gi]...)
+		}
+	}
+	bj.Output = tail(lastOutput, 2000)
+	rep.Verify.OK = true
+	rep.Verify.Output = bj.Output
+	rep.Integrate.Landed = landedBranches
+	rep.Integrate.DroppedByBisect = droppedBranches
+	rep.Integrate.FinalSHA = lastCommit
+	emit.emit("bisect_done", map[string]any{"landed": bj.LandedGroups, "dropped": bj.DroppedGroups})
+	return lastCommit, true
+}
+
+// bisectSalvagedNothing finalizes a -verify-bisect run that landed no subset:
+// every group is dropped (LandedGroups empty, DroppedGroups = all), the report
+// lands nothing (Integrate.Landed emptied, DroppedByBisect = all branches), and
+// rep.Verify.OK is left false so the run keeps exit 3. output is the tail of the
+// verify output that decided the run (a probe failure, an interaction failure,
+// or a git error). Returns ("", false) for verifyBisect to relay.
+func bisectSalvagedNothing(rep *runReport, branches [][]string, bj *bisectJSON, output string, emit *eventEmitter) (string, bool) {
+	bj.LandedGroups = [][]string{}
+	bj.DroppedGroups = [][]string{}
+	var dropped []string
+	for _, grp := range branches {
+		bj.DroppedGroups = append(bj.DroppedGroups, grp)
+		dropped = append(dropped, grp...)
+	}
+	bj.Output = tail(output, 2000)
+	rep.Integrate.Landed = []string{}
+	rep.Integrate.DroppedByBisect = dropped
+	emit.emit("bisect_done", map[string]any{"landed": [][]string{}, "dropped": bj.DroppedGroups})
+	return "", false
+}
+
+// bisectGoodGroups returns the indices of the integration groups -verify-bisect
+// found individually GREEN, driving the eval closure (overlay a subset's heads,
+// verify the resulting tree). For a small group count it probes each group ALONE
+// (k verifies, precise); above bisectAloneMax it binary-splits to bound the
+// probe count on a batch with only a few bad groups. The caller ALWAYS
+// re-verifies the union of the returned set before landing, so this is a search
+// heuristic, not the safety gate.
+func bisectGoodGroups(eval func(subset []int) bool, k int) []int {
+	all := make([]int, k)
+	for i := range all {
+		all[i] = i
+	}
+	if k <= bisectAloneMax {
+		var good []int
+		for _, i := range all {
+			if eval([]int{i}) {
+				good = append(good, i)
+			}
+		}
+		return good
+	}
+	// Binary split: the full set is already known red (that's why bisect ran),
+	// so descend straight into its halves rather than re-testing the whole.
+	mid := k / 2
+	return append(splitGood(eval, all[:mid]), splitGood(eval, all[mid:])...)
+}
+
+// splitGood isolates the green groups within subset by divide-and-conquer: a
+// subset that verifies green is kept whole; a red subset of size >1 is halved
+// and each half searched; a lone red group is dropped.
+//
+// ponytail: worst case (every group red) degrades to ~2k probes — a stricter
+// ddmin would bound it tighter; add that only if huge, mostly-broken batches
+// actually show up. The caller's final union re-verify keeps this SAFE
+// regardless of how imprecise the search is.
+func splitGood(eval func([]int) bool, subset []int) []int {
+	if len(subset) == 0 {
+		return nil
+	}
+	if eval(subset) {
+		return subset
+	}
+	if len(subset) == 1 {
+		return nil
+	}
+	mid := len(subset) / 2
+	return append(splitGood(eval, subset[:mid]), splitGood(eval, subset[mid:])...)
+}
+
+// overlayCandidate builds a -verify-bisect candidate commit: overlay the given
+// disjoint group heads onto base in the object store (no worktree) and wrap the
+// union tree in a commit whose parents are base plus each head — the same shape
+// IntegrateOverlay's combine produces, so the candidate is a real, landable
+// commit if it verifies green.
+func overlayCandidate(ctx context.Context, g *gitx.Git, base string, heads []string) (string, error) {
+	tree, err := g.OverlayTrees(ctx, base, heads)
+	if err != nil {
+		return "", err
+	}
+	return g.CommitTree(ctx, tree, append([]string{base}, heads...), "sigbound: verify-bisect candidate")
+}
+
+// verifyCandidate advances the reused bisect worktree onto commit and runs
+// -verify there (with -verify-retries/-verify-cache/-verify-impact applied via
+// runVerifyRetry). The reset+clean before CheckoutDetach clears the PRIOR
+// candidate's tracked edits / untracked leftovers — CheckoutDetach only touches
+// paths that differ between commits, so a stale mutation on an untouched path
+// would otherwise ride through — mirroring verifyWithRepair's repair-round
+// hygiene. logAttempt names the -logdir verify log for this probe.
+func verifyCandidate(ctx context.Context, g *gitx.Git, wtPath string, p runParams, commit string, changedFiles []string, logAttempt int) verifyJSON {
+	if err := g.At(wtPath).ResetHard(ctx); err != nil {
+		return verifyJSON{Ran: true, OK: false, Output: "reset worktree: " + err.Error()}
+	}
+	if err := g.At(wtPath).Clean(ctx); err != nil {
+		return verifyJSON{Ran: true, OK: false, Output: "clean worktree: " + err.Error()}
+	}
+	if err := g.At(wtPath).CheckoutDetach(ctx, commit); err != nil {
+		return verifyJSON{Ran: true, OK: false, Output: "checkout " + short(commit) + ": " + err.Error()}
+	}
+	return runVerifyRetry(ctx, g, wtPath, p, changedFiles, p.VerifyRetries, p.LogDir, logAttempt)
+}
+
+// unionWriteSet is the union of the write-sets of the given branches, dedup+
+// sorted (cell.WriteSet does both) — a candidate subset's changed-file set for
+// -verify-impact scoping. Branches missing from writeSets contribute nothing.
+func unionWriteSet(branches []string, writeSets map[string][]string) []string {
+	cs := cell.NewWriteSet()
+	for _, b := range branches {
+		for _, f := range writeSets[b] {
+			cs.Add(f)
+		}
+	}
+	return cs.Paths()
 }
 
 // runVerifyRetry runs -verify (or -verify-impact) in wtPath via runVerify and,
@@ -1941,6 +2235,9 @@ func writeRunSummary(w io.Writer, r runReport) error {
 	for _, f := range r.Integrate.Flagged {
 		fmt.Fprintf(w, "  flagged %s on %v\n", f.Branch, f.Paths)
 	}
+	if len(r.Integrate.DroppedByBisect) > 0 {
+		fmt.Fprintf(w, "  dropped by bisect: %v\n", r.Integrate.DroppedByBisect)
+	}
 	if r.Verify.Ran {
 		v := "PASS"
 		if !r.Verify.OK {
@@ -1969,6 +2266,13 @@ func writeRunSummary(w io.Writer, r runReport) error {
 				outcome = "PASS"
 			}
 			fmt.Fprintf(w, "  repair #%d: touched=%v verify=%s\n", a.N, a.FilesTouched, outcome)
+		}
+		if b := r.Verify.Bisect; b != nil {
+			fmt.Fprintf(w, "  bisect: %d probe(s), landed %d group(s), dropped %d group(s)\n",
+				b.Attempts, len(b.LandedGroups), len(b.DroppedGroups))
+			for _, grp := range b.DroppedGroups {
+				fmt.Fprintf(w, "    dropped group: %v\n", grp)
+			}
 		}
 	}
 	return nil
