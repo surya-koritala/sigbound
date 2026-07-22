@@ -4563,6 +4563,23 @@ func TestRunRunEnvModeRejectsUnknownValue(t *testing.T) {
 	}
 }
 
+// TestRunRunEnvAgentRejectsBareStar: a bare "*" in any slot's -env-*
+// allowlist is rejected before any agent runs, naming the offending flag —
+// it would otherwise silently pass NOTHING at runtime (see
+// TestSlotEnvScopedBareStarMatchesNothing), which looks like "pass
+// everything" to whoever wrote it and fails open with no error either way.
+func TestRunRunEnvAgentRejectsBareStar(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	var buf bytes.Buffer
+	_, err := runRun(&buf, []string{
+		"-repo", repo, "-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent", "true", "-env-mode", "scoped", "-env-agent", "*",
+	})
+	if err == nil || !strings.Contains(err.Error(), "-env-agent") {
+		t.Fatalf("err=%v, want an -env-agent complaint", err)
+	}
+}
+
 // TestRunRunEnvModeAndAllowlistFlagsWireIntoReport: -env-mode/-env-agent
 // parsed off argv reach runParams (proven end-to-end: the agent only sees
 // the canary because -env-agent named it) and -env-mode is recorded on the

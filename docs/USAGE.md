@@ -952,6 +952,13 @@ this: each slot gets only what it's told to get.
    allowlist says what's PERMITTED, not what's REQUIRED. Nothing else from
    the parent environment reaches the command.
 
+**The `GIT_*` family is broader than strict least-privilege**: it passes
+through as part of the base env on every slot, unconditionally, so that
+ordinary `git` usage keeps working — which also means any git credential
+helper configured via `GIT_ASKPASS`, `GIT_SSH_COMMAND`, etc. rides along too.
+If a slot must not have git credentials, don't rely on `-env-mode scoped`
+alone to withhold them.
+
 **It's per slot**, not global: an allowlisted name reaches only the flag it
 was given on. Giving `-agent` a key never exposes it to `-verify`, `-repair`,
 or any other slot unless that slot's OWN `-env-*` flag names it too.

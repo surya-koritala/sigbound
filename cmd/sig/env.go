@@ -31,6 +31,23 @@ func validateEnvMode(m string) error {
 	}
 }
 
+// validateEnvAllow rejects a bare "*" entry (or, equivalently, any entry
+// whose glob prefix is empty once the trailing "*" is cut) in a slot's
+// -env-* allowlist. permitted() below now treats an empty prefix as
+// matching nothing, so a bare "*" is inert rather than a leak -- but an
+// allowlist that silently does nothing is its own bug: whoever wrote
+// "-env-agent '*'" meant "pass everything" and got "pass nothing" instead,
+// with no error either way. Reject it loudly here, before any command runs,
+// naming the flag it came from so the fix is obvious.
+func validateEnvAllow(flag string, allow []string) error {
+	for _, a := range allow {
+		if rest, ok := strings.CutSuffix(a, "*"); ok && rest == "" {
+			return fmt.Errorf("%s: bare '*' would pass the entire environment; list variable names or NAME_* families", flag)
+		}
+	}
+	return nil
+}
+
 // baseEnvNames are the fixed variable names a scoped slot's command gets
 // regardless of that slot's -env-* allowlist: the minimum needed to find an
 // interpreter, resolve paths, and behave sanely (home dir, locale,
@@ -80,7 +97,13 @@ func slotEnv(mode string, allow []string, sigboundVars []string) []string {
 		}
 		for _, a := range allow {
 			if rest, ok := strings.CutSuffix(a, "*"); ok {
-				if strings.HasPrefix(name, rest) {
+				// A bare "*" cuts to an empty prefix -- HasPrefix(name, "")
+				// is true for every name, which would silently pass the
+				// entire parent environment. An empty prefix matches
+				// nothing instead; validateEnvAllow rejects a bare "*"
+				// outright at flag validation, so this is a second,
+				// independent guard on the same rule.
+				if rest != "" && strings.HasPrefix(name, rest) {
 					return true
 				}
 			} else if name == a {

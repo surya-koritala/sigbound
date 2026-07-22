@@ -22,6 +22,13 @@ type Task func(ctx context.Context, dir string) error
 // ShellTask adapts a shell command line into a Task. The command runs with the
 // worktree as its working directory. (Provided to demonstrate pluggability; the
 // benchmark uses in-process Tasks to keep timing about git, not shells.)
+//
+// Unused demo code today: cmd.Env is left nil, so exec.Cmd inherits the
+// FULL parent environment (os/exec's default when Env is nil), same as
+// cmd/sig's -env-mode inherit. Do not wire this into any scoped or hosted
+// path without first routing it through cmd/sig's slotEnv (see
+// cmd/sig/env.go) -- otherwise every secret the host process can see
+// leaks into whatever command line lands here.
 func ShellTask(cmdline string) Task {
 	return func(ctx context.Context, dir string) error {
 		cmd := exec.CommandContext(ctx, "sh", "-c", cmdline)

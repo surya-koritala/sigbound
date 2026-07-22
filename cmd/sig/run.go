@@ -612,6 +612,27 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	if err := validateEnvMode(*envMode); err != nil {
 		return exitOperationalError, err
 	}
+	// A bare "*" in any slot's -env-* allowlist is rejected here, before
+	// anything runs, regardless of -env-mode -- see validateEnvAllow. This
+	// catches the mistake even on a run started with -env-mode inherit
+	// (where -env-* is otherwise ignored) so it doesn't lie dormant until
+	// someone later flips to scoped and gets silent fail-open instead of
+	// the loud error they'd expect.
+	for _, slot := range []struct {
+		flag string
+		val  string
+	}{
+		{"-env-agent", *envAgent},
+		{"-env-resolver", *envResolver},
+		{"-env-verify", *envVerify},
+		{"-env-repair", *envRepair},
+		{"-env-planner", *envPlanner},
+		{"-env-publish", *envPublish},
+	} {
+		if err := validateEnvAllow(slot.flag, splitCSV(slot.val)); err != nil {
+			return exitOperationalError, err
+		}
+	}
 	// Cheap preflight: git present + version >= 2.38, before touching the repo
 	// or spawning any agent. The engine hard-depends on merge-tree/overlay
 	// plumbing that only exists from 2.38 onward; catching that here turns a

@@ -118,6 +118,38 @@ func TestSlotEnvScopedSigboundVarsAlwaysWin(t *testing.T) {
 	}
 }
 
+// TestSlotEnvScopedBareStarMatchesNothing: a bare "*" allowlist entry must
+// NOT degenerate into "pass everything" (CutSuffix("*", "*") yields an empty
+// prefix, and HasPrefix(name, "") is true for every name) -- permitted()
+// treats an empty prefix as matching nothing, so a bare "*" passes through
+// only the fixed base env, same as no allowlist at all. This is the runtime
+// half of the fix; validateEnvAllow (TestValidateEnvAllowRejectsBareStar)
+// is the other half, rejecting a bare "*" outright before any command runs.
+func TestSlotEnvScopedBareStarMatchesNothing(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	got := slotEnv(envModeScoped, []string{"*"}, nil)
+	if hasVar(got, "SIGBOUND_TEST_CANARY") {
+		t.Fatalf("bare '*' allowlist entry leaked the full parent environment: %v", got)
+	}
+	if !hasVar(got, "PATH") {
+		t.Fatalf("scoped env dropped PATH (base env should always survive when set): %v", got)
+	}
+}
+
+func TestValidateEnvAllowRejectsBareStar(t *testing.T) {
+	if err := validateEnvAllow("-env-agent", []string{"*"}); err == nil {
+		t.Fatal("bare '*': want error, got nil")
+	} else if !strings.Contains(err.Error(), "-env-agent") {
+		t.Errorf("error %q does not name the offending flag", err)
+	}
+	if err := validateEnvAllow("-env-agent", []string{"ANTHROPIC_API_KEY", "ANTHROPIC_*"}); err != nil {
+		t.Errorf("legitimate allowlist rejected: %v", err)
+	}
+	if err := validateEnvAllow("-env-agent", nil); err != nil {
+		t.Errorf("empty allowlist rejected: %v", err)
+	}
+}
+
 func TestValidateEnvMode(t *testing.T) {
 	if err := validateEnvMode(envModeInherit); err != nil {
 		t.Errorf("inherit: %v", err)
