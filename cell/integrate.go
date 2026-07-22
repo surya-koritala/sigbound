@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -258,33 +259,54 @@ func (in *Integrator) IntegrateOCC(ctx context.Context, base string, changes []B
 }
 
 // fold sequentially merges changes onto acc (starting from acc, with mergeBase
-// as the common ancestor) using in-memory merge-tree. Each landed branch extends
-// the accumulator via commit-tree; conflicts are flagged and skipped. Returns
-// the head commit plus per-branch outcomes.
+// as the common ancestor) using in-memory merge-tree. The accumulator is kept
+// as a bare TREE OID for the whole loop — merge-tree accepts tree-ish for both
+// sides, only --merge-base needs a commit, and that's mergeBase itself, which
+// is fixed for every step here (never recomputed) — so no intermediate
+// commit-tree is needed to carry it forward. Exactly ONE commit is created, at
+// the end, wrapping the fully-folded tree with acc and every landed branch as
+// parents: the group head. When acc == mergeBase (true for every caller today)
+// the very first landed branch is a no-op merge — ours has no divergence from
+// base, so the result is trivially theirs' tree and can never conflict — so
+// that redundant merge-tree call is skipped in favor of a plain tree lookup.
+// Conflicts are flagged and skipped, never folded into the accumulator.
+// Returns the head commit plus per-branch outcomes.
 func (in *Integrator) fold(ctx context.Context, mergeBase, acc string, changes []BranchChange, msgPrefix string) (head string, landed []string, flagged []BranchResult, autoMerged int, err error) {
-	head = acc
+	if len(changes) == 0 {
+		return acc, nil, nil, 0, nil
+	}
 	landedPaths := NewWriteSet()
+	tree := acc // tree accumulator; valid once the first branch lands
 	for _, bc := range changes {
-		mt, err := in.g.MergeTree(ctx, mergeBase, head, bc.Branch)
-		if err != nil {
-			return "", nil, nil, 0, fmt.Errorf("%s merge-tree %s: %w", msgPrefix, bc.Branch, err)
+		var mt gitx.MergeTreeResult
+		if len(landed) == 0 && acc == mergeBase {
+			// ours == merge-base: no divergence on our side, so the merge is
+			// trivially theirs' tree and cannot conflict. Skip merge-tree.
+			t, terr := in.g.TreeOID(ctx, bc.Branch)
+			if terr != nil {
+				return "", nil, nil, 0, fmt.Errorf("%s tree of %s: %w", msgPrefix, bc.Branch, terr)
+			}
+			mt = gitx.MergeTreeResult{Tree: t, OK: true}
+		} else {
+			mt, err = in.g.MergeTree(ctx, mergeBase, tree, bc.Branch)
+			if err != nil {
+				return "", nil, nil, 0, fmt.Errorf("%s merge-tree %s: %w", msgPrefix, bc.Branch, err)
+			}
 		}
-		tree := mt.Tree
-		resolvedMsg := ""
+		outTree := mt.Tree
 		if !mt.OK {
 			// Real conflict. With no resolver (or a resolver that declines/errors
 			// on any path) this branch is flagged for a human — main is never
 			// touched. Only a resolution covering EVERY conflicted path lands.
-			resolvedTree, ok, err := in.attemptResolve(ctx, mergeBase, head, bc.Branch, mt)
-			if err != nil {
-				return "", nil, nil, 0, fmt.Errorf("%s resolve %s: %w", msgPrefix, bc.Branch, err)
+			resolvedTree, ok, rerr := in.attemptResolve(ctx, mergeBase, tree, bc.Branch, mt)
+			if rerr != nil {
+				return "", nil, nil, 0, fmt.Errorf("%s resolve %s: %w", msgPrefix, bc.Branch, rerr)
 			}
 			if !ok {
 				flagged = append(flagged, BranchResult{Branch: bc.Branch, Conflicts: mt.Conflicts})
 				continue
 			}
-			tree = resolvedTree
-			resolvedMsg = " (resolved)"
+			outTree = resolvedTree
 		}
 		if bc.WriteSet.Overlaps(landedPaths) {
 			autoMerged++
@@ -292,12 +314,15 @@ func (in *Integrator) fold(ctx context.Context, mergeBase, acc string, changes [
 		for _, p := range bc.WriteSet.Paths() {
 			landedPaths.Add(p)
 		}
-		next, err := in.g.CommitTree(ctx, tree, []string{head, bc.Branch}, msgPrefix+resolvedMsg+": "+bc.Branch)
-		if err != nil {
-			return "", nil, nil, 0, fmt.Errorf("%s commit-tree: %w", msgPrefix, err)
-		}
-		head = next
+		tree = outTree
 		landed = append(landed, bc.Branch)
+	}
+	if len(landed) == 0 {
+		return acc, landed, flagged, autoMerged, nil
+	}
+	head, err = in.g.CommitTree(ctx, tree, append([]string{acc}, landed...), msgPrefix+": "+strings.Join(landed, ", "))
+	if err != nil {
+		return "", nil, nil, 0, fmt.Errorf("%s commit-tree: %w", msgPrefix, err)
 	}
 	return head, landed, flagged, autoMerged, nil
 }
