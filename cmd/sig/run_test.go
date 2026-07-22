@@ -3255,3 +3255,308 @@ func TestRunRunNotesOffByDefaultAttachesNothing(t *testing.T) {
 		t.Fatalf("a sigbound note exists despite -notes never being passed: %s", out)
 	}
 }
+
+// markerAgentCmd returns a shell -agent command that, on every invocation,
+// first appends one line to <markerDir>/<task id>.log — regardless of
+// success or failure — so a test can prove exactly how many times each
+// task's agent actually ran. Task "c" fails the FIRST time it runs (its own
+// marker log is still empty at that point) and succeeds every time after,
+// so the very same command string works unmodified across an initial run
+// and a -resume of it, exactly as an operator would actually reuse -agent.
+// Every task that doesn't deliberately fail writes a small file the driver's
+// autocommit then lands, so integration has real, disjoint content to work
+// with (out-<id>.txt).
+func markerAgentCmd(markerDir string) string {
+	return `MARKER="` + markerDir + `/$SIGBOUND_TASK_ID.log"
+BEFORE=$(wc -l < "$MARKER" 2>/dev/null || echo 0)
+echo ran >> "$MARKER"
+if [ "$SIGBOUND_TASK_ID" = "c" ] && [ "$BEFORE" -eq 0 ]; then
+  exit 1
+fi
+echo "content-$SIGBOUND_TASK_ID" > "out-$SIGBOUND_TASK_ID.txt"
+`
+}
+
+// markerRunCount reads how many times markerAgentCmd's task id ran, from its
+// <markerDir>/<id>.log (one "ran" line per invocation); 0 if the agent for
+// that id never ran at all (no log file yet).
+func markerRunCount(t *testing.T, markerDir, id string) int {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(markerDir, id+".log"))
+	if err != nil {
+		return 0
+	}
+	return len(strings.Split(strings.TrimSpace(string(data)), "\n"))
+}
+
+// TestRunRunResumeReRunsOnlyFailedTask is issue #19's central case: a run
+// with 3 tasks where 2 agents commit and 1 fails, followed by -resume from
+// that run's own -manifest. Resume must re-run ONLY the failed task's agent
+// (proven via markerAgentCmd's per-task invocation counts — a and b's
+// commands must not execute a second time at all), REUSE the two surviving
+// branches outright (resumed=true, identical SHAs to the initial run), and
+// still land all three onto -base exactly as an uninterrupted run would.
+//
+// The initial run is given -verify "test -f out-c.txt": since c fails, that
+// file never lands, so verify fails and the run lands NOTHING — -base stays
+// at its recorded baseSHA, the precondition -resume's moved-base check
+// requires (a run that partially LANDS already moves -base past its own
+// manifest, which is a moved base in its own right, exercised separately by
+// TestRunRunResumeMovedBaseRefusesWithoutRunning). -verify is left
+// unspecified on the resume call, so it's inherited from the manifest
+// (flag > manifest, but nothing here overrides it) — exercising that
+// inheritance too: it fails again if c's rerun doesn't actually land.
+func TestRunRunResumeReRunsOnlyFailedTask(t *testing.T) {
+	g, repo := makeGoRepo(t)
+	markerDir := t.TempDir()
+	agentCmd := markerAgentCmd(markerDir)
+
+	tasks := []taskSpec{{ID: "a", Prompt: "x"}, {ID: "b", Prompt: "x"}, {ID: "c", Prompt: "x"}}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+
+	ctx := context.Background()
+	mainBeforeInitial, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", agentCmd,
+		"-verify", "test -f out-c.txt",
+		"-manifest", manifestPath,
+	})
+	if err != nil {
+		t.Fatalf("initial runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitVerifyFailed {
+		t.Fatalf("initial code=%d, want exitVerifyFailed (c's failure means out-c.txt never lands)\n%s", code, buf.String())
+	}
+	mainAfterInitial, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainAfterInitial != mainBeforeInitial {
+		t.Fatalf("main advanced on the initial run despite verify failing; want nothing landed (baseSHA=%s stable for -resume)", mainBeforeInitial)
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		if got := markerRunCount(t, markerDir, id); got != 1 {
+			t.Fatalf("marker %s ran %d times after the initial run, want 1", id, got)
+		}
+	}
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	var initial runReport
+	if err := json.Unmarshal(data, &initial); err != nil {
+		t.Fatalf("parse manifest: %v\n%s", err, data)
+	}
+	byID := map[string]perAgentJSON{}
+	for _, a := range initial.PerAgent {
+		byID[a.ID] = a
+	}
+	if !byID["a"].OK || !byID["b"].OK {
+		t.Fatalf("want a and b to succeed initially: %+v", initial.PerAgent)
+	}
+	if byID["c"].OK {
+		t.Fatalf("want c to fail initially: %+v", byID["c"])
+	}
+	aSHA, bSHA := byID["a"].SHA, byID["b"].SHA
+	if aSHA == "" || bSHA == "" {
+		t.Fatal("a/b should have a recorded SHA after the initial run")
+	}
+	if byID["a"].Resumed || byID["b"].Resumed || byID["c"].Resumed {
+		t.Fatalf("nothing should be marked resumed on the INITIAL (non -resume) run: %+v", initial.PerAgent)
+	}
+
+	// ---- resume: only c's agent should run again ----
+	buf.Reset()
+	code, err = runRun(&buf, []string{
+		"-repo", repo,
+		"-resume",
+		"-manifest", manifestPath,
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("resume runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("resume code=%d, want exitOK\n%s", code, buf.String())
+	}
+
+	if got := markerRunCount(t, markerDir, "a"); got != 1 {
+		t.Fatalf("marker a ran %d times after resume, want 1 (must not re-run)", got)
+	}
+	if got := markerRunCount(t, markerDir, "b"); got != 1 {
+		t.Fatalf("marker b ran %d times after resume, want 1 (must not re-run)", got)
+	}
+	if got := markerRunCount(t, markerDir, "c"); got != 2 {
+		t.Fatalf("marker c ran %d times after resume, want 2 (must re-run exactly once)", got)
+	}
+
+	var resumed runReport
+	if err := json.Unmarshal(buf.Bytes(), &resumed); err != nil {
+		t.Fatalf("parse resume report: %v\n%s", err, buf.String())
+	}
+	byID = map[string]perAgentJSON{}
+	for _, a := range resumed.PerAgent {
+		byID[a.ID] = a
+	}
+	if !byID["a"].Resumed || !byID["a"].OK || byID["a"].SHA != aSHA {
+		t.Fatalf("a should be reused unchanged: %+v", byID["a"])
+	}
+	if !byID["b"].Resumed || !byID["b"].OK || byID["b"].SHA != bSHA {
+		t.Fatalf("b should be reused unchanged: %+v", byID["b"])
+	}
+	if byID["c"].Resumed {
+		t.Fatalf("c should have run fresh (its prior branch was a stale no-op), not been reused: %+v", byID["c"])
+	}
+	if !byID["c"].OK {
+		t.Fatalf("c should succeed on the resumed run: %+v", byID["c"])
+	}
+	if byID["c"].SHA == "" || byID["c"].SHA == initial.BaseSHA {
+		t.Fatalf("c should have advanced to a fresh, real commit: %+v", byID["c"])
+	}
+
+	if len(resumed.Integrate.Landed) != 3 {
+		t.Fatalf("landed=%v, want all 3 tasks", resumed.Integrate.Landed)
+	}
+	paths, err := g.LsTree(ctx, resumed.Integrate.FinalSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"out-a.txt", "out-b.txt", "out-c.txt"} {
+		if !contains(paths, want) {
+			t.Fatalf("final tree %s missing %s (have %v)", resumed.Integrate.FinalSHA, want, paths)
+		}
+	}
+	mainSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != resumed.Integrate.FinalSHA {
+		t.Fatalf("main=%s not advanced to the resumed run's finalSHA=%s", mainSHA, resumed.Integrate.FinalSHA)
+	}
+}
+
+// TestRunRunResumeMovedBaseRefusesWithoutRunning: once -base's CURRENT head
+// is no longer exactly the manifest's recorded baseSHA, -resume must refuse
+// loudly and run nothing at all — an ordinary landed run already advances
+// -base past its own recorded baseSHA, so resuming from that SAME manifest
+// again is already a moved base with no extra setup needed.
+func TestRunRunResumeMovedBaseRefusesWithoutRunning(t *testing.T) {
+	g, repo := makeGoRepo(t)
+	markerDir := t.TempDir()
+	marker := filepath.Join(markerDir, "ran")
+	agentCmd := "touch " + marker + " && echo hi > out.txt"
+
+	tasks := []taskSpec{{ID: "a", Prompt: "x"}}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", agentCmd,
+		"-manifest", manifestPath,
+	})
+	if err != nil {
+		t.Fatalf("initial runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("initial code=%d, want exitOK\n%s", code, buf.String())
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatal("agent never ran on the initial run")
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	mainBefore, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The initial run already landed, advancing main past the manifest's own
+	// recorded baseSHA — resuming from THIS SAME manifest now must refuse.
+	buf.Reset()
+	code, err = runRun(&buf, []string{
+		"-repo", repo,
+		"-resume",
+		"-manifest", manifestPath,
+	})
+	if err == nil {
+		t.Fatalf("want an error resuming onto a moved base, got a clean report:\n%s", buf.String())
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError: %v", code, err)
+	}
+	if !strings.Contains(err.Error(), "moved") {
+		t.Fatalf("error should name the moved base: %v", err)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("the agent ran despite the moved-base refusal; -resume must fail before anything runs")
+	}
+	mainAfter, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainAfter != mainBefore {
+		t.Fatalf("main moved from %s to %s despite the refusal", mainBefore, mainAfter)
+	}
+}
+
+// TestRunRunResumeWithoutManifestErrors: -resume REQUIRES -manifest (it's
+// -resume's only source for the prior run's task list, base, and commands);
+// omitting it must fail loudly, before any agent runs.
+func TestRunRunResumeWithoutManifestErrors(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-resume",
+		"-agent", "true",
+	})
+	if err == nil {
+		t.Fatal("want an error: -resume without -manifest")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if !strings.Contains(err.Error(), "-manifest") {
+		t.Fatalf("error should mention -manifest: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("no report should be written when -resume fails before any agent runs, got:\n%s", buf.String())
+	}
+}
+
+// TestRunRunResumeWithTasksErrors: -resume never re-plans, so passing -tasks
+// alongside it is a loud error rather than silently ignoring one or the
+// other.
+func TestRunRunResumeWithTasksErrors(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	tasks := []taskSpec{{ID: "a", Prompt: "x"}}
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-resume",
+		"-tasks", tasksFileFor(t, tasks),
+		"-agent", "true",
+	})
+	if err == nil {
+		t.Fatal("want an error: -resume with -tasks")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if !strings.Contains(err.Error(), "-tasks") {
+		t.Fatalf("error should mention -tasks: %v", err)
+	}
+}

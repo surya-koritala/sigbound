@@ -81,6 +81,14 @@ type perAgentJSON struct {
 	// including retries (see -agent-retries / runAgentWithRetries). 1 when the
 	// first try succeeded or -agent-retries is 0.
 	Attempts int `json:"attempts,omitempty"`
+	// Resumed is true iff -resume reused this task's agent/<id> branch
+	// outright instead of running its agent again (see runParams.Resume /
+	// resumeAgent): the branch already differed from the recorded baseSHA, so
+	// it already held real committed work from a PRIOR run. Always false when
+	// the agent actually ran THIS run — whether that's because -resume was
+	// off, or -resume was on but the branch was missing or a stale no-op (the
+	// agent committed nothing last time) and so got a fresh run.
+	Resumed bool `json:"resumed,omitempty"`
 }
 
 // integrateJSON is the cell integrator's result, projected for the report.
@@ -252,6 +260,15 @@ type runParams struct {
 	AgentRetries    int           // retry a FAILED agent (bad exit or -agent-timeout, never a lane-strict stray) up to this many more times; see runAgentWithRetries
 	Budget          time.Duration // wall-clock ceiling for the agent phase + integrate + verify (0 = none); see driveRun
 	Notes           bool          // when the run LANDS, attach the report as a git note under refs/notes/sigbound on the landed commit; see -notes and attachNote
+	// Resume and ResumeBaseSHA implement -resume (see resumeAgent): when
+	// Resume is set, driveRun refuses to run at all unless the base branch's
+	// CURRENT head is still exactly ResumeBaseSHA (the baseSHA the prior run
+	// recorded) — resuming onto a base that has since moved would integrate
+	// against the wrong tree — and every task's agent/<id> branch that
+	// already differs from ResumeBaseSHA is reused as-is instead of run
+	// again.
+	Resume        bool
+	ResumeBaseSHA string
 }
 
 // repairFailureMax bounds the captured verify output handed to the fixer agent
@@ -297,7 +314,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N]) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -380,6 +397,12 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		"(which prints to stdout instead — set both to get either or both). FILE's directory is created if needed and must be writable, checked before any agent runs, same fail-fast "+
 		"policy as -logdir. A write failure AFTER the run completes is different: by then real work may already be landed on -base, so losing the manifest must never look like losing "+
 		"the run — that failure is best-effort, warned loudly on stderr, and never changes the exit code. Feed the file straight to sig replay's own -manifest flag")
+	resume := fs.Bool("resume", false, "resume a prior run instead of planning/loading tasks fresh: REQUIRES -manifest pointing at that prior run's own -manifest output, and -tasks/-goal must NOT be "+
+		"passed (resume never re-plans; the manifest already recorded the task list). Every task whose agent/<id> branch already differs from the manifest's recorded baseSHA is reused as-is — "+
+		"its agent never runs again, and the report marks it resumed=true; a task whose branch is missing or unchanged from baseSHA (its agent committed nothing last time) runs fresh, exactly "+
+		"as an ordinary run. -base/-strategy/-agent/-resolver/-verify/-repair are read from the manifest too, UNLESS this command line sets that flag (or its preset) explicitly, in which case "+
+		"the explicit value wins (flag beats manifest, the same precedence -config gives a command-line flag over a config file). Fails loudly, before anything runs, if -base's CURRENT head "+
+		"has moved past the manifest's recorded baseSHA — resuming onto a different base would integrate against the wrong tree; re-run fresh instead. See docs/USAGE.md's Resume section")
 	notes := fs.Bool("notes", false, "when the run LANDS (the base ref actually advances), attach the full JSON report as a git note on the landed commit under the NAMESPACED "+
 		"ref refs/notes/sigbound (never git's default refs/notes/commits). Best-effort: a failure here is warned on stderr but never fails the run or changes its exit code, since "+
 		"landing has already happened by the time this runs. See docs/USAGE.md's Provenance section for how to read the note back and how to push it (notes do not push by default). "+
@@ -419,6 +442,34 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		return exitOperationalError, presetErr
 	}
 	*agentCmd, *repairCmd, *plannerCmd, *verifyCmd = newAgentCmd, newRepairCmd, newPlannerCmd, newVerifyCmd
+	// -resume never re-plans: its task list, base, strategy, and
+	// agent/resolver/verify/repair commands come from a PRIOR run's
+	// -manifest file instead of -tasks/-goal, which is why it demands
+	// -manifest and forbids them — checked before the manifest is even read,
+	// no point loading a file that's about to be rejected as excess input.
+	// Anything THIS command line sets explicitly (flag or preset —
+	// explicitFlags already tracks both, the same set -config's own
+	// precedence reuses) still wins over the manifest's recorded value;
+	// loadResumeManifest applies that precedence per field. Run BEFORE the
+	// "-agent is required" check below, so a resumed agent command supplied
+	// only by the manifest still satisfies it. The moved-base refusal itself
+	// lives in driveRun — it needs the CURRENT base head, which driveRun
+	// resolves via RevParse, not something worth duplicating here.
+	var resumeTasks []taskSpec
+	var resumeBaseSHA string
+	if *resume {
+		if strings.TrimSpace(*tasksFile) != "" || strings.TrimSpace(*goal) != "" {
+			return exitOperationalError, errors.New("-resume does not re-plan: -tasks/-goal must not be passed alongside it — the manifest already recorded the task list")
+		}
+		if strings.TrimSpace(*manifest) == "" {
+			return exitOperationalError, errors.New("-resume requires -manifest pointing at the prior run's manifest")
+		}
+		var rerr error
+		resumeTasks, resumeBaseSHA, rerr = loadResumeManifest(*manifest, explicitFlags, base, strategy, agentCmd, resolverCmd, verifyCmd, repairCmd)
+		if rerr != nil {
+			return exitOperationalError, rerr
+		}
+	}
 	// lanesExplicit: a planned run (-goal) defaults -lanes to strict UNLESS the
 	// caller set -lanes explicitly (command line OR config file — see
 	// explicitFlags above), in which case that choice always wins.
@@ -471,20 +522,25 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		}
 	}
 
-	// Task source: exactly one of -tasks (explicit) or -goal (planned). If both
-	// are set it is an error rather than silently ignoring one.
+	// Task source: exactly one of -tasks (explicit), -goal (planned), or
+	// -resume (replayed from a manifest — already validated exclusive of
+	// both, above). If both -tasks and -goal are set it is an error rather
+	// than silently ignoring one.
 	haveTasks := strings.TrimSpace(*tasksFile) != ""
 	haveGoal := strings.TrimSpace(*goal) != ""
 	switch {
 	case haveTasks && haveGoal:
 		return exitOperationalError, errors.New("-tasks and -goal are mutually exclusive; pass exactly one")
-	case !haveTasks && !haveGoal:
+	case !*resume && !haveTasks && !haveGoal:
 		return exitOperationalError, errors.New("one of -tasks or -goal is required")
 	}
 
 	var tasks []taskSpec
 	var err error
-	if haveTasks {
+	switch {
+	case *resume:
+		tasks = resumeTasks
+	case haveTasks:
 		tasks, err = loadTasks(*tasksFile)
 		if err != nil {
 			return exitOperationalError, err
@@ -492,7 +548,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		if len(tasks) == 0 {
 			return exitOperationalError, errors.New("no tasks in -tasks file")
 		}
-	} else {
+	default:
 		// -min-tasks/-n are -goal-only concepts (a -tasks run has neither a
 		// planner-requested count nor a floor to check), so this validation lives
 		// here instead of the flag checks above. Caught before the planner even
@@ -567,6 +623,8 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		LogDir:          logDirAbs,
 		EventsPath:      *events,
 		Notes:           *notes,
+		Resume:          *resume,
+		ResumeBaseSHA:   resumeBaseSHA,
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
 	if err != nil {
@@ -710,6 +768,56 @@ func loadTasks(path string) ([]taskSpec, error) {
 	return tasks, nil
 }
 
+// loadResumeManifest implements -resume's manifest side: it reads path (the
+// prior run's own -manifest output — the same flag doubles as -resume's
+// input, so a chain of resumes just keeps overwriting/reading one file) and
+// returns the task list to run — resume never re-plans, so tasks always come
+// from here — plus the baseSHA that run integrated against, which driveRun's
+// moved-base check compares against -base's CURRENT head.
+//
+// Every other manifest-recorded value (base/strategy/agent/resolver/verify/
+// repair) is written into its flag pointer ONLY when that flag (or its
+// -*-preset, for the three that have one) was NOT itself set explicitly on
+// THIS command line — explicit is the exact same fs.Visit/applyConfigFile
+// set runRun already threads through -config's precedence, so a config-file
+// choice counts as explicit here too. This is what gives -resume its
+// documented precedence: command-line flag > manifest.
+func loadResumeManifest(path string, explicit map[string]bool, base, strategy, agentCmd, resolverCmd, verifyCmd, repairCmd *string) ([]taskSpec, string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("-resume: read -manifest %s: %w", path, err)
+	}
+	var prior runReport
+	if err := json.Unmarshal(data, &prior); err != nil {
+		return nil, "", fmt.Errorf("-resume: parse -manifest %s: %w", path, err)
+	}
+	if len(prior.Tasks) == 0 {
+		return nil, "", fmt.Errorf("-resume: -manifest %s has no recorded tasks", path)
+	}
+	if strings.TrimSpace(prior.BaseSHA) == "" {
+		return nil, "", fmt.Errorf("-resume: -manifest %s is missing baseSHA — not a sig run manifest", path)
+	}
+	if !explicit["base"] && prior.Base != "" {
+		*base = prior.Base
+	}
+	if !explicit["strategy"] && prior.Strategy != "" {
+		*strategy = prior.Strategy
+	}
+	if !explicit["agent"] && !explicit["agent-preset"] && prior.AgentCmd != "" {
+		*agentCmd = prior.AgentCmd
+	}
+	if !explicit["resolver"] && prior.ResolverCmd != "" {
+		*resolverCmd = prior.ResolverCmd
+	}
+	if !explicit["verify"] && !explicit["verify-preset"] && prior.VerifyCmd != "" {
+		*verifyCmd = prior.VerifyCmd
+	}
+	if !explicit["repair"] && !explicit["repair-preset"] && prior.RepairCmd != "" {
+		*repairCmd = prior.RepairCmd
+	}
+	return prior.Tasks, prior.BaseSHA, nil
+}
+
 // eventEmitter streams one JSON object per line to its underlying writer as
 // driveRun progresses (see -events), guarded by mu since agents run
 // concurrently in goroutines (driveRun's fan-out below) and must not
@@ -791,6 +899,18 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if err != nil {
 		return runReport{}, fmt.Errorf("resolve base %q in %s: %w", p.Base, p.Repo, err)
 	}
+	// -resume's moved-base refusal: the prior run's manifest recorded
+	// ResumeBaseSHA as the tree every surviving agent/<id> branch forked
+	// from. If -base's CURRENT head is no longer that exact commit, someone
+	// (another run, a plain commit) has moved it since — resuming onto it
+	// now would integrate reused branches against a base they never actually
+	// forked from. Fail loudly here, before wtRoot or any worktree exists, so
+	// nothing runs at all; re-running fresh (without -resume) is the correct
+	// recovery, not a silent resume onto the wrong tree.
+	if p.Resume && baseSHA != p.ResumeBaseSHA {
+		return runReport{}, fmt.Errorf("-resume: base %q is now at %s but the manifest recorded %s — it has moved since that run; re-run fresh instead of resuming onto a different base",
+			p.Base, short(baseSHA), short(p.ResumeBaseSHA))
+	}
 
 	wtRoot, err := os.MkdirTemp("", "sig-run-*")
 	if err != nil {
@@ -850,6 +970,18 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			defer wg.Done()
 			defer func() { <-sem }()
 			branch := "agent/" + tasks[i].ID
+			// -resume: a branch that already holds real work (its head
+			// differs from baseSHA) is reused outright, no agent invocation
+			// at all. resumeAgent also clears a STALE no-op branch (head ==
+			// baseSHA) before falling through, so the fresh run below can
+			// create it the ordinary way. See resumeAgent's doc comment.
+			if p.Resume {
+				if a, reused := resumeAgent(ctx, g, &admin, branch, baseSHA, p, tasks[i]); reused {
+					agents[i] = a
+					emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "resumed": true, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "wallMs": int64(0)})
+					return
+				}
+			}
 			emit.emit("agent_start", map[string]any{"id": tasks[i].ID, "branch": branch})
 			agentStart := time.Now()
 			agents[i] = runAgentWithRetries(ctx, g, &admin, wtRoot, baseSHA, p, tasks[i])
@@ -1460,36 +1592,99 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 		}
 	}
 
-	// ---- lane enforcement ----
-	// Compare the agent's ACTUAL write-set against the task's DECLARED file-set.
-	// Only enforce when the task declared files (planner path) and the agent
-	// actually landed a write-set; -tasks entries without Files are exempt.
+	applyLaneEnforcement(&a, t, p)
+	return a, true
+}
+
+// applyLaneEnforcement compares an agent's ACTUAL write-set (a.Files) against
+// its task's DECLARED file-set (t.Files), populating a's DeclaredFiles/
+// ActualFiles/InLane/Strayed and, in -lanes strict, flipping a.OK to false on
+// any stray (an out-of-lane agent is a failed agent — it does not land).
+// Enforced only when the task declared files (the planner path; -tasks
+// entries without Files are exempt) and the agent actually landed OK. Shared
+// by runAgent (an agent that ran THIS run) and resumeAgent (-resume reusing a
+// branch that survived from a prior one), so both apply the exact same lane
+// rules regardless of which run actually produced the branch's commits.
+func applyLaneEnforcement(a *perAgentJSON, t taskSpec, p runParams) {
 	a.DeclaredFiles = t.Files
 	a.ActualFiles = a.Files
 	a.InLane = true
-	if a.OK && p.LaneMode != laneOff && len(t.Files) > 0 {
-		declared := make(map[string]bool, len(t.Files))
-		for _, f := range t.Files {
-			declared[f] = true
-		}
-		var strayed []string
-		for _, f := range a.Files {
-			if !declared[f] {
-				strayed = append(strayed, f)
-			}
-		}
-		if len(strayed) > 0 {
-			a.Strayed = strayed
-			a.InLane = false
-			if p.LaneMode == laneStrict {
-				// strict: an out-of-lane agent is a failed agent — it does not
-				// land. Recorded here (never silently dropped).
-				a.OK = false
-				a.Stderr = tail("out-of-lane (strict): wrote outside declared files "+
-					fmt.Sprintf("%v", strayed)+"; not landed\n"+a.Stderr, 800)
-			}
+	if !a.OK || p.LaneMode == laneOff || len(t.Files) == 0 {
+		return
+	}
+	declared := make(map[string]bool, len(t.Files))
+	for _, f := range t.Files {
+		declared[f] = true
+	}
+	var strayed []string
+	for _, f := range a.Files {
+		if !declared[f] {
+			strayed = append(strayed, f)
 		}
 	}
+	if len(strayed) > 0 {
+		a.Strayed = strayed
+		a.InLane = false
+		if p.LaneMode == laneStrict {
+			// strict: an out-of-lane agent is a failed agent — it does not
+			// land. Recorded here (never silently dropped).
+			a.OK = false
+			a.Stderr = tail("out-of-lane (strict): wrote outside declared files "+
+				fmt.Sprintf("%v", strayed)+"; not landed\n"+a.Stderr, 800)
+		}
+	}
+}
+
+// resumeAgent implements -resume's per-task decision (see runParams.Resume):
+//
+//   - branch missing (no agent/<id> ref at all): nothing to reuse. Returns
+//     reused=false so the caller falls through to an ordinary fresh
+//     runAgentWithRetries call.
+//   - branch exists but its head equals baseSHA (a STALE no-op: that agent
+//     ran in a prior run but committed nothing): deleted here — its content
+//     is byte-identical to base, so nothing is lost — and reused=false,
+//     again falling through to a fresh run. Deleting first is required: it
+//     clears the way for the fresh run's ordinary WorktreeAdd (`-b`,
+//     loud-fail-on-collision) instead of needing runAgent's WorktreeAddReset
+//     gating, which is reserved for branches THIS SAME RUN created itself
+//     (see runAgent's doc comment) — a branch surviving from a PRIOR run
+//     never qualifies for that, no matter how safe deleting it happens to be.
+//   - branch exists and its head DIFFERS from baseSHA: real committed work
+//     from a prior run. Reused as-is (reused=true) — the agent never runs
+//     again — with a.Resumed=true and the same lane enforcement (see
+//     applyLaneEnforcement) a freshly-run agent would get.
+//
+// admin is locked only around the delete (an admin-level git ref mutation,
+// same posture as the worktree add/remove steps it's already shared with).
+func resumeAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, branch, baseSHA string, p runParams, t taskSpec) (perAgentJSON, bool) {
+	head, err := g.RevParse(ctx, branch)
+	if err != nil {
+		return perAgentJSON{}, false // no surviving branch: run fresh
+	}
+	if head == baseSHA {
+		admin.Lock()
+		_ = g.BranchDelete(ctx, branch)
+		admin.Unlock()
+		return perAgentJSON{}, false // stale no-op branch: cleared, run fresh
+	}
+
+	a := perAgentJSON{ID: t.ID, Branch: branch, SHA: head, Files: []string{}, InLane: true, Resumed: true}
+	files, ferr := g.DiffNameOnly(ctx, baseSHA, head)
+	if ferr != nil {
+		// Same invariant runAgent enforces: a.Files must never silently stay
+		// at its zero-value "touched nothing" when the real diff couldn't be
+		// computed (that would read as a legitimate no-op to integrateBranches'
+		// OCC partitioning) — so a failed diff fails the reuse instead. The
+		// branch itself is left untouched (its content is real, unlike the
+		// no-op case above): never delete on an error we don't understand.
+		a.Stderr = "resume: diff " + short(baseSHA) + ".." + short(head) + " failed: " + ferr.Error()
+		return a, true
+	}
+	if len(files) > 0 {
+		a.Files = files
+	}
+	a.OK = true
+	applyLaneEnforcement(&a, t, p)
 	return a, true
 }
 
