@@ -27,13 +27,14 @@ the results, and optionally verifies and repairs the merged tree.
 ```
 sig run -repo PATH -base BRANCH
         (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N])
-        -agent CMD
+        -agent CMD [-agent-timeout D] [-agent-retries N]
         [-strategy overlay] [-assert]
         [-resolver CMD] [-resolver-timeout D]
         [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]]
         [-lanes off|warn|strict]
         [-no-autocommit]
         [-keep-failed]
+        [-budget D]
         [-logdir DIR]
         [-json]
 ```
@@ -51,6 +52,8 @@ sig run -repo PATH -base BRANCH
 | `-min-tasks` | `0` | Minimum tasks a `-goal` plan must produce; fewer fails **before any agent runs** (`0` = no floor). Must be `<= -n`. |
 | `-planner-timeout` | `120s` | Timeout for the planner command (`0` = none). |
 | `-agent` | *(required)* | Command (run once per task, via `sh -c`) that edits files in the task's worktree. |
+| `-agent-timeout` | `0` | Timeout for each `-agent` command (`0` = none). On expiry the agent fails (`exit=-1`) and the report marks `timedOut=true`. |
+| `-agent-retries` | `0` | Retry a FAILED agent (bad exit or `-agent-timeout`) up to N more times, each in a fresh worktree off the same base. A lane-strict out-of-lane failure is never retried — that's a plan violation, not a timing fluke. |
 | `-strategy` | `overlay` | Integration strategy: `overlay`, `mergetree`, `naive`, `porcelain` (see [Strategies](#strategies)). |
 | `-assert` | `false` | Paranoid cross-check for `-strategy overlay`: independently recompute the combine via `merge-tree` and error out (nothing lands) on any tree mismatch. Roughly doubles integration cost (it re-merges everything); for paranoia/CI, not routine use. |
 | `-resolver` | — | Conflict-resolver command; low-confidence cases are flagged, never guessed. |
@@ -61,9 +64,27 @@ sig run -repo PATH -base BRANCH
 | `-repair-max` | `2` | Max repair attempts before reporting `verify.ok=false` honestly. |
 | `-lanes` | `warn`* | Lane enforcement: `off`, `warn`, or `strict` (see [File lanes](#file-lanes)). *`-goal` runs default to `strict` instead unless `-lanes` is set explicitly. |
 | `-no-autocommit` | `false` | Do **not** commit edits an agent left uncommitted. By default the driver stages and commits them, so edit-only agents still land. |
-| `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. A kept worktree stays registered with git until you remove it: `git worktree remove <path>` (or `git worktree prune` after deleting the directory yourself). |
+| `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. A kept worktree stays registered with git until you remove it: `git worktree remove <path>` (or `git worktree prune` after deleting the directory yourself). With `-agent-retries`, only the LAST failed attempt's worktree is kept — every earlier attempt is torn down as it fails. |
+| `-budget` | `0` | Wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (`0` = none). On expiry, outstanding agents are cancelled and fail; integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial. |
 | `-logdir` | — | Write each agent/repair/verify/planner command's **full** stdout+stderr to `<logdir>/<name>.log` (`agent-<id>.log`, `repair-<n>.log`, `verify-<n>.log`, `planner.log`), on top of the truncated tails the report keeps in memory. The directory is created if needed and must be writable — checked before any agent runs, so a bad `-logdir` fails the whole run rather than silently dropping logs partway through. Repeated runs against the same `-logdir` **append** to the same files; there is no per-run rotation. A task's `id` is sanitized for use in the filename (non-alphanumeric characters become `-`), so two exotic ids that sanitize to the same string share one log file. |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
+
+### Timeouts, retries, and budget
+
+`-agent-timeout`, `-agent-retries`, and `-budget` compose. `-agent-timeout`
+bounds a single agent command so one hung agent can't hang the whole run —
+on expiry it's reported `exit=-1, timedOut=true`. `-agent-retries` then
+decides whether to try that same task again, in a fresh worktree off the
+same base; a bad exit or an `-agent-timeout` expiry is retried, but a
+lane-strict out-of-lane failure never is (`-lanes strict`), since that's a
+plan violation no retry fixes. `-budget` caps the ENTIRE run — the agent
+phase, integrate, and verify — with one wall-clock ceiling that sits above
+both: once it expires, every outstanding agent is cancelled and fails
+(consuming no further retries, since a cancelled run can't usefully retry
+anything), and integrate/verify are attempted against whatever's left of
+that same expired context. If they can't complete, `sig run` reports an
+honest operational error naming the budget instead of ever landing a
+partial tree — the same `-verify` gate applies as on any other run.
 
 ### Determinism
 
@@ -256,7 +277,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
     "ok": true, "exit": 0, "autocommitted": false,
     "declaredFiles": ["…"], "actualFiles": ["…"],
     "inLane": true, "strayed": [], "stderr": "",
-    "worktreeKept": ""
+    "worktreeKept": "", "timedOut": false, "attempts": 1
   } ],
   "integrate": {
     "strategy": "overlay", "groups": 3,

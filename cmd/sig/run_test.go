@@ -508,6 +508,349 @@ func TestDriveRunKeepFailed(t *testing.T) {
 	}
 }
 
+// TestDriveRunAgentTimeout: -agent-timeout bounds a single hung agent instead
+// of letting it block the whole run. The agent sleeps far longer than the
+// timeout; a driveRun call that actually enforces -agent-timeout returns well
+// before the sleep would finish on its own (asserted below), and the failed
+// attempt is reported exit=-1, timedOut=true, with the reason in stderr.
+func TestDriveRunAgentTimeout(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	task := taskSpec{ID: "slow", Prompt: "x"}
+
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: "sleep 5", AgentTimeout: 200 * time.Millisecond}
+	start := time.Now()
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("driveRun took %s; -agent-timeout 200ms should have cut the 5s sleep short", elapsed)
+	}
+	if len(rep.PerAgent) != 1 {
+		t.Fatalf("perAgent=%d, want 1", len(rep.PerAgent))
+	}
+	a := rep.PerAgent[0]
+	if a.OK {
+		t.Fatal("timed-out agent must not be OK")
+	}
+	if !a.TimedOut {
+		t.Fatal("want timedOut=true")
+	}
+	if a.Exit != -1 {
+		t.Fatalf("exit=%d, want -1", a.Exit)
+	}
+	if !strings.Contains(a.Stderr, "agent-timeout") {
+		t.Fatalf("stderr should note the timeout: %q", a.Stderr)
+	}
+	if a.Attempts != 1 {
+		t.Fatalf("attempts=%d, want 1 (no -agent-retries set)", a.Attempts)
+	}
+}
+
+// TestDriveRunAgentRetries: -agent-retries re-runs a FAILED agent in a fresh
+// worktree off the same base, up to N more times, and Attempts reports the
+// total number of tries made. Cases: succeeds on the retry; the existing
+// no-retries behavior is unchanged; a lane-strict out-of-lane failure is
+// never retried (it's a plan violation, not a timing fluke a retry could
+// fix) — both alone and combined with -keep-failed, where the stray's
+// worktree must still be kept even though it stops on attempt 1 (the attempt
+// that ends the loop, not the one -agent-retries would have predicted as
+// "last"); and -keep-failed keeps only the LAST failed attempt's worktree,
+// tearing every earlier one down.
+func TestDriveRunAgentRetries(t *testing.T) {
+	ctx := context.Background()
+	badTask := taskSpec{ID: "bad", Prompt: "x"}
+
+	// ---- fails on the first invocation, succeeds on the second ----
+	_, repo := makeGoRepo(t)
+	marker := filepath.Join(t.TempDir(), "attempt-marker")
+	flakyAgent := "test -f '" + marker + "' && { echo done > out.txt; exit 0; } || { touch '" + marker + "'; exit 1; }"
+	flakyTask := taskSpec{ID: "flaky", Prompt: "x"}
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: flakyAgent,
+		AgentRetries: 1, Autocommit: true,
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{flakyTask})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	a := rep.PerAgent[0]
+	if !a.OK {
+		t.Fatalf("want the retried agent to succeed, got %+v", a)
+	}
+	if a.Attempts != 2 {
+		t.Fatalf("attempts=%d, want 2 (failed once, succeeded on retry)", a.Attempts)
+	}
+	if !a.Autocommitted || !contains(a.Files, "out.txt") {
+		t.Fatalf("want the successful retry's edit autocommitted: %+v", a)
+	}
+
+	// ---- -agent-retries 0 (default): today's behavior — a single failing
+	// attempt fails outright, never retried ----
+	_, repo0 := makeGoRepo(t)
+	p0 := runParams{Repo: repo0, Base: "main", Strategy: "overlay", AgentCmd: "exit 1"}
+	rep0, err := driveRun(ctx, p0, []taskSpec{badTask})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	a0 := rep0.PerAgent[0]
+	if a0.OK {
+		t.Fatal("want the agent to fail with no retries configured")
+	}
+	if a0.Attempts != 1 {
+		t.Fatalf("attempts=%d, want 1 (no -agent-retries set)", a0.Attempts)
+	}
+
+	// ---- lane-strict stray: a plan violation, never retried even though
+	// -agent-retries is set ----
+	_, repoStray := makeGoRepo(t)
+	strayAgent := buildTestAgent(t)
+	strayTask := taskSpec{ID: "stray", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{
+			"a.go": "package main\n\nfunc a() int { return 1 }\n",
+			"b.go": "package main\n\nfunc b() int { return 2 }\n",
+		},
+	}), Files: []string{"a.go"}}
+	pStray := runParams{Repo: repoStray, Base: "main", Strategy: "overlay", AgentCmd: strayAgent, LaneMode: laneStrict, AgentRetries: 3}
+	repStray, err := driveRun(ctx, pStray, []taskSpec{strayTask})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	aStray := repStray.PerAgent[0]
+	if aStray.OK {
+		t.Fatal("strict: out-of-lane agent must not be OK")
+	}
+	if aStray.Attempts != 1 {
+		t.Fatalf("attempts=%d, want 1 (a lane-strict stray is never retried)", aStray.Attempts)
+	}
+
+	// ---- -keep-failed + -agent-retries>0 + lane-strict stray: the stray stops
+	// the retry loop on attempt 1, which IS the attempt that ends the loop, so
+	// -keep-failed must still keep its worktree — even though a naive
+	// "attempt > AgentRetries" check would (wrongly) call attempt 1 "not the
+	// last attempt" since AgentRetries is 3 ----
+	_, repoStrayKF := makeGoRepo(t)
+	tmpStrayKF := t.TempDir()
+	t.Setenv("TMPDIR", tmpStrayKF)
+	strayAgentKF := buildTestAgent(t)
+	strayTaskKF := taskSpec{ID: "stray", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{
+			"a.go": "package main\n\nfunc a() int { return 1 }\n",
+			"b.go": "package main\n\nfunc b() int { return 2 }\n",
+		},
+	}), Files: []string{"a.go"}}
+	pStrayKF := runParams{Repo: repoStrayKF, Base: "main", Strategy: "overlay", AgentCmd: strayAgentKF, LaneMode: laneStrict, AgentRetries: 3, KeepFailed: true}
+	repStrayKF, err := driveRun(ctx, pStrayKF, []taskSpec{strayTaskKF})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	aStrayKF := repStrayKF.PerAgent[0]
+	if aStrayKF.OK {
+		t.Fatal("strict+keep-failed: out-of-lane agent must not be OK")
+	}
+	if aStrayKF.Attempts != 1 {
+		t.Fatalf("attempts=%d, want 1 (a lane-strict stray is never retried)", aStrayKF.Attempts)
+	}
+	if aStrayKF.WorktreeKept == "" {
+		t.Fatal("strict+keep-failed+agent-retries: want worktreeKept set on the attempt that actually ends the loop")
+	}
+	if fi, err := os.Stat(aStrayKF.WorktreeKept); err != nil || !fi.IsDir() {
+		t.Fatalf("kept worktree %s should still exist as a dir: %v", aStrayKF.WorktreeKept, err)
+	}
+
+	// ---- -keep-failed + -agent-retries: only the LAST failed attempt's
+	// worktree survives; earlier ones are torn down as each attempt fails ----
+	_, repoKF := makeGoRepo(t)
+	tmpKF := t.TempDir()
+	t.Setenv("TMPDIR", tmpKF)
+	pKF := runParams{Repo: repoKF, Base: "main", Strategy: "overlay", AgentCmd: "exit 1", AgentRetries: 2, KeepFailed: true}
+	repKF, err := driveRun(ctx, pKF, []taskSpec{badTask})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	aKF := repKF.PerAgent[0]
+	if aKF.OK {
+		t.Fatal("want the agent to still fail after exhausting retries")
+	}
+	if aKF.Attempts != 3 {
+		t.Fatalf("attempts=%d, want 3 (1 + 2 retries)", aKF.Attempts)
+	}
+	if aKF.WorktreeKept == "" {
+		t.Fatal("want worktreeKept set for the final failed attempt")
+	}
+	if fi, err := os.Stat(aKF.WorktreeKept); err != nil || !fi.IsDir() {
+		t.Fatalf("kept worktree %s should still exist as a dir: %v", aKF.WorktreeKept, err)
+	}
+	runRootEntries, err := os.ReadDir(tmpKF)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runRootEntries) != 1 {
+		t.Fatalf("want exactly one sig-run-* root under %s, found %v", tmpKF, runRootEntries)
+	}
+	wtEntries, err := os.ReadDir(filepath.Join(tmpKF, runRootEntries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wtEntries) != 1 {
+		t.Fatalf("want exactly one surviving worktree dir (only the last failed attempt kept), found %v", wtEntries)
+	}
+}
+
+// gitOut runs a git plumbing command directly against repo (bypassing gitx,
+// which has no exported branch-creation call) and returns trimmed stdout.
+func gitOut(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestDriveRunAgentRetriesPreExistingBranchSurvives: a foreign agent/<id>
+// branch left over from a PRIOR run (holding a real, committed user commit)
+// must survive a run that reuses that same task ID with -agent-retries set.
+// Attempt 1's WorktreeAdd loud-fails on the collision (see WorktreeAdd's
+// doc comment); that must be terminal — never retried into a
+// WorktreeAddReset that would -B-reset the foreign branch and silently
+// destroy the prior commit. This is the regression case for the bug where
+// the retry gate was keyed off `attempt >= 2` instead of "did THIS run
+// create the branch": that condition can't tell a foreign pre-existing
+// branch apart from one this run made itself on an earlier attempt.
+func TestDriveRunAgentRetriesPreExistingBranchSurvives(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+
+	baseSHA := gitOut(t, repo, "rev-parse", "HEAD")
+	tree := gitOut(t, repo, "rev-parse", baseSHA+"^{tree}")
+	// A distinct commit (new SHA, same tree) simulating a prior run's landed
+	// work, reachable only through agent/collide.
+	// -c ident flags: commit-tree needs an identity, and CI runners have no
+	// global git config (gitx sets ident via env, but this is a raw git call).
+	userSHA := gitOut(t, repo, "-c", "user.name=test", "-c", "user.email=test@local",
+		"commit-tree", tree, "-p", baseSHA, "-m", "user work from a prior run")
+	gitOut(t, repo, "update-ref", "refs/heads/agent/collide", userSHA)
+
+	task := taskSpec{ID: "collide", Prompt: "x"}
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: "exit 0", AgentRetries: 2}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	a := rep.PerAgent[0]
+	if a.OK {
+		t.Fatal("want the agent to fail: agent/collide collides with a foreign branch")
+	}
+	if a.Attempts != 1 {
+		t.Fatalf("attempts=%d, want 1 (a WorktreeAdd collision is terminal, never retried)", a.Attempts)
+	}
+	if !strings.Contains(a.Stderr, "worktree add") {
+		t.Fatalf("want the worktree-add failure reported in stderr, got %q", a.Stderr)
+	}
+	if got := gitOut(t, repo, "rev-parse", "refs/heads/agent/collide"); got != userSHA {
+		t.Fatalf("agent/collide moved from %s to %s: the foreign branch's commit was destroyed", userSHA, got)
+	}
+}
+
+// TestDriveRunBudgetExhausted: -budget caps the whole run (agent phase +
+// integrate + verify) with one wall-clock ceiling. Two tasks share one -agent
+// command that routes on SIGBOUND_TASK_ID: "fast" commits immediately via the
+// deterministic test agent, "slow" sleeps far longer than the budget. Once
+// the budget fires, the slow agent is cancelled (fails) and ctx is already
+// expired by the time driveRun reaches integrate/land, so those git calls
+// can't complete either — driveRun returns an honest operational error
+// naming the budget rather than landing a partial tree. (The alternative —
+// completing integration inside a leftover grace period — would need a
+// second, ungated context and contradicts what -budget promises; see
+// driveRun's -budget comment. This is the "pick the achievable assertion"
+// case called out in the -budget design.)
+func TestDriveRunBudgetExhausted(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	tasks := []taskSpec{
+		{ID: "fast", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"fast.go": "package main\n\nfunc fast() int { return 1 }\n"},
+		})},
+		{ID: "slow", Prompt: "x"},
+	}
+	// -agent is one command for every task; route on SIGBOUND_TASK_ID so "slow"
+	// sleeps while "fast" runs the real committing test agent.
+	agentCmd := `if [ "$SIGBOUND_TASK_ID" = "slow" ]; then sleep 6; else ` + agent + `; fi`
+
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agentCmd, Budget: 900 * time.Millisecond}
+	start := time.Now()
+	rep, err := driveRun(ctx, p, tasks)
+	elapsed := time.Since(start)
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("driveRun took %s; -budget 900ms should have cut the 6s sleep short", elapsed)
+	}
+	if err == nil {
+		t.Fatalf("want an honest operational error once the budget is exhausted, got a clean report: %+v", rep)
+	}
+	if !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("error should name the exhausted budget: %v", err)
+	}
+
+	byID := map[string]perAgentJSON{}
+	for _, a := range rep.PerAgent {
+		byID[a.ID] = a
+	}
+	if !byID["fast"].OK {
+		t.Fatalf("fast agent should have finished well inside the budget: %+v", byID["fast"])
+	}
+	if byID["slow"].OK {
+		t.Fatal("slow agent should have been cancelled by the budget")
+	}
+
+	// The budget's honest failure must never leave a partial tree landed.
+	mainSHA, err2 := g.RevParse(ctx, "main")
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	if mainSHA != rep.BaseSHA {
+		t.Fatalf("main=%s advanced past baseSHA=%s despite the budget failing the run", mainSHA, rep.BaseSHA)
+	}
+}
+
+// TestDriveRunVerifyKilledByBudget: when -budget expires while -verify itself
+// is running (agent phase + integrate already finished, unlike
+// TestDriveRunBudgetExhausted above where the budget kills an agent), verify
+// naturally fails because its command gets killed along with ctx — but
+// without help that reads as an ordinary verify failure, hiding the real
+// cause. driveRun must name the exhausted budget in the verify output.
+func TestDriveRunVerifyKilledByBudget(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	task := taskSpec{ID: "noop", Prompt: "x"} // agent does nothing; nothing needs to land for verify to run
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: "exit 0",
+		VerifyCmd: "sleep 5", Budget: 700 * time.Millisecond,
+	}
+	start := time.Now()
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("driveRun: %v (verify failing is a report-level outcome, not an operational error)", err)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("driveRun took %s; -budget 700ms should have cut the 5s verify sleep short", elapsed)
+	}
+	if !rep.Verify.Ran || rep.Verify.OK {
+		t.Fatalf("want verify to have run and failed once the budget killed it, got %+v", rep.Verify)
+	}
+	if !strings.Contains(rep.Verify.Output, "budget") {
+		t.Fatalf("verify output should name the exhausted budget instead of reading as a plain failure, got: %q", rep.Verify.Output)
+	}
+}
+
 // TestRunExitCode exercises the outcome->exit-code mapping directly (the
 // seam runRun uses), including the override precedence when a report matches
 // more than one failure class: verify-failed > no-agent-succeeded > flagged.
