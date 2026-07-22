@@ -297,6 +297,111 @@ func TestDriveRunLaneEnforcement(t *testing.T) {
 	}
 }
 
+// TestDriveRunKeepFailed: -keep-failed retains a FAILED agent's worktree on
+// disk (and names it in the report) instead of tearing it down; without the
+// flag the worktree is removed as before. A successful agent's worktree is
+// always removed, flag or not — -keep-failed only affects failures.
+func TestDriveRunKeepFailed(t *testing.T) {
+	ctx := context.Background()
+	task := taskSpec{ID: "bad", Prompt: "x"} // sig-testagent would fail on this prompt too, but "exit 1" is simpler and direct
+
+	// ---- failing agent, -keep-failed: worktree survives, path reported ----
+	_, repo := makeGoRepo(t)
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp) // pin driveRun's worktree root under a dir this test controls
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: "exit 1", KeepFailed: true}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if len(rep.PerAgent) != 1 || rep.PerAgent[0].OK {
+		t.Fatalf("want one failed agent, got %+v", rep.PerAgent)
+	}
+	kept := rep.PerAgent[0].WorktreeKept
+	if kept == "" {
+		t.Fatal("want worktreeKept set for a failed agent run with -keep-failed")
+	}
+	if fi, err := os.Stat(kept); err != nil || !fi.IsDir() {
+		t.Fatalf("kept worktree %s should still exist as a dir: %v", kept, err)
+	}
+
+	// ---- same failure, no -keep-failed: worktree (and its root) cleaned up ----
+	_, repo2 := makeGoRepo(t)
+	tmp2 := t.TempDir()
+	t.Setenv("TMPDIR", tmp2)
+	p2 := runParams{Repo: repo2, Base: "main", Strategy: "overlay", AgentCmd: "exit 1"}
+	rep2, err := driveRun(ctx, p2, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if got := rep2.PerAgent[0].WorktreeKept; got != "" {
+		t.Fatalf("want no worktreeKept without -keep-failed, got %q", got)
+	}
+	entries, err := os.ReadDir(tmp2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("want the run's worktree root cleaned up under %s, found %v", tmp2, entries)
+	}
+
+	// ---- successful agent, -keep-failed set: still removed (not a failure) ----
+	_, repo3 := makeGoRepo(t)
+	tmp3 := t.TempDir()
+	t.Setenv("TMPDIR", tmp3)
+	agent := buildTestAgent(t)
+	goodTask := taskSpec{ID: "good", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"ok.go": "package main\n\nfunc ok() int { return 1 }\n"},
+	})}
+	p3 := runParams{Repo: repo3, Base: "main", Strategy: "overlay", AgentCmd: agent, KeepFailed: true}
+	rep3, err := driveRun(ctx, p3, []taskSpec{goodTask})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep3.PerAgent[0].OK {
+		t.Fatalf("want the agent to succeed, got %+v", rep3.PerAgent[0])
+	}
+	if got := rep3.PerAgent[0].WorktreeKept; got != "" {
+		t.Fatalf("want no worktreeKept for a successful agent even with -keep-failed, got %q", got)
+	}
+	entries3, err := os.ReadDir(tmp3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries3) != 0 {
+		t.Fatalf("want the successful agent's worktree root cleaned up under %s, found %v", tmp3, entries3)
+	}
+
+	// ---- out-of-lane under -lanes strict, -keep-failed: strict turns the stray
+	// into a failure, so it must be kept too, same as any other failed agent ----
+	_, repo4 := makeGoRepo(t)
+	tmp4 := t.TempDir()
+	t.Setenv("TMPDIR", tmp4)
+	strayAgent := buildTestAgent(t)
+	strayTask := taskSpec{ID: "stray", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{
+			"a.go": "package main\n\nfunc a() int { return 1 }\n",
+			"b.go": "package main\n\nfunc b() int { return 2 }\n",
+		},
+	}), Files: []string{"a.go"}}
+	p4 := runParams{Repo: repo4, Base: "main", Strategy: "overlay", AgentCmd: strayAgent, LaneMode: laneStrict, KeepFailed: true}
+	rep4, err := driveRun(ctx, p4, []taskSpec{strayTask})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	a4 := rep4.PerAgent[0]
+	if a4.OK {
+		t.Fatal("strict+keep-failed: out-of-lane agent must not be OK")
+	}
+	kept4 := a4.WorktreeKept
+	if kept4 == "" {
+		t.Fatal("strict+keep-failed: want worktreeKept set for an out-of-lane agent under -lanes strict")
+	}
+	if fi, err := os.Stat(kept4); err != nil || !fi.IsDir() {
+		t.Fatalf("kept worktree %s should still exist as a dir: %v", kept4, err)
+	}
+}
+
 // TestRunExitCode exercises the outcome->exit-code mapping directly (the
 // seam runRun uses), including the override precedence when a report matches
 // more than one failure class: verify-failed > no-agent-succeeded > flagged.
