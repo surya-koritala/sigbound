@@ -277,6 +277,64 @@ func TestIntegrateConflictFlagged(t *testing.T) {
 	}
 }
 
+// TestFoldGroupHeadIsOneCommit is the seam test for the tree-OID fold (issue
+// #23): a multi-branch overlapping group must still fold to the SAME tree as
+// porcelain, and it must do so via exactly ONE new commit — the group head,
+// with acc and every landed branch as its parents — not one commit per landed
+// branch. It calls fold directly since IntegrationResult doesn't expose a
+// group head on its own (IntegrateOCC's FinalSHA is the disjoint combine of
+// group heads, not a group head itself).
+func TestFoldGroupHeadIsOneCommit(t *testing.T) {
+	ctx := context.Background()
+	g, pool, base := scenario(t, 4)
+	const n = 5
+	// All n agents edit the SAME hot file on distinct, spaced lines -> one
+	// overlapping group, every branch auto-merges clean.
+	overlap := map[int]hotEdit{}
+	for i := 0; i < n; i++ {
+		overlap[i] = hotEdit{file: "f000.txt", line: i*5 + 1}
+	}
+	changes := spawnAgents(t, pool, base, n, overlap)
+
+	in := NewIntegrator(pool.Git())
+	head, landed, flagged, _, err := in.fold(ctx, base, base, changes, "sigbound: test")
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	if len(landed) != n || len(flagged) != 0 {
+		t.Fatalf("landed=%d flagged=%d, want %d/0", len(landed), len(flagged), n)
+	}
+
+	// Tree must match what the porcelain baseline produces for the same batch.
+	porc, err := in.IntegratePorcelain(ctx, base, changes)
+	if err != nil {
+		t.Fatalf("porcelain: %v", err)
+	}
+	if got, want := treeHash(t, g, head), treeHash(t, g, porc.FinalSHA); got != want {
+		t.Fatalf("fold tree != porcelain tree")
+	}
+
+	// Exactly one octopus commit: parent 1 is acc (base), parents 2..n+1 are
+	// the landed branches in order, and there is no parent n+2 — i.e. head is
+	// ONE commit, not a chain of n.
+	if p, err := g.RevParse(ctx, head+"^1"); err != nil || p != base {
+		t.Fatalf("head^1 = %q (err %v), want base %q", p, err, base)
+	}
+	for i, branch := range landed {
+		want, err := g.RevParse(ctx, branch)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", branch, err)
+		}
+		p, err := g.RevParse(ctx, fmt.Sprintf("%s^%d", head, i+2))
+		if err != nil || p != want {
+			t.Fatalf("head^%d = %q (err %v), want landed branch %s = %q", i+2, p, err, branch, want)
+		}
+	}
+	if _, err := g.RevParse(ctx, fmt.Sprintf("%s^%d", head, n+2)); err == nil {
+		t.Fatalf("head has an extra parent beyond acc + %d landed branches", n)
+	}
+}
+
 func treeHash(t *testing.T, g *gitx.Git, rev string) string {
 	t.Helper()
 	ctx := context.Background()
