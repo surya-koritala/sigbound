@@ -62,3 +62,6 @@ jobs:
 
       - name: Fuzz git diff parser (internal/gitx)
         run: go test -run=NONE -fuzz=FuzzParseDiffRawZ -fuzztime=15s ./internal/gitx/
+
+      - name: Fuzz strategy agreement (cell)
+        run: go test -run=NONE -fuzz=FuzzStrategiesAgree -fuzztime=15s ./cell/
