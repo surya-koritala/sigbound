@@ -8,6 +8,52 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-22
+
+The differentiators: salvage landing, provenance and replay, resumable runs,
+publishing, a reusable GitHub Action, and engine speedups — every landing
+still gated on a verify of the exact tree that lands.
+
+### Added
+
+- **`-verify-bisect`** — when the combined tree fails verify (after the repair
+  loop has had first shot), bisect over the integration groups and land the
+  union of the green ones, but only after that exact union tree passes its own
+  verify; interaction failures land nothing. Dropped groups are reported as
+  `droppedByBisect`, distinct from conflicts.
+- **`-verify-cache`** — opt-in cache of green verify verdicts keyed by
+  (tree OID, resolved command + impact scope, sigbound version), stored under
+  the repo's git dir; only passes are ever cached, failures always re-run.
+- **Run manifest and provenance** — the report now records the resolved
+  commands, version, and start time; `-manifest FILE` writes it, `-notes`
+  attaches it as a git note under `refs/notes/sigbound` on the landed commit.
+- **`sig replay`** — re-integrates a manifest's recorded base and branches
+  (excluding any dropped by bisect) and compares tree OIDs: REPRODUCED,
+  DIVERGED, or a repo-state error; read-only, never moves refs.
+- **`-resume`** — reuse surviving `agent/<id>` branches from a prior run's
+  manifest, re-running only failed or no-op tasks; refuses loudly if the base
+  has moved past the recorded baseSHA.
+- **`-publish`** — a bring-your-own command that runs once after a landed run,
+  receiving the JSON report on stdin plus `SIGBOUND_FINAL_SHA` and friends;
+  publish failure never unlands (new exit code 6).
+- **GitHub Action** — a composite action at the repo root installs a released
+  `sig` (checksum-verified), runs `sig doctor`, assembles `sig run` from typed
+  inputs, and surfaces exit code, final SHA, and report as outputs.
+- **Differential engine fuzzer** — `FuzzStrategiesAgree` drives random bounded
+  scenarios through all four strategies and fails on any tree or
+  landed/flagged disagreement with porcelain; wired into CI's fuzz smoke.
+
+### Changed
+
+- **Fold on tree OIDs** — the overlapping-group fold keeps its accumulator as
+  a tree and emits one octopus commit per group instead of a commit per
+  branch; the pure-fold path is 33–53% faster at 256 agents, with byte-
+  identical trees.
+- **Batched resolver reads and a reused verify worktree** — conflicted-path
+  contents come from one `cat-file --batch` per batch, and verify retries and
+  repair re-verifies share one worktree, reset hard and cleaned between every
+  use so neither tracked nor untracked state can leak across attempts.
+
 ## [0.2.0] - 2026-07-22
 
 Hardening of the single-machine CLI: CI-friendly exit codes and events,
@@ -104,6 +150,7 @@ Initial public release.
 - **`sig version`** — reports the version, and the git commit and build date
   when built from a checkout.
 
-[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/surya-koritala/sigbound/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/surya-koritala/sigbound/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/surya-koritala/sigbound/releases/tag/v0.1.0
