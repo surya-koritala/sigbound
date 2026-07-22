@@ -8,6 +8,73 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-22
+
+Hardening of the single-machine CLI: CI-friendly exit codes and events,
+robustness knobs for flaky suites and hung agents, preflight checks, presets,
+and a release pipeline. Zero module dependencies as of this release.
+
+### Added
+
+- **Exit codes for CI** — `sig run` returns distinct codes: 0 landed+verified,
+  1 operational error, 2 usage, 3 verify failed (nothing landed), 4 conflicts
+  flagged, 5 no agent succeeded.
+- **`sig doctor`** — preflight that validates the git version (>= 2.38) and
+  live-probes the exact `merge-tree --write-tree` and overlay plumbing the
+  engine depends on; `sig run`/`sig integrate` now do the cheap version check
+  up front.
+- **`-verify-retries`** — re-run a failing verify on the same tree and pass on
+  any green; a flaky pass is surfaced as `flaky` in the report. `-verify` is
+  documented as requiring determinism.
+- **`-agent-timeout`, `-agent-retries`, `-budget`** — per-agent wall clock,
+  retries in fresh worktrees (lane strays and branch collisions are terminal),
+  and a hard run-wide ceiling; nothing partial ever lands on exhaustion.
+- **`-verify-impact`** — scoped verification: maps the landed write-set to Go
+  packages, expands to reverse dependents (including test-only importers), and
+  runs a narrower command with `SIGBOUND_IMPACTED_PKGS`; any doubt (non-Go
+  changes, `go.mod`, testdata, unmapped dirs, `go list` errors) falls back to
+  the full `-verify`.
+- **`-events`** — an NDJSON lifecycle stream (run/agent/integrate/verify/
+  repair/land start+done, per-phase wall times) for driving CI and dashboards.
+- **`-logdir`** — full per-command stdout+stderr streamed to per-agent/verify/
+  repair/planner files; a failing log file can never fail the run.
+- **`-dry-run`** — print the plan and the predicted partition (computed by the
+  real partitioner from declared file-sets) without running any agent.
+- **`sig.conf` config file** (`-config`) — a flat `KEY=VALUE` flags file with
+  CLI > config > default precedence and loud unknown-key errors.
+- **Presets** — `-agent-preset`/`-repair-preset`/`-planner-preset`
+  (`claude|codex|aider`) and `-verify-preset` (`go|node|python|rust`) expand to
+  known-good command strings; a raw flag always wins.
+- **`-keep-failed`** — keep a failed agent's worktree for inspection.
+- **`-min-tasks`** and strict-lane default for planned runs — a planner that
+  under-delivers fails before any agent runs; planned tasks get `-lanes strict`
+  unless overridden.
+- **`-assert`** — opt-in cross-check that recombines the overlay result via
+  merge-tree and refuses to land on any tree mismatch.
+- **Partial report on error** — a mid-run failure still emits the report for
+  completed agents, so their branches are recoverable.
+- **Release pipeline** — GoReleaser config and a tag-triggered workflow
+  producing versioned binaries for linux/darwin (amd64+arm64) and windows
+  (amd64), with checksums and a Homebrew tap hook.
+
+### Changed
+
+- **Write-set reuse and batched diffs** — `sig run` reuses each agent's
+  computed write-set for partitioning; `sig integrate` computes all branches'
+  write-sets in one batched `git diff-tree --stdin` pass.
+- **Zero dependencies** — the unused SQLite-backed bench store was removed;
+  `go.mod` now has no requires and the CLI links stdlib only.
+
+### Fixed
+
+- An agent whose write-set diff fails is now failed loudly and excluded from
+  integration (a wrong empty write-set could previously let overlapping
+  content land silently).
+- Retry branch resets are gated on this-run creation, so a leftover
+  `agent/<id>` branch from a prior run is never silently reset.
+- External commands are bounded with `WaitDelay` uniformly, so a hung
+  grandchild holding an inherited pipe cannot defeat timeouts.
+
 ## [0.1.0] - 2026-07-21
 
 Initial public release.
@@ -37,5 +104,6 @@ Initial public release.
 - **`sig version`** — reports the version, and the git commit and build date
   when built from a checkout.
 
-[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/surya-koritala/sigbound/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/surya-koritala/sigbound/releases/tag/v0.1.0

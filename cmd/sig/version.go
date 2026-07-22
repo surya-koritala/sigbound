@@ -11,7 +11,7 @@ import (
 // developed toward and can be overridden at build time:
 //
 //	go build -ldflags "-X main.Version=0.1.0" ./cmd/sig
-var Version = "0.1.0"
+var Version = "0.2.0"
 
 // runVersion prints the version and, when the binary was built from a git
 // checkout, the commit and build date recorded by the Go toolchain via
