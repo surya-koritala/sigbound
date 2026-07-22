@@ -50,6 +50,9 @@ page](https://github.com/surya-koritala/sigbound/releases).
 Requires Go 1.25+ and the `git` binary (>= 2.38). Run `sig doctor` to check
 your git.
 
+Running in CI? `surya-koritala/sigbound` is also a GitHub Action — see
+[GitHub Action](docs/USAGE.md#github-action) in the docs.
+
 ## Usage
 
 Run a set of tasks from a file. `examples/tasks.json` describes three features on separate files; each task's file list is enforced.
