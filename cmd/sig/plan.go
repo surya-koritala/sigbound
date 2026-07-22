@@ -136,10 +136,13 @@ func (p *CommandPlanner) attempt(ctx context.Context, goal, repoMap string, n in
 	cmd.Stderr = &errBuf
 	// With -logdir, both streams ALSO stream to a full log file (io.MultiWriter)
 	// while out/errBuf keep parsing the plan / reporting failures as before.
+	// bestEffortWriter: a log-write failure must never fail an otherwise-successful
+	// planner invocation (see bestEffortWriter's doc, run.go, for why).
 	if logf := openLog(p.LogDir, "planner.log"); logf != nil {
 		defer logf.Close()
-		cmd.Stdout = io.MultiWriter(&out, logf)
-		cmd.Stderr = io.MultiWriter(&errBuf, logf)
+		blog := bestEffortWriter{logf}
+		cmd.Stdout = io.MultiWriter(&out, blog)
+		cmd.Stderr = io.MultiWriter(&errBuf, blog)
 	}
 	if err := cmd.Run(); err != nil {
 		// Non-zero exit, timeout, or spawn failure. Fail safe: no plan, no run.

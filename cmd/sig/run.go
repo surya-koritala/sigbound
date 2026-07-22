@@ -682,10 +682,16 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 	// stdout is discarded; the fixer signals its work through file edits (which
 	// the driver commits) exactly like an edit-only agent. With -logdir, both
 	// streams also stream to a full log file; see runAgent for the same pattern.
+	// The log is wrapped in bestEffortWriter (both here and for stdout, even
+	// though stdout would otherwise be a bare *os.File) so a log-write failure
+	// can never fail the repair command; wrapping stdout costs exec's
+	// pipe+goroutine instead of a plain fd dup, which is fine since WaitDelay is
+	// set above.
 	if logf := openLog(p.LogDir, fmt.Sprintf("repair-%d.log", attempt)); logf != nil {
 		defer logf.Close()
-		cmd.Stdout = logf
-		cmd.Stderr = io.MultiWriter(&errBuf, logf)
+		blog := bestEffortWriter{logf}
+		cmd.Stdout = blog
+		cmd.Stderr = io.MultiWriter(&errBuf, blog)
 	}
 	if runErr := cmd.Run(); runErr != nil {
 		return head, nil, fmt.Errorf("repair command: %w: %s", runErr, tail(errBuf.String(), 400))
@@ -767,10 +773,15 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 	// stdout is discarded; the agent signals its work through commits + exit code.
 	// With -logdir, both streams ALSO stream to a full log file (io.MultiWriter)
 	// while errBuf keeps capturing the same bounded in-memory tail as before.
+	// The log is wrapped in bestEffortWriter (both here and for stdout, even
+	// though stdout would otherwise be a bare *os.File) so a log-write failure
+	// can never fail the agent; wrapping stdout costs exec's pipe+goroutine
+	// instead of a plain fd dup, which is fine since WaitDelay is set above.
 	if logf := openLog(p.LogDir, "agent-"+sanitizeID(t.ID)+".log"); logf != nil {
 		defer logf.Close()
-		cmd.Stdout = logf
-		cmd.Stderr = io.MultiWriter(&errBuf, logf)
+		blog := bestEffortWriter{logf}
+		cmd.Stdout = blog
+		cmd.Stderr = io.MultiWriter(&errBuf, blog)
 	}
 	runErr := cmd.Run()
 	a.Exit = 0
@@ -887,7 +898,9 @@ func runVerify(ctx context.Context, g *gitx.Git, finalSHA, verifyCmd string, log
 	cmd.Stderr = &outBuf
 	if logf := openLog(logDir, fmt.Sprintf("verify-%d.log", logAttempt)); logf != nil {
 		defer logf.Close()
-		cmd.Stdout = io.MultiWriter(&outBuf, logf)
+		// bestEffortWriter: a log-write failure must never turn a passing verify
+		// into OK=false. See bestEffortWriter's doc for the os/exec mechanism.
+		cmd.Stdout = io.MultiWriter(&outBuf, bestEffortWriter{logf})
 		cmd.Stderr = cmd.Stdout
 	}
 	err = cmd.Run()
@@ -981,20 +994,52 @@ func prepareLogDir(dir string) error {
 // -logdir), appended so multiple invocations that share one logical attempt
 // (-verify-retries re-running on the same tree, or a planner re-plan) land in
 // the same file instead of clobbering each other. Returns nil when logDir is
-// empty or the file can't be opened. -logdir's directory is validated once,
-// up front (prepareLogDir), before any agent runs, so a failure here is
-// unexpected; when it happens logging degrades to best-effort — the command
-// that triggered it must still run normally, never fail because of a log
-// write.
+// empty or the file can't be opened; -logdir's directory is validated once,
+// up front (prepareLogDir), before any agent runs, so an open failure here is
+// unexpected — when it happens that command simply runs without a log.
+//
+// Opening is only half the guarantee: every caller wraps the returned file in
+// bestEffortWriter before attaching it to cmd.Stdout/Stderr, so a WRITE
+// failure AFTER a successful open (disk full, permissions revoked mid-run,
+// etc.) degrades the same way — the command that triggered it still runs and
+// reports normally, never failed because of a log write. See bestEffortWriter
+// for why that wrapping is required at every call site, not just here.
 func openLog(logDir, name string) *os.File {
 	if logDir == "" {
 		return nil
 	}
-	f, err := os.OpenFile(filepath.Join(logDir, name), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := openLogFile(filepath.Join(logDir, name), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil
 	}
 	return f
+}
+
+// openLogFile is the file-open call openLog uses, factored into a var so a
+// test can substitute a file that fails every Write (e.g. one opened
+// O_RDONLY) to exercise the bestEffortWriter path end-to-end through a real
+// agent run, without needing to fabricate an actual disk-full condition.
+// Production code never reassigns this.
+var openLogFile = os.OpenFile
+
+// bestEffortWriter wraps a log-file writer so a failing Write can never fail
+// the command being logged. os/exec promotes a copy-goroutine's write error
+// into cmd.Run()'s returned error even when the child process itself exited
+// 0: as soon as any of Stdout/Stderr is not a bare *os.File, exec adds a
+// pipe+goroutine to service it, and that goroutine's write error overrides an
+// otherwise-clean exit (see cmd.Wait in package os/exec). A -logdir write
+// failure (disk full, log file closed out from under us, etc.) must never
+// turn a successful agent/verify/repair/planner run into a reported failure,
+// so every write here is swallowed and reported as a (full-length, nil-error)
+// success — the command runs to completion either way; only the log is
+// incomplete.
+type bestEffortWriter struct {
+	w io.Writer
+}
+
+func (b bestEffortWriter) Write(p []byte) (int, error) {
+	b.w.Write(p) //nolint:errcheck // deliberately best-effort; see type doc
+	return len(p), nil
 }
 
 // tail returns at most the last max characters of s, prefixed with an ellipsis
