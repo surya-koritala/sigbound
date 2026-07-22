@@ -58,10 +58,10 @@ jobs:
           check-latest: true
 
       - name: Fuzz plan parser (cmd/sig)
-        run: go test -run=NONE -fuzz=FuzzParsePlan -fuzztime=15s ./cmd/sig/
+        run: .github/scripts/fuzz-smoke.sh FuzzParsePlan ./cmd/sig/ 15s
 
       - name: Fuzz git diff parser (internal/gitx)
-        run: go test -run=NONE -fuzz=FuzzParseDiffRawZ -fuzztime=15s ./internal/gitx/
+        run: .github/scripts/fuzz-smoke.sh FuzzParseDiffRawZ ./internal/gitx/ 15s
 
       - name: Fuzz strategy agreement (cell)
-        run: go test -run=NONE -fuzz=FuzzStrategiesAgree -fuzztime=15s ./cell/
+        run: .github/scripts/fuzz-smoke.sh FuzzStrategiesAgree ./cell/ 15s
