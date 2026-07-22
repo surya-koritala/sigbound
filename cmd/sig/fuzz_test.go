@@ -3,13 +3,14 @@ package main
 // Native-fuzzing targets for the parsers of UNTRUSTED input in the sig command:
 // the auto-planner's plan JSON (parsePlan — arbitrary model output, the highest
 // value target here), the path-validation predicates it depends on (relSafe,
-// slugSafe), and the -config flags-file parser (parseConfigFile — an external
-// text file, hand-edited or generated). parsePlan is the gate that decides
-// whether a run ever starts, so it must reject every malformed/hostile plan
-// without panicking; relSafe/slugSafe are the safety predicates that keep a
-// declared path from escaping the repo or a slug from becoming an unsafe
-// branch/dir name. Each target asserts "did not panic" plus the invariant the
-// parser is supposed to guarantee on the accept path.
+// slugSafe), the -config flags-file parser (parseConfigFile — an external
+// text file, hand-edited or generated), and -verify-impact's `go list -json`
+// output parser (parseGoListJSON — an external command's stdout). parsePlan is
+// the gate that decides whether a run ever starts, so it must reject every
+// malformed/hostile plan without panicking; relSafe/slugSafe are the safety
+// predicates that keep a declared path from escaping the repo or a slug from
+// becoming an unsafe branch/dir name. Each target asserts "did not panic" plus
+// the invariant the parser is supposed to guarantee on the accept path.
 
 import (
 	"bytes"
@@ -194,6 +195,41 @@ func FuzzParseConfigFile(f *testing.F) {
 			if e.Line < 1 {
 				t.Fatalf("accepted entry with non-positive line number: %+v", e)
 			}
+		}
+	})
+}
+
+// FuzzParseGoListJSON fuzzes -verify-impact's `go list -json` output parser
+// (see impact.go) with arbitrary bytes as that command's stdout. `go list
+// -json ./...` prints a STREAM of JSON objects (not one array), decoded via
+// repeated json.Decoder.Decode calls — the classic footgun for a hand-rolled
+// streaming decoder is looping forever or panicking on a truncated/partial
+// trailing object, so seeds specifically target that shape. A crasher here
+// would let a hostile or simply broken `go` toolchain output wedge or crash a
+// verify run instead of just failing the impact-scoping fallback.
+func FuzzParseGoListJSON(f *testing.F) {
+	f.Add([]byte(`{"Dir":"/repo/a","ImportPath":"a","Imports":["fmt"]}`))
+	f.Add([]byte(`{"Dir":"/repo/a","ImportPath":"a"}
+{"Dir":"/repo/b","ImportPath":"b","Imports":["a"],"TestImports":["testing"],"XTestImports":["a"]}
+`))
+	f.Add([]byte(``))
+	f.Add([]byte(`null`))
+	f.Add([]byte(`{}`))
+	f.Add([]byte(`[]`)) // an array, not the streaming-object shape
+	f.Add([]byte(`not json at all`))
+	f.Add([]byte(`{"Dir":"/repo/a","ImportPath":"a"`))                                       // truncated mid-object
+	f.Add([]byte(`{"Dir":"/repo/a","ImportPath":"a"}{`))                                     // truncated second object
+	f.Add([]byte(`{"Dir":"/repo/a","Imports":"not an array"}`))                              // wrong field type
+	f.Add([]byte("{\"Dir\":\"/repo/a\x00\",\"ImportPath\":\"a\"}"))                          // embedded NUL
+	f.Add([]byte(`{"Dir":"/repo/a","ImportPath":"a"}   {"Dir":"/repo/b","ImportPath":"b"}`)) // extra whitespace between objects
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		pkgs, err := parseGoListJSON(data)
+		if err != nil {
+			return // rejecting malformed/truncated output is fine, as long as it did not panic
+		}
+		for _, pk := range pkgs {
+			_ = pk // decoded successfully; no further invariant to check beyond "did not panic"
 		}
 	})
 }

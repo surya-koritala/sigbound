@@ -107,15 +107,24 @@ type integrateJSON struct {
 //     invocation (i.e. the first invocation on that tree failed but a later one
 //     on the SAME tree passed) — see runVerifyRetry. -verify is supposed to be
 //     deterministic; a flaky pass is surfaced, not silently swallowed.
+//   - Scope and ImpactedPkgs are set only when -verify-impact is configured
+//     (see computeImpact): "impact" when the scoped -verify-impact command
+//     actually ran (ImpactedPkgs names which packages, transitively expanded
+//     to reverse-dependents), "full" when ANY doubt fell back to the full
+//     -verify command instead. Both stay zero-valued — and so vanish from the
+//     JSON report via omitempty — when -verify-impact isn't set at all, so a
+//     run without it reports byte-identical to before this field existed.
 //   - Repairs details each attempt (see repairAttemptJSON).
 type verifyJSON struct {
-	Ran      bool                `json:"ran"`
-	OK       bool                `json:"ok"`
-	Attempts int                 `json:"attempts"`
-	Repaired bool                `json:"repaired"`
-	Flaky    bool                `json:"flaky,omitempty"`
-	Output   string              `json:"output"`
-	Repairs  []repairAttemptJSON `json:"repairs,omitempty"`
+	Ran          bool                `json:"ran"`
+	OK           bool                `json:"ok"`
+	Attempts     int                 `json:"attempts"`
+	Repaired     bool                `json:"repaired"`
+	Flaky        bool                `json:"flaky,omitempty"`
+	Scope        string              `json:"scope,omitempty"`
+	ImpactedPkgs []string            `json:"impactedPkgs,omitempty"`
+	Output       string              `json:"output"`
+	Repairs      []repairAttemptJSON `json:"repairs,omitempty"`
 }
 
 // repairAttemptJSON is one turn of the repair loop: the fixer agent ran, the
@@ -190,6 +199,7 @@ type runParams struct {
 	ResolverCmd     string
 	ResolverTimeout time.Duration
 	VerifyCmd       string
+	VerifyImpactCmd string        // optional command run INSTEAD of -verify when computeImpact can confidently scope to the impacted Go packages; requires VerifyCmd, which stays the fallback on any doubt (see runVerify)
 	VerifyRetries   int           // re-run a FAILING -verify up to this many more times on the same tree before giving up (0 = today's behavior)
 	RepairCmd       string        // fixer-agent command run when -verify fails (empty => no repair loop)
 	RepairMax       int           // max repair attempts before giving up honestly (default via flag)
@@ -246,7 +256,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N]) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N]) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -289,6 +299,12 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	verifyRetries := fs.Int("verify-retries", 0, "after a FAILING -verify invocation, re-run it up to N more times on the same tree; passes on any green. "+
 		"A pass on a retry marks the report flaky=true (the passing run's output is reported). 0 = today's behavior: a single failing invocation fails verify. "+
 		"-verify must still be deterministic — retries mitigate flaky suites, not a license to skip that")
+	verifyImpactCmd := fs.String("verify-impact", "", "optional command (run via `sh -c`) run INSTEAD of -verify when Sigbound can confidently compute the impacted Go packages from the "+
+		"run's landed write-set: one `go list -json ./...` spawn in the verify checkout, then a reverse-import closure over the changed packages. ANY doubt — a non-Go file changed "+
+		"(including go.mod/go.sum), a change under a testdata/ directory, a `go list` failure, or an empty impact set — falls back to running the FULL -verify command instead; "+
+		"impact scoping trades confidence for speed, and -verify remains the source of truth. Requires -verify (or -verify-preset): it composes WITH -verify rather than replacing "+
+		"it. Receives SIGBOUND_IMPACTED_PKGS (space-separated ./relative package paths, transitively expanded to reverse-dependents) and SIGBOUND_CHANGED_FILES (space-separated "+
+		"changed paths) in addition to the usual environment. See docs/USAGE.md's Scoped verification section")
 	repairCmd := fs.String("repair", "", "optional self-healing fixer command (run via `sh -c`) invoked in a worktree at the integrated head when -verify FAILS; "+
 		"receives SIGBOUND_FAILURE (captured verify output) + SIGBOUND_REPO, edits files to fix the failure (the driver auto-commits them), then -verify re-runs. Looped up to -repair-max times")
 	repairPreset := fs.String("repair-preset", "", "expand a known repair-harness preset (claude|codex|aider) into -repair's sh -c command; an explicit -repair always overrides its preset. "+
@@ -353,6 +369,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	}
 	if strings.TrimSpace(*agentCmd) == "" {
 		return exitOperationalError, errors.New("-agent is required")
+	}
+	if strings.TrimSpace(*verifyImpactCmd) != "" && strings.TrimSpace(*verifyCmd) == "" {
+		return exitOperationalError, errors.New("-verify-impact requires -verify (or -verify-preset): it composes WITH -verify, which stays required as the fallback")
 	}
 	if err := validateStrategy(*strategy); err != nil {
 		return exitOperationalError, err
@@ -459,6 +478,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		ResolverCmd:     *resolverCmd,
 		ResolverTimeout: *resolverTimeout,
 		VerifyCmd:       *verifyCmd,
+		VerifyImpactCmd: *verifyImpactCmd,
 		VerifyRetries:   *verifyRetries,
 		RepairCmd:       *repairCmd,
 		RepairMax:       *repairMax,
@@ -788,6 +808,20 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	rep.Integrate = ir
 	emit.emit("integrate_done", map[string]any{"landed": ir.Landed, "flagged": ir.Flagged, "resolved": ir.Resolved, "finalSHA": ir.FinalSHA, "wallMs": ir.WallMs})
 
+	// changedFiles is the run's LANDED write-set — every path any landed branch
+	// touched — reusing the write-sets already computed for OCC partitioning
+	// (writeSets above) rather than re-diffing. It's -verify-impact's input for
+	// test-impact analysis (see computeImpact); built from ir.Landed (not every
+	// branch that ran) since only landed changes actually reach the verified
+	// tree. cell.WriteSet dedups+sorts for free.
+	changedSet := cell.NewWriteSet()
+	for _, b := range ir.Landed {
+		for _, f := range writeSets[b] {
+			changedSet.Add(f)
+		}
+	}
+	changedFiles := changedSet.Paths()
+
 	// ---- verify the integrated tree (self-healing via -repair), then land ----
 	// Nothing is on the base ref yet. Land only if verify passes (or is unset);
 	// on an honest failure leave the base ref at baseSHA, so a red run lands
@@ -795,7 +829,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	// the head via a repair; FinalSHA reports whatever we computed either way.
 	landSHA := res.FinalSHA
 	if strings.TrimSpace(p.VerifyCmd) != "" {
-		rep.Verify, landSHA = verifyWithRepair(ctx, g, p, res.FinalSHA, emit)
+		rep.Verify, landSHA = verifyWithRepair(ctx, g, p, res.FinalSHA, changedFiles, emit)
 		rep.Integrate.FinalSHA = landSHA
 		if !rep.Verify.OK {
 			// A -budget expiry can kill -verify mid-run (its command context is a
@@ -841,10 +875,18 @@ func budgetAwareErr(p runParams, ctx context.Context, op string, err error) erro
 // around every -verify invocation this call makes (attempt 0 = pre-repair, N
 // = after repair round N, matching -logdir's verify-<n>.log numbering) and a
 // repair_start/repair_done pair around every fixer invocation.
-func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string, emit *eventEmitter) (verifyJSON, string) {
+//
+// changedFiles is the run's landed write-set — -verify-impact's input for
+// computeImpact (see runVerify). Each repair round folds that round's
+// FilesTouched into changedFiles and RECOMPUTES impact for the re-verify
+// (same fallback rules as the initial decision, e.g. a fixer that touches a
+// non-Go file falls back to full just like any other doubt) — a repair
+// changes the tree, so re-deciding scope from scratch, not memoizing the
+// first decision, is what keeps the fallback honest.
+func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string, changedFiles []string, emit *eventEmitter) (verifyJSON, string) {
 	emit.emit("verify_start", map[string]any{"attempt": 0})
 	vStart := time.Now()
-	v := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries, p.LogDir, 0)
+	v := runVerifyRetry(ctx, g, head, p, changedFiles, p.VerifyRetries, p.LogDir, 0)
 	emit.emit("verify_done", map[string]any{"ok": v.OK, "flaky": v.Flaky, "attempt": 0, "wallMs": time.Since(vStart).Milliseconds()})
 	// Green first try (possibly after a retry), or no repair configured/allowed
 	// => done, loop never runs. v already carries Flaky, so it survives here.
@@ -854,6 +896,8 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 
 	var repairs []repairAttemptJSON
 	lastOutput := v.Output
+	lastScope := v.Scope
+	lastImpacted := v.ImpactedPkgs
 	ok := false
 	flaky := false
 	for attempt := 1; attempt <= p.RepairMax; attempt++ {
@@ -873,11 +917,18 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 			break
 		}
 		head = newHead
+		changedSet := cell.NewWriteSet(changedFiles...)
+		for _, f := range touched {
+			changedSet.Add(f)
+		}
+		changedFiles = changedSet.Paths()
 		emit.emit("verify_start", map[string]any{"attempt": attempt})
 		vStart = time.Now()
-		rv := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries, p.LogDir, attempt)
+		rv := runVerifyRetry(ctx, g, head, p, changedFiles, p.VerifyRetries, p.LogDir, attempt)
 		emit.emit("verify_done", map[string]any{"ok": rv.OK, "flaky": rv.Flaky, "attempt": attempt, "wallMs": time.Since(vStart).Milliseconds()})
 		lastOutput = rv.Output
+		lastScope = rv.Scope
+		lastImpacted = rv.ImpactedPkgs
 		rec.VerifyOK = rv.OK
 		repairs = append(repairs, rec)
 		emit.emit("repair_done", map[string]any{"attempt": attempt, "verifyOk": rec.VerifyOK, "wallMs": repairWallMs})
@@ -891,33 +942,37 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 	// Reached only after an initial verify FAILURE, so ok==true means a repair
 	// fixed it (Repaired=true). ok==false => honest failure with the last output.
 	return verifyJSON{
-		Ran:      true,
-		OK:       ok,
-		Attempts: len(repairs),
-		Repaired: ok,
-		Flaky:    flaky,
-		Output:   lastOutput,
-		Repairs:  repairs,
+		Ran:          true,
+		OK:           ok,
+		Attempts:     len(repairs),
+		Repaired:     ok,
+		Flaky:        flaky,
+		Scope:        lastScope,
+		ImpactedPkgs: lastImpacted,
+		Output:       lastOutput,
+		Repairs:      repairs,
 	}, head
 }
 
-// runVerifyRetry runs verifyCmd on head via runVerify and, on FAILURE, re-runs
-// it up to retries more times on the SAME tree (head is never re-integrated or
-// re-checked-out to a different commit — only re-verified) — passing on any
-// green invocation. A pass on an invocation after the first is flaky: -verify
-// is supposed to be deterministic, so retries are a mitigation for flaky test
-// suites, not a license to skip that; the flaky pass is surfaced via
-// verifyJSON.Flaky rather than silently reported as a clean first-try green.
-// retries=0 reproduces the pre-existing behavior exactly: one invocation, no
-// retry, never flaky. When all retries are exhausted, the last (failing)
-// invocation's result is returned, same as today. logAttempt names this
-// logical verify attempt (0 = pre-repair, N = after repair round N) for
-// -logdir's verify-<n>.log; every retry within this call appends to the same
-// file (see openLog).
-func runVerifyRetry(ctx context.Context, g *gitx.Git, head, verifyCmd string, retries int, logDir string, logAttempt int) verifyJSON {
-	v := runVerify(ctx, g, head, verifyCmd, logDir, logAttempt)
+// runVerifyRetry runs -verify (or -verify-impact) on head via runVerify and,
+// on FAILURE, re-runs it up to retries more times on the SAME tree (head is
+// never re-integrated or re-checked-out to a different commit — only
+// re-verified) — passing on any green invocation. A pass on an invocation
+// after the first is flaky: -verify is supposed to be deterministic, so
+// retries are a mitigation for flaky test suites, not a license to skip
+// that; the flaky pass is surfaced via verifyJSON.Flaky rather than silently
+// reported as a clean first-try green. retries=0 reproduces the pre-existing
+// behavior exactly: one invocation, no retry, never flaky. When all retries
+// are exhausted, the last (failing) invocation's result is returned, same as
+// today. changedFiles is passed straight through to runVerify unchanged
+// across retries (same tree, same scope decision every invocation).
+// logAttempt names this logical verify attempt (0 = pre-repair, N = after
+// repair round N) for -logdir's verify-<n>.log; every retry within this call
+// appends to the same file (see openLog).
+func runVerifyRetry(ctx context.Context, g *gitx.Git, head string, p runParams, changedFiles []string, retries int, logDir string, logAttempt int) verifyJSON {
+	v := runVerify(ctx, g, head, p, changedFiles, logDir, logAttempt)
 	for attempt := 0; !v.OK && attempt < retries; attempt++ {
-		v = runVerify(ctx, g, head, verifyCmd, logDir, logAttempt)
+		v = runVerify(ctx, g, head, p, changedFiles, logDir, logAttempt)
 		if v.OK {
 			v.Flaky = true
 		}
@@ -1252,10 +1307,17 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 	return a, true
 }
 
-// runVerify materializes finalSHA into a detached worktree and runs verifyCmd
-// there. The main working tree is never touched. logAttempt names the
-// -logdir log file (verify-<logAttempt>.log); see runVerifyRetry.
-func runVerify(ctx context.Context, g *gitx.Git, finalSHA, verifyCmd string, logDir string, logAttempt int) verifyJSON {
+// runVerify materializes finalSHA into a detached worktree and runs -verify
+// there — or, when -verify-impact is set and computeImpact can confidently
+// scope changedFiles down to a set of impacted Go packages, -verify-impact
+// instead (with SIGBOUND_IMPACTED_PKGS/SIGBOUND_CHANGED_FILES set). ANY doubt
+// (see computeImpact) falls back to running -verify untouched — this whole
+// scoping decision is a no-op, and Scope stays "" (never "full"), when
+// -verify-impact isn't configured at all, so a run without it behaves
+// byte-identically to before -verify-impact existed. The main working tree is
+// never touched. logAttempt names the -logdir log file
+// (verify-<logAttempt>.log); see runVerifyRetry.
+func runVerify(ctx context.Context, g *gitx.Git, finalSHA string, p runParams, changedFiles []string, logDir string, logAttempt int) verifyJSON {
 	dir, err := os.MkdirTemp("", "sig-verify-*")
 	if err != nil {
 		return verifyJSON{Ran: true, OK: false, Output: err.Error()}
@@ -1268,10 +1330,27 @@ func runVerify(ctx context.Context, g *gitx.Git, finalSHA, verifyCmd string, log
 	}
 	defer func() { _ = g.WorktreeRemove(ctx, checkout) }()
 
+	verifyCmd := p.VerifyCmd
+	var scope string
+	var impacted []string
+	var extraEnv []string
+	if strings.TrimSpace(p.VerifyImpactCmd) != "" {
+		scope = "full"
+		if pkgs, ok := computeImpact(ctx, checkout, changedFiles); ok {
+			scope = "impact"
+			impacted = pkgs
+			verifyCmd = p.VerifyImpactCmd
+			extraEnv = []string{
+				"SIGBOUND_IMPACTED_PKGS=" + strings.Join(pkgs, " "),
+				"SIGBOUND_CHANGED_FILES=" + strings.Join(changedFiles, " "),
+			}
+		}
+	}
+
 	cmd := exec.CommandContext(ctx, "sh", "-c", verifyCmd)
 	cmd.Dir = checkout
 	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), extraEnv...)
 	// Combined output, same as CombinedOutput(): both streams into one buffer
 	// (outBuf) for the bounded report tail. With -logdir, both ALSO stream to
 	// a full log file; see runAgent for the same pattern.
@@ -1286,7 +1365,7 @@ func runVerify(ctx context.Context, g *gitx.Git, finalSHA, verifyCmd string, log
 		cmd.Stderr = cmd.Stdout
 	}
 	err = cmd.Run()
-	return verifyJSON{Ran: true, OK: err == nil, Output: tail(outBuf.String(), 2000)}
+	return verifyJSON{Ran: true, OK: err == nil, Scope: scope, ImpactedPkgs: impacted, Output: tail(outBuf.String(), 2000)}
 }
 
 func writeRunSummary(w io.Writer, r runReport) error {
@@ -1325,6 +1404,12 @@ func writeRunSummary(w io.Writer, r runReport) error {
 			v = "FAIL"
 		}
 		fmt.Fprintf(w, "verify: %s", v)
+		if r.Verify.Scope != "" {
+			fmt.Fprintf(w, "  scope=%s", r.Verify.Scope)
+			if r.Verify.Scope == "impact" {
+				fmt.Fprintf(w, " (%d pkgs)", len(r.Verify.ImpactedPkgs))
+			}
+		}
 		if r.Verify.Flaky {
 			fmt.Fprint(w, "  flaky=true")
 		}

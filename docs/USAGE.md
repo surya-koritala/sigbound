@@ -31,7 +31,7 @@ sig run [-config PATH]
         (-agent CMD | -agent-preset NAME) [-agent-timeout D] [-agent-retries N]
         [-strategy overlay] [-assert]
         [-resolver CMD] [-resolver-timeout D]
-        [(-verify CMD | -verify-preset NAME) [-verify-retries N]
+        [(-verify CMD | -verify-preset NAME) [-verify-retries N] [-verify-impact CMD]
           [(-repair CMD | -repair-preset NAME) [-repair-max N]]]
         [-lanes off|warn|strict]
         [-no-autocommit]
@@ -68,6 +68,7 @@ sig run [-config PATH]
 | `-verify` | — | Command run in a detached checkout of the integrated tree; non-zero exit = merge fails and does not land. |
 | `-verify-preset` | — | Expand a named per-language build+test preset (`go`, `node`, `python`, `rust`) into `-verify`'s command (see [Presets](#presets)). An explicit `-verify` always overrides its preset. |
 | `-verify-retries` | `0` | After a FAILING `-verify` invocation, re-run it up to N more times on the same tree; passes on any green. A pass on a retry marks the report `flaky=true`. `0` = today's behavior. |
+| `-verify-impact` | — | Command run INSTEAD of `-verify` when Sigbound can confidently scope it to the impacted Go packages (see [Scoped verification](#scoped-verification)). Requires `-verify` (or `-verify-preset`), which stays the fallback on any doubt. |
 | `-repair` | — | Fixer command invoked when `-verify` fails; edits are committed and `-verify` re-runs. |
 | `-repair-preset` | — | Expand a named repair-harness preset (`claude`, `codex`, `aider`) into `-repair`'s command (see [Presets](#presets)). An explicit `-repair` always overrides its preset. |
 | `-repair-max` | `2` | Max repair attempts before reporting `verify.ok=false` honestly. |
@@ -96,6 +97,54 @@ anything), and integrate/verify are attempted against whatever's left of
 that same expired context. If they can't complete, `sig run` reports an
 honest operational error naming the budget instead of ever landing a
 partial tree — the same `-verify` gate applies as on any other run.
+
+### Scoped verification
+
+`-verify` runs the whole suite once, on the whole tree, every time — for a
+large repo that's usually the dominant cost of a run. `-verify-impact CMD`
+lets you point Sigbound at a command that runs ONLY the tests for the Go
+packages actually affected by this run's changes, using the write-set the
+integrator already computed (no extra diffing):
+
+```bash
+sig run ... -verify 'go test ./...' -verify-impact 'go test $SIGBOUND_IMPACTED_PKGS'
+```
+
+When it decides scoping is safe, Sigbound runs `go list -json ./...` in the
+same detached checkout `-verify` would use, builds the reverse import graph
+(including test-only imports — a change to package A can break the tests of
+anything whose _test.go files import A, even if A's own sources don't reach
+it), and expands the changed packages to every transitive reverse dependent.
+The result is exported to `-verify-impact` as two environment variables:
+
+| Variable | Given to | Meaning |
+|----------|----------|---------|
+| `SIGBOUND_IMPACTED_PKGS` | `-verify-impact` | Space-separated `./relative` package paths: the changed packages plus every package that (transitively) imports one of them. |
+| `SIGBOUND_CHANGED_FILES` | `-verify-impact` | Space-separated repo-relative paths of every file this run's landed write-set touched. |
+
+**`-verify-impact` only ever runs INSTEAD of `-verify` on high confidence;
+`-verify` is required and remains the fallback — and the source of truth —
+on ANY doubt.** Impact scoping trades confidence for speed: it can only ever
+narrow which tests run, never which changes get checked. The full `-verify`
+command runs instead whenever:
+
+- a changed path is anything other than a `.go` file inside the module
+  (a `go.mod`/`go.sum` change, a doc, a config file, ...);
+- a changed path sits under a directory named `testdata/` (the Go tool never
+  treats those as package source, so impact analysis can't reason about them
+  safely);
+- `go list` fails to run or its output can't be parsed;
+- the resulting impact set is empty, or a changed `.go` file doesn't map to
+  any package `go list` reported.
+
+The report's `verify.scope` names which command actually ran (`"impact"` or
+`"full"`) and `verify.impactedPkgs` lists the packages, when scoped — both
+fields are absent entirely when `-verify-impact` isn't set, so a run without
+it is unaffected. `-verify-impact` failing is an ordinary verify failure,
+gated and repaired exactly like `-verify` failing — `-repair`'s re-verify
+runs through the same seam, RECOMPUTING impact after each repair attempt (a
+fixer's own edits are new changes on top of the original write-set, so the
+scope decision is re-made from scratch every time, never memoized).
 
 ### Determinism
 
@@ -424,6 +473,8 @@ command **you** supply, run via `sh -c`. Sigbound passes context through
 | `SIGBOUND_THEIRS` | `-resolver` | Path to the "theirs" version. |
 | `SIGBOUND_PATH` | `-resolver` | Repo-relative path of the conflicted file. Write the resolved body to stdout; empty output, a non-zero exit, or a timeout flags the conflict for a human. |
 | `SIGBOUND_FAILURE` | `-repair` | The captured `-verify` output to fix. Edit files to fix it; the driver commits the edits and re-runs `-verify`. |
+| `SIGBOUND_IMPACTED_PKGS` | `-verify-impact` | Space-separated `./relative` package paths: the changed packages plus every transitive reverse dependent (see [Scoped verification](#scoped-verification)). |
+| `SIGBOUND_CHANGED_FILES` | `-verify-impact` | Space-separated repo-relative paths this run's landed write-set touched. |
 
 ---
 
@@ -450,6 +501,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   },
   "verify": {
     "ran": true, "ok": true, "attempts": 1, "repaired": false, "flaky": false,
+    "scope": "impact", "impactedPkgs": ["./a", "./b"],
     "output": "…",
     "repairs": [ { "n": 1, "filesTouched": ["…"], "verifyOk": true } ]
   },
@@ -462,6 +514,9 @@ With `-json`, `sig run` prints a full report. Top-level shape:
 - `integrate.resolved` — overlapping branches that still landed (auto-merged or
   resolver-resolved).
 - `verify.ok` is the bottom line: `false` means nothing was landed onto `-base`.
+- `verify.scope`/`verify.impactedPkgs` are present iff `-verify-impact` was
+  set (see [Scoped verification](#scoped-verification)); `scope` is `"full"`
+  on any doubt, `"impact"` when the scoped command ran.
 - `logDir` is present iff `-logdir` was set; it names the directory holding
   each command's full stdout+stderr log (see `-logdir` above).
 
