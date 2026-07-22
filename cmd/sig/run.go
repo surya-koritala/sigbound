@@ -73,6 +73,14 @@ type perAgentJSON struct {
 	// -keep-failed retained it (i.e. the agent failed and teardown was skipped).
 	// Empty for every successful agent, and for a failed one without -keep-failed.
 	WorktreeKept string `json:"worktreeKept,omitempty"`
+	// TimedOut is true iff -agent-timeout expired while this attempt's agent
+	// command was running (see runAgent). Not set for a run-budget cancellation
+	// (see runAgentWithRetries/driveRun) or an ordinary bad exit.
+	TimedOut bool `json:"timedOut,omitempty"`
+	// Attempts is the total number of times this task's agent was run,
+	// including retries (see -agent-retries / runAgentWithRetries). 1 when the
+	// first try succeeded or -agent-retries is 0.
+	Attempts int `json:"attempts,omitempty"`
 }
 
 // integrateJSON is the cell integrator's result, projected for the report.
@@ -182,13 +190,16 @@ type runParams struct {
 	ResolverCmd     string
 	ResolverTimeout time.Duration
 	VerifyCmd       string
-	VerifyRetries   int    // re-run a FAILING -verify up to this many more times on the same tree before giving up (0 = today's behavior)
-	RepairCmd       string // fixer-agent command run when -verify fails (empty => no repair loop)
-	RepairMax       int    // max repair attempts before giving up honestly (default via flag)
-	Autocommit      bool   // commit an agent's uncommitted edits when it made no commit itself
-	LaneMode        string // lane enforcement: laneOff | laneWarn | laneStrict
-	KeepFailed      bool   // keep a FAILED agent's worktree on disk instead of removing it
-	LogDir          string // when set, full per-command stdout+stderr logs are written here (see openLog)
+	VerifyRetries   int           // re-run a FAILING -verify up to this many more times on the same tree before giving up (0 = today's behavior)
+	RepairCmd       string        // fixer-agent command run when -verify fails (empty => no repair loop)
+	RepairMax       int           // max repair attempts before giving up honestly (default via flag)
+	Autocommit      bool          // commit an agent's uncommitted edits when it made no commit itself
+	LaneMode        string        // lane enforcement: laneOff | laneWarn | laneStrict
+	KeepFailed      bool          // keep a FAILED agent's worktree on disk instead of removing it
+	LogDir          string        // when set, full per-command stdout+stderr logs are written here (see openLog)
+	AgentTimeout    time.Duration // per-agent command timeout (0 = none); see runAgent
+	AgentRetries    int           // retry a FAILED agent (bad exit or -agent-timeout, never a lane-strict stray) up to this many more times; see runAgentWithRetries
+	Budget          time.Duration // wall-clock ceiling for the agent phase + integrate + verify (0 = none); see driveRun
 }
 
 // repairFailureMax bounds the captured verify output handed to the fixer agent
@@ -234,7 +245,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-logdir DIR] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -254,6 +265,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	plannerTimeout := fs.Duration("planner-timeout", 120*time.Second, "timeout for the -planner command (0 = none)")
 	agentCmd := fs.String("agent", "", "shell command (run via `sh -c`, once per task) that edits files (and optionally commits) in the task's worktree; "+
 		"receives SIGBOUND_TASK, SIGBOUND_TASK_ID, SIGBOUND_REPO, SIGBOUND_BRANCH env vars with cwd=the worktree")
+	agentTimeout := fs.Duration("agent-timeout", 0, "timeout for each -agent command (0 = none); on expiry the agent fails (exit=-1) and the report marks timedOut=true")
+	agentRetries := fs.Int("agent-retries", 0, "retry a FAILED agent (bad exit or -agent-timeout) up to N more times, each in a fresh worktree off the same base. "+
+		"A lane-strict out-of-lane failure is never retried — that's a plan violation, not a timing fluke. 0 = no retries")
 	strategy := fs.String("strategy", cell.StrategyOverlay, "integration strategy: "+strings.Join(cell.AvailableStrategies(), ", "))
 	assert := fs.Bool("assert", false, "paranoid cross-check for -strategy overlay: independently recompute the combine via merge-tree and error (never land) on any tree mismatch. "+
 		"Roughly doubles integration cost (it re-merges everything); for paranoia/CI, not routine use")
@@ -270,6 +284,8 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	lanes := fs.String("lanes", laneWarn, "lane enforcement for declared file-sets: off (ignore) | warn (record out-of-lane writes, still land) | strict (out-of-lane => failed agent, not landed). warn is best-effort; strict is the real disjointness guarantee. "+
 		"Default is warn, EXCEPT a planned run (-goal) with -lanes not set explicitly defaults to strict, since the planner already promised a disjoint split")
 	keepFailed := fs.Bool("keep-failed", false, "keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected; the path is printed and recorded in the report. Successful agents' worktrees are always removed")
+	budget := fs.Duration("budget", 0, "wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (0 = none). On expiry, outstanding agents are cancelled and fail; "+
+		"integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial")
 	logDir := fs.String("logdir", "", "when set, write each agent/repair/verify/planner command's FULL stdout+stderr to <logdir>/<name>.log "+
 		"(agent-<id>.log, repair-<n>.log, verify-<n>.log, planner.log), in addition to the truncated tails the report keeps in memory. "+
 		"The directory is created if needed and must be writable; checked before any agent runs")
@@ -385,6 +401,8 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Strategy:        *strategy,
 		Assert:          *assert,
 		AgentCmd:        *agentCmd,
+		AgentTimeout:    *agentTimeout,
+		AgentRetries:    *agentRetries,
 		ResolverCmd:     *resolverCmd,
 		ResolverTimeout: *resolverTimeout,
 		VerifyCmd:       *verifyCmd,
@@ -394,6 +412,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Autocommit:      !*noAutocommit,
 		LaneMode:        laneMode,
 		KeepFailed:      *keepFailed,
+		Budget:          *budget,
 		LogDir:          logDirAbs,
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
@@ -488,6 +507,19 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 		os.RemoveAll(wtRoot)
 	}()
 
+	// -budget bounds the rest of driveRun (agent phase + integrate + verify)
+	// with one wall-clock ceiling. Once it fires, every outstanding agent is
+	// cancelled (see runAgent) and integrate/verify below run against whatever
+	// is left of the same expired ctx — honestly, with no separate grace
+	// period: if a git command can no longer complete, it fails and that
+	// surfaces as an operational error naming the budget (see the integrate
+	// error handling below), never a silently-landed partial tree.
+	if p.Budget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.Budget)
+		defer cancel()
+	}
+
 	// ---- fan out: one agent per task, each in its own isolated worktree ----
 	agents := make([]perAgentJSON, len(tasks))
 	var admin sync.Mutex // serialize git worktree add/remove admin steps
@@ -499,7 +531,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			agents[i] = runAgent(ctx, g, &admin, wtRoot, baseSHA, p, tasks[i])
+			agents[i] = runAgentWithRetries(ctx, g, &admin, wtRoot, baseSHA, p, tasks[i])
 		}(i)
 	}
 	wg.Wait()
@@ -525,7 +557,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 	start := time.Now()
 	res, err := integrateBranches(ctx, g, p.Base, baseSHA, branches, writeSets, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false)
 	if err != nil {
-		return rep, fmt.Errorf("integrate: %w", err)
+		return rep, budgetAwareErr(p, ctx, "integrate", err)
 	}
 	wall := time.Since(start)
 
@@ -560,10 +592,22 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 		}
 	}
 	if err := g.UpdateRef(ctx, "refs/heads/"+p.Base, landSHA); err != nil {
-		return rep, fmt.Errorf("land %s: %w", short(landSHA), err)
+		return rep, budgetAwareErr(p, ctx, "land "+short(landSHA), err)
 	}
 	rep.Integrate.FinalSHA = landSHA
 	return rep, nil
+}
+
+// budgetAwareErr wraps err from a driveRun phase (integrate, land), naming
+// the exhausted -budget when that's honestly why op couldn't complete — ctx
+// already dead by the time op ran, not some unrelated git failure. Plain
+// "%s: %w" wrapping otherwise (no -budget set, or ctx is still fine and
+// something else broke).
+func budgetAwareErr(p runParams, ctx context.Context, op string, err error) error {
+	if p.Budget > 0 && ctx.Err() != nil {
+		return fmt.Errorf("%s: run budget (%s) exhausted before it could complete: %w", op, p.Budget, err)
+	}
+	return fmt.Errorf("%s: %w", op, err)
 }
 
 // verifyWithRepair runs -verify (with -verify-retries applied, see
@@ -724,6 +768,36 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 	return newHead, files, nil
 }
 
+// runAgentWithRetries wraps runAgent with -agent-retries: on a FAILED attempt
+// (bad exit or an -agent-timeout expiry) it tears down that attempt's
+// worktree and retries in a FRESH one off the same base, up to
+// p.AgentRetries more times. Two cases stop the retry loop early, before
+// attempts are exhausted:
+//
+//   - a lane-strict out-of-lane failure (a.InLane false) — that's a plan
+//     violation, not a timing fluke a retry could fix;
+//   - ctx already done (e.g. -budget exhausted) — every further attempt would
+//     just fail the same way, so retrying only burns worktree churn.
+//
+// Only the LAST attempt's worktree is kept under -keep-failed; every earlier
+// failed attempt is torn down regardless (attemptParams.KeepFailed is only
+// ever true on that final call). a.Attempts records the total number of
+// tries actually made (1 when the first try succeeded or no retries were
+// configured, matching today's report shape).
+func runAgentWithRetries(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec) perAgentJSON {
+	var a perAgentJSON
+	for attempt := 1; ; attempt++ {
+		last := attempt > p.AgentRetries
+		attemptParams := p
+		attemptParams.KeepFailed = p.KeepFailed && last
+		a = runAgent(ctx, g, admin, wtRoot, baseSHA, attemptParams, t)
+		a.Attempts = attempt
+		if a.OK || last || !a.InLane || ctx.Err() != nil {
+			return a
+		}
+	}
+}
+
 // runAgent creates a worktree on branch agent/<id> off base, runs the agent
 // command there, and reports what it committed. The worktree is torn down
 // after, UNLESS the agent ultimately FAILED (see the lane-enforcement block
@@ -733,7 +807,10 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 // integration either way.
 func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec) (a perAgentJSON) {
 	branch := "agent/" + t.ID
-	a = perAgentJSON{ID: t.ID, Branch: branch, Files: []string{}}
+	// InLane defaults true (not the zero value) so a failure that never reaches
+	// the lane-enforcement block below — e.g. WorktreeAdd itself failing —
+	// isn't mistaken by runAgentWithRetries for a lane-strict stray.
+	a = perAgentJSON{ID: t.ID, Branch: branch, Files: []string{}, InLane: true}
 	dir := filepath.Join(wtRoot, "wt-"+sanitizeID(t.ID))
 
 	admin.Lock()
@@ -752,11 +829,24 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 			return
 		}
 		admin.Lock()
-		_ = g.WorktreeRemove(ctx, dir)
+		// WithoutCancel: teardown must happen even when ctx is already dead (a
+		// -budget or -agent-timeout expiry) — an agent's admin cleanup is not
+		// itself subject to either, only the agent command is (see actx below).
+		_ = g.WorktreeRemove(context.WithoutCancel(ctx), dir)
 		admin.Unlock()
 	}()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", p.AgentCmd)
+	// -agent-timeout scopes ONLY the agent command below, not the worktree
+	// admin around it. actx is a child of ctx, so it's also cut short if ctx
+	// itself ends first (e.g. -budget) — see the runErr handling below, which
+	// tells the two apart so the report blames the right one.
+	actx := ctx
+	if p.AgentTimeout > 0 {
+		var cancel context.CancelFunc
+		actx, cancel = context.WithTimeout(ctx, p.AgentTimeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(actx, "sh", "-c", p.AgentCmd)
 	cmd.Dir = dir
 	// If the run is cancelled, WaitDelay force-closes inherited pipes so a hung
 	// agent (or one that leaked a background process holding our stderr) can't
@@ -793,6 +883,20 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 		}
 	}
 	a.Stderr = tail(errBuf.String(), 800)
+	if runErr != nil {
+		switch {
+		case ctx.Err() != nil:
+			// The OUTER ctx ended out from under this agent — e.g. -budget
+			// exhausted — not -agent-timeout specifically, even though actx
+			// (derived from ctx) also reports done at this point. Checked
+			// before actx below so the report blames the real cause.
+			a.Stderr = tail("run ended before the agent finished (-budget exhausted): "+a.Stderr, 800)
+		case actx.Err() == context.DeadlineExceeded:
+			a.TimedOut = true
+			a.Exit = -1
+			a.Stderr = tail(fmt.Sprintf("agent-timeout (%s) exceeded: ", p.AgentTimeout)+a.Stderr, 800)
+		}
+	}
 
 	// Read what the agent committed straight from the branch head — never the
 	// main working tree.
@@ -917,9 +1021,15 @@ func writeRunSummary(w io.Writer, r runReport) error {
 		if !a.OK {
 			status = fmt.Sprintf("FAILED(exit %d)", a.Exit)
 		}
+		if a.TimedOut {
+			status += " TIMEOUT"
+		}
 		fmt.Fprintf(w, "  agent %-12s %-16s %-16s files=%v\n", a.ID, a.Branch, status, a.Files)
 		if len(a.Strayed) > 0 {
 			fmt.Fprintf(w, "    out-of-lane: wrote %v outside declared %v\n", a.Strayed, a.DeclaredFiles)
+		}
+		if a.Attempts > 1 {
+			fmt.Fprintf(w, "    attempts: %d\n", a.Attempts)
 		}
 		if a.WorktreeKept != "" {
 			fmt.Fprintf(w, "    kept worktree: %s\n", a.WorktreeKept)

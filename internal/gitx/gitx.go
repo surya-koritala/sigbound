@@ -171,10 +171,14 @@ func (g *Git) TreeOID(ctx context.Context, rev string) (string, error) {
 	return g.run(ctx, "rev-parse", "--verify", rev+"^{tree}")
 }
 
-// WorktreeAdd creates a new worktree at path on a fresh branch off base.
-// Runs in the main repo; the new worktree shares this repo's object store.
+// WorktreeAdd creates a new worktree at path on branch, (re)created fresh off
+// base. Runs in the main repo; the new worktree shares this repo's object
+// store. Uses `-B` (force create-or-reset), not `-b`, so a caller retrying a
+// failed attempt on the same branch name (see cmd/sig's -agent-retries) can
+// just call this again — the branch is reset to base rather than erroring
+// because it already exists.
 func (g *Git) WorktreeAdd(ctx context.Context, path, branch, base string) error {
-	_, err := g.run(ctx, "worktree", "add", "-q", "-b", branch, "--", path, base)
+	_, err := g.run(ctx, "worktree", "add", "-q", "-B", branch, "--", path, base)
 	return err
 }
 
