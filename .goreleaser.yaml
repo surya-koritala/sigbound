@@ -1,0 +1,65 @@
+version: 2
+
+builds:
+  - id: sig
+    main: ./cmd/sig
+    binary: sig
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+
+archives:
+  - id: sig
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    include:
+      - '^feat'
+      - '^fix'
+      - '^perf'
+      - '^docs'
+
+# Publishes to github.com/surya-koritala/homebrew-tap. That repo must exist
+# and HOMEBREW_TAP_TOKEN (a PAT with repo write access, since the tap is a
+# separate repository from GITHUB_TOKEN's scope) must be set for the upload
+# to happen; otherwise it's skipped and the rest of the release still
+# succeeds. See docs/RELEASE.md.
+#
+# Uses homebrew_casks rather than the older brews directive: brews is
+# deprecated as of GoReleaser v2 (fails `goreleaser check`), and
+# homebrew_casks is its documented replacement, including for plain CLI
+# binaries via the `binaries` field.
+homebrew_casks:
+  - name: sig
+    repository:
+      owner: surya-koritala
+      name: homebrew-tap
+      token: '{{ .Env.HOMEBREW_TAP_TOKEN }}'
+    skip_upload: '{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}'
+    homepage: https://github.com/surya-koritala/sigbound
+    description: Run AI coding agents in parallel on one repo and auto-merge their work
+    binaries:
+      - sig
