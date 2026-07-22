@@ -1,0 +1,157 @@
+name: Nightly deep regression
+
+# PR CI (ci.yml) is deliberately fast: 15s fuzz smoke, one -race run. This
+# workflow runs the deeper, slower regression PR latency can't afford:
+# 5-minute fuzzing on every fuzz target, the full A/B correctness sweep, and
+# -race on both supported Go versions. It fails loudly on failure — no
+# issue-bot machinery, the maintainer watches the Actions tab (solo
+# maintainer, so a pinned-issue bot is unused complexity for now).
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Every Fuzz* target in the repo, 5 minutes each via the existing
+  # fuzz-smoke.sh retry/crasher-detection wrapper (reused as-is, just with a
+  # longer fuzztime than the 15s PR smoke test uses). The matrix is
+  # enumerated explicitly so a target quietly going unfuzzed is a visible
+  # diff here, not a silent gap — see CONTRIBUTING.md's "Nightly regression"
+  # section for how to add a new one.
+  deep-fuzz:
+    name: deep fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: FuzzParsePlan
+            pkg: ./cmd/sig/
+          - target: FuzzRelSafe
+            pkg: ./cmd/sig/
+          - target: FuzzSlugSafe
+            pkg: ./cmd/sig/
+          - target: FuzzParseConfigFile
+            pkg: ./cmd/sig/
+          - target: FuzzParseGoListJSON
+            pkg: ./cmd/sig/
+          - target: FuzzParseDiffRawZ
+            pkg: ./internal/gitx/
+          - target: FuzzParseMergeTreeZ
+            pkg: ./internal/gitx/
+          - target: FuzzParseDiffTreeStdinRawZ
+            pkg: ./internal/gitx/
+          - target: FuzzParseBatchCheckLine
+            pkg: ./internal/gitx/
+          - target: FuzzParseGitVersion
+            pkg: ./internal/gitx/
+          - target: FuzzParseLsTreeZ
+            pkg: ./internal/gitx/
+          - target: FuzzParseCatFileBatch
+            pkg: ./internal/gitx/
+          - target: FuzzStrategiesAgree
+            pkg: ./cell/
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Fuzz ${{ matrix.target }} (${{ matrix.pkg }}, 5m)
+        run: .github/scripts/fuzz-smoke.sh ${{ matrix.target }} ${{ matrix.pkg }} 5m
+
+      # A real crasher leaves a corpus file under testdata/fuzz/<target>/;
+      # fuzz-smoke.sh already prints its path and contents to the log, this
+      # just also hands it back as a downloadable artifact so the maintainer
+      # can commit it straight in as a regression seed.
+      - name: Upload crasher artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crasher-${{ matrix.target }}
+          path: '**/testdata/fuzz/${{ matrix.target }}/**'
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # The full -race suite on the oldest and newest supported Go, same as
+  # ci.yml's race job but without the -short/fast constraints CI implies.
+  race-matrix:
+    name: race (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.25', '1.26']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+  # The full sigbench A/B sweep: all strategies, both overlap knobs, plus a
+  # conflict-heavy variant sigbench's own -conflict flag exposes.
+  #
+  # sigbench's -sweep mode never sets a non-zero exit code on a correctness
+  # failure at an individual sweep point (runSweep only logs "[sweep]
+  # CORRECTNESS FAILURE ..." to stderr and keeps going) — only its
+  # non-sweep, single-config mode calls os.Exit(2) via gateOK. So the sweep
+  # step greps the captured output for the sweep's own failure line and for
+  # a "NO"/"FAIL"/"ERR" cell in the trees-eq/correct table columns; the
+  # conflict-heavy step runs in non-sweep mode where the exit code alone is
+  # authoritative.
+  bench-correctness:
+    name: bench correctness sweep
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: A/B correctness sweep (all strategies, both overlap knobs)
+        run: |
+          go run ./cmd/sigbench -sweep -runs 3 -warmup 1 2>&1 | tee sweep.log
+          if grep -q 'CORRECTNESS FAILURE' sweep.log || grep -Pq '\tNO\t|\tFAIL\t|\tERR\t' sweep.log; then
+            echo "sigbench: correctness failure detected in sweep output (see above)" >&2
+            exit 1
+          fi
+
+      - name: Conflict-heavy correctness (non-sweep; exit code is authoritative)
+        run: go run ./cmd/sigbench -agents 128 -overlap 0.5 -conflict 0.3 -runs 3 -warmup 1
+
+  # The repo's shell-tooling self-tests: offline, no Go toolchain needed.
+  ci-selfcheck:
+    name: shell tooling self-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: fuzz-smoke.sh self-test
+        run: bash .github/scripts/fuzz-smoke_test.sh
+
+      - name: action/install.sh self-test
+        run: bash action/install_test.sh
+
+      - name: action/run.sh self-test
+        run: bash action/run_test.sh
