@@ -224,6 +224,14 @@ type runReport struct {
 	VerifyCmd   string `json:"verifyCmd,omitempty"`
 	RepairCmd   string `json:"repairCmd,omitempty"`
 	PlannerCmd  string `json:"plannerCmd,omitempty"`
+	// EnvMode is -env-mode (envModeInherit or envModeScoped) — provenance for
+	// what environment the commands above ran with. The -env-* allowlists
+	// themselves are deliberately NOT recorded here, and the actual resolved
+	// environment (parent vars passed through, SIGBOUND_* values) is NEVER
+	// recorded anywhere — unlike AgentCmd/VerifyCmd/etc. above, a run's
+	// environment can carry secrets a command's own source text never
+	// mentions. See docs/USAGE.md's Scoped environments section.
+	EnvMode string `json:"envMode"`
 	// Publish is the -publish command's outcome (see runPublish), set only
 	// when the run LANDED (base ref advanced; -verify green or unset) AND
 	// -publish was configured — nil (omitted from JSON) otherwise, so a run
@@ -298,6 +306,21 @@ type runParams struct {
 	PlannerCmd      string // recorded on the report for provenance only; driveRun itself never plans — planning already happened by the time it's called
 	ResolverCmd     string
 	ResolverTimeout time.Duration
+	// EnvMode is -env-mode: envModeInherit (default; any other value driveRun
+	// might be handed directly, e.g. a test's zero-value runParams{}, is also
+	// treated as inherit -- see slotEnv) or envModeScoped. EnvAgent/
+	// EnvResolver/EnvVerify/EnvRepair/EnvPublish are that mode's per-slot
+	// -env-* allowlists (extra parent-env variable names/NAME_* globs passed
+	// through on top of the scoped base env); unused in inherit mode. Every
+	// cmd.Env assignment in this file routes through slotEnv with these, so
+	// scoping is applied identically slot to slot. See docs/USAGE.md's
+	// Scoped environments section.
+	EnvMode         string
+	EnvAgent        []string
+	EnvResolver     []string
+	EnvVerify       []string
+	EnvRepair       []string
+	EnvPublish      []string
 	VerifyCmd       string
 	VerifyImpactCmd string        // optional command run INSTEAD of -verify when computeImpact can confidently scope to the impacted Go packages; requires VerifyCmd, which stays the fallback on any doubt (see runVerify)
 	VerifyRetries   int           // re-run a FAILING -verify up to this many more times on the same tree before giving up (0 = today's behavior)
@@ -380,7 +403,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset); -publish succeeded or was unset")
@@ -489,6 +512,18 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		"set, else empty — a path pointer only, since -manifest itself is written after the run returns; use stdin for the report's actual contents). A publish FAILURE does NOT "+
 		"unland the work or flip verify's verdict — it's reported as its own report.publish field and the run exits 6 instead of 0. See docs/USAGE.md's Publish section. Default \"\": off")
 	publishTimeout := fs.Duration("publish-timeout", 120*time.Second, "timeout for the -publish command (0 = none)")
+	envMode := fs.String("env-mode", envModeInherit, "environment given to every -agent/-resolver/-verify/-repair/-planner/-publish command: inherit (default) hands each the "+
+		"FULL parent environment plus its own SIGBOUND_* vars, today's behavior, byte-identical. scoped hands each ONLY a minimal base environment (PATH, HOME, USER, SHELL, "+
+		"TMPDIR, LANG, LC_*, TERM, GIT_*, whichever are actually set) plus its own SIGBOUND_* vars plus whatever that slot's own -env-* flag allowlists through -- nothing else "+
+		"from the parent env. Least privilege for a BYO command that's LLM-driven and can exfiltrate whatever env it can see (a secret meant for -agent should never be visible "+
+		"to -verify, let alone every other tenant's slot in a hosted setting). See docs/USAGE.md's Scoped environments section")
+	envAgent := fs.String("env-agent", "", "-env-mode scoped only: comma-separated extra parent-env variable NAMES (or NAME_* globs) passed through to -agent on top of the "+
+		"scoped base env, e.g. ANTHROPIC_API_KEY. A name not set in the parent is silently skipped. Ignored in -env-mode inherit")
+	envResolver := fs.String("env-resolver", "", "-env-mode scoped only: same as -env-agent, for -resolver")
+	envVerify := fs.String("env-verify", "", "-env-mode scoped only: same as -env-agent, for -verify")
+	envRepair := fs.String("env-repair", "", "-env-mode scoped only: same as -env-agent, for -repair")
+	envPlanner := fs.String("env-planner", "", "-env-mode scoped only: same as -env-agent, for -planner")
+	envPublish := fs.String("env-publish", "", "-env-mode scoped only: same as -env-agent, for -publish")
 	asJSON := fs.Bool("json", false, "emit the full JSON report (default: a terse human summary)")
 
 	if err := fs.Parse(argv); err != nil {
@@ -574,6 +609,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	if err := validateLaneMode(*lanes); err != nil {
 		return exitOperationalError, err
 	}
+	if err := validateEnvMode(*envMode); err != nil {
+		return exitOperationalError, err
+	}
 	// Cheap preflight: git present + version >= 2.38, before touching the repo
 	// or spawning any agent. The engine hard-depends on merge-tree/overlay
 	// plumbing that only exists from 2.38 onward; catching that here turns a
@@ -644,7 +682,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		}
 		// Plan from the goal. A bad plan returns an error here — before any agent
 		// runs — so a broken plan never launches a broken run (fail-safe).
-		tasks, err = planTasks(context.Background(), *repo, *goal, *plannerCmd, *n, *plannerTimeout, logDirAbs)
+		tasks, err = planTasks(context.Background(), *repo, *goal, *plannerCmd, *n, *plannerTimeout, logDirAbs, *envMode, splitCSV(*envPlanner))
 		if err != nil {
 			return exitOperationalError, err
 		}
@@ -721,6 +759,12 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Manifest:        manifestPath,
 		Resume:          *resume,
 		ResumeBaseSHA:   resumeBaseSHA,
+		EnvMode:         *envMode,
+		EnvAgent:        splitCSV(*envAgent),
+		EnvResolver:     splitCSV(*envResolver),
+		EnvVerify:       splitCSV(*envVerify),
+		EnvRepair:       splitCSV(*envRepair),
+		EnvPublish:      splitCSV(*envPublish),
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
 	if err != nil {
@@ -1016,6 +1060,9 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if p.LaneMode == "" {
 		p.LaneMode = laneWarn // default when driven in-process without flag parsing
 	}
+	if p.EnvMode == "" {
+		p.EnvMode = envModeInherit // same in-process default as LaneMode above; slotEnv treats "" as inherit anyway
+	}
 	rep = runReport{
 		Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks, LogDir: p.LogDir,
 		Strategy:    p.Strategy,
@@ -1024,6 +1071,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		VerifyCmd:   p.VerifyCmd,
 		RepairCmd:   p.RepairCmd,
 		PlannerCmd:  p.PlannerCmd,
+		EnvMode:     p.EnvMode,
 		Version:     Version,
 		StartedAt:   runStart.UTC().Format(time.RFC3339),
 	}
@@ -1107,7 +1155,14 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	// after -verify passes (below), so a failing verify never lands a broken tree.
 	emit.emit("integrate_start", map[string]any{"branches": branches})
 	start := time.Now()
-	res, err := integrateBranches(ctx, g, p.Base, baseSHA, branches, writeSets, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false)
+	// resolverEnv stays nil (cell.CommandResolver's own default, the full
+	// os.Environ()) in -env-mode inherit; only -env-mode scoped computes a
+	// narrowed base env to hand the resolver -- see slotEnv/-env-resolver.
+	var resolverEnv []string
+	if p.EnvMode == envModeScoped {
+		resolverEnv = slotEnv(envModeScoped, p.EnvResolver, nil)
+	}
+	res, err := integrateBranches(ctx, g, p.Base, baseSHA, branches, writeSets, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false, resolverEnv)
 	if err != nil {
 		return rep, budgetAwareErr(p, ctx, "integrate", err)
 	}
@@ -1238,14 +1293,14 @@ func runPublish(ctx context.Context, p runParams, rep runReport) publishJSON {
 	cmd := exec.CommandContext(pctx, "sh", "-c", p.PublishCmd)
 	cmd.Dir = p.Repo
 	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
-	cmd.Env = append(os.Environ(),
-		"SIGBOUND_FINAL_SHA="+rep.Integrate.FinalSHA,
-		"SIGBOUND_BASE_BRANCH="+p.Base,
-		"SIGBOUND_BASE_SHA="+rep.BaseSHA,
-		"SIGBOUND_REPO="+p.Repo,
-		"SIGBOUND_LANDED="+strings.Join(rep.Integrate.Landed, " "),
-		"SIGBOUND_MANIFEST="+p.Manifest,
-	)
+	cmd.Env = slotEnv(p.EnvMode, p.EnvPublish, []string{
+		"SIGBOUND_FINAL_SHA=" + rep.Integrate.FinalSHA,
+		"SIGBOUND_BASE_BRANCH=" + p.Base,
+		"SIGBOUND_BASE_SHA=" + rep.BaseSHA,
+		"SIGBOUND_REPO=" + p.Repo,
+		"SIGBOUND_LANDED=" + strings.Join(rep.Integrate.Landed, " "),
+		"SIGBOUND_MANIFEST=" + p.Manifest,
+	})
 	if reportJSON, err := json.Marshal(rep); err != nil {
 		// rep is all strings/slices/structs — this should never actually
 		// fail; best-effort warn and let the command run without stdin,
@@ -1751,10 +1806,10 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 	cmd := exec.CommandContext(ctx, "sh", "-c", p.RepairCmd)
 	cmd.Dir = wtPath
 	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
-	cmd.Env = append(os.Environ(),
-		"SIGBOUND_FAILURE="+tail(failure, repairFailureMax),
-		"SIGBOUND_REPO="+p.Repo,
-	)
+	cmd.Env = slotEnv(p.EnvMode, p.EnvRepair, []string{
+		"SIGBOUND_FAILURE=" + tail(failure, repairFailureMax),
+		"SIGBOUND_REPO=" + p.Repo,
+	})
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	// stdout is discarded; the fixer signals its work through file edits (which
@@ -1932,12 +1987,12 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 	// agent (or one that leaked a background process holding our stderr) can't
 	// block the whole run. See cell.CommandResolver.Resolve for the mechanism.
 	cmd.WaitDelay = 2 * time.Second
-	cmd.Env = append(os.Environ(),
-		"SIGBOUND_TASK="+t.Prompt,
-		"SIGBOUND_TASK_ID="+t.ID,
-		"SIGBOUND_REPO="+p.Repo,
-		"SIGBOUND_BRANCH="+branch,
-	)
+	cmd.Env = slotEnv(p.EnvMode, p.EnvAgent, []string{
+		"SIGBOUND_TASK=" + t.Prompt,
+		"SIGBOUND_TASK_ID=" + t.ID,
+		"SIGBOUND_REPO=" + p.Repo,
+		"SIGBOUND_BRANCH=" + branch,
+	})
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	// stdout is discarded; the agent signals its work through commits + exit code.
@@ -2195,7 +2250,7 @@ func runVerify(ctx context.Context, g *gitx.Git, wtPath string, p runParams, cha
 	cmd := exec.CommandContext(ctx, "sh", "-c", verifyCmd)
 	cmd.Dir = wtPath
 	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
-	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd.Env = slotEnv(p.EnvMode, p.EnvVerify, extraEnv)
 	// Combined output, same as CombinedOutput(): both streams into one buffer
 	// (outBuf) for the bounded report tail. With -logdir, both ALSO stream to
 	// a full log file; see runAgent for the same pattern.

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -192,5 +193,90 @@ func TestResolverTimeoutFlags(t *testing.T) {
 	}
 	if !strings.Contains(hot, markerA) || strings.Contains(hot, markerB) {
 		t.Fatalf("hot file not the clean agent-0 version after timeout:\n%s", hot)
+	}
+}
+
+// ---- Env (issue #56: scoped environments) ----------------------------------
+
+// TestCommandResolverEnvFieldScopesEnvironment: a non-nil Env replaces
+// os.Environ() as the resolver command's base environment — a variable set
+// in THIS test process (standing in for another tenant's secret in a hosted
+// caller) does not reach the command, while the per-conflict SIGBOUND_* vars
+// and whatever Env itself named still do. The resolver command is `env`
+// itself, so its own stdout (captured as the "resolved" body) IS the
+// environment it saw — no temp file needed to inspect it.
+func TestCommandResolverEnvFieldScopesEnvironment(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	r := &CommandResolver{
+		Args: []string{"sh", "-c", "env"},
+		Env:  []string{"PATH=" + os.Getenv("PATH")},
+	}
+	resolved, ok, err := r.Resolve(context.Background(), Conflict{Path: "f.txt", Base: "b", Ours: "o", Theirs: "t"})
+	if err != nil || !ok {
+		t.Fatalf("Resolve: ok=%v err=%v", ok, err)
+	}
+	if strings.Contains(resolved, "SIGBOUND_TEST_CANARY") {
+		t.Fatalf("scoped Env leaked SIGBOUND_TEST_CANARY:\n%s", resolved)
+	}
+	if !strings.Contains(resolved, "PATH=") {
+		t.Fatalf("scoped Env dropped PATH, which it explicitly named:\n%s", resolved)
+	}
+	if !strings.Contains(resolved, "SIGBOUND_PATH=f.txt") {
+		t.Fatalf("per-conflict SIGBOUND_PATH missing from a scoped Env:\n%s", resolved)
+	}
+}
+
+// TestCommandResolverEnvNilKeepsLibraryDefault: Env left nil (the zero
+// value) is today's behavior, unchanged — the full os.Environ(), same as
+// before this field existed.
+func TestCommandResolverEnvNilKeepsLibraryDefault(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	r := &CommandResolver{Args: []string{"sh", "-c", "env"}}
+	resolved, ok, err := r.Resolve(context.Background(), Conflict{Path: "f.txt"})
+	if err != nil || !ok {
+		t.Fatalf("Resolve: ok=%v err=%v", ok, err)
+	}
+	if !strings.Contains(resolved, "SIGBOUND_TEST_CANARY=leak-me") {
+		t.Fatalf("nil Env should default to the full os.Environ() (today's behavior):\n%s", resolved)
+	}
+}
+
+// TestCommandResolverEnvConcurrentCallsDoNotCorruptEachOther: the integrator
+// folds independent conflict groups in parallel (see combineDisjoint /
+// Integrator's group goroutines), so Resolve can be called concurrently many
+// times on the SAME *CommandResolver — and therefore the same r.Env slice.
+// Each concurrent call must see its OWN conflict's SIGBOUND_PATH, never
+// another call's. env is built with spare capacity (make(..., 1, 8)) so a
+// naive `append(r.Env, ...)` would have room to write in place into r.Env's
+// shared backing array; Resolve's capacity clamp must force every call to
+// allocate its own array instead. Run under `go test -race` this also
+// catches the data race directly, not just a wrong-value symptom.
+func TestCommandResolverEnvConcurrentCallsDoNotCorruptEachOther(t *testing.T) {
+	base := make([]string, 1, 8) // len 1, cap 8: deliberate spare capacity
+	base[0] = "PATH=" + os.Getenv("PATH")
+	r := &CommandResolver{Args: []string{"sh", "-c", `printf 'SEEN:%s' "$SIGBOUND_PATH"`}}
+	r.Env = base
+
+	const n = 64
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failures []string
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			path := fmt.Sprintf("path-%03d.txt", i)
+			resolved, ok, err := r.Resolve(context.Background(), Conflict{Path: path})
+			want := "SEEN:" + path
+			if err != nil || !ok || resolved != want {
+				mu.Lock()
+				failures = append(failures, fmt.Sprintf("call %d: ok=%v err=%v resolved=%q, want %q", i, ok, err, resolved, want))
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	if len(failures) > 0 {
+		t.Fatalf("%d/%d concurrent Resolve calls saw the wrong SIGBOUND_PATH (shared Env corrupted):\n%s", len(failures), n, strings.Join(failures, "\n"))
 	}
 }

@@ -49,6 +49,13 @@ type CommandResolver struct {
 	// Timeout bounds each per-conflict invocation. Zero means no explicit
 	// timeout (the caller's context still applies).
 	Timeout time.Duration
+	// Env, when non-nil, is the base environment each invocation gets instead
+	// of the full os.Environ() — the seam a caller (e.g. the sig CLI's
+	// -env-mode scoped) uses to hand this resolver a deliberately narrowed
+	// environment. The per-conflict SIGBOUND_* vars below are always appended
+	// on top, so they're never affected either way. nil (the default) keeps
+	// today's behavior: os.Environ() untouched.
+	Env []string
 }
 
 // Resolve runs the configured command for one conflict. See CommandResolver.
@@ -98,7 +105,19 @@ func (r *CommandResolver) Resolve(ctx context.Context, c Conflict) (string, bool
 	// every platform. The happy path is unaffected: a resolver that exits closes
 	// its pipes and Wait returns immediately.
 	cmd.WaitDelay = 2 * time.Second
-	cmd.Env = append(os.Environ(),
+	env := r.Env
+	if env == nil {
+		env = os.Environ()
+	} else {
+		// Resolve runs concurrently across conflict groups (the integrator
+		// folds groups in parallel), and r.Env is one slice shared by every
+		// call. Clamping its capacity forces the append below to always
+		// allocate a fresh backing array instead of possibly writing into
+		// r.Env's own — without this, two goroutines appending at the same
+		// len(env) would race on (and corrupt) the same memory.
+		env = env[:len(env):len(env)]
+	}
+	cmd.Env = append(env,
 		"SIGBOUND_BASE="+basePath,
 		"SIGBOUND_OURS="+oursPath,
 		"SIGBOUND_THEIRS="+theirsPath,

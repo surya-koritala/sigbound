@@ -44,6 +44,8 @@ sig run [-config PATH]
         [-manifest FILE]
         [-notes]
         [-publish CMD [-publish-timeout D]]
+        [-env-mode inherit|scoped]
+        [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES]
         [-dry-run]
         [-json]
 ```
@@ -90,6 +92,13 @@ sig run [-config PATH]
 | `-notes` | `false` | When the run LANDS, attach the full JSON report as a git note on the landed commit under the namespaced `refs/notes/sigbound` (see [Provenance](#provenance)). Best-effort: a failure is warned on stderr but never fails the run, since landing already happened. |
 | `-publish` | — | Command (run via `sh -c`, cwd = the TARGET REPO) run once, after the run LANDS (see [Publish](#publish)). A failure doesn't unland the work; it's reported in `publish` and the run exits `6`. Default `""`: off. |
 | `-publish-timeout` | `120s` | Timeout for the `-publish` command (`0` = none). |
+| `-env-mode` | `inherit` | Environment given to every `-agent`/`-resolver`/`-verify`/`-repair`/`-planner`/`-publish` command (see [Scoped environments](#scoped-environments)). `inherit`: the full parent environment plus that slot's own `SIGBOUND_*` vars — today's behavior, byte-identical. `scoped`: only a minimal base environment (`PATH`, `HOME`, `USER`, `SHELL`, `TMPDIR`, `LANG`, `LC_*`, `TERM`, `GIT_*`) plus that slot's `SIGBOUND_*` vars plus whatever its own `-env-*` flag allowlists through — nothing else from the parent. |
+| `-env-agent` | — | `-env-mode scoped` only: comma-separated extra parent-env variable NAMES (or `NAME_*` globs) passed through to `-agent`, e.g. `ANTHROPIC_API_KEY`. A name unset in the parent is silently skipped. Ignored in `-env-mode inherit`. |
+| `-env-resolver` | — | Same as `-env-agent`, for `-resolver`. |
+| `-env-verify` | — | Same as `-env-agent`, for `-verify`. |
+| `-env-repair` | — | Same as `-env-agent`, for `-repair`. |
+| `-env-planner` | — | Same as `-env-agent`, for `-planner`. |
+| `-env-publish` | — | Same as `-env-agent`, for `-publish`. |
 | `-dry-run` | `false` | Load or plan the tasks, print them plus the predicted OCC partition, then exit — no worktree, agent, verify, or repair ever runs (see [Dry run](#dry-run)). |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
 
@@ -539,8 +548,10 @@ integration strategy, duplicated here even though `integrate.strategy`
 already has it, so it's readable without integrate having run at all),
 `agentCmd`/`resolverCmd`/`verifyCmd`/`repairCmd`/`plannerCmd` (the exact,
 RESOLVED command strings this run executed — after `-*-preset` expansion and
-`-config` merging), `version` (the sigbound version that produced this
-report), and `startedAt` (an RFC3339 timestamp for when the run began).
+`-config` merging), `envMode` (`-env-mode`'s value, `inherit` or `scoped` —
+see [Scoped environments](#scoped-environments)), `version` (the sigbound
+version that produced this report), and `startedAt` (an RFC3339 timestamp
+for when the run began).
 
 **These commands are redacted NOTHING.** They're your own shell commands,
 recorded verbatim — if you baked a secret (an API key, a token) into
@@ -548,6 +559,14 @@ recorded verbatim — if you baked a secret (an API key, a token) into
 in the git note on the landed commit. Treat both accordingly: don't commit a
 `-manifest` file to a public repo, and remember `-notes` writes into the
 target repo's own object store.
+
+**`envMode` is the one exception.** Everything above (`agentCmd`, etc.) is
+recorded verbatim; `envMode` deliberately is not extended the same way — the
+`-env-*` allowlists (which variable NAMES each slot was permitted to see)
+and, above all, the actual resolved environment each command ran with
+(parent vars passed through, `SIGBOUND_*` values) are NEVER written to the
+manifest, the note, or anywhere else. Only the mode name (`inherit` or
+`scoped`) is. See [Scoped environments](#scoped-environments).
 
 **Reading a note back:**
 
@@ -901,6 +920,69 @@ command **you** supply, run via `sh -c`. Sigbound passes context through
 
 ---
 
+## Scoped environments
+
+**Threat model.** Every slot above is a shell command **you** supply, and by
+default (`-env-mode inherit`) it gets the FULL environment `sig run` itself
+was started with — every variable, whether that slot needs it or not. On a
+laptop, where you run `sig` in your own shell to drive your own commands,
+that's harmless: it's your shell either way. It stops being harmless the
+moment one of those commands is LLM-driven (which `-agent`/`-repair`/
+`-planner` typically are) or the process is driving several tenants' work at
+once (a hosted layer built on `sig run`): an agent prompt is untrusted input
+by construction, and a command that can read `os.Environ()` can exfiltrate
+anything in it — a secret meant for `-verify` becomes visible to `-agent`
+too, and in a multi-tenant setting, one tenant's key becomes visible to
+every other tenant's slot. `-env-mode scoped` is least privilege for exactly
+this: each slot gets only what it's told to get.
+
+**What `scoped` hands each command:**
+
+1. A minimal, fixed base: `PATH`, `HOME`, `USER`, `SHELL`, `TMPDIR`, `LANG`,
+   `LC_*`, `TERM`, `GIT_*` — whichever of these are actually set in the
+   parent process (nothing here is invented; an unset one just stays unset).
+   Enough to find an interpreter, resolve paths, behave sanely under a
+   locale/terminal, and let the command's own `git` calls work normally.
+2. That slot's own `SIGBOUND_*` vars (see [Environment
+   variables](#environment-variables) above) — unaffected either way.
+3. Whatever that slot's `-env-*` flag allowlists through: extra parent-env
+   variable NAMES, or `NAME_*` globs for a family of vars (model CLIs often
+   read several, e.g. `ANTHROPIC_API_KEY` plus `ANTHROPIC_*` config knobs).
+   A name that isn't actually set in the parent is silently skipped — an
+   allowlist says what's PERMITTED, not what's REQUIRED. Nothing else from
+   the parent environment reaches the command.
+
+**It's per slot**, not global: an allowlisted name reaches only the flag it
+was given on. Giving `-agent` a key never exposes it to `-verify`, `-repair`,
+or any other slot unless that slot's OWN `-env-*` flag names it too.
+
+```
+sig run -repo . -base main -tasks tasks.json \
+  -agent 'claude -p --permission-mode acceptEdits "$SIGBOUND_TASK"' \
+  -verify 'go build ./... && go test ./...' \
+  -env-mode scoped \
+  -env-agent ANTHROPIC_API_KEY
+```
+
+Here `-agent` sees `ANTHROPIC_API_KEY` (needed to call the model) plus the
+base env plus its own `SIGBOUND_TASK`/`SIGBOUND_TASK_ID`/`SIGBOUND_REPO`/
+`SIGBOUND_BRANCH`; `-verify` — a plain `go build`/`go test`, no key needed —
+sees only the base env. Neither sees anything else from the shell `sig run`
+itself was launched in.
+
+`-env-mode inherit` (the default) is unaffected by any of this — every
+`-env-*` flag is simply ignored, and behavior is byte-identical to before
+`-env-mode` existed. Turning `scoped` on for a command that DOES need
+something from the parent (a proxy `HTTP_PROXY`, an ssh agent socket, a tool
+config file path) and forgetting its `-env-*` entry fails the SAME way a
+missing/wrong credential always would — the command errors out, same as if
+you'd never set that variable in your shell at all; there is nothing
+`sig run` does differently or worse. See `-env-mode`/`-env-agent`/
+`-env-resolver`/`-env-verify`/`-env-repair`/`-env-planner`/`-env-publish` in
+[Flags](#flags) above.
+
+---
+
 ## JSON report
 
 With `-json`, `sig run` prints a full report. Top-level shape:
@@ -938,6 +1020,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   },
   "logDir": "…",
   "agentCmd": "…", "resolverCmd": "…", "verifyCmd": "…", "repairCmd": "…", "plannerCmd": "…",
+  "envMode": "inherit",
   "publish": { "ran": true, "ok": true, "exit": 0, "output": "…" },
   "version": "0.2.0",
   "startedAt": "2025-01-01T00:00:00Z"
@@ -978,12 +1061,15 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   landed successfully; it's `publish` that failed, reflected in the exit code
   (`6`) rather than `verify.ok`.
 - `strategy`, `agentCmd`/`resolverCmd`/`verifyCmd`/`repairCmd`/`plannerCmd`,
-  `version`, and `startedAt` are the [provenance](#provenance) fields —
-  always populated (`resolverCmd`/`verifyCmd`/`repairCmd`/`plannerCmd` are
-  `omitempty` and simply absent when that slot wasn't configured for this
-  run), whether or not `-manifest`/`-notes` were passed: they're part of the
-  ordinary report: `-manifest`/`-notes` just persist it. This is also the
-  exact shape `sig replay -manifest FILE` expects.
+  `envMode`, `version`, and `startedAt` are the [provenance](#provenance)
+  fields — always populated (`resolverCmd`/`verifyCmd`/`repairCmd`/
+  `plannerCmd` are `omitempty` and simply absent when that slot wasn't
+  configured for this run), whether or not `-manifest`/`-notes` were passed:
+  they're part of the ordinary report: `-manifest`/`-notes` just persist it.
+  This is also the exact shape `sig replay -manifest FILE` expects.
+  `envMode` is `-env-mode`'s value (`inherit` or `scoped`) — the `-env-*`
+  allowlists and the actual resolved environment are deliberately NOT part
+  of this report (see [Scoped environments](#scoped-environments)).
 
 Without `-json`, the same run prints a short human summary.
 

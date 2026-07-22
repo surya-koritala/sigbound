@@ -298,7 +298,7 @@ func TestIntegrateBranchesReusesPrecomputedWriteSets(t *testing.T) {
 		"agent/x": {"fake-shared.txt"},
 		"agent/y": {"fake-shared.txt"},
 	}
-	res, err := integrateBranches(ctx, g, "main", base, branches, lying, "overlay", "", 0, false, false)
+	res, err := integrateBranches(ctx, g, "main", base, branches, lying, "overlay", "", 0, false, false, nil)
 	if err != nil {
 		t.Fatalf("integrateBranches (lying writeSets): %v", err)
 	}
@@ -311,7 +311,7 @@ func TestIntegrateBranchesReusesPrecomputedWriteSets(t *testing.T) {
 
 	// No precomputed data at all: the batched fallback must compute the real,
 	// disjoint write-sets and partition the same two branches into 2 groups.
-	res, err = integrateBranches(ctx, g, "main", base, branches, nil, "overlay", "", 0, false, false)
+	res, err = integrateBranches(ctx, g, "main", base, branches, nil, "overlay", "", 0, false, false, nil)
 	if err != nil {
 		t.Fatalf("integrateBranches (nil writeSets): %v", err)
 	}
@@ -4293,5 +4293,310 @@ func TestWriteRunSummaryShowsResumed(t *testing.T) {
 	}
 	if strings.Contains(bLine, "RESUMED") {
 		t.Fatalf("non-resumed agent's line = %q, want no RESUMED", bLine)
+	}
+}
+
+// ---- -env-mode / -env-* (issue #56) ----------------------------------------
+
+// envScopedFixture builds a one-agent repo whose -agent both dumps its full
+// environment to agentEnvOut and writes a.go (so -no-autocommit's opposite,
+// Autocommit, lands it), and whose -verify just dumps its own environment to
+// verifyEnvOut and exits 0. Shared by every agent/verify -env-mode test below.
+func envScopedFixture(t *testing.T) (repo, agentEnvOut, verifyEnvOut string) {
+	t.Helper()
+	_, repo = makeGoRepo(t)
+	dir := t.TempDir()
+	agentEnvOut = filepath.Join(dir, "agent.env")
+	verifyEnvOut = filepath.Join(dir, "verify.env")
+	return repo, agentEnvOut, verifyEnvOut
+}
+
+// TestDriveRunEnvScopedStripsCanaryFromAgentAndVerify is -env-mode scoped's
+// central case: a variable present in sigbound's OWN process environment
+// (planted here, standing in for one tenant's secret in a hosted setting)
+// must NOT reach either the -agent or the -verify command, while the base
+// environment (PATH) and each slot's own SIGBOUND_* vars still do.
+func TestDriveRunEnvScopedStripsCanaryFromAgentAndVerify(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	ctx := context.Background()
+	repo, agentEnvOut, verifyEnvOut := envScopedFixture(t)
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", Autocommit: true,
+		AgentCmd:  fmt.Sprintf(`env > %q; printf 'package main\n\nfunc a() int { return 1 }\n' > a.go`, agentEnvOut),
+		VerifyCmd: fmt.Sprintf(`env > %q`, verifyEnvOut),
+		EnvMode:   envModeScoped,
+	}
+	task := taskSpec{ID: "a", Prompt: "n/a"}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if len(rep.PerAgent) != 1 || !rep.PerAgent[0].OK {
+		t.Fatalf("agent not ok: %+v", rep.PerAgent)
+	}
+	if !rep.Verify.Ran || !rep.Verify.OK {
+		t.Fatalf("verify ran=%v ok=%v output=%q", rep.Verify.Ran, rep.Verify.OK, rep.Verify.Output)
+	}
+	if rep.EnvMode != envModeScoped {
+		t.Fatalf("rep.EnvMode=%q, want %q", rep.EnvMode, envModeScoped)
+	}
+
+	agentEnv := parseEnvFile(t, agentEnvOut)
+	verifyEnv := parseEnvFile(t, verifyEnvOut)
+	for name, env := range map[string]map[string]string{"agent": agentEnv, "verify": verifyEnv} {
+		if _, leaked := env["SIGBOUND_TEST_CANARY"]; leaked {
+			t.Fatalf("%s: SIGBOUND_TEST_CANARY leaked into the scoped environment: %v", name, env)
+		}
+		if _, ok := env["PATH"]; !ok {
+			t.Fatalf("%s: PATH missing from the scoped base environment", name)
+		}
+	}
+	if agentEnv["SIGBOUND_TASK_ID"] != "a" || agentEnv["SIGBOUND_REPO"] != repo || agentEnv["SIGBOUND_BRANCH"] != "agent/a" {
+		t.Fatalf("agent's own SIGBOUND_* vars did not arrive: %+v", agentEnv)
+	}
+}
+
+// TestDriveRunEnvInheritKeepsCanaryTodaysBehavior: -env-mode inherit (and
+// leaving EnvMode unset, its zero value) is today's behavior, unchanged — the
+// full parent environment, canary included, reaches -agent.
+func TestDriveRunEnvInheritKeepsCanaryTodaysBehavior(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	ctx := context.Background()
+
+	for _, mode := range []string{envModeInherit, ""} {
+		repo, agentEnvOut, _ := envScopedFixture(t)
+		p := runParams{
+			Repo: repo, Base: "main", Strategy: "overlay", Autocommit: true,
+			AgentCmd: fmt.Sprintf(`env > %q; printf 'package main\n\nfunc a() int { return 1 }\n' > a.go`, agentEnvOut),
+			EnvMode:  mode,
+		}
+		rep, err := driveRun(ctx, p, []taskSpec{{ID: "a", Prompt: "n/a"}})
+		if err != nil {
+			t.Fatalf("mode %q: driveRun: %v", mode, err)
+		}
+		if len(rep.PerAgent) != 1 || !rep.PerAgent[0].OK {
+			t.Fatalf("mode %q: agent not ok: %+v", mode, rep.PerAgent)
+		}
+		env := parseEnvFile(t, agentEnvOut)
+		if env["SIGBOUND_TEST_CANARY"] != "leak-me" {
+			t.Fatalf("mode %q: SIGBOUND_TEST_CANARY=%q, want it present (inherit is byte-identical to today)", mode, env["SIGBOUND_TEST_CANARY"])
+		}
+	}
+}
+
+// TestDriveRunEnvScopedAllowlistScopesPerSlot: -env-agent allowlists the
+// canary through to -agent ONLY — the same run's -verify (no allowlist of
+// its own) still never sees it. A second allowlisted name that isn't set in
+// the parent at all is silently skipped, not surfaced as an error or an
+// empty entry.
+func TestDriveRunEnvScopedAllowlistScopesPerSlot(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	ctx := context.Background()
+	repo, agentEnvOut, verifyEnvOut := envScopedFixture(t)
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", Autocommit: true,
+		AgentCmd:  fmt.Sprintf(`env > %q; printf 'package main\n\nfunc a() int { return 1 }\n' > a.go`, agentEnvOut),
+		VerifyCmd: fmt.Sprintf(`env > %q`, verifyEnvOut),
+		EnvMode:   envModeScoped,
+		EnvAgent:  []string{"SIGBOUND_TEST_CANARY", "SIGBOUND_TEST_DOES_NOT_EXIST"},
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{{ID: "a", Prompt: "n/a"}})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.OK {
+		t.Fatalf("verify not ok: %q", rep.Verify.Output)
+	}
+
+	agentEnv := parseEnvFile(t, agentEnvOut)
+	if agentEnv["SIGBOUND_TEST_CANARY"] != "leak-me" {
+		t.Fatalf("-env-agent should have allowlisted the canary through: %+v", agentEnv)
+	}
+	if _, present := agentEnv["SIGBOUND_TEST_DOES_NOT_EXIST"]; present {
+		t.Fatalf("an allowlisted name unset in the parent must be skipped, not passed as empty: %+v", agentEnv)
+	}
+
+	verifyEnv := parseEnvFile(t, verifyEnvOut)
+	if _, leaked := verifyEnv["SIGBOUND_TEST_CANARY"]; leaked {
+		t.Fatalf("-env-agent's allowlist must not leak into -verify (no allowlist of its own): %+v", verifyEnv)
+	}
+}
+
+// TestDriveRunEnvScopedAllowlistGlobSuffix: a NAME_* entry in -env-agent
+// passes every parent var sharing that prefix, e.g. -env-agent
+// SIGBOUND_TEST_* for a family of vars a model CLI expects.
+func TestDriveRunEnvScopedAllowlistGlobSuffix(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	t.Setenv("SIGBOUND_OTHER_NOMATCH", "should-not-match")
+	ctx := context.Background()
+	repo, agentEnvOut, _ := envScopedFixture(t)
+
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", Autocommit: true,
+		AgentCmd: fmt.Sprintf(`env > %q; printf 'package main\n\nfunc a() int { return 1 }\n' > a.go`, agentEnvOut),
+		EnvMode:  envModeScoped,
+		EnvAgent: []string{"SIGBOUND_TEST_*"},
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{{ID: "a", Prompt: "n/a"}})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if len(rep.PerAgent) != 1 || !rep.PerAgent[0].OK {
+		t.Fatalf("agent not ok: %+v", rep.PerAgent)
+	}
+	env := parseEnvFile(t, agentEnvOut)
+	if env["SIGBOUND_TEST_CANARY"] != "leak-me" {
+		t.Fatalf("glob allowlist SIGBOUND_TEST_* should have passed SIGBOUND_TEST_CANARY: %+v", env)
+	}
+	if _, leaked := env["SIGBOUND_OTHER_NOMATCH"]; leaked {
+		t.Fatalf("glob allowlist SIGBOUND_TEST_* over-matched a non-prefixed var: %+v", env)
+	}
+}
+
+// TestDriveRunEnvScopedAppliesToResolver: -env-mode scoped reaches -resolver
+// too, via the same integrateBranches/CommandResolver seam -verify and
+// -agent go through. Two agents edit the same line of shared.txt (a real
+// conflict merge-tree can't auto-resolve), forcing the resolver to run; it
+// dumps its own environment (and still resolves the conflict, via a trivial
+// union, so the run lands cleanly either way).
+func TestDriveRunEnvScopedAppliesToResolver(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	resolverEnvOut := filepath.Join(t.TempDir(), "resolver.env")
+
+	tasks := []taskSpec{
+		{ID: "t1", Prompt: mustJSON(t, map[string]any{
+			"edit": map[string]any{"file": "shared.txt", "line": 5, "text": "t1-was-here"},
+		})},
+		{ID: "t2", Prompt: mustJSON(t, map[string]any{
+			"edit": map[string]any{"file": "shared.txt", "line": 5, "text": "t2-was-here"},
+		})},
+	}
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		ResolverCmd:     fmt.Sprintf(`env > %q; cat "$SIGBOUND_OURS" "$SIGBOUND_THEIRS"`, resolverEnvOut),
+		ResolverTimeout: 10 * time.Second,
+		EnvMode:         envModeScoped,
+	}
+	rep, err := driveRun(ctx, p, tasks)
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if len(rep.Integrate.Flagged) != 0 {
+		t.Fatalf("flagged=%v, want none (the union resolver should have resolved the conflict)", rep.Integrate.Flagged)
+	}
+
+	env := parseEnvFile(t, resolverEnvOut)
+	if _, leaked := env["SIGBOUND_TEST_CANARY"]; leaked {
+		t.Fatalf("SIGBOUND_TEST_CANARY leaked into a scoped -resolver: %+v", env)
+	}
+	if _, ok := env["PATH"]; !ok {
+		t.Fatalf("PATH missing from the scoped -resolver environment")
+	}
+	if _, ok := env["SIGBOUND_PATH"]; !ok {
+		t.Fatalf("-resolver's own SIGBOUND_PATH did not arrive: %+v", env)
+	}
+}
+
+// TestDriveRunEnvScopedAppliesToRepairAndPublish: -env-mode scoped reaches
+// -repair and -publish too. -verify fails until -repair creates fixed.txt
+// (auto-committed by the repair loop itself), after which -verify passes and
+// the run lands, triggering -publish. Both fixer and publisher dump their
+// own environment.
+func TestDriveRunEnvScopedAppliesToRepairAndPublish(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	dir := t.TempDir()
+	repairEnvOut := filepath.Join(dir, "repair.env")
+	publishEnvOut := filepath.Join(dir, "publish.env")
+
+	task := taskSpec{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+	})}
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:  "test -f fixed.txt",
+		RepairCmd:  fmt.Sprintf(`env > %q; printf x > fixed.txt`, repairEnvOut),
+		RepairMax:  1,
+		PublishCmd: fmt.Sprintf(`env > %q`, publishEnvOut),
+		EnvMode:    envModeScoped,
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.OK || !rep.Verify.Repaired {
+		t.Fatalf("verify ok=%v repaired=%v, want repair to have fixed it: %q", rep.Verify.OK, rep.Verify.Repaired, rep.Verify.Output)
+	}
+	if rep.Publish == nil || !rep.Publish.OK {
+		t.Fatalf("rep.Publish=%+v, want ran=true ok=true (the run landed)", rep.Publish)
+	}
+
+	for name, path := range map[string]string{"repair": repairEnvOut, "publish": publishEnvOut} {
+		env := parseEnvFile(t, path)
+		if _, leaked := env["SIGBOUND_TEST_CANARY"]; leaked {
+			t.Fatalf("%s: SIGBOUND_TEST_CANARY leaked into a scoped environment: %+v", name, env)
+		}
+		if _, ok := env["PATH"]; !ok {
+			t.Fatalf("%s: PATH missing from the scoped base environment", name)
+		}
+	}
+}
+
+// TestRunRunEnvModeRejectsUnknownValue: -env-mode only accepts inherit|scoped,
+// checked before any agent runs — same fail-fast posture as -lanes/-strategy.
+func TestRunRunEnvModeRejectsUnknownValue(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	var buf bytes.Buffer
+	_, err := runRun(&buf, []string{
+		"-repo", repo, "-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent", "true", "-env-mode", "bogus",
+	})
+	if err == nil || !strings.Contains(err.Error(), "-env-mode") {
+		t.Fatalf("err=%v, want an -env-mode complaint", err)
+	}
+}
+
+// TestRunRunEnvModeAndAllowlistFlagsWireIntoReport: -env-mode/-env-agent
+// parsed off argv reach runParams (proven end-to-end: the agent only sees
+// the canary because -env-agent named it) and -env-mode is recorded on the
+// report as provenance.
+func TestRunRunEnvModeAndAllowlistFlagsWireIntoReport(t *testing.T) {
+	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
+	_, repo := makeGoRepo(t)
+	agentEnvOut := filepath.Join(t.TempDir(), "agent.env")
+	agentCmd := fmt.Sprintf(`env > %q; printf 'package main\n\nfunc a() int { return 1 }\n' > a.go`, agentEnvOut)
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent", agentCmd,
+		"-env-mode", "scoped",
+		"-env-agent", "SIGBOUND_TEST_CANARY",
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code, buf.String())
+	}
+	var rep runReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse report: %v\n%s", err, buf.String())
+	}
+	if rep.EnvMode != envModeScoped {
+		t.Fatalf("rep.EnvMode=%q, want %q", rep.EnvMode, envModeScoped)
+	}
+	env := parseEnvFile(t, agentEnvOut)
+	if env["SIGBOUND_TEST_CANARY"] != "leak-me" {
+		t.Fatalf("-env-agent SIGBOUND_TEST_CANARY did not reach the agent: %+v", env)
 	}
 }
