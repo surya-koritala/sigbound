@@ -162,6 +162,34 @@ func FuzzParseBatchCheckLine(f *testing.F) {
 	})
 }
 
+// FuzzParseGitVersion fuzzes the `git version` output decoder that gates
+// CheckMinVersion (and so every `sig run`/`sig integrate` preflight, plus
+// `sig doctor`) on untrusted external command output.
+func FuzzParseGitVersion(f *testing.F) {
+	f.Add("git version 2.39.3 (Apple Git-146)")
+	f.Add("git version 2.38.0")
+	f.Add("git version 2.43.0.windows.1")
+	f.Add("git version 2.30.2.msysgit.0")
+	f.Add("")
+	f.Add("git version")
+	f.Add("git version \n")
+	f.Add("not git at all")
+	f.Add("2")
+	f.Add("git version -1.-2")
+	f.Add("git version 99999999999999999999.0")
+	f.Add("\x00\xff\xfe")
+
+	f.Fuzz(func(t *testing.T, out string) {
+		major, minor, err := ParseGitVersion(out)
+		if err != nil {
+			return // rejecting unparseable/malformed output is fine, must not panic
+		}
+		if major < 0 || minor < 0 {
+			t.Fatalf("ParseGitVersion(%q) = %d.%d, want non-negative", out, major, minor)
+		}
+	})
+}
+
 // FuzzParseLsTreeModeZ fuzzes the single-record `git ls-tree -z` mode decoder.
 func FuzzParseLsTreeModeZ(f *testing.F) {
 	f.Add("")

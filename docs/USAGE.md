@@ -4,11 +4,12 @@ Complete reference for the `sig` CLI. For a five-minute walkthrough on your own
 repository, see [`examples/`](../examples/). For the shape of the whole
 pipeline, see the [README](../README.md#how-it-works).
 
-`sig` has three subcommands:
+`sig` has four subcommands:
 
 ```
 sig run        run agents on a repo and integrate their work (the driver)
 sig integrate  integrate a set of existing branches (the engine, standalone)
+sig doctor     check that git is new enough and its plumbing actually works
 sig version    print the version, git commit, and build date
 ```
 
@@ -146,6 +147,41 @@ sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-a
 | `-resolver` | — | Per-conflict resolver command. |
 | `-resolver-timeout` | `30s` | Per-conflict timeout for `-resolver` (`0` = none). |
 | `-no-land` | `false` | Integrate without moving the base ref; leave the result as a detached commit. |
+
+---
+
+## `sig doctor`
+
+Checks that `git` is new enough and that the plumbing sigbound depends on —
+`git merge-tree --write-tree -z --name-only --merge-base=` and the overlay
+index plumbing (`read-tree`/`update-index`/`write-tree`) — actually works,
+instead of trusting the version string. Both require git >= 2.38; without
+this check, an older git fails deep inside a run with a bare "merge-tree exit
+N" instead of a clear message.
+
+```
+sig doctor [-repo PATH]
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-repo` | — | Run the live probe inside this existing repo instead of a throwaway temp repo. The probe only builds objects via plumbing (no worktree, branch, or ref), so it never mutates the repo. |
+
+`sig doctor` prints one line per check (`ok` or `FAIL: <reason>`) and exits
+`0` if every check passes, `1` if any fails:
+
+```
+$ sig doctor
+git on PATH: ok
+git version >= 2.38: ok
+live probe: merge-tree + overlay plumbing: ok
+```
+
+`sig run` and `sig integrate` also run the cheap part of this (git present +
+version check) automatically before doing anything, so a too-old git is
+caught before any agent runs; they do **not** run the live probe (it's
+overkill to pay for on every invocation) — run `sig doctor` directly for the
+full picture.
 
 ---
 

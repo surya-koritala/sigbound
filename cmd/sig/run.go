@@ -301,6 +301,15 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	if *minTasks > *n {
 		return exitOperationalError, fmt.Errorf("-min-tasks %d exceeds -n %d", *minTasks, *n)
 	}
+	// Cheap preflight: git present + version >= 2.38, before touching the repo
+	// or spawning any agent. The engine hard-depends on merge-tree/overlay
+	// plumbing that only exists from 2.38 onward; catching that here turns a
+	// cryptic mid-run "merge-tree exit N" into one actionable line. This does
+	// NOT exercise the plumbing itself (too slow to run on every invocation) —
+	// see `sig doctor` for the live probe.
+	if err := gitx.CheckMinVersion(context.Background(), "git"); err != nil {
+		return exitOperationalError, err
+	}
 
 	// Task source: exactly one of -tasks (explicit) or -goal (planned). If both
 	// are set it is an error rather than silently ignoring one.

@@ -43,6 +43,14 @@ func main() {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "doctor":
+		code, err := runDoctor(os.Stdout, os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sig doctor:", err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "version", "-v", "--version":
 		runVersion(os.Stdout)
 	case "-h", "--help", "help":
@@ -58,6 +66,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-assert] [-no-land]")
 	fmt.Fprintln(w, "  sig run       -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-json]")
+	fmt.Fprintln(w, "  sig doctor    [-repo PATH]")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))
 }
@@ -179,6 +188,13 @@ func runIntegrate(argv []string) error {
 	}
 
 	ctx := context.Background()
+	// Cheap preflight: git present + version >= 2.38, before touching the
+	// repo. See runRun's identical check for why (the engine hard-depends on
+	// merge-tree/overlay plumbing from git 2.38 onward); `sig doctor` has the
+	// full live probe.
+	if err := gitx.CheckMinVersion(ctx, "git"); err != nil {
+		return err
+	}
 	g := gitx.New(*repo)
 
 	// Resolve the base branch to a stable commit SHA so the merge-base is fixed
