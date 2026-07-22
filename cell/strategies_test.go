@@ -77,6 +77,38 @@ func TestIntegrateOverlayAssertHealthy(t *testing.T) {
 	}
 }
 
+// TestIntegrateOverlayAssertOverlap extends the -assert paranoia check to a
+// batch with a genuinely overlapping group (same hot-file setup as
+// TestAllStrategiesAgreeClean): the group folds via merge-tree and
+// auto-resolves, then its head combines with the disjoint groups' heads via
+// overlay. -assert must recompute that combine, agree with no error, and
+// leave the auto-merge outcome untouched.
+func TestIntegrateOverlayAssertOverlap(t *testing.T) {
+	ctx := context.Background()
+	_, pool, base := scenario(t, 12)
+	const n = 10
+	// Agents 0..5 edit the same hot file on distinct spaced lines (one group,
+	// all auto-merge); 6..9 are disjoint.
+	overlap := map[int]hotEdit{}
+	for i := 0; i < 6; i++ {
+		overlap[i] = hotEdit{file: "f000.txt", line: i*5 + 1}
+	}
+	changes := spawnAgents(t, pool, base, n, overlap)
+
+	asserted := NewIntegrator(pool.Git()).WithAssert()
+	got, err := asserted.IntegrateOverlay(ctx, base, changes)
+	if err != nil {
+		t.Fatalf("assert-on overlay: %v", err)
+	}
+	if len(got.Landed) != n || len(got.Flagged) != 0 {
+		t.Fatalf("assert-on landed=%d flagged=%d, want %d/0", len(got.Landed), len(got.Flagged), n)
+	}
+	// 5 of the 6 hot-group agents are auto-merged overlaps (first lands clean).
+	if got.AutoMerged != 5 {
+		t.Fatalf("assert-on autoMerged=%d, want 5", got.AutoMerged)
+	}
+}
+
 // TestOverlayAssertMismatchErrors exercises the comparison seam directly: a
 // real overlay/merge-tree divergence would mean the partition invariant is
 // broken (a bug that, by construction, doesn't exist in this codebase), so
