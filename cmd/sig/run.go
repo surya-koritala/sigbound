@@ -91,12 +91,17 @@ type integrateJSON struct {
 //   - OK is the FINAL verdict: green either on the first try or after repair.
 //     When repair never fixes it, OK stays false and Output is the last failure
 //     — the driver reports honestly and never claims a false green.
+//   - Flaky is true iff a -verify-retries retry was needed to reach a green
+//     invocation (i.e. the first invocation on that tree failed but a later one
+//     on the SAME tree passed) — see runVerifyRetry. -verify is supposed to be
+//     deterministic; a flaky pass is surfaced, not silently swallowed.
 //   - Repairs details each attempt (see repairAttemptJSON).
 type verifyJSON struct {
 	Ran      bool                `json:"ran"`
 	OK       bool                `json:"ok"`
 	Attempts int                 `json:"attempts"`
 	Repaired bool                `json:"repaired"`
+	Flaky    bool                `json:"flaky,omitempty"`
 	Output   string              `json:"output"`
 	Repairs  []repairAttemptJSON `json:"repairs,omitempty"`
 }
@@ -171,6 +176,7 @@ type runParams struct {
 	ResolverCmd     string
 	ResolverTimeout time.Duration
 	VerifyCmd       string
+	VerifyRetries   int    // re-run a FAILING -verify up to this many more times on the same tree before giving up (0 = today's behavior)
 	RepairCmd       string // fixer-agent command run when -verify fails (empty => no repair loop)
 	RepairMax       int    // max repair attempts before giving up honestly (default via flag)
 	Autocommit      bool   // commit an agent's uncommitted edits when it made no commit itself
@@ -220,7 +226,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-resolver CMD] [-verify CMD [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -243,6 +249,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	resolverCmd := fs.String("resolver", "", "optional conflict resolver command (see `sig integrate -h`); reads SIGBOUND_BASE/SIGBOUND_OURS/SIGBOUND_THEIRS/SIGBOUND_PATH, writes the resolved body to stdout")
 	resolverTimeout := fs.Duration("resolver-timeout", 30*time.Second, "per-conflict timeout for -resolver (0 = none)")
 	verifyCmd := fs.String("verify", "", "optional command run (via `sh -c`) in a detached checkout of the integrated tree; non-zero exit => verify failed")
+	verifyRetries := fs.Int("verify-retries", 0, "after a FAILING -verify invocation, re-run it up to N more times on the same tree; passes on any green. "+
+		"A pass on a retry marks the report flaky=true (the passing run's output is reported). 0 = today's behavior: a single failing invocation fails verify. "+
+		"-verify must still be deterministic — retries mitigate flaky suites, not a license to skip that")
 	repairCmd := fs.String("repair", "", "optional self-healing fixer command (run via `sh -c`) invoked in a worktree at the integrated head when -verify FAILS; "+
 		"receives SIGBOUND_FAILURE (captured verify output) + SIGBOUND_REPO, edits files to fix the failure (the driver auto-commits them), then -verify re-runs. Looped up to -repair-max times")
 	repairMax := fs.Int("repair-max", 2, "max -repair attempts before reporting verify.ok=false honestly (only used with -repair)")
@@ -307,6 +316,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		ResolverCmd:     *resolverCmd,
 		ResolverTimeout: *resolverTimeout,
 		VerifyCmd:       *verifyCmd,
+		VerifyRetries:   *verifyRetries,
 		RepairCmd:       *repairCmd,
 		RepairMax:       *repairMax,
 		Autocommit:      !*noAutocommit,
@@ -466,17 +476,20 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 	return rep, nil
 }
 
-// verifyWithRepair runs -verify on head and, when it fails and -repair is set,
-// drives the self-healing repair loop: up to p.RepairMax times it materializes
-// the current head in a worktree, runs the fixer agent there (SIGBOUND_FAILURE =
+// verifyWithRepair runs -verify (with -verify-retries applied, see
+// runVerifyRetry) on head and, when it fails and -repair is set, drives the
+// self-healing repair loop: up to p.RepairMax times it materializes the
+// current head in a worktree, runs the fixer agent there (SIGBOUND_FAILURE =
 // the last verify output, SIGBOUND_REPO = repo), auto-commits whatever the fixer
-// edited, advances head to that commit, and re-verifies — stopping as soon as
-// verify passes. It returns the verify verdict (green either first-try or after
-// repair; honestly false if never fixed) and the possibly-advanced head the base
-// ref should point at. If -verify passes on the first try, no repair runs.
+// edited, advances head to that commit, and re-verifies (again with retries) —
+// stopping as soon as verify passes. It returns the verify verdict (green
+// either first-try or after repair; honestly false if never fixed) and the
+// possibly-advanced head the base ref should point at. If -verify passes on
+// the first try, no repair runs.
 func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string) (verifyJSON, string) {
-	v := runVerify(ctx, g, head, p.VerifyCmd)
-	// Green first try, or no repair configured/allowed => done, loop never runs.
+	v := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries)
+	// Green first try (possibly after a retry), or no repair configured/allowed
+	// => done, loop never runs. v already carries Flaky, so it survives here.
 	if v.OK || strings.TrimSpace(p.RepairCmd) == "" || p.RepairMax < 1 {
 		return v, head
 	}
@@ -484,6 +497,7 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 	var repairs []repairAttemptJSON
 	lastOutput := v.Output
 	ok := false
+	flaky := false
 	for attempt := 1; attempt <= p.RepairMax; attempt++ {
 		newHead, touched, rerr := runRepair(ctx, g, p, head, lastOutput)
 		rec := repairAttemptJSON{N: attempt, FilesTouched: touched, VerifyOK: false}
@@ -497,12 +511,13 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 			break
 		}
 		head = newHead
-		rv := runVerify(ctx, g, head, p.VerifyCmd)
+		rv := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries)
 		lastOutput = rv.Output
 		rec.VerifyOK = rv.OK
 		repairs = append(repairs, rec)
 		if rv.OK {
 			ok = true
+			flaky = rv.Flaky
 			break
 		}
 	}
@@ -514,9 +529,31 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 		OK:       ok,
 		Attempts: len(repairs),
 		Repaired: ok,
+		Flaky:    flaky,
 		Output:   lastOutput,
 		Repairs:  repairs,
 	}, head
+}
+
+// runVerifyRetry runs verifyCmd on head via runVerify and, on FAILURE, re-runs
+// it up to retries more times on the SAME tree (head is never re-integrated or
+// re-checked-out to a different commit — only re-verified) — passing on any
+// green invocation. A pass on an invocation after the first is flaky: -verify
+// is supposed to be deterministic, so retries are a mitigation for flaky test
+// suites, not a license to skip that; the flaky pass is surfaced via
+// verifyJSON.Flaky rather than silently reported as a clean first-try green.
+// retries=0 reproduces the pre-existing behavior exactly: one invocation, no
+// retry, never flaky. When all retries are exhausted, the last (failing)
+// invocation's result is returned, same as today.
+func runVerifyRetry(ctx context.Context, g *gitx.Git, head, verifyCmd string, retries int) verifyJSON {
+	v := runVerify(ctx, g, head, verifyCmd)
+	for attempt := 0; !v.OK && attempt < retries; attempt++ {
+		v = runVerify(ctx, g, head, verifyCmd)
+		if v.OK {
+			v.Flaky = true
+		}
+	}
+	return v
 }
 
 // runRepair materializes head in a throwaway detached worktree, runs the -repair
@@ -738,6 +775,9 @@ func writeRunSummary(w io.Writer, r runReport) error {
 			v = "FAIL"
 		}
 		fmt.Fprintf(w, "verify: %s", v)
+		if r.Verify.Flaky {
+			fmt.Fprint(w, "  flaky=true")
+		}
 		if r.Verify.Attempts > 0 {
 			fmt.Fprintf(w, "  repaired=%v attempts=%d", r.Verify.Repaired, r.Verify.Attempts)
 		}
