@@ -481,10 +481,15 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 
 	// Only branches the agent actually committed to (exit 0, head advanced) are
 	// candidates for integration; failures/no-ops are left out, never landed.
+	// writeSets reuses each agent's ACTUAL write-set (a.Files, already computed
+	// above for lane enforcement) so integrateBranches doesn't re-diff every
+	// branch it was just handed.
 	var branches []string
+	writeSets := make(map[string][]string, len(agents))
 	for _, a := range agents {
 		if a.OK {
 			branches = append(branches, a.Branch)
+			writeSets[a.Branch] = a.Files
 		}
 	}
 
@@ -492,7 +497,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 	// The integrated commit is computed detached; the base ref is advanced only
 	// after -verify passes (below), so a failing verify never lands a broken tree.
 	start := time.Now()
-	res, err := integrateBranches(ctx, g, p.Base, baseSHA, branches, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false)
+	res, err := integrateBranches(ctx, g, p.Base, baseSHA, branches, writeSets, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false)
 	if err != nil {
 		return rep, fmt.Errorf("integrate: %w", err)
 	}
@@ -759,7 +764,20 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 	}
 	a.OK = runErr == nil && herr == nil && head != "" && head != baseSHA
 	if a.OK {
-		if files, ferr := g.DiffNameOnly(ctx, baseSHA, head); ferr == nil && len(files) > 0 {
+		// INVARIANT: an agent whose write-set cannot be computed must never enter
+		// a write-set-driven partition. a.Files feeds integrateBranches (via
+		// writeSets below) as the branch's write-set for overlap detection; if the
+		// diff errors, a.Files would stay at its zero value ([]string{}), which
+		// integrateBranches reads as a POSITIVE assertion of "touched nothing" —
+		// silently routing an overlapping branch through the overlay path with
+		// stale/wrong content. So a failed diff fails the agent instead. An empty
+		// result with no error (len(files)==0, ferr==nil) is a legitimate no-op
+		// agent and must NOT fail here.
+		files, ferr := g.DiffNameOnly(ctx, baseSHA, head)
+		if ferr != nil {
+			a.OK = false
+			a.Stderr = tail("diff "+short(baseSHA)+".."+short(head)+" failed: "+ferr.Error()+"\n"+a.Stderr, 800)
+		} else if len(files) > 0 {
 			a.Files = files
 		}
 	}

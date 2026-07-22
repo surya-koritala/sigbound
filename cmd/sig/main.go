@@ -68,12 +68,38 @@ func usage(w *os.File) {
 // partition / parallel folding / conflict handling / landing; it only supplies
 // the branch names and the same resolver/strategy/assert knobs. When land is
 // true the base branch ref is advanced to the integrated commit.
-func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string, branches []string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool) (cell.IntegrationResult, error) {
+//
+// writeSets carries any ALREADY-COMPUTED write-sets (branch -> paths), e.g.
+// `sig run`'s runAgent already ran `git diff` per agent for lane enforcement —
+// reusing that here avoids re-diffing the same branch. A nil map, or a branch
+// missing from it (or mapped to nil), is not treated as "no changes"; its
+// write-set is computed here instead, for every such branch in ONE batched
+// diff-tree call rather than a `git diff --name-only` fork per branch (see
+// gitx.DiffNameOnlyBatch). `sig integrate` has no precomputed data, so it
+// always passes nil and every branch goes through the batched path.
+func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool) (cell.IntegrationResult, error) {
+	var need []string
+	for _, b := range branches {
+		// Contract: omit the key (or map it to nil) to request recompute; an
+		// empty non-nil slice is a positive assertion of no changes.
+		if ws := writeSets[b]; ws == nil {
+			need = append(need, b)
+		}
+	}
+	var computed map[string][]string
+	if len(need) > 0 {
+		var err error
+		computed, err = g.DiffNameOnlyBatch(ctx, baseSHA, need)
+		if err != nil {
+			return cell.IntegrationResult{}, fmt.Errorf("batch write-sets: %w", err)
+		}
+	}
+
 	changes := make([]cell.BranchChange, 0, len(branches))
 	for _, b := range branches {
-		paths, err := g.DiffNameOnly(ctx, baseSHA, b)
-		if err != nil {
-			return cell.IntegrationResult{}, fmt.Errorf("write-set for %q: %w", b, err)
+		paths := writeSets[b]
+		if paths == nil {
+			paths = computed[b]
 		}
 		changes = append(changes, cell.BranchChange{Branch: b, WriteSet: cell.NewWriteSet(paths...)})
 	}
@@ -165,7 +191,7 @@ func runIntegrate(argv []string) error {
 	// Hand the batch to the shared integrate path (partition, parallel folding,
 	// optional resolver, and landing are entirely the cell's job).
 	start := time.Now()
-	res, err := integrateBranches(ctx, g, *base, baseSHA, branches, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand)
+	res, err := integrateBranches(ctx, g, *base, baseSHA, branches, nil, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand)
 	if err != nil {
 		return err
 	}

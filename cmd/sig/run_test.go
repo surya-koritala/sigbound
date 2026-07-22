@@ -244,6 +244,83 @@ func TestDriveRunAssertHealthy(t *testing.T) {
 	}
 }
 
+// TestIntegrateBranchesReusesPrecomputedWriteSets is the correctness anchor for
+// the writeSets param. The write-set only drives OCC PARTITIONING (which
+// branches are treated as overlapping); actual landed content always comes
+// from the branch's real tree, so the only observable signal that a supplied
+// write-set was TRUSTED (not silently re-diffed and corrected) is the
+// resulting group count. Two branches touch disjoint real files (x.txt,
+// y.txt — an accurate diff partitions them into 2 independent groups), but a
+// deliberately WRONG writeSets claims they both touched the same path: if
+// integrateBranches actually used that lie for partitioning, they land forced
+// into ONE group instead of two. The complementary nil-writeSets call proves
+// the batched fallback (gitx.DiffNameOnlyBatch) still computes the correct,
+// disjoint real write-sets when nothing is precomputed.
+func TestIntegrateBranchesReusesPrecomputedWriteSets(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := gitx.New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "keep.txt"), []byte("k\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base, err := g.CommitAll(ctx, "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mkBranch := func(branch, file string) {
+		wt := filepath.Join(t.TempDir(), branch)
+		if err := g.WorktreeAdd(ctx, wt, branch, base); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(wt, file), []byte("new\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := g.At(wt).CommitAll(ctx, branch); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.WorktreeRemove(ctx, wt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkBranch("agent/x", "x.txt")
+	mkBranch("agent/y", "y.txt")
+	branches := []string{"agent/x", "agent/y"}
+
+	// Lie: both branches supposedly touched the same path, though their real
+	// diffs (x.txt vs y.txt) are disjoint.
+	lying := map[string][]string{
+		"agent/x": {"fake-shared.txt"},
+		"agent/y": {"fake-shared.txt"},
+	}
+	res, err := integrateBranches(ctx, g, "main", base, branches, lying, "overlay", "", 0, false, false)
+	if err != nil {
+		t.Fatalf("integrateBranches (lying writeSets): %v", err)
+	}
+	if res.Groups != 1 {
+		t.Fatalf("groups=%d with a lying shared-path writeSets, want 1 (forced together): integrateBranches did not trust the supplied write-sets", res.Groups)
+	}
+	if len(res.Landed) != 2 {
+		t.Fatalf("landed=%v, want both branches (folding two non-conflicting real diffs together must still succeed)", res.Landed)
+	}
+
+	// No precomputed data at all: the batched fallback must compute the real,
+	// disjoint write-sets and partition the same two branches into 2 groups.
+	res, err = integrateBranches(ctx, g, "main", base, branches, nil, "overlay", "", 0, false, false)
+	if err != nil {
+		t.Fatalf("integrateBranches (nil writeSets): %v", err)
+	}
+	if res.Groups != 2 {
+		t.Fatalf("groups=%d with nil writeSets, want 2 (real diffs are disjoint): the batched fallback computed the wrong write-sets", res.Groups)
+	}
+	if len(res.Landed) != 2 {
+		t.Fatalf("landed=%v, want both branches", res.Landed)
+	}
+}
+
 // TestDriveRunLaneEnforcement: an agent that declares Files=[a.go] but also
 // writes b.go is "out of lane". In warn mode it still lands but the report
 // records strayed=[b.go]; in strict mode it is treated as a failed agent — not

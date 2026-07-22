@@ -334,6 +334,168 @@ func TestOverlayManyDisjoint(t *testing.T) {
 	}
 }
 
+// TestDiffNameOnlyBatchMatchesPerBranch is the correctness anchor for
+// DiffNameOnlyBatch: its result for every branch must equal what a per-branch
+// DiffNameOnly loop (the code path it replaces) would have produced, including
+// a branch with NO changes vs base (contributes no diff-tree block at all) and
+// a path containing spaces (must survive the -z NUL-delimited decode intact).
+func TestDiffNameOnlyBatchMatchesPerBranch(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "keep.txt", "k\n")
+	write(t, dir, "mod.txt", "orig\n")
+	write(t, dir, "gone.txt", "g\n")
+	base, err := g.CommitAll(ctx, "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	branchFrom(t, g, base, "h1", func(d string) {
+		write(t, d, "mod.txt", "changed\n")
+		write(t, d, "new dir/file with spaces.txt", "space\n")
+	})
+	branchFrom(t, g, base, "h2", func(d string) {
+		_ = os.Remove(filepath.Join(d, "gone.txt"))
+		write(t, d, "added.txt", "new\n")
+	})
+	branchFrom(t, g, base, "h3-nochange", func(d string) {})
+	// h4 spans TWO commits, so its write-set only matches base...head (not
+	// head's single most recent commit vs its immediate parent).
+	h4wt := filepath.Join(t.TempDir(), "h4-multi")
+	if err := g.WorktreeAdd(ctx, h4wt, "h4-multi", base); err != nil {
+		t.Fatal(err)
+	}
+	write(t, h4wt, "c1.txt", "c1\n")
+	if _, err := g.At(h4wt).CommitAll(ctx, "c1"); err != nil {
+		t.Fatal(err)
+	}
+	write(t, h4wt, "c2.txt", "c2\n")
+	if _, err := g.At(h4wt).CommitAll(ctx, "c2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.WorktreeRemove(ctx, h4wt); err != nil {
+		t.Fatal(err)
+	}
+
+	branches := []string{"h1", "h2", "h3-nochange", "h4-multi"}
+
+	want := map[string][]string{}
+	for _, b := range branches {
+		paths, err := g.DiffNameOnly(ctx, base, b)
+		if err != nil {
+			t.Fatalf("DiffNameOnly(%s): %v", b, err)
+		}
+		sort.Strings(paths)
+		want[b] = paths
+	}
+
+	got, err := g.DiffNameOnlyBatch(ctx, base, branches)
+	if err != nil {
+		t.Fatalf("DiffNameOnlyBatch: %v", err)
+	}
+	if len(got) != len(branches) {
+		t.Fatalf("DiffNameOnlyBatch returned %d entries, want %d", len(got), len(branches))
+	}
+	for _, b := range branches {
+		gotPaths := append([]string(nil), got[b]...)
+		sort.Strings(gotPaths)
+		wantPaths := want[b]
+		if len(gotPaths) != len(wantPaths) {
+			t.Fatalf("branch %q: batched=%v, per-branch=%v", b, gotPaths, wantPaths)
+		}
+		for i := range gotPaths {
+			if gotPaths[i] != wantPaths[i] {
+				t.Fatalf("branch %q: batched=%v, per-branch=%v", b, gotPaths, wantPaths)
+			}
+		}
+	}
+	// The no-change branch must come back empty, not merely "absent".
+	if len(got["h3-nochange"]) != 0 {
+		t.Fatalf("h3-nochange write-set = %v, want empty", got["h3-nochange"])
+	}
+}
+
+// TestDiffNameOnlyBatchSupersetWhenBaseAdvanced covers the case
+// integrateBranches relies on: baseSHA has moved PAST a branch's fork point
+// (e.g. other branches already landed onto base before this one is diffed).
+// DiffNameOnlyBatch's two-tree diff (base tip vs branch tip) necessarily picks
+// up base's own post-fork changes too, so it must be a SUPERSET of the
+// three-dot DiffNameOnly(base, branch) result, which only shows the branch's
+// changes since the merge-base — the extra paths are exactly the conservative,
+// partition-safe behavior callers depend on. A path genuinely changed on both
+// sides must appear in both results.
+func TestDiffNameOnlyBatchSupersetWhenBaseAdvanced(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	write(t, dir, "a.txt", "1\n")
+	write(t, dir, "b.txt", "1\n")
+	write(t, dir, "c.txt", "1\n")
+	fork, err := g.CommitAll(ctx, "fork")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Branch forks here, changing a.txt (its own) and c.txt (base will ALSO
+	// change this one below — the genuine overlap).
+	branch := branchFrom(t, g, fork, "b1", func(d string) {
+		write(t, d, "a.txt", "branch-a\n")
+		write(t, d, "c.txt", "branch-c\n")
+	})
+
+	// Base advances past the fork point without the branch: b.txt is a
+	// base-only change (branch never touched it); c.txt is the genuine
+	// overlap (base changed it independently of the branch).
+	write(t, dir, "b.txt", "base-b\n")
+	write(t, dir, "c.txt", "base-c\n")
+	baseAdvanced, err := g.CommitAll(ctx, "base-advances")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	threeDot, err := g.DiffNameOnly(ctx, baseAdvanced, branch)
+	if err != nil {
+		t.Fatalf("DiffNameOnly: %v", err)
+	}
+	batch, err := g.DiffNameOnlyBatch(ctx, baseAdvanced, []string{branch})
+	if err != nil {
+		t.Fatalf("DiffNameOnlyBatch: %v", err)
+	}
+	twoTree := batch[branch]
+
+	got := map[string]bool{}
+	for _, p := range twoTree {
+		got[p] = true
+	}
+	for _, p := range threeDot {
+		if !got[p] {
+			t.Fatalf("two-tree result %v is missing three-dot path %q — not a superset", twoTree, p)
+		}
+	}
+	// The genuinely-overlapping path (changed on both sides) must be caught.
+	if !got["c.txt"] {
+		t.Fatalf("two-tree result %v missing genuinely-overlapping path c.txt", twoTree)
+	}
+	// The base-only path is exactly the extra conservatism: present in
+	// two-tree, absent from three-dot (which only looks at the branch's own
+	// changes since the merge-base).
+	if !got["b.txt"] {
+		t.Fatalf("two-tree result %v missing base-only path b.txt (conservatism)", twoTree)
+	}
+	for _, p := range threeDot {
+		if p == "b.txt" {
+			t.Fatalf("three-dot unexpectedly included base-only path b.txt: %v", threeDot)
+		}
+	}
+}
+
 func itoa(n int) string {
 	if n == 0 {
 		return "0"

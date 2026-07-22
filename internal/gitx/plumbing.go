@@ -11,6 +11,9 @@ package gitx
 //                    for disjoint inputs, see plumbing_test.go).
 //   - BatchReader  : one long-running `git cat-file --batch-check` reused for all
 //                    object/ref resolution across a run (no per-lookup spawn).
+//   - DiffNameOnlyBatch : every branch's write-set vs. base in ONE `git
+//                    diff-tree --stdin` process instead of one `git diff` fork
+//                    per branch.
 //   - UpdateRefs   : one `git update-ref --stdin` applying every ref move
 //                    atomically in a single process (the final landing).
 
@@ -222,6 +225,134 @@ func (g *Git) diffTreeUnion(ctx context.Context, base string, trees []string) ([
 		return nil, fmt.Errorf("diff-tree --stdin: exit %d: %s", code, strings.TrimSpace(se))
 	}
 	return parseDiffRawZ(out)
+}
+
+// diffTreeBlockZ is one input line's records from a `git diff-tree --stdin`
+// run that KEEPS the commit-id header (i.e. --no-commit-id is NOT passed) —
+// the header is the exact rev given as that line's first token, letting
+// DiffNameOnlyBatch segment one combined run back into one write-set per
+// branch.
+type diffTreeBlockZ struct {
+	Header string
+	Paths  []string
+}
+
+// parseDiffTreeStdinRawZ decodes NUL-delimited output from `git diff-tree
+// --stdin -r -z --raw --no-renames --no-abbrev` WITH commit-id headers. Git's
+// --raw meta records always start with ':' (":<srcmode> <dstmode> ..."); a
+// field that does NOT start with ':' can therefore only be a commit-id header
+// — a bare path never appears except immediately after a ':' meta record, so
+// there is no ambiguity between the two. Each header starts a new block; the
+// paths that follow (the second field of each meta/path pair) belong to it,
+// until the next header or end of input. A line with no diff contributes no
+// header and no block at all, so blocks are a SUBSEQUENCE of the input lines,
+// in the same relative order. It is a pure function of untrusted git output
+// and must never panic. Fuzzed by FuzzParseDiffTreeStdinRawZ.
+func parseDiffTreeStdinRawZ(out string) ([]diffTreeBlockZ, error) {
+	parts := strings.Split(out, "\x00")
+	var blocks []diffTreeBlockZ
+	i := 0
+	for i < len(parts) {
+		f := parts[i]
+		if f == "" { // trailing empty after final NUL
+			i++
+			continue
+		}
+		if !strings.HasPrefix(f, ":") {
+			blocks = append(blocks, diffTreeBlockZ{Header: f})
+			i++
+			continue
+		}
+		if len(blocks) == 0 {
+			return nil, fmt.Errorf("diff-tree --stdin: meta record %q before any header", f)
+		}
+		if i+1 >= len(parts) {
+			return nil, fmt.Errorf("diff-tree --stdin: dangling record %q", f)
+		}
+		cur := &blocks[len(blocks)-1]
+		cur.Paths = append(cur.Paths, parts[i+1])
+		i += 2
+	}
+	return blocks, nil
+}
+
+// DiffNameOnlyBatch returns each branch's write-set versus baseSHA — the same
+// paths a per-branch DiffNameOnly(ctx, baseSHA, branch) would return — computed
+// in ONE `git diff-tree --stdin` process instead of an N-way fork of `git diff
+// --name-only`. The batched replacement for a per-branch DiffNameOnly loop.
+//
+// The --stdin two-tree form only accepts raw commit OIDs (branch names/refs are
+// not resolved there), so every branch is first resolved to its commit SHA in
+// ONE `cat-file --batch-check` process (BatchReader) rather than a `git
+// rev-parse` fork per branch. An unresolvable branch is a loud error, matching
+// DiffNameOnly's per-call failure on a bad ref.
+//
+// A branch identical to base (no changes) maps to a nil slice, same as
+// DiffNameOnly's empty result.
+func (g *Git) DiffNameOnlyBatch(ctx context.Context, baseSHA string, branches []string) (map[string][]string, error) {
+	result := make(map[string][]string, len(branches))
+	if len(branches) == 0 {
+		return result, nil
+	}
+	if strings.ContainsAny(baseSHA, " \t\n") {
+		return nil, fmt.Errorf("diff-tree --stdin: illegal whitespace in base %q", baseSHA)
+	}
+
+	br, err := g.NewBatchReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer br.Close()
+
+	shas := make([]string, len(branches))
+	for i, b := range branches {
+		sha, rerr := br.ResolveCommit(b)
+		if rerr != nil {
+			return nil, fmt.Errorf("resolve %q: %w", b, rerr)
+		}
+		shas[i] = sha
+		result[b] = nil // default: no changes vs base unless a block below says otherwise
+	}
+
+	var in strings.Builder
+	for _, sha := range shas {
+		in.WriteString(sha)
+		in.WriteByte(' ')
+		in.WriteString(baseSHA)
+		in.WriteByte('\n')
+	}
+	// Same flags as diffTreeUnion, minus --no-commit-id: the header is exactly
+	// what lets this batched call be segmented back into one result per branch,
+	// which the union (which doesn't care which tree a path came from) doesn't need.
+	out, se, code, err := g.runWith(ctx, nil, []byte(in.String()),
+		"diff-tree", "--stdin", "-r", "-z", "--raw", "--no-renames", "--no-abbrev")
+	if err != nil {
+		return nil, err
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("diff-tree --stdin: exit %d: %s", code, strings.TrimSpace(se))
+	}
+	blocks, err := parseDiffTreeStdinRawZ(out)
+	if err != nil {
+		return nil, err
+	}
+
+	// Blocks are a subsequence of the input lines in the same relative order
+	// (a no-diff line contributes none) — walk both in lockstep rather than
+	// keying by header SHA, so two branches that happen to share a commit SHA
+	// (e.g. two agents landing byte-identical results) are still both filled in
+	// correctly instead of colliding on one map key.
+	bi := 0
+	for i, b := range branches {
+		if bi < len(blocks) && blocks[bi].Header == shas[i] {
+			result[b] = blocks[bi].Paths
+			bi++
+		}
+	}
+	if bi != len(blocks) {
+		return nil, fmt.Errorf("diff-tree --stdin: %d unconsumed block(s); output did not match the %d requested branches", len(blocks)-bi, len(branches))
+	}
+	return result, nil
 }
 
 // ensureTreeish verifies every rev resolves to a readable tree, in ONE
