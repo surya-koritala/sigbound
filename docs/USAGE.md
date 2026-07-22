@@ -925,6 +925,87 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 
 ---
 
+## GitHub Action
+
+`surya-koritala/sigbound` is also a composite GitHub Action ([`action.yml`](../action.yml)
+at the repo root), so a workflow can run `sig run` without hand-rolling the
+install + invocation itself:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0   # sig run needs real history, not a shallow clone
+
+- uses: surya-koritala/sigbound@v0.3.0
+  id: sigbound
+  with:
+    repo-path: .
+    tasks: examples/tasks.json
+    agent:  'claude -p --permission-mode acceptEdits "$SIGBOUND_TASK"'
+    verify: 'go build ./... && go test ./...'
+
+- run: echo "landed ${{ steps.sigbound.outputs.landed-count }} branch(es) at ${{ steps.sigbound.outputs.final-sha }}"
+```
+
+See [`examples/sigbound-action.yml`](../examples/sigbound-action.yml) for a
+complete workflow, including a `-goal`/planner run. That example — like any
+real use of this action — needs your own agent CLI and its auth (an API key
+secret, typically) already set up on the runner; sigbound never bundles a
+model, in CI or anywhere else, so there's no way to test a *real* agent
+inside this repo's own CI.
+
+**What it does.** Three steps, all shell (no third-party actions):
+
+1. **Install.** Downloads the Linux `sig` binary matching `version` (default
+   `latest`, resolved via the GitHub API) from this repo's
+   [releases](https://github.com/surya-koritala/sigbound/releases), verifies
+   it against that release's `checksums.txt`, and puts it on `PATH` for the
+   rest of the job. Linux runners only (`ubuntu-latest` or a self-hosted
+   Linux box) — the same constraint every step below inherits.
+2. **`sig doctor`.** Runs before anything else so a runner with too old a
+   `git` fails fast with an actionable message instead of failing deep
+   inside the agent run.
+3. **`sig run`.** Assembled from this action's inputs — only the flags whose
+   input is actually set are passed — with `-json` captured to a report
+   file. See [Inputs](#inputs) below for the full mapping.
+
+**The exit code is never swallowed.** `sig run`'s [exit code](#exit-codes) is
+always published as the `exit-code` output, but a non-zero exit ALSO fails
+the step (and so the job) with a message naming what that code means — a
+`-verify` failure fails your CI run, honestly, by default. If you want to
+inspect the outputs on a failing run instead of stopping the job, add
+`continue-on-error: true` to the action's own step and check `exit-code`
+yourself in a later step.
+
+### Inputs
+
+| Input | Default | Maps to |
+|-------|---------|---------|
+| `version` | `latest` | Release to install (`latest`, or e.g. `0.3.0` / `v0.3.0`). |
+| `repo-path` | `.` | `-repo` |
+| `base` | — | `-base` (sig run's own `main` default applies when unset) |
+| `tasks` | — | `-tasks` (mutually exclusive with `goal`) |
+| `goal` | — | `-goal` (mutually exclusive with `tasks`) |
+| `planner` | — | `-planner` |
+| `n` | — | `-n` |
+| `agent` | *(required)* | `-agent` |
+| `resolver` | — | `-resolver` |
+| `verify` | — | `-verify` |
+| `repair` | — | `-repair` |
+| `strategy` | — | `-strategy` |
+| `extra-args` | — | Appended verbatim after every flag above — the escape hatch for anything without a dedicated input (e.g. `-agent-timeout 300s -lanes strict -verify-retries 2`). |
+
+### Outputs
+
+| Output | From the report |
+|--------|------------------|
+| `exit-code` | `sig run`'s own exit code (0-6; see [Exit codes](#exit-codes)). |
+| `final-sha` | `integrate.finalSHA` — empty if nothing landed. |
+| `report` | Path to the full JSON report file this run wrote. |
+| `landed-count` | `integrate.landed`'s length. |
+
+---
+
 ## Benchmark
 
 `sigbench` measures parallel integration against a sequential `git merge`

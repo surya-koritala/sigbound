@@ -1,0 +1,63 @@
+# Example: run sigbound in CI with the surya-koritala/sigbound GitHub Action.
+#
+# This is illustrative, not turnkey: the `agent`/`verify` commands below
+# assume the `claude` CLI is already installed and authenticated on the
+# runner (an API key in `secrets.ANTHROPIC_API_KEY`, say). Sigbound never
+# bundles a model — bring your own CLI and auth, here or swapped for
+# whatever harness you use. Copy this to .github/workflows/ in your OWN
+# repository and adjust the goal/agent/verify commands for your project.
+name: sigbound
+
+on:
+  workflow_dispatch:
+    inputs:
+      goal:
+        description: 'What should the agents build?'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Install and authenticate your own agent CLI here. This step is a
+      # placeholder — swap it for however your harness actually gets onto
+      # the runner (npm install -g, a released binary, etc).
+      - name: Set up the agent CLI
+        run: npm install -g @anthropic-ai/claude-code
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: sigbound
+        id: sigbound
+        uses: surya-koritala/sigbound@v0.3.0
+        with:
+          repo-path: .
+          base: main
+          goal: ${{ inputs.goal }}
+          planner: 'claude -p "$SIGBOUND_PROMPT"'
+          n: '3'
+          agent: 'claude -p --permission-mode acceptEdits "$SIGBOUND_TASK"'
+          verify: 'go build ./... && go test ./...'
+          repair: 'claude -p --permission-mode acceptEdits "Fix this build failure: $SIGBOUND_FAILURE"'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      # Read the action's outputs however your workflow needs to: gate a
+      # later step, post a summary, fail loudly, etc. This step only runs
+      # its own commands after a landing (`always()` still sees a run that
+      # failed verify — exit-code/landed-count are set either way).
+      - name: Report the outcome
+        if: always()
+        run: |
+          echo "sig run exit code: ${{ steps.sigbound.outputs.exit-code }}"
+          echo "landed commit:     ${{ steps.sigbound.outputs.final-sha }}"
+          echo "branches landed:   ${{ steps.sigbound.outputs.landed-count }}"
+          echo "full report:       ${{ steps.sigbound.outputs.report }}"

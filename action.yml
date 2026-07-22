@@ -1,0 +1,124 @@
+name: 'Sigbound'
+description: 'Install sig and run AI coding agents in parallel on a git repo, auto-merging their verified work.'
+author: 'Surya Koritala'
+branding:
+  icon: 'git-merge'
+  color: 'blue'
+
+inputs:
+  version:
+    description: >-
+      sig release to install: "latest" (default) resolves the newest GitHub
+      release, or pin an exact version ("0.3.0" / "v0.3.0").
+    required: false
+    default: 'latest'
+  repo-path:
+    description: 'Path to the target git repository (sig run -repo).'
+    required: false
+    default: '.'
+  base:
+    description: >-
+      Base branch the agents fork from and the result lands onto (sig run
+      -base). Left unset, sig run's own default ("main") applies.
+    required: false
+    default: ''
+  tasks:
+    description: 'Path to a JSON tasks file (sig run -tasks). Mutually exclusive with goal.'
+    required: false
+    default: ''
+  goal:
+    description: >-
+      Natural-language goal for the planner to split into tasks (sig run
+      -goal). Mutually exclusive with tasks.
+    required: false
+    default: ''
+  planner:
+    description: 'Planner command (sig run -planner). Required when goal is set.'
+    required: false
+    default: ''
+  n:
+    description: 'Number of parallel tasks the planner should produce from goal (sig run -n).'
+    required: false
+    default: ''
+  agent:
+    description: >-
+      Shell command that edits files in each task's worktree (sig run
+      -agent). This is a bring-your-own-model command: it needs whatever
+      CLI/auth it depends on already set up on the runner.
+    required: true
+  resolver:
+    description: 'Conflict-resolver command (sig run -resolver).'
+    required: false
+    default: ''
+  verify:
+    description: 'Command that gates landing; non-zero exit fails the merge (sig run -verify).'
+    required: false
+    default: ''
+  repair:
+    description: 'Fixer command invoked when verify fails (sig run -repair).'
+    required: false
+    default: ''
+  strategy:
+    description: 'Integration strategy: overlay, mergetree, naive, or porcelain (sig run -strategy).'
+    required: false
+    default: ''
+  extra-args:
+    description: >-
+      Additional sig run flags, appended verbatim after every other flag
+      this action sets — the escape hatch for flags without a dedicated
+      input (e.g. "-agent-timeout 300s -lanes strict").
+    required: false
+    default: ''
+
+outputs:
+  exit-code:
+    description: 'The exit code sig run returned (0-6; see docs/USAGE.md#exit-codes).'
+    value: ${{ steps.sig-run.outputs.exit-code }}
+  final-sha:
+    description: 'The commit base was advanced to (integrate.finalSHA); empty if nothing landed.'
+    value: ${{ steps.sig-run.outputs.final-sha }}
+  report:
+    description: 'Path to the full JSON report file this run wrote.'
+    value: ${{ steps.sig-run.outputs.report }}
+  landed-count:
+    description: 'Number of branches that landed (integrate.landed length).'
+    value: ${{ steps.sig-run.outputs.landed-count }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install sig
+      shell: bash
+      env:
+        SIG_VERSION: ${{ inputs.version }}
+        INSTALL_DIR: ${{ runner.temp }}/sigbound/bin
+        RUNNER_ARCH_IN: ${{ runner.arch }}
+        RUNNER_OS_IN: ${{ runner.os }}
+      run: bash "${{ github.action_path }}/action/install.sh"
+
+    - name: sig doctor
+      shell: bash
+      run: |
+        if ! sig doctor -repo "${{ inputs.repo-path }}"; then
+          echo "::error::sig doctor failed — sigbound requires git >= 2.38 with working merge-tree/overlay plumbing; see the FAIL line(s) above for the specific check" >&2
+          exit 1
+        fi
+
+    - name: sig run
+      id: sig-run
+      shell: bash
+      env:
+        INPUT_REPO_PATH: ${{ inputs.repo-path }}
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_TASKS: ${{ inputs.tasks }}
+        INPUT_GOAL: ${{ inputs.goal }}
+        INPUT_PLANNER: ${{ inputs.planner }}
+        INPUT_N: ${{ inputs.n }}
+        INPUT_AGENT: ${{ inputs.agent }}
+        INPUT_RESOLVER: ${{ inputs.resolver }}
+        INPUT_VERIFY: ${{ inputs.verify }}
+        INPUT_REPAIR: ${{ inputs.repair }}
+        INPUT_STRATEGY: ${{ inputs.strategy }}
+        INPUT_EXTRA_ARGS: ${{ inputs.extra-args }}
+        REPORT_PATH: ${{ runner.temp }}/sigbound/report.json
+      run: bash "${{ github.action_path }}/action/run.sh"
