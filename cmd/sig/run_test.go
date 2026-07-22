@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -2292,6 +2293,317 @@ func TestRunRunUnknownAgentPresetFailsBeforeAnyAgent(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("error=%q, want it to contain %q", got, want)
 		}
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("report=%q, want no report written (nothing should have run)", buf.String())
+	}
+}
+
+// ---- -verify-impact (issue #10: test-impact analysis) ----
+
+// makeImpactGoRepo initializes a temp module with THREE packages for
+// test-impact analysis (mirrors writeImpactFixture in impact_test.go, but as
+// a real git repo agents can commit to): a (leaf), b (imports a), c
+// (independent) — plus a non-Go file (README.md) agents can touch to
+// exercise the "any doubt" fallback. `go build ./...` on the base tree
+// passes.
+func makeImpactGoRepo(t *testing.T) (*gitx.Git, string) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := gitx.New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	write := func(rel, content string) {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.com/impact\n\ngo 1.21\n")
+	write("a/a.go", "package a\n\nfunc A() int { return 1 }\n")
+	write("b/b.go", "package b\n\nimport \"example.com/impact/a\"\n\nfunc B() int { return a.A() + 1 }\n")
+	write("c/c.go", "package c\n\nfunc C() int { return 3 }\n")
+	write("README.md", "impact test fixture\n")
+	if _, err := g.CommitAll(ctx, "base"); err != nil {
+		t.Fatal(err)
+	}
+	return g, dir
+}
+
+// newImpactVerifyParams returns a runParams whose -verify writes fullMarker
+// (proving the FULL command ran) and whose -verify-impact dumps
+// SIGBOUND_IMPACTED_PKGS/SIGBOUND_CHANGED_FILES to outFile (proving the
+// SCOPED command ran, and exactly what it saw) — a test tells the two paths
+// apart by which file shows up, not just by reading Scope back out of the
+// report.
+func newImpactVerifyParams(t *testing.T, repo, agent string) (p runParams, fullMarker, outFile string) {
+	t.Helper()
+	fullMarker = filepath.Join(t.TempDir(), "full-marker.txt")
+	outFile = filepath.Join(t.TempDir(), "impact-out.txt")
+	p = runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:       fmt.Sprintf("echo full > %q", fullMarker),
+		VerifyImpactCmd: fmt.Sprintf(`printf '%%s\n%%s\n' "$SIGBOUND_IMPACTED_PKGS" "$SIGBOUND_CHANGED_FILES" > %q`, outFile),
+	}
+	return p, fullMarker, outFile
+}
+
+// TestDriveRunVerifyImpactScopesToChangedLeafPackage: changing only c/c.go
+// (an independent package, nothing imports it) must run the SCOPED
+// -verify-impact command with SIGBOUND_IMPACTED_PKGS=./c, not the full
+// -verify command.
+func TestDriveRunVerifyImpactScopesToChangedLeafPackage(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeImpactGoRepo(t)
+	agent := buildTestAgent(t)
+	p, fullMarker, outFile := newImpactVerifyParams(t, repo, agent)
+
+	task := taskSpec{ID: "c", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"c/c.go": "package c\n\nfunc C() int { return 30 }\n"},
+	})}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.Ran || !rep.Verify.OK {
+		t.Fatalf("verify ran=%v ok=%v output=%q", rep.Verify.Ran, rep.Verify.OK, rep.Verify.Output)
+	}
+	if rep.Verify.Scope != "impact" {
+		t.Fatalf("scope=%q, want impact: %s", rep.Verify.Scope, rep.Verify.Output)
+	}
+	if got := strings.Join(rep.Verify.ImpactedPkgs, " "); got != "./c" {
+		t.Fatalf("impactedPkgs=%q, want ./c (independent package, no reverse deps)", got)
+	}
+	if _, err := os.Stat(fullMarker); err == nil {
+		t.Fatal("full-verify marker exists; the FULL -verify command ran, want the scoped -verify-impact command only")
+	}
+	out, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("read verify-impact output file: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	if len(lines) != 2 || lines[0] != "./c" {
+		t.Fatalf("verify-impact saw %q, want SIGBOUND_IMPACTED_PKGS=./c on the first line", out)
+	}
+	if !strings.Contains(lines[1], "c/c.go") {
+		t.Fatalf("SIGBOUND_CHANGED_FILES=%q, want it to include c/c.go", lines[1])
+	}
+}
+
+// TestDriveRunVerifyImpactExpandsToReverseDependents: changing a/a.go must
+// impact BOTH a and b (b imports a) but NOT c (independent) — the reverse
+// dependency, not just the changed package itself, reaches the scoped
+// command.
+func TestDriveRunVerifyImpactExpandsToReverseDependents(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeImpactGoRepo(t)
+	agent := buildTestAgent(t)
+	p, fullMarker, _ := newImpactVerifyParams(t, repo, agent)
+
+	task := taskSpec{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"a/a.go": "package a\n\nfunc A() int { return 100 }\n"},
+	})}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep.Verify.Scope != "impact" {
+		t.Fatalf("scope=%q, want impact: %s", rep.Verify.Scope, rep.Verify.Output)
+	}
+	if got := strings.Join(rep.Verify.ImpactedPkgs, " "); got != "./a ./b" {
+		t.Fatalf("impactedPkgs=%q, want ./a ./b (b imports a; c is independent and must be excluded)", got)
+	}
+	if _, err := os.Stat(fullMarker); err == nil {
+		t.Fatal("full-verify marker exists, want the scoped command only")
+	}
+}
+
+// TestDriveRunVerifyImpactFallsBackOnNonGoChange: a change to a non-Go file
+// (README.md) is "any doubt" — the FULL -verify command must run instead of
+// -verify-impact, and the report must say scope=full.
+func TestDriveRunVerifyImpactFallsBackOnNonGoChange(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeImpactGoRepo(t)
+	agent := buildTestAgent(t)
+	p, fullMarker, outFile := newImpactVerifyParams(t, repo, agent)
+
+	task := taskSpec{ID: "docs", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"README.md": "updated\n"},
+	})}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.Ran || !rep.Verify.OK {
+		t.Fatalf("verify ran=%v ok=%v output=%q", rep.Verify.Ran, rep.Verify.OK, rep.Verify.Output)
+	}
+	if rep.Verify.Scope != "full" {
+		t.Fatalf("scope=%q, want full (non-Go file changed => any doubt)", rep.Verify.Scope)
+	}
+	if len(rep.Verify.ImpactedPkgs) != 0 {
+		t.Fatalf("impactedPkgs=%v, want none on a full-scope run", rep.Verify.ImpactedPkgs)
+	}
+	if _, err := os.Stat(fullMarker); err != nil {
+		t.Fatalf("full-verify marker missing, want the FULL -verify command to have run: %v", err)
+	}
+	if _, err := os.Stat(outFile); err == nil {
+		t.Fatal("verify-impact output file exists; the scoped command must not have run")
+	}
+}
+
+// TestDriveRunVerifyImpactFallsBackOnGoModChange: go.mod is not a .go file
+// but still lives in the module — it must still trigger the full fallback,
+// same as any other non-Go change.
+func TestDriveRunVerifyImpactFallsBackOnGoModChange(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeImpactGoRepo(t)
+	agent := buildTestAgent(t)
+	p, fullMarker, outFile := newImpactVerifyParams(t, repo, agent)
+
+	task := taskSpec{ID: "mod", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"go.mod": "module example.com/impact\n\ngo 1.21\n\n// bumped\n"},
+	})}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep.Verify.Scope != "full" {
+		t.Fatalf("scope=%q, want full (go.mod change => any doubt)", rep.Verify.Scope)
+	}
+	if _, err := os.Stat(fullMarker); err != nil {
+		t.Fatalf("full-verify marker missing: %v", err)
+	}
+	if _, err := os.Stat(outFile); err == nil {
+		t.Fatal("verify-impact output file exists; want full fallback only")
+	}
+}
+
+// TestDriveRunVerifyImpactAbsentIsByteIdentical proves -verify-impact is
+// fully opt-in: with it unset, verify.scope/verify.impactedPkgs stay
+// zero-valued (and so vanish from the JSON report via omitempty) and the
+// plain -verify command runs exactly as it did before this feature existed.
+func TestDriveRunVerifyImpactAbsentIsByteIdentical(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeImpactGoRepo(t)
+	agent := buildTestAgent(t)
+	fullMarker := filepath.Join(t.TempDir(), "full-marker.txt")
+
+	task := taskSpec{ID: "c", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"c/c.go": "package c\n\nfunc C() int { return 30 }\n"},
+	})}
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd: fmt.Sprintf("echo full > %q", fullMarker),
+		// VerifyImpactCmd deliberately left unset.
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.Ran || !rep.Verify.OK {
+		t.Fatalf("verify ran=%v ok=%v output=%q", rep.Verify.Ran, rep.Verify.OK, rep.Verify.Output)
+	}
+	if rep.Verify.Scope != "" || rep.Verify.ImpactedPkgs != nil {
+		t.Fatalf("scope=%q impactedPkgs=%v, want both zero-valued with -verify-impact unset", rep.Verify.Scope, rep.Verify.ImpactedPkgs)
+	}
+	if _, err := os.Stat(fullMarker); err != nil {
+		t.Fatalf("-verify did not run: %v", err)
+	}
+	b, err := json.Marshal(rep.Verify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"scope"`) || strings.Contains(string(b), `"impactedPkgs"`) {
+		t.Fatalf("verify JSON=%s, want no scope/impactedPkgs keys when -verify-impact is unset (byte-identical to before this feature)", b)
+	}
+}
+
+// TestDriveRunVerifyImpactRecomputesAfterRepair: the repair loop's fixer adds
+// a brand-new, independent package (d/d.go) on top of the original landed
+// change (c/c.go). The re-verify after repair must fold the fixer's edit
+// into the changed-file set and RECOMPUTE impact from scratch — not reuse
+// the pre-repair decision — so the second invocation sees ./c AND ./d.
+func TestDriveRunVerifyImpactRecomputesAfterRepair(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeImpactGoRepo(t)
+	agent := buildTestAgent(t)
+
+	marker := filepath.Join(t.TempDir(), "verify-marker")
+	out1 := filepath.Join(t.TempDir(), "impact-1.txt")
+	out2 := filepath.Join(t.TempDir(), "impact-2.txt")
+	// -verify-impact: fails the FIRST invocation (recording that attempt's
+	// impacted set to out1), passes every later invocation (recording to
+	// out2) — a marker-file flaky pattern (same trick as
+	// TestDriveRunVerifyRetries) standing in for a real compiler round-trip.
+	verifyImpact := fmt.Sprintf(
+		`test -f %q && { printf '%%s\n' "$SIGBOUND_IMPACTED_PKGS" > %q; exit 0; } || { touch %q; printf '%%s\n' "$SIGBOUND_IMPACTED_PKGS" > %q; exit 1; }`,
+		marker, out2, marker, out1,
+	)
+	p := runParams{
+		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:       "exit 1", // canary: only reached if scoping unexpectedly falls back to full
+		VerifyImpactCmd: verifyImpact,
+		RepairCmd:       `mkdir -p d && printf 'package d\n\nfunc D() int { return 4 }\n' > d/d.go`,
+		RepairMax:       1,
+	}
+
+	task := taskSpec{ID: "c", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"c/c.go": "package c\n\nfunc C() int { return 30 }\n"},
+	})}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.OK || !rep.Verify.Repaired {
+		t.Fatalf("verify ok=%v repaired=%v output=%q", rep.Verify.OK, rep.Verify.Repaired, rep.Verify.Output)
+	}
+	if rep.Verify.Scope != "impact" {
+		t.Fatalf("scope=%q, want impact", rep.Verify.Scope)
+	}
+	first, err := os.ReadFile(out1)
+	if err != nil {
+		t.Fatalf("read first-attempt impact: %v", err)
+	}
+	if strings.TrimSpace(string(first)) != "./c" {
+		t.Fatalf("first attempt impacted=%q, want ./c", first)
+	}
+	second, err := os.ReadFile(out2)
+	if err != nil {
+		t.Fatalf("read post-repair impact: %v", err)
+	}
+	if got := strings.TrimSpace(string(second)); got != "./c ./d" {
+		t.Fatalf("post-repair impacted=%q, want ./c ./d (repair's new file folded into the recomputed impact set)", got)
+	}
+	if got := rep.Verify.ImpactedPkgs; len(got) != 2 || got[0] != "./c" || got[1] != "./d" {
+		t.Fatalf("report impactedPkgs=%v, want [./c ./d]", got)
+	}
+}
+
+// TestRunRunVerifyImpactRequiresVerify: -verify-impact without -verify (or
+// -verify-preset) must fail before any agent runs — it composes WITH
+// -verify, which stays required as the fallback, never a substitute for it.
+func TestRunRunVerifyImpactRequiresVerify(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent", "true",
+		"-verify-impact", `go test $SIGBOUND_IMPACTED_PKGS`,
+	})
+	if err == nil {
+		t.Fatal("want an error: -verify-impact without -verify")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if !strings.Contains(err.Error(), "-verify-impact") || !strings.Contains(err.Error(), "-verify") {
+		t.Fatalf("error=%q, want it to name -verify-impact and -verify", err.Error())
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("report=%q, want no report written (nothing should have run)", buf.String())
