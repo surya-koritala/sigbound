@@ -488,6 +488,108 @@ func TestRunRunNoReportWhenNoAgentsRan(t *testing.T) {
 	}
 }
 
+// TestDriveRunVerifyRetries covers -verify-retries against a verify command
+// that fails on its first invocation and passes on every one after. Each
+// invocation runs in a FRESH detached worktree (see runVerify), so the
+// fail-once state has to live outside the checkout: a marker file at a fixed
+// path, created by the command itself on its first (failing) run.
+func TestDriveRunVerifyRetries(t *testing.T) {
+	ctx := context.Background()
+	agent := buildTestAgent(t)
+	task := taskSpec{ID: "ok", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"good.go": "package main\n\nfunc good() int { return 1 }\n"},
+	})}
+	flakyVerify := func(marker string) string {
+		return "test -f '" + marker + "' || { touch '" + marker + "'; exit 1; }"
+	}
+
+	// ---- -verify-retries 1: fails once, retry passes -> ok=true, flaky=true ----
+	_, repo1 := makeGoRepo(t)
+	p1 := runParams{
+		Repo: repo1, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:     flakyVerify(filepath.Join(t.TempDir(), "marker")),
+		VerifyRetries: 1,
+	}
+	rep1, err := driveRun(ctx, p1, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep1.Verify.OK {
+		t.Fatalf("verify.ok=false, want true after a retry: %q", rep1.Verify.Output)
+	}
+	if !rep1.Verify.Flaky {
+		t.Fatal("verify.flaky=false, want true (passed only on the 2nd invocation)")
+	}
+	if mainSHA, err := gitx.New(repo1).RevParse(ctx, "main"); err != nil || mainSHA != rep1.Integrate.FinalSHA {
+		t.Fatalf("flaky-but-green run must still land: main=%s finalSHA=%s err=%v", mainSHA, rep1.Integrate.FinalSHA, err)
+	}
+
+	// ---- -verify-retries 0 (fresh marker, same command): today's behavior — a
+	// single failing invocation fails verify outright, never flaky ----
+	_, repo0 := makeGoRepo(t)
+	p0 := runParams{
+		Repo: repo0, Base: "main", Strategy: "overlay", AgentCmd: agent,
+		VerifyCmd:     flakyVerify(filepath.Join(t.TempDir(), "marker")),
+		VerifyRetries: 0,
+	}
+	rep0, err := driveRun(ctx, p0, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep0.Verify.OK {
+		t.Fatal("verify.ok=true with -verify-retries 0, want false (no retry to save a failing first invocation)")
+	}
+	if rep0.Verify.Flaky {
+		t.Fatal("verify.flaky=true with -verify-retries 0, want false")
+	}
+	if code := runExitCode(rep0); code != exitVerifyFailed {
+		t.Fatalf("runExitCode=%d, want exitVerifyFailed", code)
+	}
+}
+
+// TestDriveRunRepairUsesVerifyRetries: the repair-loop interplay is untouched
+// at the default -verify-retries=0 — same fixture, same assertions as
+// TestDriveRunRepairSucceeds, just with VerifyRetries set explicitly to prove
+// the new seam doesn't change repair behavior when retries are off.
+func TestDriveRunRepairUsesVerifyRetries(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	p := runParams{
+		Repo:          repo,
+		Base:          "main",
+		Strategy:      "overlay",
+		AgentCmd:      agent,
+		VerifyCmd:     "go build ./...",
+		VerifyRetries: 0,
+		RepairCmd:     `printf 'package main\n\nfunc helper() int { return helperX() }\n' > repair_fix.go`,
+		RepairMax:     2,
+	}
+
+	rep, err := driveRun(ctx, p, brokenBuildTasks(t))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	v := rep.Verify
+	if !v.Ran || !v.OK {
+		t.Fatalf("verify ran=%v ok=%v output=%q", v.Ran, v.OK, v.Output)
+	}
+	if !v.Repaired {
+		t.Fatal("repaired=false; expected the repair loop to have fixed an initial failure")
+	}
+	if v.Flaky {
+		t.Fatal("flaky=true with -verify-retries 0; repair loop behavior must be unaffected")
+	}
+	mainSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mainSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("main=%s not advanced to repaired finalSHA=%s", mainSHA, rep.Integrate.FinalSHA)
+	}
+}
+
 func contains(ss []string, want string) bool {
 	for _, s := range ss {
 		if s == want {

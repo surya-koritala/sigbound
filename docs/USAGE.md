@@ -29,7 +29,7 @@ sig run -repo PATH -base BRANCH
         -agent CMD
         [-strategy overlay]
         [-resolver CMD] [-resolver-timeout D]
-        [-verify CMD [-repair CMD [-repair-max N]]]
+        [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]]
         [-lanes off|warn|strict]
         [-no-autocommit]
         [-json]
@@ -51,11 +51,23 @@ sig run -repo PATH -base BRANCH
 | `-resolver` | — | Conflict-resolver command; low-confidence cases are flagged, never guessed. |
 | `-resolver-timeout` | `30s` | Per-conflict timeout for `-resolver` (`0` = none). |
 | `-verify` | — | Command run in a detached checkout of the integrated tree; non-zero exit = merge fails and does not land. |
+| `-verify-retries` | `0` | After a FAILING `-verify` invocation, re-run it up to N more times on the same tree; passes on any green. A pass on a retry marks the report `flaky=true`. `0` = today's behavior. |
 | `-repair` | — | Fixer command invoked when `-verify` fails; edits are committed and `-verify` re-runs. |
 | `-repair-max` | `2` | Max repair attempts before reporting `verify.ok=false` honestly. |
 | `-lanes` | `warn` | Lane enforcement: `off`, `warn`, or `strict` (see [File lanes](#file-lanes)). |
 | `-no-autocommit` | `false` | Do **not** commit edits an agent left uncommitted. By default the driver stages and commits them, so edit-only agents still land. |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
+
+### Determinism
+
+`-verify` **must be deterministic**: the same tree should produce the same
+verdict every time. `-verify-retries` is a mitigation for flaky test suites —
+a transient failure re-runs on the exact same commit, never a different one —
+not a license to ship a nondeterministic check. Every retried pass is surfaced
+honestly: the report's `verify.flaky` is `true` whenever a passing run needed
+a retry, so a flaky suite stays visible even though the run goes green.
+`verify-bisect` and `verify-cache` (planned) both assume `-verify` is
+deterministic; an undocumented flaky command will confuse them.
 
 ### Tasks file
 
@@ -187,7 +199,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
     "finalSHA": "…", "wallMs": 12
   },
   "verify": {
-    "ran": true, "ok": true, "attempts": 1, "repaired": false,
+    "ran": true, "ok": true, "attempts": 1, "repaired": false, "flaky": false,
     "output": "…",
     "repairs": [ { "n": 1, "filesTouched": ["…"], "verifyOk": true } ]
   }
