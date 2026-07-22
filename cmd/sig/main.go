@@ -56,8 +56,8 @@ func main() {
 
 func usage(w *os.File) {
 	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-no-land]")
-	fmt.Fprintln(w, "  sig run       -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-resolver CMD] [-verify CMD [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-json]")
+	fmt.Fprintln(w, "  sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-assert] [-no-land]")
+	fmt.Fprintln(w, "  sig run       -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-json]")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))
 }
@@ -66,9 +66,9 @@ func usage(w *os.File) {
 // batch to cell.Integrator — the ONE integration code path in this binary. Both
 // `sig integrate` and `sig run` call it, so the driver never reimplements
 // partition / parallel folding / conflict handling / landing; it only supplies
-// the branch names and the same resolver/strategy knobs. When land is true the
-// base branch ref is advanced to the integrated commit.
-func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string, branches []string, strategy, resolverCmd string, resolverTimeout time.Duration, land bool) (cell.IntegrationResult, error) {
+// the branch names and the same resolver/strategy/assert knobs. When land is
+// true the base branch ref is advanced to the integrated commit.
+func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string, branches []string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool) (cell.IntegrationResult, error) {
 	changes := make([]cell.BranchChange, 0, len(branches))
 	for _, b := range branches {
 		paths, err := g.DiffNameOnly(ctx, baseSHA, b)
@@ -81,6 +81,9 @@ func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string
 	in := cell.NewIntegrator(g)
 	if land {
 		in = in.WithLandRef("refs/heads/" + baseRef)
+	}
+	if assert {
+		in = in.WithAssert()
 	}
 	if cmd := strings.TrimSpace(resolverCmd); cmd != "" {
 		// Same shell-wrapped CommandResolver the integrate command uses, so the
@@ -117,13 +120,15 @@ type resultJSON struct {
 func runIntegrate(argv []string) error {
 	fs := flag.NewFlagSet("integrate", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-no-land]")
+		fmt.Fprintln(fs.Output(), "usage: sig integrate -repo PATH -base BRANCH -branches b1,b2,.. [-strategy overlay] [-assert] [-no-land]")
 		fs.PrintDefaults()
 	}
 	repo := fs.String("repo", "", "path to the target git repository")
 	base := fs.String("base", "main", "base branch to land the branches onto")
 	branchesCSV := fs.String("branches", "", "comma-separated agent branch names to integrate")
 	strategy := fs.String("strategy", cell.StrategyOverlay, "integration strategy: "+strings.Join(cell.AvailableStrategies(), ", "))
+	assert := fs.Bool("assert", false, "paranoid cross-check for -strategy overlay: independently recompute the combine via merge-tree and error (never land) on any tree mismatch. "+
+		"Roughly doubles integration cost (it re-merges everything); for paranoia/CI, not routine use")
 	noLand := fs.Bool("no-land", false, "integrate without moving the base ref (leave finalSHA detached)")
 	resolverCmd := fs.String("resolver", "", "shell command (run via `sh -c`) invoked per conflicted path to resolve conflicts; "+
 		"reads the SIGBOUND_BASE/SIGBOUND_OURS/SIGBOUND_THEIRS file paths + SIGBOUND_PATH env vars, writes the resolved body to stdout. "+
@@ -160,7 +165,7 @@ func runIntegrate(argv []string) error {
 	// Hand the batch to the shared integrate path (partition, parallel folding,
 	// optional resolver, and landing are entirely the cell's job).
 	start := time.Now()
-	res, err := integrateBranches(ctx, g, *base, baseSHA, branches, *strategy, *resolverCmd, *resolverTimeout, !*noLand)
+	res, err := integrateBranches(ctx, g, *base, baseSHA, branches, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand)
 	if err != nil {
 		return err
 	}

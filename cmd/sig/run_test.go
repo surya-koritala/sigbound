@@ -216,6 +216,34 @@ func TestDriveRunFlagsWithoutResolver(t *testing.T) {
 	}
 }
 
+// TestDriveRunAssertHealthy wires -assert (runParams.Assert -> integrateBranches
+// -> cell.WithAssert) end to end on a healthy disjoint batch: it must still
+// land everything normally, proving the paranoid cross-check doesn't change
+// the outcome when there's nothing wrong to catch.
+func TestDriveRunAssertHealthy(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	tasks := []taskSpec{
+		{ID: "a", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"a.go": "package main\n\nfunc a() int { return 1 }\n"},
+		})},
+		{ID: "b", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"b.go": "package main\n\nfunc b() int { return 2 }\n"},
+		})},
+	}
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", Assert: true, AgentCmd: agent}
+
+	rep, err := driveRun(ctx, p, tasks)
+	if err != nil {
+		t.Fatalf("driveRun with -assert: %v", err)
+	}
+	if len(rep.Integrate.Landed) != 2 || len(rep.Integrate.Flagged) != 0 {
+		t.Fatalf("landed=%d flagged=%d, want 2/0", len(rep.Integrate.Landed), len(rep.Integrate.Flagged))
+	}
+}
+
 // TestDriveRunLaneEnforcement: an agent that declares Files=[a.go] but also
 // writes b.go is "out of lane". In warn mode it still lands but the report
 // records strayed=[b.go]; in strict mode it is treated as a failed agent — not
