@@ -34,6 +34,7 @@ sig run -repo PATH -base BRANCH
         [-lanes off|warn|strict]
         [-no-autocommit]
         [-keep-failed]
+        [-logdir DIR]
         [-json]
 ```
 
@@ -61,6 +62,7 @@ sig run -repo PATH -base BRANCH
 | `-lanes` | `warn`* | Lane enforcement: `off`, `warn`, or `strict` (see [File lanes](#file-lanes)). *`-goal` runs default to `strict` instead unless `-lanes` is set explicitly. |
 | `-no-autocommit` | `false` | Do **not** commit edits an agent left uncommitted. By default the driver stages and commits them, so edit-only agents still land. |
 | `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. A kept worktree stays registered with git until you remove it: `git worktree remove <path>` (or `git worktree prune` after deleting the directory yourself). |
+| `-logdir` | — | Write each agent/repair/verify/planner command's **full** stdout+stderr to `<logdir>/<name>.log` (`agent-<id>.log`, `repair-<n>.log`, `verify-<n>.log`, `planner.log`), on top of the truncated tails the report keeps in memory. The directory is created if needed and must be writable — checked before any agent runs, so a bad `-logdir` fails the whole run rather than silently dropping logs partway through. Repeated runs against the same `-logdir` **append** to the same files; there is no per-run rotation. A task's `id` is sanitized for use in the filename (non-alphanumeric characters become `-`), so two exotic ids that sanitize to the same string share one log file. |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
 
 ### Determinism
@@ -265,7 +267,8 @@ With `-json`, `sig run` prints a full report. Top-level shape:
     "ran": true, "ok": true, "attempts": 1, "repaired": false, "flaky": false,
     "output": "…",
     "repairs": [ { "n": 1, "filesTouched": ["…"], "verifyOk": true } ]
-  }
+  },
+  "logDir": "…"
 }
 ```
 
@@ -274,6 +277,8 @@ With `-json`, `sig run` prints a full report. Top-level shape:
 - `integrate.resolved` — overlapping branches that still landed (auto-merged or
   resolver-resolved).
 - `verify.ok` is the bottom line: `false` means nothing was landed onto `-base`.
+- `logDir` is present iff `-logdir` was set; it names the directory holding
+  each command's full stdout+stderr log (see `-logdir` above).
 
 Without `-json`, the same run prints a short human summary.
 

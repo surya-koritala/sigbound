@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -995,6 +996,160 @@ func TestDriveRunRepairFailsHonestly(t *testing.T) {
 	}
 }
 
+// TestDriveRunLogDirCapturesFullAgentOutput: with -logdir, an agent's FULL
+// stdout+stderr (well beyond the 800-byte in-memory tail) lands in
+// agent-<id>.log, while a.Stderr stays bounded exactly as it does without
+// -logdir. The agent fails on purpose (exit 1) — the log path must work
+// regardless of whether the agent ultimately lands.
+func TestDriveRunLogDirCapturesFullAgentOutput(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	logDir := t.TempDir()
+
+	// 3000 bytes of stderr (well past the 800-byte tail) plus a stdout marker
+	// (stdout is normally discarded entirely; -logdir must still capture it).
+	agentCmd := "printf 'stdout-marker\\n'; head -c 3000 /dev/zero | tr '\\0' 'X' >&2; exit 1"
+	task := taskSpec{ID: "logtest", Prompt: "n/a"}
+
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agentCmd, LogDir: logDir}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if len(rep.PerAgent) != 1 || rep.PerAgent[0].OK {
+		t.Fatalf("want one failed agent (exit 1), got %+v", rep.PerAgent)
+	}
+	a := rep.PerAgent[0]
+
+	// In-memory capture stays bounded, same as without -logdir.
+	if len(a.Stderr) > 803 { // 800 + "..." prefix
+		t.Fatalf("a.Stderr not bounded: len=%d", len(a.Stderr))
+	}
+
+	logPath := filepath.Join(logDir, "agent-logtest.log")
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", logPath, err)
+	}
+	if !strings.Contains(string(data), "stdout-marker") {
+		t.Fatalf("%s missing stdout content (stdout is discarded without -logdir, must be captured with it):\n%.200s", logPath, data)
+	}
+	if got := strings.Count(string(data), "X"); got != 3000 {
+		t.Fatalf("%s has %d X's, want the full 3000-byte stderr (not truncated)", logPath, got)
+	}
+
+	if rep.LogDir != logDir {
+		t.Fatalf("rep.LogDir=%q, want %q", rep.LogDir, logDir)
+	}
+	var sumBuf bytes.Buffer
+	if err := emitReport(&sumBuf, rep, false); err != nil {
+		t.Fatalf("emitReport: %v", err)
+	}
+	if !strings.Contains(sumBuf.String(), "logs: "+logDir) {
+		t.Fatalf("summary missing 'logs: %s' line:\n%s", logDir, sumBuf.String())
+	}
+}
+
+// TestDriveRunLogDirVerifyAndRepairFiles exercises the full verify/repair loop
+// with -logdir: an initial FAILING verify (verify-0.log), a repair attempt
+// (repair-1.log), and the post-repair verify that passes (verify-1.log) must
+// all appear under -logdir with the expected names, alongside each agent's log.
+func TestDriveRunLogDirVerifyAndRepairFiles(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	logDir := t.TempDir()
+
+	p := runParams{
+		Repo:      repo,
+		Base:      "main",
+		Strategy:  "overlay",
+		AgentCmd:  agent,
+		VerifyCmd: "go build ./...",
+		RepairCmd: `printf 'package main\n\nfunc helper() int { return helperX() }\n' > repair_fix.go`,
+		RepairMax: 2,
+		LogDir:    logDir,
+	}
+
+	rep, err := driveRun(ctx, p, brokenBuildTasks(t))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if !rep.Verify.OK || !rep.Verify.Repaired {
+		t.Fatalf("verify ok=%v repaired=%v, want the repair loop to fix it: %q", rep.Verify.OK, rep.Verify.Repaired, rep.Verify.Output)
+	}
+
+	// sig-testagent and the repair fixer here are both silent on success (they
+	// only write/commit files), so only existence is asserted for their logs;
+	// verify's failing output is checked for real content separately below.
+	for _, name := range []string{
+		"agent-caller.log", "agent-helper.log",
+		"verify-0.log", // initial verify: FAILS (undefined: helper)
+		"repair-1.log", // the fixer's own log
+		"verify-1.log", // post-repair verify: PASSES
+	} {
+		path := filepath.Join(logDir, name)
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected log file %s: %v", path, err)
+		}
+	}
+	v0, err := os.ReadFile(filepath.Join(logDir, "verify-0.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(v0), "helper") {
+		t.Fatalf("verify-0.log missing the build failure output:\n%s", v0)
+	}
+}
+
+// TestRunRunLogDirUnwritableFailsBeforeAgents: an unwritable/uncreatable
+// -logdir must fail the run BEFORE any agent runs — never silently drop the
+// requested logs. Here -logdir names a path that is already a regular FILE,
+// so os.MkdirAll cannot turn it into a directory; a chmod-based test would be
+// unreliable when tests run as root.
+func TestRunRunLogDirUnwritableFailsBeforeAgents(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	marker := filepath.Join(t.TempDir(), "agent-ran")
+	agentCmd := "touch " + marker
+
+	blocked := filepath.Join(t.TempDir(), "blocked")
+	if err := os.WriteFile(blocked, []byte("not a directory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logDir := filepath.Join(blocked, "logs") // parent "blocked" is a file, not a dir
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-base", "main",
+		"-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent", agentCmd,
+		"-logdir", logDir,
+	})
+	if err == nil {
+		t.Fatal("unwritable -logdir: want error, got nil")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("no report should be written when -logdir fails before any agent runs, got:\n%s", buf.String())
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("agent ran despite an unwritable -logdir; must fail before any agent runs")
+	}
+}
+
+// tasksFileFor writes tasks as a JSON -tasks file and returns its path.
+func tasksFileFor(t *testing.T, tasks []taskSpec) string {
+	t.Helper()
+	f := filepath.Join(t.TempDir(), "tasks.json")
+	if err := os.WriteFile(f, []byte(mustJSON(t, tasks)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
 // TestDriveRunRepairSkippedWhenVerifyPasses: when -verify passes on the FIRST
 // try, the repair loop must never run even though -repair is configured.
 func TestDriveRunRepairSkippedWhenVerifyPasses(t *testing.T) {
@@ -1036,5 +1191,125 @@ func TestDriveRunRepairSkippedWhenVerifyPasses(t *testing.T) {
 	}
 	if contains(paths, "should_not_exist.go") {
 		t.Fatal("fixer ran despite verify passing on the first try")
+	}
+}
+
+// openReadOnly creates an empty file at path and reopens it O_RDONLY, so every
+// Write() to the returned handle fails immediately (EBADF) — a real,
+// portable, permission-independent way to make an already-successfully-opened
+// file fail every write, used below to reproduce the exact -logdir failure
+// mode bestEffortWriter guards against.
+func openReadOnly(t *testing.T, path string) *os.File {
+	t.Helper()
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+// TestBestEffortWriterSwallowsErrors is the direct unit test of the seam: a
+// real failing writer (a file opened O_RDONLY) must never make
+// bestEffortWriter.Write return an error or a short count.
+func TestBestEffortWriterSwallowsErrors(t *testing.T) {
+	f := openReadOnly(t, filepath.Join(t.TempDir(), "readonly.log"))
+
+	// Confirm the premise: writing to an O_RDONLY file really does fail.
+	if _, err := f.Write([]byte("x")); err == nil {
+		t.Fatal("premise broken: write to an O_RDONLY file succeeded")
+	}
+
+	w := bestEffortWriter{f}
+	n, err := w.Write([]byte("hello"))
+	if err != nil {
+		t.Fatalf("bestEffortWriter.Write returned error %v, want nil (must swallow)", err)
+	}
+	if n != len("hello") {
+		t.Fatalf("bestEffortWriter.Write returned n=%d, want %d", n, len("hello"))
+	}
+}
+
+// TestBestEffortWriterKeepsCommandRunCleanOnLogWriteFailure reproduces the
+// exact os/exec behavior the CRITICAL finding is about: as soon as
+// cmd.Stdout is anything other than a bare *os.File, exec services it via a
+// pipe + copy-goroutine, and that goroutine's write error is promoted into
+// cmd.Run()'s returned error even though the child process itself exited 0.
+// The "control" subtest confirms the bug is real without the fix; the
+// "fixed" subtest confirms bestEffortWriter neutralizes it while still
+// capturing the real output.
+func TestBestEffortWriterKeepsCommandRunCleanOnLogWriteFailure(t *testing.T) {
+	t.Run("control: unwrapped failing writer fails a clean exit", func(t *testing.T) {
+		f := openReadOnly(t, filepath.Join(t.TempDir(), "readonly.log"))
+		var buf bytes.Buffer
+		cmd := exec.Command("sh", "-c", "echo hello")
+		cmd.Stdout = io.MultiWriter(&buf, f)
+		if err := cmd.Run(); err == nil {
+			t.Fatal("premise broken: expected the log-write failure to surface as a Run() error " +
+				"(the os/exec behavior bestEffortWriter works around) — got nil")
+		}
+	})
+
+	t.Run("fixed: bestEffortWriter keeps a clean exit clean", func(t *testing.T) {
+		f := openReadOnly(t, filepath.Join(t.TempDir(), "readonly.log"))
+		var buf bytes.Buffer
+		cmd := exec.Command("sh", "-c", "echo hello")
+		cmd.Stdout = io.MultiWriter(&buf, bestEffortWriter{f})
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("Run() = %v, want nil — a failing -logdir write must never fail the command", err)
+		}
+		if got := strings.TrimSpace(buf.String()); got != "hello" {
+			t.Fatalf("captured output = %q, want %q (real output must still land)", got, "hello")
+		}
+	})
+}
+
+// TestDriveRunAgentSurvivesLogWriteFailure is the agent-level counterpart:
+// with -logdir wired to a log file that fails every write (forced via
+// openLogFile, the seam openLog uses), a real agent that lands a commit must
+// still be reported OK — not just the bestEffortWriter primitive in
+// isolation, but the actual runAgent call site that wraps it.
+func TestDriveRunAgentSurvivesLogWriteFailure(t *testing.T) {
+	orig := openLogFile
+	openLogFile = func(name string, _ int, perm os.FileMode) (*os.File, error) {
+		if err := os.WriteFile(name, nil, perm); err != nil {
+			return nil, err
+		}
+		return os.OpenFile(name, os.O_RDONLY, 0) // every Write() to this fails
+	}
+	t.Cleanup(func() { openLogFile = orig })
+
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	logDir := t.TempDir()
+	agentBin := buildTestAgent(t)
+
+	task := taskSpec{ID: "survives", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"landed.go": "package main\n\nfunc landed() int { return 1 }\n"},
+	})}
+	// Real output on both streams so the log-write path is actually exercised
+	// (not skipped because the child produced nothing to write).
+	agentCmd := "printf 'stdout-line\\n'; printf 'stderr-line\\n' >&2; " + agentBin
+
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agentCmd, LogDir: logDir}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if len(rep.PerAgent) != 1 {
+		t.Fatalf("want 1 agent result, got %d", len(rep.PerAgent))
+	}
+	a := rep.PerAgent[0]
+	if !a.OK {
+		t.Fatalf("agent OK=false (exit=%d stderr=%q); a failing -logdir write must never fail the agent", a.Exit, a.Stderr)
+	}
+	if a.SHA == "" || a.SHA == rep.BaseSHA {
+		t.Fatalf("agent did not land its commit: sha=%q base=%q", a.SHA, rep.BaseSHA)
+	}
+	if len(a.Files) != 1 || a.Files[0] != "landed.go" {
+		t.Fatalf("agent.Files=%v, want [landed.go]", a.Files)
 	}
 }

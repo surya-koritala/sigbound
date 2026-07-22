@@ -129,6 +129,7 @@ type runReport struct {
 	PerAgent  []perAgentJSON `json:"perAgent"`
 	Integrate integrateJSON  `json:"integrate"`
 	Verify    verifyJSON     `json:"verify"`
+	LogDir    string         `json:"logDir,omitempty"` // set iff -logdir was given; full per-command logs live here
 }
 
 // sig run exit codes. An operational error (bad flags, a git/integrate
@@ -187,6 +188,7 @@ type runParams struct {
 	Autocommit      bool   // commit an agent's uncommitted edits when it made no commit itself
 	LaneMode        string // lane enforcement: laneOff | laneWarn | laneStrict
 	KeepFailed      bool   // keep a FAILED agent's worktree on disk instead of removing it
+	LogDir          string // when set, full per-command stdout+stderr logs are written here (see openLog)
 }
 
 // repairFailureMax bounds the captured verify output handed to the fixer agent
@@ -232,7 +234,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-logdir DIR] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -268,6 +270,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	lanes := fs.String("lanes", laneWarn, "lane enforcement for declared file-sets: off (ignore) | warn (record out-of-lane writes, still land) | strict (out-of-lane => failed agent, not landed). warn is best-effort; strict is the real disjointness guarantee. "+
 		"Default is warn, EXCEPT a planned run (-goal) with -lanes not set explicitly defaults to strict, since the planner already promised a disjoint split")
 	keepFailed := fs.Bool("keep-failed", false, "keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected; the path is printed and recorded in the report. Successful agents' worktrees are always removed")
+	logDir := fs.String("logdir", "", "when set, write each agent/repair/verify/planner command's FULL stdout+stderr to <logdir>/<name>.log "+
+		"(agent-<id>.log, repair-<n>.log, verify-<n>.log, planner.log), in addition to the truncated tails the report keeps in memory. "+
+		"The directory is created if needed and must be writable; checked before any agent runs")
 	asJSON := fs.Bool("json", false, "emit the full JSON report (default: a terse human summary)")
 
 	if err := fs.Parse(argv); err != nil {
@@ -311,6 +316,17 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		return exitOperationalError, err
 	}
 
+	// -logdir is validated (created + confirmed writable) before any agent or
+	// planner command runs, same as every other fail-safe check above: a bad
+	// -logdir must fail the run up front, never silently drop logs partway
+	// through. See openLog for how it's used once streaming starts.
+	logDirAbs := strings.TrimSpace(*logDir)
+	if logDirAbs != "" {
+		if err := prepareLogDir(logDirAbs); err != nil {
+			return exitOperationalError, err
+		}
+	}
+
 	// Task source: exactly one of -tasks (explicit) or -goal (planned). If both
 	// are set it is an error rather than silently ignoring one.
 	haveTasks := strings.TrimSpace(*tasksFile) != ""
@@ -335,7 +351,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	} else {
 		// Plan from the goal. A bad plan returns an error here — before any agent
 		// runs — so a broken plan never launches a broken run (fail-safe).
-		tasks, err = planTasks(context.Background(), *repo, *goal, *plannerCmd, *n, *plannerTimeout)
+		tasks, err = planTasks(context.Background(), *repo, *goal, *plannerCmd, *n, *plannerTimeout, logDirAbs)
 		if err != nil {
 			return exitOperationalError, err
 		}
@@ -378,6 +394,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Autocommit:      !*noAutocommit,
 		LaneMode:        laneMode,
 		KeepFailed:      *keepFailed,
+		LogDir:          logDirAbs,
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
 	if err != nil {
@@ -457,7 +474,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 	if p.LaneMode == "" {
 		p.LaneMode = laneWarn // default when driven in-process without flag parsing
 	}
-	rep := runReport{Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks}
+	rep := runReport{Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks, LogDir: p.LogDir}
 	// Normally wtRoot (and every per-agent worktree under it) is torn down when
 	// the run ends. -keep-failed retains individual failed agents' worktrees
 	// (see runAgent); when any survive, leave wtRoot itself in place too, or
@@ -560,7 +577,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 // possibly-advanced head the base ref should point at. If -verify passes on
 // the first try, no repair runs.
 func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string) (verifyJSON, string) {
-	v := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries)
+	v := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries, p.LogDir, 0)
 	// Green first try (possibly after a retry), or no repair configured/allowed
 	// => done, loop never runs. v already carries Flaky, so it survives here.
 	if v.OK || strings.TrimSpace(p.RepairCmd) == "" || p.RepairMax < 1 {
@@ -572,7 +589,7 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 	ok := false
 	flaky := false
 	for attempt := 1; attempt <= p.RepairMax; attempt++ {
-		newHead, touched, rerr := runRepair(ctx, g, p, head, lastOutput)
+		newHead, touched, rerr := runRepair(ctx, g, p, head, lastOutput, attempt)
 		rec := repairAttemptJSON{N: attempt, FilesTouched: touched, VerifyOK: false}
 		if rerr != nil || newHead == head {
 			// Fixer failed to spawn/commit, or produced no change: record the
@@ -584,7 +601,7 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 			break
 		}
 		head = newHead
-		rv := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries)
+		rv := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries, p.LogDir, attempt)
 		lastOutput = rv.Output
 		rec.VerifyOK = rv.OK
 		repairs = append(repairs, rec)
@@ -617,11 +634,14 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 // verifyJSON.Flaky rather than silently reported as a clean first-try green.
 // retries=0 reproduces the pre-existing behavior exactly: one invocation, no
 // retry, never flaky. When all retries are exhausted, the last (failing)
-// invocation's result is returned, same as today.
-func runVerifyRetry(ctx context.Context, g *gitx.Git, head, verifyCmd string, retries int) verifyJSON {
-	v := runVerify(ctx, g, head, verifyCmd)
+// invocation's result is returned, same as today. logAttempt names this
+// logical verify attempt (0 = pre-repair, N = after repair round N) for
+// -logdir's verify-<n>.log; every retry within this call appends to the same
+// file (see openLog).
+func runVerifyRetry(ctx context.Context, g *gitx.Git, head, verifyCmd string, retries int, logDir string, logAttempt int) verifyJSON {
+	v := runVerify(ctx, g, head, verifyCmd, logDir, logAttempt)
 	for attempt := 0; !v.OK && attempt < retries; attempt++ {
-		v = runVerify(ctx, g, head, verifyCmd)
+		v = runVerify(ctx, g, head, verifyCmd, logDir, logAttempt)
 		if v.OK {
 			v.Flaky = true
 		}
@@ -635,7 +655,9 @@ func runVerifyRetry(ctx context.Context, g *gitx.Git, head, verifyCmd string, re
 // fixer edited — exactly like an edit-only agent (reusing the CommitAll path).
 // It returns the new commit SHA (== head when the fixer changed nothing) and the
 // files that commit touched vs. head. The main working tree is never touched.
-func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure string) (string, []string, error) {
+// attempt is this repair round's 1-based number (see verifyWithRepair's loop),
+// used only to name the -logdir log file (repair-<attempt>.log).
+func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure string, attempt int) (string, []string, error) {
 	dir, err := os.MkdirTemp("", "sig-repair-*")
 	if err != nil {
 		return head, nil, err
@@ -658,7 +680,19 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	// stdout is discarded; the fixer signals its work through file edits (which
-	// the driver commits) exactly like an edit-only agent.
+	// the driver commits) exactly like an edit-only agent. With -logdir, both
+	// streams also stream to a full log file; see runAgent for the same pattern.
+	// The log is wrapped in bestEffortWriter (both here and for stdout, even
+	// though stdout would otherwise be a bare *os.File) so a log-write failure
+	// can never fail the repair command; wrapping stdout costs exec's
+	// pipe+goroutine instead of a plain fd dup, which is fine since WaitDelay is
+	// set above.
+	if logf := openLog(p.LogDir, fmt.Sprintf("repair-%d.log", attempt)); logf != nil {
+		defer logf.Close()
+		blog := bestEffortWriter{logf}
+		cmd.Stdout = blog
+		cmd.Stderr = io.MultiWriter(&errBuf, blog)
+	}
 	if runErr := cmd.Run(); runErr != nil {
 		return head, nil, fmt.Errorf("repair command: %w: %s", runErr, tail(errBuf.String(), 400))
 	}
@@ -737,6 +771,18 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	// stdout is discarded; the agent signals its work through commits + exit code.
+	// With -logdir, both streams ALSO stream to a full log file (io.MultiWriter)
+	// while errBuf keeps capturing the same bounded in-memory tail as before.
+	// The log is wrapped in bestEffortWriter (both here and for stdout, even
+	// though stdout would otherwise be a bare *os.File) so a log-write failure
+	// can never fail the agent; wrapping stdout costs exec's pipe+goroutine
+	// instead of a plain fd dup, which is fine since WaitDelay is set above.
+	if logf := openLog(p.LogDir, "agent-"+sanitizeID(t.ID)+".log"); logf != nil {
+		defer logf.Close()
+		blog := bestEffortWriter{logf}
+		cmd.Stdout = blog
+		cmd.Stderr = io.MultiWriter(&errBuf, blog)
+	}
 	runErr := cmd.Run()
 	a.Exit = 0
 	if runErr != nil {
@@ -825,8 +871,9 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 }
 
 // runVerify materializes finalSHA into a detached worktree and runs verifyCmd
-// there. The main working tree is never touched.
-func runVerify(ctx context.Context, g *gitx.Git, finalSHA, verifyCmd string) verifyJSON {
+// there. The main working tree is never touched. logAttempt names the
+// -logdir log file (verify-<logAttempt>.log); see runVerifyRetry.
+func runVerify(ctx context.Context, g *gitx.Git, finalSHA, verifyCmd string, logDir string, logAttempt int) verifyJSON {
 	dir, err := os.MkdirTemp("", "sig-verify-*")
 	if err != nil {
 		return verifyJSON{Ran: true, OK: false, Output: err.Error()}
@@ -843,12 +890,28 @@ func runVerify(ctx context.Context, g *gitx.Git, finalSHA, verifyCmd string) ver
 	cmd.Dir = checkout
 	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
 	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
-	return verifyJSON{Ran: true, OK: err == nil, Output: tail(string(out), 2000)}
+	// Combined output, same as CombinedOutput(): both streams into one buffer
+	// (outBuf) for the bounded report tail. With -logdir, both ALSO stream to
+	// a full log file; see runAgent for the same pattern.
+	var outBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &outBuf
+	if logf := openLog(logDir, fmt.Sprintf("verify-%d.log", logAttempt)); logf != nil {
+		defer logf.Close()
+		// bestEffortWriter: a log-write failure must never turn a passing verify
+		// into OK=false. See bestEffortWriter's doc for the os/exec mechanism.
+		cmd.Stdout = io.MultiWriter(&outBuf, bestEffortWriter{logf})
+		cmd.Stderr = cmd.Stdout
+	}
+	err = cmd.Run()
+	return verifyJSON{Ran: true, OK: err == nil, Output: tail(outBuf.String(), 2000)}
 }
 
 func writeRunSummary(w io.Writer, r runReport) error {
 	fmt.Fprintf(w, "repo %s  base %s (%s)  lanes=%s\n", r.Repo, r.Base, short(r.BaseSHA), r.LaneMode)
+	if r.LogDir != "" {
+		fmt.Fprintf(w, "logs: %s\n", r.LogDir)
+	}
 	for _, a := range r.PerAgent {
 		status := "ok"
 		if !a.OK {
@@ -907,6 +970,76 @@ func sanitizeID(id string) string {
 		return "task"
 	}
 	return b.String()
+}
+
+// prepareLogDir creates dir (and its parents) for -logdir and confirms it is
+// actually writable, so a bad -logdir fails before any agent or planner
+// command runs instead of silently dropping every full-output log. MkdirAll
+// alone would not catch an existing-but-unwritable directory, so this also
+// probes with a throwaway file.
+func prepareLogDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("-logdir %s: %w", dir, err)
+	}
+	probe, err := os.CreateTemp(dir, ".sigbound-logdir-check-*")
+	if err != nil {
+		return fmt.Errorf("-logdir %s is not writable: %w", dir, err)
+	}
+	probe.Close()
+	os.Remove(probe.Name())
+	return nil
+}
+
+// openLog opens <logDir>/name for a command's full stdout+stderr capture (see
+// -logdir), appended so multiple invocations that share one logical attempt
+// (-verify-retries re-running on the same tree, or a planner re-plan) land in
+// the same file instead of clobbering each other. Returns nil when logDir is
+// empty or the file can't be opened; -logdir's directory is validated once,
+// up front (prepareLogDir), before any agent runs, so an open failure here is
+// unexpected — when it happens that command simply runs without a log.
+//
+// Opening is only half the guarantee: every caller wraps the returned file in
+// bestEffortWriter before attaching it to cmd.Stdout/Stderr, so a WRITE
+// failure AFTER a successful open (disk full, permissions revoked mid-run,
+// etc.) degrades the same way — the command that triggered it still runs and
+// reports normally, never failed because of a log write. See bestEffortWriter
+// for why that wrapping is required at every call site, not just here.
+func openLog(logDir, name string) *os.File {
+	if logDir == "" {
+		return nil
+	}
+	f, err := openLogFile(filepath.Join(logDir, name), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil
+	}
+	return f
+}
+
+// openLogFile is the file-open call openLog uses, factored into a var so a
+// test can substitute a file that fails every Write (e.g. one opened
+// O_RDONLY) to exercise the bestEffortWriter path end-to-end through a real
+// agent run, without needing to fabricate an actual disk-full condition.
+// Production code never reassigns this.
+var openLogFile = os.OpenFile
+
+// bestEffortWriter wraps a log-file writer so a failing Write can never fail
+// the command being logged. os/exec promotes a copy-goroutine's write error
+// into cmd.Run()'s returned error even when the child process itself exited
+// 0: as soon as any of Stdout/Stderr is not a bare *os.File, exec adds a
+// pipe+goroutine to service it, and that goroutine's write error overrides an
+// otherwise-clean exit (see cmd.Wait in package os/exec). A -logdir write
+// failure (disk full, log file closed out from under us, etc.) must never
+// turn a successful agent/verify/repair/planner run into a reported failure,
+// so every write here is swallowed and reported as a (full-length, nil-error)
+// success — the command runs to completion either way; only the log is
+// incomplete.
+type bestEffortWriter struct {
+	w io.Writer
+}
+
+func (b bestEffortWriter) Write(p []byte) (int, error) {
+	b.w.Write(p) //nolint:errcheck // deliberately best-effort; see type doc
+	return len(p), nil
 }
 
 // tail returns at most the last max characters of s, prefixed with an ellipsis
