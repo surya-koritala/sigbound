@@ -37,7 +37,8 @@ git clone https://github.com/surya-koritala/sigbound && cd sigbound
 go build -o sig ./cmd/sig
 ```
 
-Requires Go 1.25+ and the `git` binary.
+Requires Go 1.25+ and the `git` binary (>= 2.38). Run `sig doctor` to check
+your git.
 
 ## Usage
 
