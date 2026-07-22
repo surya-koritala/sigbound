@@ -575,30 +575,38 @@ other host CLI itself (see the top-level [How it works](../README.md#how-it-work
 guarantee that `sig` never starts a server or acts as a git host). `-publish`
 shells out to whatever your repo already uses instead.
 
-It receives the same `SIGBOUND_*` env-var pattern as every other slot (see
-[Environment variables](#environment-variables)): `SIGBOUND_FINAL_SHA` (the
-landed commit), `SIGBOUND_BASE` (the base branch name), `SIGBOUND_BASE_SHA`
-(the base commit BEFORE this run), `SIGBOUND_REPO`, `SIGBOUND_LANDED`
-(space-separated names of the branches that actually landed), and
-`SIGBOUND_MANIFEST` (the `-manifest` path when set, else empty — note this is
-the *path*, not a promise the file already exists: `-manifest` itself is
-written back to disk only after `driveRun` returns, same as always).
+The **full JSON run report** (the same document `-json` prints and `-manifest`
+writes to disk) is piped to the command's **stdin** — its own `publish` field
+is absent there, since this call is what fills it in. This is the delivery
+mechanism for the report's contents; read whatever you need from it with
+`jq`, e.g. `jq -r .integrate.finalSHA` to pull the landed commit off stdin.
+
+It also receives the same `SIGBOUND_*` env-var pattern as every other slot
+(see [Environment variables](#environment-variables)): `SIGBOUND_FINAL_SHA`
+(the landed commit), `SIGBOUND_BASE_BRANCH` (the base branch name),
+`SIGBOUND_BASE_SHA` (the base commit BEFORE this run), `SIGBOUND_REPO`,
+`SIGBOUND_LANDED` (space-separated names of the branches that actually
+landed), and `SIGBOUND_MANIFEST` (the `-manifest` path when set, else empty —
+just a *pointer* to where the manifest will live, not a promise the file
+already exists: `-manifest` itself is written back to disk only after
+`driveRun` returns, same as always — use stdin for the report's actual
+contents).
 
 Two common patterns, depending on whether `-base` is the branch you actually
 review against or a throwaway integration branch:
 
 ```bash
 # Direct push: -base IS the branch reviewers look at.
-sig run ... -publish 'git push origin "$SIGBOUND_BASE"'
+sig run ... -publish 'git push origin "$SIGBOUND_BASE_BRANCH"'
 
 # Push to a fresh branch + open a PR/MR against an upstream base — for when
 # -base is an internal integration branch, not what you review against.
-sig run ... -publish 'git push origin "$SIGBOUND_BASE:refs/heads/sigbound/$SIGBOUND_FINAL_SHA" \
+sig run ... -publish 'git push origin "$SIGBOUND_BASE_BRANCH:refs/heads/sigbound/$SIGBOUND_FINAL_SHA" \
   && gh pr create --base main --head "sigbound/$SIGBOUND_FINAL_SHA" \
        --title "sigbound: $SIGBOUND_LANDED" --fill'
 
 # GitLab equivalent of the second pattern:
-sig run ... -publish 'git push origin "$SIGBOUND_BASE:refs/heads/sigbound/$SIGBOUND_FINAL_SHA" \
+sig run ... -publish 'git push origin "$SIGBOUND_BASE_BRANCH:refs/heads/sigbound/$SIGBOUND_FINAL_SHA" \
   && glab mr create --source-branch "sigbound/$SIGBOUND_FINAL_SHA" --target-branch main --fill'
 ```
 
@@ -805,10 +813,10 @@ command **you** supply, run via `sh -c`. Sigbound passes context through
 | `SIGBOUND_IMPACTED_PKGS` | `-verify-impact` | Space-separated `./relative` package paths: the changed packages plus every transitive reverse dependent (see [Scoped verification](#scoped-verification)). |
 | `SIGBOUND_CHANGED_FILES` | `-verify-impact` | Space-separated repo-relative paths this run's landed write-set touched. |
 | `SIGBOUND_FINAL_SHA` | `-publish` | The commit `-base` was advanced to (see [Publish](#publish)). |
-| `SIGBOUND_BASE` | `-publish` | The base branch NAME (e.g. `main`) — note this is a different meaning than the `-resolver` row above with the same variable name; each slot documents its own. |
+| `SIGBOUND_BASE_BRANCH` | `-publish` | The base branch NAME (e.g. `main`). |
 | `SIGBOUND_BASE_SHA` | `-publish` | The base commit BEFORE this run (i.e. this run's `baseSHA`). |
 | `SIGBOUND_LANDED` | `-publish` | Space-separated `agent/<id>` branch names that actually landed. |
-| `SIGBOUND_MANIFEST` | `-publish` | The `-manifest` path, when set; empty otherwise. Just the path — `-manifest` itself is written after the run returns. |
+| `SIGBOUND_MANIFEST` | `-publish` | The `-manifest` path, when set; empty otherwise. Just a path pointer — `-manifest` itself is written after the run returns; the full report arrives on **stdin** instead (see [Publish](#publish)). |
 
 ---
 

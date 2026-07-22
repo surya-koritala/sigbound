@@ -446,9 +446,11 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	publishCmd := fs.String("publish", "", "optional command (run via `sh -c`, cwd = the TARGET REPO itself — unlike -agent/-verify/-repair, which each run in a throwaway worktree) run "+
 		"EXACTLY ONCE, after the run LANDS (base ref advanced; -verify green or unset) — never on a run that failed verify, had no agent succeed, or landed nothing (every branch "+
 		"flagged). Sigbound stays host-agnostic: this is a BYO seam for pushing the landed branch and opening a PR/MR with whatever host CLI the repo already uses (gh, glab, ...); "+
-		"sigbound never calls one itself. Receives SIGBOUND_FINAL_SHA (the landed commit), SIGBOUND_BASE (the base branch name), SIGBOUND_BASE_SHA (the base commit BEFORE this run), "+
-		"SIGBOUND_REPO, SIGBOUND_LANDED (space-separated landed branch names), and SIGBOUND_MANIFEST (the -manifest path when set, else empty). A publish FAILURE does NOT unland the "+
-		"work or flip verify's verdict — it's reported as its own report.publish field and the run exits 6 instead of 0. See docs/USAGE.md's Publish section. Default \"\": off")
+		"sigbound never calls one itself. The full JSON run report is piped to the command's STDIN (its own \"publish\" field is absent there — it hasn't run yet); "+
+		"e.g. `jq -r .integrate.finalSHA` reads the landed commit from stdin. Also receives SIGBOUND_FINAL_SHA (the landed commit), SIGBOUND_BASE_BRANCH (the base branch name), "+
+		"SIGBOUND_BASE_SHA (the base commit BEFORE this run), SIGBOUND_REPO, SIGBOUND_LANDED (space-separated landed branch names), and SIGBOUND_MANIFEST (the -manifest path when "+
+		"set, else empty — a path pointer only, since -manifest itself is written after the run returns; use stdin for the report's actual contents). A publish FAILURE does NOT "+
+		"unland the work or flip verify's verdict — it's reported as its own report.publish field and the run exits 6 instead of 0. See docs/USAGE.md's Publish section. Default \"\": off")
 	publishTimeout := fs.Duration("publish-timeout", 120*time.Second, "timeout for the -publish command (0 = none)")
 	asJSON := fs.Bool("json", false, "emit the full JSON report (default: a terse human summary)")
 
@@ -1133,7 +1135,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if strings.TrimSpace(p.PublishCmd) != "" && landSHA != baseSHA {
 		emit.emit("publish_start", map[string]any{})
 		pubStart := time.Now()
-		pub := runPublish(ctx, p, landSHA, baseSHA, rep.Integrate.Landed)
+		pub := runPublish(ctx, p, rep)
 		rep.Publish = &pub
 		emit.emit("publish_done", map[string]any{"ok": pub.OK, "exit": pub.Exit, "wallMs": time.Since(pubStart).Milliseconds()})
 	}
@@ -1149,13 +1151,19 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 // TARGET REPO itself (never a throwaway worktree — publishing acts ON the
 // repo, e.g. `git push`, rather than editing its content the way -agent/
 // -verify/-repair do). Called only after the run has genuinely landed (see
-// driveRun's call site). finalSHA/baseSHA/landed populate the SIGBOUND_*
-// env vars documented on -publish; p.Manifest supplies SIGBOUND_MANIFEST
-// (empty when -manifest wasn't set). Mirrors runAgent/runRepair/runVerify's
-// exec pattern: WaitDelay so a hung command can't block the run past
-// -publish-timeout, full output tail-bounded for the report, and streamed to
-// -logdir's publish.log when set.
-func runPublish(ctx context.Context, p runParams, finalSHA, baseSHA string, landed []string) publishJSON {
+// driveRun's call site), with rep the fully-assembled report at that point
+// (its Publish field still nil — this call is what fills it in). rep is
+// JSON-marshaled and piped to the command's stdin: the delivery mechanism
+// for the full run report, per -publish's contract. rep.Integrate.FinalSHA/
+// rep.BaseSHA/rep.Integrate.Landed also populate the SIGBOUND_* env vars
+// documented on -publish; p.Manifest supplies SIGBOUND_MANIFEST (empty when
+// -manifest wasn't set — just a path pointer, since -manifest itself isn't
+// written until after the run returns; stdin carries the actual report).
+// Mirrors runAgent/runRepair/runVerify's exec pattern: WaitDelay so a hung
+// command can't block the run past -publish-timeout, full output
+// tail-bounded for the report, and streamed to -logdir's publish.log when
+// set.
+func runPublish(ctx context.Context, p runParams, rep runReport) publishJSON {
 	pctx := ctx
 	if p.PublishTimeout > 0 {
 		var cancel context.CancelFunc
@@ -1166,13 +1174,21 @@ func runPublish(ctx context.Context, p runParams, finalSHA, baseSHA string, land
 	cmd.Dir = p.Repo
 	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
 	cmd.Env = append(os.Environ(),
-		"SIGBOUND_FINAL_SHA="+finalSHA,
-		"SIGBOUND_BASE="+p.Base,
-		"SIGBOUND_BASE_SHA="+baseSHA,
+		"SIGBOUND_FINAL_SHA="+rep.Integrate.FinalSHA,
+		"SIGBOUND_BASE_BRANCH="+p.Base,
+		"SIGBOUND_BASE_SHA="+rep.BaseSHA,
 		"SIGBOUND_REPO="+p.Repo,
-		"SIGBOUND_LANDED="+strings.Join(landed, " "),
+		"SIGBOUND_LANDED="+strings.Join(rep.Integrate.Landed, " "),
 		"SIGBOUND_MANIFEST="+p.Manifest,
 	)
+	if reportJSON, err := json.Marshal(rep); err != nil {
+		// rep is all strings/slices/structs — this should never actually
+		// fail; best-effort warn and let the command run without stdin,
+		// same posture as writeManifest/attachNote's encode failures.
+		fmt.Fprintf(os.Stderr, "warning: -publish: encode report for stdin: %v\n", err)
+	} else {
+		cmd.Stdin = bytes.NewReader(reportJSON)
+	}
 	var outBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &outBuf

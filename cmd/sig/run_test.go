@@ -3621,9 +3621,10 @@ func parseEnvFile(t *testing.T, path string) map[string]string {
 
 // TestDriveRunPublishRunsOnceWithFullEnvOnGreenLand is issue #20's central
 // case: on a clean landed run, -publish runs EXACTLY ONCE (proven by a
-// marker file appended to on every invocation), with cwd = the repo itself
-// and every documented SIGBOUND_* var set to the value the report itself
-// records — SIGBOUND_FINAL_SHA/BASE/BASE_SHA/REPO/LANDED/MANIFEST.
+// marker file appended to on every invocation), with cwd = the repo itself,
+// the full JSON run report piped on stdin, and every documented SIGBOUND_*
+// var set to the value the report itself records —
+// SIGBOUND_FINAL_SHA/BASE_BRANCH/BASE_SHA/REPO/LANDED/MANIFEST.
 func TestDriveRunPublishRunsOnceWithFullEnvOnGreenLand(t *testing.T) {
 	ctx := context.Background()
 	_, repo := makeGoRepo(t)
@@ -3634,7 +3635,8 @@ func TestDriveRunPublishRunsOnceWithFullEnvOnGreenLand(t *testing.T) {
 
 	marker := filepath.Join(t.TempDir(), "publish.count")
 	envOut := filepath.Join(t.TempDir(), "publish.env")
-	publishCmd := fmt.Sprintf(`echo ran >> %q; pwd > %q.cwd; env > %q`, marker, marker, envOut)
+	stdinOut := filepath.Join(t.TempDir(), "publish.stdin")
+	publishCmd := fmt.Sprintf(`cat > %q; echo ran >> %q; pwd > %q.cwd; env > %q`, stdinOut, marker, marker, envOut)
 
 	p := runParams{
 		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
@@ -3682,20 +3684,41 @@ func TestDriveRunPublishRunsOnceWithFullEnvOnGreenLand(t *testing.T) {
 
 	env := parseEnvFile(t, envOut)
 	want := map[string]string{
-		"SIGBOUND_FINAL_SHA": rep.Integrate.FinalSHA,
-		"SIGBOUND_BASE":      "main",
-		"SIGBOUND_BASE_SHA":  rep.BaseSHA,
-		"SIGBOUND_REPO":      repo,
-		"SIGBOUND_LANDED":    strings.Join(rep.Integrate.Landed, " "),
-		"SIGBOUND_MANIFEST":  "/tmp/some-manifest.json",
+		"SIGBOUND_FINAL_SHA":   rep.Integrate.FinalSHA,
+		"SIGBOUND_BASE_BRANCH": "main",
+		"SIGBOUND_BASE_SHA":    rep.BaseSHA,
+		"SIGBOUND_REPO":        repo,
+		"SIGBOUND_LANDED":      strings.Join(rep.Integrate.Landed, " "),
+		"SIGBOUND_MANIFEST":    "/tmp/some-manifest.json",
 	}
 	for k, wantV := range want {
 		if got, ok := env[k]; !ok || got != wantV {
 			t.Fatalf("%s=%q (present=%v), want %q", k, got, ok, wantV)
 		}
 	}
+	if _, ok := env["SIGBOUND_BASE"]; ok {
+		t.Fatalf("SIGBOUND_BASE is set (%q) for -publish; want only SIGBOUND_BASE_BRANCH (SIGBOUND_BASE is the -resolver slot's file-path variable)", env["SIGBOUND_BASE"])
+	}
 	if rep.Integrate.FinalSHA == rep.BaseSHA {
 		t.Fatal("test setup: finalSHA == baseSHA, SIGBOUND_FINAL_SHA/SIGBOUND_BASE_SHA distinctness wouldn't be exercised")
+	}
+
+	// The full JSON run report must arrive on stdin, with the report's own
+	// "publish" field still absent (this call is what fills it in) — and its
+	// finalSHA must match the report driveRun ultimately returns.
+	stdinData, err := os.ReadFile(stdinOut)
+	if err != nil {
+		t.Fatalf("read publish stdin dump: %v", err)
+	}
+	if strings.Contains(string(stdinData), `"publish"`) {
+		t.Fatalf("publish stdin report already contains a \"publish\" key:\n%s", stdinData)
+	}
+	var stdinRep runReport
+	if err := json.Unmarshal(stdinData, &stdinRep); err != nil {
+		t.Fatalf("publish stdin is not valid report JSON: %v\n%s", err, stdinData)
+	}
+	if stdinRep.Integrate.FinalSHA != rep.Integrate.FinalSHA {
+		t.Fatalf("stdin report integrate.finalSHA=%q, want %q", stdinRep.Integrate.FinalSHA, rep.Integrate.FinalSHA)
 	}
 }
 
@@ -3923,8 +3946,8 @@ func TestRunRunPublishFlagWired(t *testing.T) {
 	if got := env["SIGBOUND_MANIFEST"]; got != manifestPath {
 		t.Fatalf("SIGBOUND_MANIFEST=%q, want the -manifest flag's path %q", got, manifestPath)
 	}
-	if got := env["SIGBOUND_BASE"]; got != "main" {
-		t.Fatalf("SIGBOUND_BASE=%q, want %q", got, "main")
+	if got := env["SIGBOUND_BASE_BRANCH"]; got != "main" {
+		t.Fatalf("SIGBOUND_BASE_BRANCH=%q, want %q", got, "main")
 	}
 	if got := env["SIGBOUND_FINAL_SHA"]; got != rep.Integrate.FinalSHA {
 		t.Fatalf("SIGBOUND_FINAL_SHA=%q, want %q", got, rep.Integrate.FinalSHA)
