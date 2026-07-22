@@ -28,7 +28,7 @@ the results, and optionally verifies and repairs the merged tree.
 ```
 sig run [-config PATH]
         -repo PATH -base BRANCH
-        (-tasks FILE | -goal STRING (-planner CMD | -planner-preset NAME) [-n N] [-min-tasks N])
+        (-tasks FILE | -goal STRING (-planner CMD | -planner-preset NAME) [-n N] [-min-tasks N] | -resume -manifest FILE)
         (-agent CMD | -agent-preset NAME) [-agent-timeout D] [-agent-retries N]
         [-strategy overlay] [-assert]
         [-resolver CMD] [-resolver-timeout D]
@@ -83,7 +83,8 @@ sig run [-config PATH]
 | `-budget` | `0` | Wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (`0` = none). On expiry, outstanding agents are cancelled and fail; integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial. |
 | `-logdir` | — | Write each agent/repair/verify/planner command's **full** stdout+stderr to `<logdir>/<name>.log` (`agent-<id>.log`, `repair-<n>.log`, `verify-<n>.log`, `planner.log`), on top of the truncated tails the report keeps in memory. The directory is created if needed and must be writable — checked before any agent runs, so a bad `-logdir` fails the whole run rather than silently dropping logs partway through. Repeated runs against the same `-logdir` **append** to the same files; there is no per-run rotation. A task's `id` is sanitized for use in the filename (non-alphanumeric characters become `-`), so two exotic ids that sanitize to the same string share one log file. |
 | `-events` | — | Stream one JSON object per line to FILE as the run progresses (see [Events](#events)); `-` writes to stderr. The file is truncated fresh each run. Opening it is checked before any agent runs, same fail-fast policy as `-logdir`; a write failure afterward is best-effort and never fails the run. |
-| `-manifest` | — | Write the full JSON report to FILE at the end of the run, independent of `-json` (see [Provenance](#provenance)). FILE's directory is created if needed and checked writable before any agent runs, same fail-fast policy as `-logdir`; a write failure AFTER the run completes is best-effort and warned on stderr — by then real work may already be landed. |
+| `-manifest` | — | Write the full JSON report to FILE at the end of the run, independent of `-json` (see [Provenance](#provenance)). FILE's directory is created if needed and checked writable before any agent runs, same fail-fast policy as `-logdir`; a write failure AFTER the run completes is best-effort and warned on stderr — by then real work may already be landed. With `-resume`, this SAME flag also names the prior run's manifest to resume FROM (see [Resume](#resume)). |
+| `-resume` | `false` | Resume a prior run instead of planning/loading tasks fresh (see [Resume](#resume)). Requires `-manifest`; `-tasks`/`-goal` must not be passed. |
 | `-notes` | `false` | When the run LANDS, attach the full JSON report as a git note on the landed commit under the namespaced `refs/notes/sigbound` (see [Provenance](#provenance)). Best-effort: a failure is warned on stderr but never fails the run, since landing already happened. |
 | `-dry-run` | `false` | Load or plan the tasks, print them plus the predicted OCC partition, then exit — no worktree, agent, verify, or repair ever runs (see [Dry run](#dry-run)). |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
@@ -488,6 +489,69 @@ See [`sig replay`](#sig-replay) below for what a `-manifest` file (or a
 `-notes` note, since the shape is identical) is actually *for*: feeding it
 back in to deterministically reproduce the integration it recorded.
 
+### Resume
+
+`runAgent` deliberately never cleans up an `agent/<id>` branch — it tears
+down the worktree but the branch (and whatever the agent committed to it)
+survives the run, win or lose. `-resume` is the glue that turns that
+leftover work into a cheap restart: given a prior run's `-manifest`, it skips
+re-running the (expensive) agent for every task whose branch already holds
+real work, and only runs fresh what's actually missing.
+
+```
+sig run -repo PATH -resume -manifest FILE [-agent CMD] [-verify CMD] ...
+```
+
+**What gets reused.** For each task in the manifest:
+
+- Its `agent/<id>` branch exists and its head **differs** from the
+  manifest's recorded `baseSHA` → reused outright. The agent never runs
+  again; the report marks that task `resumed: true` with the SAME `sha` the
+  original run recorded.
+- Its branch is **missing**, or exists but its head **equals** `baseSHA`
+  (the agent ran last time but committed nothing) → runs fresh, exactly like
+  an ordinary (non-`-resume`) task. A stale no-op branch is deleted first —
+  its content is byte-identical to base, so nothing is lost — clearing the
+  way for the fresh run's normal worktree setup.
+
+Integration and verification then proceed over the union of reused and
+freshly-run branches exactly as in an ordinary run: nothing about landing,
+`-verify`, or `-repair` changes once the agent phase decides what ran.
+
+**The moved-base refusal.** `-resume` fails loudly, before anything runs, if
+`-base`'s CURRENT head is no longer exactly the manifest's recorded
+`baseSHA`:
+
+```
+-resume: base "main" is now at <sha> but the manifest recorded <sha> — it has
+moved since that run; re-run fresh instead of resuming onto a different base
+```
+
+This is not a technicality: every reused branch forked from `baseSHA`, so
+integrating it against a DIFFERENT current base would silently combine work
+against a tree it was never actually written for. A run that already landed
+something has, by definition, moved `-base` past its own manifest's
+`baseSHA` — resuming from that same manifest again is exactly this case.
+`-resume` is for restarting a run that DIDN'T land (an interrupted run, a
+`-verify` failure, a mid-run operational error) and left agent branches
+behind with the base untouched — not for continuing after a partial landing.
+This makes `-resume` safe, not magical: it never guesses which base you
+meant, it insists on the exact one the prior run recorded.
+
+**The manifest requirement.** `-resume` never re-plans, so `-tasks`/`-goal`
+must not be passed alongside it (a loud error, not a silent ignore) — the
+task list always comes from `-manifest`, which is REQUIRED with `-resume`.
+The same `-manifest` flag doubles as both input (the prior run's file) and
+output (this run's own manifest is written back to that same path at the
+end), so a chain of resumes just keeps reading and overwriting one file.
+
+**Flag-over-manifest precedence.** `-base`, `-strategy`, `-agent`,
+`-resolver`, `-verify`, and `-repair` are all read from the manifest, but
+any of them set EXPLICITLY on this command line (directly or via its
+`-*-preset`) overrides the manifest's recorded value — the same
+flag-beats-file precedence `-config` gives a command-line flag over a config
+file. Leave them unset to reuse the prior run's commands verbatim.
+
 ---
 
 ## `sig integrate`
@@ -693,7 +757,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
     "ok": true, "exit": 0, "autocommitted": false,
     "declaredFiles": ["…"], "actualFiles": ["…"],
     "inLane": true, "strayed": [], "stderr": "",
-    "worktreeKept": "", "timedOut": false, "attempts": 1
+    "worktreeKept": "", "timedOut": false, "attempts": 1, "resumed": false
   } ],
   "strategy": "overlay",
   "integrate": {
@@ -716,6 +780,10 @@ With `-json`, `sig run` prints a full report. Top-level shape:
 
 - `integrate.landed` / `integrate.flagged` — branches that merged vs. branches
   set aside for a human (real conflicts).
+- `perAgent[].resumed` is `true` iff `-resume` reused that task's `agent/<id>`
+  branch outright instead of running its agent again (see
+  [Resume](#resume)); always `false` on a run without `-resume`, and false
+  for any task `-resume` still ran fresh (a missing or stale no-op branch).
 - `integrate.resolved` — overlapping branches that still landed (auto-merged or
   resolver-resolved).
 - `verify.ok` is the bottom line: `false` means nothing was landed onto `-base`.
@@ -757,7 +825,7 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 |-------|--------|------|
 | `run_start` | `repo`, `base`, `baseSHA`, `tasks` | Once, right after the base ref resolves. |
 | `agent_start` | `id`, `branch` | Once per task, right before that agent's worktree/command starts. |
-| `agent_done` | `id`, `ok`, `exit`, `attempts`, `files`, `inLane`, `wallMs` | Once per task, after all of that task's attempts (including `-agent-retries`) finish. |
+| `agent_done` | `id`, `ok`, `exit`, `attempts`, `files`, `inLane`, `wallMs`, `resumed`* | Once per task, after all of that task's attempts (including `-agent-retries`) finish. *`resumed` is present (`true`) only for a task `-resume` reused outright — see [Resume](#resume) — with `wallMs=0` since no agent command ran; absent for every ordinary task. |
 | `integrate_start` | `branches` | Once, before the successfully-committed branches are folded together. |
 | `integrate_done` | `landed`, `flagged`, `resolved`, `finalSHA`, `wallMs` | Once, after integration (before landing). |
 | `verify_start` | `attempt` | Before each `-verify` invocation. `attempt` is `0` pre-repair, `N` after repair round `N` (matches `-logdir`'s `verify-<n>.log`). |

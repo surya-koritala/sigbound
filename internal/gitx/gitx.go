@@ -252,6 +252,17 @@ func (g *Git) WorktreeRemove(ctx context.Context, path string) error {
 	return err
 }
 
+// BranchDelete force-deletes a local branch ref (`git branch -D`). Any commit
+// it pointed at is left in the object store (unreachable, subject to normal
+// gc) — this only ever removes the REF, never a commit. Used by `sig run
+// -resume` to clear a stale no-op agent/<id> branch (head == the base it
+// forked from, i.e. that agent committed nothing last time) before letting a
+// fresh run re-create it with the ordinary loud-fail WorktreeAdd.
+func (g *Git) BranchDelete(ctx context.Context, branch string) error {
+	_, err := g.run(ctx, "branch", "-D", branch)
+	return err
+}
+
 // CheckoutDetach switches an ALREADY-detached worktree to commit — `git
 // checkout --detach <commit>` — touching only the paths that differ from
 // whatever the worktree currently has checked out. Used to advance a verify

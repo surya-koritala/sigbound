@@ -335,6 +335,34 @@ func TestCheckoutB(t *testing.T) {
 	}
 }
 
+// --- BranchDelete -------------------------------------------------------
+
+func TestBranchDelete(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+	commit := branchFrom(t, g, base, "throwaway", func(d string) { write(t, d, "x.txt", "1\n") })
+
+	if _, err := g.run(ctx, "rev-parse", "--verify", "refs/heads/throwaway"); err != nil {
+		t.Fatalf("branch should exist before delete: %v", err)
+	}
+	if err := g.BranchDelete(ctx, "throwaway"); err != nil {
+		t.Fatalf("BranchDelete: %v", err)
+	}
+	if _, err := g.run(ctx, "rev-parse", "--verify", "refs/heads/throwaway"); err == nil {
+		t.Fatal("branch still resolves after BranchDelete")
+	}
+	// The commit itself survives (unreachable, not deleted) — BranchDelete only
+	// removes the ref, matching its doc comment.
+	if _, err := g.RevParse(ctx, commit); err != nil {
+		t.Fatalf("commit %s should still resolve after its branch ref was deleted: %v", commit, err)
+	}
+
+	// Error path: deleting a branch that never existed.
+	if err := g.BranchDelete(ctx, "never-existed"); err == nil {
+		t.Fatal("want an error deleting a nonexistent branch")
+	}
+}
+
 // --- Init / Commit / AddAll error paths -------------------------------------
 
 func TestInitMkdirError(t *testing.T) {
