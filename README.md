@@ -3,7 +3,7 @@
 Run multiple AI coding agents on one repository in parallel, and merge their work automatically — landing only changes that build and pass your tests.
 
 [![build](https://img.shields.io/badge/build-passing-brightgreen)](#testing)
-[![tests](https://img.shields.io/badge/tests-80-brightgreen)](#testing)
+[![tests](https://img.shields.io/badge/tests-165-brightgreen)](#testing)
 [![coverage](https://img.shields.io/badge/coverage-83%25-brightgreen)](#testing)
 [![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -78,13 +78,13 @@ Or start from a goal and let a model plan the tasks:
 
 `-agent`, `-resolver`, `-repair`, and `-planner` are shell commands you supply; the examples use the `claude` CLI, but anything that edits files in the working directory works. Each command receives the relevant `SIGBOUND_*` environment variables.
 
-Typing that `sh -c` wiring by hand is the fiddliest part of a first run, so `-agent-preset`/`-repair-preset`/`-planner-preset` (`claude`, `codex`, `aider`) and `-verify-preset` (`go`, `node`, `python`, `rust`) expand a short name into the known-good command above — an explicit `-agent`/`-verify`/etc. always overrides its preset. The first example collapses to:
+Typing that `sh -c` wiring by hand is the fiddliest part of a first run, so `-agent-preset`/`-repair-preset`/`-planner-preset` (`claude`, `codex`, `aider`) and `-verify-preset` (`go`, `node`, `python`, `rust`) expand a short name into the known-good command above — an explicit `-agent`/`-verify`/etc. always overrides its preset. Just the `-agent`/`-verify` pair from the first example collapses to:
 
 ```bash
 ./sig run -repo /path/to/your/repo -tasks examples/tasks.json -agent-preset claude -verify-preset go
 ```
 
-See [Presets](docs/USAGE.md#presets) for every preset's exact expansion.
+That drops `-resolver` and `-repair` from the first example rather than presetting them: `-repair` has its own `-repair-preset claude|codex|aider` if you want it, but there's no `-resolver-preset` at all — see [Presets](docs/USAGE.md#presets) for every preset's exact expansion.
 
 That invocation is long and doesn't change much run to run — put your standing flags in `sig.conf` (one `key=value` per line; see [Config file](docs/USAGE.md#config-file)) and just pass `-config sig.conf -tasks ...` from then on.
 
@@ -148,9 +148,9 @@ go run ./cmd/sigbench -sweep -runs 5 -warmup 1
 
 ## Testing
 
-- 80 tests, including end-to-end runs against real git repositories.
+- 165 tests, including end-to-end runs against real git repositories.
 - Coverage: 83% on the integration engine, 90% on the git plumbing.
-- 7 fuzz targets covering every parser of git and model output. Fuzzing found and fixed a bug in the `ls-tree` parser that could have produced a silently incorrect merged tree; the triggering input is kept as a regression test.
+- 11 fuzz targets covering every parser of git and model output. Fuzzing found and fixed a bug in the `ls-tree` parser that could have produced a silently incorrect merged tree; the triggering input is kept as a regression test.
 
 ```bash
 go test -race ./...

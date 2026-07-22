@@ -326,9 +326,9 @@ func TestRunGoalMinTasksFailsBeforeAnyAgent(t *testing.T) {
 	}
 }
 
-// TestRunMinTasksExceedsNFailsAtFlagValidation: -min-tasks > -n is rejected at
-// flag-validation time — before the planner command even runs (its command
-// here would fail the test if invoked).
+// TestRunMinTasksExceedsNFailsAtFlagValidation: -min-tasks > -n is rejected as
+// soon as runRun dispatches to the -goal branch — before the planner command
+// even runs (its command here would fail the test if invoked).
 func TestRunMinTasksExceedsNFailsAtFlagValidation(t *testing.T) {
 	_, repo := makeGoRepo(t)
 	agent := buildTestAgent(t)
@@ -347,6 +347,34 @@ func TestRunMinTasksExceedsNFailsAtFlagValidation(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "-min-tasks 3 exceeds -n 2") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestRunTasksIgnoresMinTasksExceedsN: -min-tasks/-n are -goal-only concepts,
+// so a -tasks run with -min-tasks > -n (which would fail a -goal run, see
+// TestRunMinTasksExceedsNFailsAtFlagValidation above) must NOT be rejected —
+// both flags are simply unused on the -tasks path.
+func TestRunTasksIgnoresMinTasksExceedsN(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	task := taskSpec{ID: "a", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"new.go": "package main\n\nfunc newFn() int { return 1 }\n"},
+	})}
+	tasksFile := tasksFileFor(t, []taskSpec{task})
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFile,
+		"-n", "2",
+		"-min-tasks", "3",
+		"-agent", agent,
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK", code)
 	}
 }
 

@@ -36,7 +36,6 @@ func main() {
 		conflict = flag.Float64("conflict", 0.0, "fraction of overlapping agents forced into a real conflict")
 		hotfiles = flag.Int("hotfiles", 1, "number of shared hot files overlaps are spread across")
 		seed     = flag.Int64("seed", 1, "RNG seed (reproducibility)")
-		store    = flag.String("store", "", "optional SQLite path to persist run metadata (off hot path)")
 		strategy = flag.String("strategy", "all", "comma-separated strategies, or 'all' (porcelain,naive,mergetree,overlay)")
 		runs     = flag.Int("runs", 5, "measured runs per strategy (median/min/max reported)")
 		warmup   = flag.Int("warmup", 1, "warmup runs per strategy (unmeasured)")
@@ -61,13 +60,12 @@ func main() {
 	}
 
 	cfg := bench.Config{
-		Agents:    *agents,
-		Files:     *files,
-		Overlap:   *overlap,
-		Conflict:  *conflict,
-		HotFiles:  *hotfiles,
-		Seed:      *seed,
-		StorePath: *store,
+		Agents:   *agents,
+		Files:    *files,
+		Overlap:  *overlap,
+		Conflict: *conflict,
+		HotFiles: *hotfiles,
+		Seed:     *seed,
 	}
 	ab, err := bench.RunAB(ctx, cfg, strategies, *warmup, *runs)
 	if err != nil {

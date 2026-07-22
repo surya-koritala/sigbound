@@ -47,9 +47,9 @@ var plannerPresets = map[string]string{
 }
 
 // verifyPresets are -verify's known-good build+test command per ecosystem,
-// selected by -verify-preset=NAME. Seeded from the same languages RepoMap
-// (plan.go) already detects (Go via its exported-decl scan; the others are
-// the idiomatic one-liner for that ecosystem).
+// selected by -verify-preset=NAME. Go's is backed by RepoMap's exported-decl
+// scan (plan.go); RepoMap has no equivalent detection for node/python/rust —
+// those three are just the idiomatic one-liner for that ecosystem.
 var verifyPresets = map[string]string{
 	"go":     "go build ./... && go test ./...",
 	"node":   "npm test",
