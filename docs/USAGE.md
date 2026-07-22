@@ -969,6 +969,12 @@ inside this repo's own CI.
    input is actually set are passed — with `-json` captured to a report
    file. See [Inputs](#inputs) below for the full mapping.
 
+> **Secrets:** this step logs the assembled `sig run` command line (every
+> flag, including `agent`/`verify`/`resolver`/`repair`/`extra-args`) to the
+> job log, so pass secret values via the step's own `env:` and reference
+> the environment variable from your command — never embed a secret
+> literal in an input string (the example above already does this right).
+
 **The exit code is never swallowed.** `sig run`'s [exit code](#exit-codes) is
 always published as the `exit-code` output, but a non-zero exit ALSO fails
 the step (and so the job) with a message naming what that code means — a

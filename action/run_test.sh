@@ -55,6 +55,78 @@ assert_eq "$(serialize "${ARGS[@]}")" \
     -resolver 'git merge-file -p --union "$SIGBOUND_OURS" "$SIGBOUND_BASE" "$SIGBOUND_THEIRS"' \
     -repair 'claude -p "Fix this: $SIGBOUND_FAILURE"')"
 
+# --- INPUT_EXTRA_ARGS tokenizing: quote-aware, never executes -------------
+#
+# build_sig_run_args tokenizes INPUT_EXTRA_ARGS with xargs (quote-aware word
+# splitting, no shell in between) rather than eval. These cases pin that
+# down: quoted words still group into one argument, and shell metacharacters
+# ($(...), backticks, ;) land as inert literal argv text instead of running.
+
+unset INPUT_TASKS INPUT_GOAL INPUT_PLANNER INPUT_N INPUT_RESOLVER INPUT_VERIFY \
+  INPUT_REPAIR INPUT_STRATEGY
+
+# Quoted args with spaces group into a single argument, same as a shell
+# would parse them.
+INPUT_BASE="main"
+INPUT_EXTRA_ARGS='-message "hello world" -count 2'
+build_sig_run_args
+assert_eq "$(serialize "${ARGS[@]}")" \
+  "$(serialize run -repo . -json -base main -agent 'claude -p "$SIGBOUND_TASK"' \
+    -message "hello world" -count 2)"
+
+# Injection payloads must come through as inert literal arguments: no
+# execution, and the payload text itself survives unexpanded. Each check
+# clears its own marker file, runs build_sig_run_args, then asserts the
+# marker was never created and the literal payload shows up in ARGS.
+injection_dir="$(mktemp -d)"
+trap 'rm -rf "$injection_dir"' EXIT
+
+assert_inert() {
+  local extra_args="$1" marker="$2" want_token="$3"
+  rm -f "$marker"
+  INPUT_EXTRA_ARGS="$extra_args"
+  build_sig_run_args
+  if [ -f "$marker" ]; then
+    echo "injection executed: INPUT_EXTRA_ARGS=$extra_args created $marker" >&2
+    exit 1
+  fi
+  local found=0 a
+  for a in "${ARGS[@]}"; do
+    [ "$a" = "$want_token" ] && found=1
+  done
+  if [ "$found" -ne 1 ]; then
+    echo "payload not preserved literally: $want_token" >&2
+    echo "ARGS: $(serialize "${ARGS[@]}")" >&2
+    exit 1
+  fi
+}
+
+# $(...) command substitution: stays literal text, never runs.
+marker="$injection_dir/cmdsub"
+assert_inert "-message \"\$(touch $marker)\"" "$marker" "\$(touch $marker)"
+
+# Backticks: same deal, never runs.
+marker="$injection_dir/backtick"
+assert_inert "-message \"\`touch $marker\`\"" "$marker" "\`touch $marker\`"
+
+# Bare semicolon: not a command separator here, just a literal argument.
+marker="$injection_dir/semi"
+assert_inert "-flag ; touch $marker" "$marker" ";"
+
+# Empty and whitespace-only input: no extra args appended, no error.
+unset INPUT_BASE
+INPUT_EXTRA_ARGS=""
+build_sig_run_args
+assert_eq "$(serialize "${ARGS[@]}")" \
+  "$(serialize run -repo . -json -agent 'claude -p "$SIGBOUND_TASK"')"
+
+INPUT_EXTRA_ARGS="   "
+build_sig_run_args
+assert_eq "$(serialize "${ARGS[@]}")" \
+  "$(serialize run -repo . -json -agent 'claude -p "$SIGBOUND_TASK"')"
+
+echo "run.sh: extra-args tokenizing ok (no injection, quoting preserved)"
+
 # exit_code_message covers every documented code plus an unknown fallback.
 for code in 0 1 2 3 4 5 6 99; do
   msg="$(exit_code_message "$code")"

@@ -29,10 +29,26 @@ build_sig_run_args() {
   [ -n "${INPUT_REPAIR:-}" ] && ARGS+=(-repair "$INPUT_REPAIR")
   [ -n "${INPUT_STRATEGY:-}" ] && ARGS+=(-strategy "$INPUT_STRATEGY")
   # Escape hatch: appended verbatim, last, so it can override anything above.
-  # eval'd (not word-split) so a quoted value like -verify "go test ./..."
-  # survives as one argument, the same way a shell would parse it.
+  # Tokenized (not eval'd) so a quoted value like -verify "go test ./..."
+  # survives as one argument, the same way a shell would parse it — but
+  # nothing in the string is ever executed. xargs's own quote-aware word
+  # splitting groups quoted words; each token is emitted NUL-delimited by
+  # printf (run directly by xargs, no shell in between) and read back into
+  # an array, so shell metacharacters like $(...), `...`, and ; land as
+  # inert literal argv entries instead of being interpreted.
   if [ -n "${INPUT_EXTRA_ARGS:-}" ]; then
-    eval "ARGS+=($INPUT_EXTRA_ARGS)"
+    local extra=()
+    while IFS= read -r -d '' tok; do
+      extra+=("$tok")
+    done < <(xargs -n1 printf '%s\0' <<<"$INPUT_EXTRA_ARGS")
+    # Guard the append: under `set -u`, "${extra[@]}" on a still-empty array
+    # (e.g. INPUT_EXTRA_ARGS was whitespace-only) is an unbound-variable
+    # error on bash <4.4 — notably macOS's stock /bin/bash (3.2). (A bare
+    # `[ ... ] && ARGS+=(...)` would also trip `set -e` when the test is
+    # false, since that's the exit status of the whole statement.)
+    if [ "${#extra[@]}" -gt 0 ]; then
+      ARGS+=("${extra[@]}")
+    fi
   fi
 }
 

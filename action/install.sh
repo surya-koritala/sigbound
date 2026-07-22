@@ -90,7 +90,16 @@ main() {
     echo "$install_dir" >>"$GITHUB_PATH"
   fi
 
-  echo "sigbound-action: installed $("$install_dir/sig" version | head -1) to $install_dir/sig" >&2
+  # Captured explicitly (not inline in the echo arg) so a broken binary's
+  # non-zero exit is checked directly by `if` — inside a command
+  # substitution nested in echo's argument list, set -e can't see it, and
+  # the script would report success even when `sig version` fails.
+  local ver
+  if ! ver="$("$install_dir/sig" version | head -1)"; then
+    echo "sigbound-action: sig version sanity check failed after install; the installed binary looks broken" >&2
+    exit 1
+  fi
+  echo "sigbound-action: installed $ver to $install_dir/sig" >&2
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

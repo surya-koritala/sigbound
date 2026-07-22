@@ -98,8 +98,10 @@ runs:
 
     - name: sig doctor
       shell: bash
+      env:
+        INPUT_REPO_PATH: ${{ inputs.repo-path }}
       run: |
-        if ! sig doctor -repo "${{ inputs.repo-path }}"; then
+        if ! sig doctor -repo "$INPUT_REPO_PATH"; then
           echo "::error::sig doctor failed — sigbound requires git >= 2.38 with working merge-tree/overlay plumbing; see the FAIL line(s) above for the specific check" >&2
           exit 1
         fi
