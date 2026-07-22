@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -192,5 +194,242 @@ func TestDriveRunAutocommit(t *testing.T) {
 	}
 	if len(rep2.Integrate.Landed) != 0 {
 		t.Fatalf("landed=%d, want 0", len(rep2.Integrate.Landed))
+	}
+}
+
+// alphaBetaPlan returns a two-task, pairwise-disjoint plan (own new file each)
+// suitable for a real driveRun through the CLI entry point.
+func alphaBetaPlan(t *testing.T) []taskSpec {
+	t.Helper()
+	return []taskSpec{
+		{ID: "p1", Files: []string{"alpha.go"}, Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"},
+		})},
+		{ID: "p2", Files: []string{"beta.go"}, Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"beta.go": "package main\n\nfunc beta() int { return 2 }\n"},
+		})},
+	}
+}
+
+// captureStderr redirects os.Stderr for the duration of fn and returns
+// whatever was written to it. Used to observe the -min-tasks warning, which
+// (per design) goes straight to os.Stderr rather than through runRun's report
+// writer.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	fn()
+	w.Close()
+	os.Stderr = orig
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
+}
+
+// TestRunGoalMinTasksFailsBeforeAnyAgent: a planner that returns fewer tasks
+// than -min-tasks makes runRun fail BEFORE any agent runs (fail-safe, like
+// every other plan validation) and names got vs. want. The base ref must not
+// move and no report is written.
+func TestRunGoalMinTasksFailsBeforeAnyAgent(t *testing.T) {
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	before, err := g.RevParse(context.Background(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	planner := planFileCmd(t, mustJSON(t, alphaBetaPlan(t))) // 2 tasks
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-goal", "add alpha and beta helpers",
+		"-planner", planner,
+		"-n", "4",
+		"-min-tasks", "3",
+		"-agent", agent,
+	})
+	if err == nil {
+		t.Fatal("plan has fewer tasks than -min-tasks: want error, got nil")
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if !strings.Contains(err.Error(), "planner produced 2 tasks, -min-tasks 3") {
+		t.Fatalf("error should name got vs want (2 vs 3): %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("no report should be written when -min-tasks fails the plan, got:\n%s", buf.String())
+	}
+	after, err := g.RevParse(context.Background(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("main advanced (%s -> %s) despite a -min-tasks failure; no agent should run", before, after)
+	}
+}
+
+// TestRunMinTasksExceedsNFailsAtFlagValidation: -min-tasks > -n is rejected at
+// flag-validation time — before the planner command even runs (its command
+// here would fail the test if invoked).
+func TestRunMinTasksExceedsNFailsAtFlagValidation(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	var buf bytes.Buffer
+	_, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-goal", "x",
+		"-planner", "echo 'planner ran: should not happen' >&2; exit 1",
+		"-n", "2",
+		"-min-tasks", "3",
+		"-agent", agent,
+	})
+	if err == nil {
+		t.Fatal("-min-tasks > -n: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "-min-tasks 3 exceeds -n 2") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestRunGoalFewerThanNWarnsOnStderr: when the planner returns fewer tasks
+// than -n and -min-tasks doesn't fail it (0 = no floor, the default), the run
+// still proceeds but a warning naming got vs. requested is written to
+// stderr — surfacing under-parallelization instead of silently swallowing it.
+func TestRunGoalFewerThanNWarnsOnStderr(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	plan := []taskSpec{alphaBetaPlan(t)[0]} // 1 task, but -n 4 requested
+	planner := planFileCmd(t, mustJSON(t, plan))
+
+	var buf bytes.Buffer
+	var code int
+	var runErr error
+	stderr := captureStderr(t, func() {
+		code, runErr = runRun(&buf, []string{
+			"-repo", repo,
+			"-goal", "add alpha",
+			"-planner", planner,
+			"-n", "4",
+			"-agent", agent,
+		})
+	})
+	if runErr != nil {
+		t.Fatalf("runRun: %v\n%s", runErr, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK (fewer tasks than -n is a warning, not a failure)", code)
+	}
+	if !strings.Contains(stderr, "1") || !strings.Contains(stderr, "4") {
+		t.Fatalf("warning should name got (1) vs requested (4), got stderr=%q", stderr)
+	}
+}
+
+// TestRunGoalDefaultsToStrictLanes: a planned run (-goal/-planner) with -lanes
+// not set explicitly defaults to strict, not warn — the planner already
+// promised a pairwise-disjoint split, and strict is the only mode that
+// actually preserves it on land.
+func TestRunGoalDefaultsToStrictLanes(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	planner := planFileCmd(t, mustJSON(t, alphaBetaPlan(t)))
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-goal", "add alpha and beta helpers",
+		"-planner", planner,
+		"-n", "2",
+		"-agent", agent,
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK", code)
+	}
+	var rep runReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse report: %v\n%s", err, buf.String())
+	}
+	if rep.LaneMode != laneStrict {
+		t.Fatalf("laneMode=%q, want %q (planned runs default to strict)", rep.LaneMode, laneStrict)
+	}
+}
+
+// TestRunGoalExplicitLanesWarnStaysWarn: an explicit -lanes ALWAYS wins over
+// the planned-run strict default.
+func TestRunGoalExplicitLanesWarnStaysWarn(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	planner := planFileCmd(t, mustJSON(t, alphaBetaPlan(t)))
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-goal", "add alpha and beta helpers",
+		"-planner", planner,
+		"-n", "2",
+		"-agent", agent,
+		"-lanes", "warn",
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK", code)
+	}
+	var rep runReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse report: %v\n%s", err, buf.String())
+	}
+	if rep.LaneMode != laneWarn {
+		t.Fatalf("laneMode=%q, want %q (explicit -lanes must win over the planned-run default)", rep.LaneMode, laneWarn)
+	}
+}
+
+// TestRunTasksFileDefaultsWarnLanes: a -tasks run (not planned) keeps the
+// laneWarn default as today — only -goal runs get the strict default.
+func TestRunTasksFileDefaultsWarnLanes(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+
+	tasks := []taskSpec{alphaBetaPlan(t)[0]}
+	tasksFile := filepath.Join(t.TempDir(), "tasks.json")
+	if err := os.WriteFile(tasksFile, []byte(mustJSON(t, tasks)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFile,
+		"-agent", agent,
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK", code)
+	}
+	var rep runReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse report: %v\n%s", err, buf.String())
+	}
+	if rep.LaneMode != laneWarn {
+		t.Fatalf("laneMode=%q, want %q (-tasks runs keep the warn default)", rep.LaneMode, laneWarn)
 	}
 }

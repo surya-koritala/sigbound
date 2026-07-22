@@ -25,7 +25,7 @@ the results, and optionally verifies and repairs the merged tree.
 
 ```
 sig run -repo PATH -base BRANCH
-        (-tasks FILE | -goal STRING -planner CMD [-n N])
+        (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N])
         -agent CMD
         [-strategy overlay]
         [-resolver CMD] [-resolver-timeout D]
@@ -46,6 +46,7 @@ sig run -repo PATH -base BRANCH
 | `-goal` | — | Natural-language goal; the `-planner` turns it into disjoint tasks. Mutually exclusive with `-tasks`. |
 | `-planner` | — | Planner command (run via `sh -c`). Required with `-goal`. |
 | `-n` | `4` | Number of parallel tasks the planner should produce from `-goal`. |
+| `-min-tasks` | `0` | Minimum tasks a `-goal` plan must produce; fewer fails **before any agent runs** (`0` = no floor). Must be `<= -n`. |
 | `-planner-timeout` | `120s` | Timeout for the planner command (`0` = none). |
 | `-agent` | *(required)* | Command (run once per task, via `sh -c`) that edits files in the task's worktree. |
 | `-strategy` | `overlay` | Integration strategy: `overlay`, `mergetree`, `naive`, `porcelain` (see [Strategies](#strategies)). |
@@ -55,7 +56,7 @@ sig run -repo PATH -base BRANCH
 | `-verify-retries` | `0` | After a FAILING `-verify` invocation, re-run it up to N more times on the same tree; passes on any green. A pass on a retry marks the report `flaky=true`. `0` = today's behavior. |
 | `-repair` | — | Fixer command invoked when `-verify` fails; edits are committed and `-verify` re-runs. |
 | `-repair-max` | `2` | Max repair attempts before reporting `verify.ok=false` honestly. |
-| `-lanes` | `warn` | Lane enforcement: `off`, `warn`, or `strict` (see [File lanes](#file-lanes)). |
+| `-lanes` | `warn`* | Lane enforcement: `off`, `warn`, or `strict` (see [File lanes](#file-lanes)). *`-goal` runs default to `strict` instead unless `-lanes` is set explicitly. |
 | `-no-autocommit` | `false` | Do **not** commit edits an agent left uncommitted. By default the driver stages and commits them, so edit-only agents still land. |
 | `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. A kept worktree stays registered with git until you remove it: `git worktree remove <path>` (or `git worktree prune` after deleting the directory yourself). |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
@@ -70,6 +71,23 @@ honestly: the report's `verify.flaky` is `true` whenever a passing run needed
 a retry, so a flaky suite stays visible even though the run goes green.
 `verify-bisect` and `verify-cache` (planned) both assume `-verify` is
 deterministic; an undocumented flaky command will confuse them.
+
+### Planning
+
+The prompt the planner receives explicitly allows it to return **fewer** than
+`-n` tasks when the goal doesn't split cleanly, so a degenerate plan (e.g. one
+task for the whole goal) is not itself an error. Two safeguards keep that from
+going unnoticed:
+
+- If the plan has fewer tasks than `-n`, a warning naming the actual vs.
+  requested count is printed to stderr — the run still proceeds.
+- `-min-tasks` sets a hard floor: a plan with fewer tasks than `-min-tasks`
+  fails **before any agent runs**, naming got vs. want (fail-safe, same as
+  every other plan validation). `-min-tasks` must be `<= -n`, checked at
+  flag-parse time.
+
+A planned run (`-goal`) also changes the [`-lanes`](#file-lanes) default to
+`strict`; see below.
 
 ### Tasks file
 
@@ -150,8 +168,10 @@ Each task can declare the files it is allowed to touch (`files` in the tasks
 file, or a plan produced by the planner). `-lanes` controls enforcement:
 
 - `off` — ignore declared file-sets.
-- `warn` *(default)* — record out-of-lane writes but still land them.
-- `strict` — an out-of-lane write makes the agent a failed agent; its work is
+- `warn` *(default for `-tasks` runs)* — record out-of-lane writes but still
+  land them.
+- `strict` *(default for planned `-goal` runs, unless `-lanes` is set
+  explicitly)* — an out-of-lane write makes the agent a failed agent; its work is
   not landed. This is the real disjointness guarantee.
 
 ---

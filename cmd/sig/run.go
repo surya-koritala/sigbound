@@ -231,7 +231,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N]) -agent CMD [-strategy overlay] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-strategy overlay] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -247,6 +247,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	goal := fs.String("goal", "", "natural-language goal; the -planner turns it into parallel disjoint tasks (mutually exclusive with -tasks)")
 	plannerCmd := fs.String("planner", "", "planner command (run via `sh -c`), required with -goal: reads SIGBOUND_GOAL/SIGBOUND_REPOMAP/SIGBOUND_N/SIGBOUND_PROMPT and writes a JSON task array [{\"id\",\"prompt\"}] to stdout")
 	n := fs.Int("n", 4, "number of parallel tasks the -planner should produce from -goal")
+	minTasks := fs.Int("min-tasks", 0, "minimum number of tasks a -goal plan must produce; fewer fails before any agent runs (fail-safe; 0 = no floor). Must be <= -n")
 	plannerTimeout := fs.Duration("planner-timeout", 120*time.Second, "timeout for the -planner command (0 = none)")
 	agentCmd := fs.String("agent", "", "shell command (run via `sh -c`, once per task) that edits files (and optionally commits) in the task's worktree; "+
 		"receives SIGBOUND_TASK, SIGBOUND_TASK_ID, SIGBOUND_REPO, SIGBOUND_BRANCH env vars with cwd=the worktree")
@@ -261,7 +262,8 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		"receives SIGBOUND_FAILURE (captured verify output) + SIGBOUND_REPO, edits files to fix the failure (the driver auto-commits them), then -verify re-runs. Looped up to -repair-max times")
 	repairMax := fs.Int("repair-max", 2, "max -repair attempts before reporting verify.ok=false honestly (only used with -repair)")
 	noAutocommit := fs.Bool("no-autocommit", false, "do NOT commit an agent's uncommitted edits; by default the driver stages+commits edits an agent left uncommitted so edit-only agents still land")
-	lanes := fs.String("lanes", laneWarn, "lane enforcement for declared file-sets: off (ignore) | warn (default; record out-of-lane writes, still land) | strict (out-of-lane => failed agent, not landed). warn is best-effort; strict is the real disjointness guarantee")
+	lanes := fs.String("lanes", laneWarn, "lane enforcement for declared file-sets: off (ignore) | warn (record out-of-lane writes, still land) | strict (out-of-lane => failed agent, not landed). warn is best-effort; strict is the real disjointness guarantee. "+
+		"Default is warn, EXCEPT a planned run (-goal) with -lanes not set explicitly defaults to strict, since the planner already promised a disjoint split")
 	keepFailed := fs.Bool("keep-failed", false, "keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected; the path is printed and recorded in the report. Successful agents' worktrees are always removed")
 	asJSON := fs.Bool("json", false, "emit the full JSON report (default: a terse human summary)")
 
@@ -271,6 +273,16 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		}
 		return exitOperationalError, err
 	}
+	// lanesExplicit tracks whether the caller passed -lanes (vs. relying on its
+	// zero-value default), via fs.Visit (only visits flags actually set on the
+	// command line). Needed below: a planned run defaults to strict UNLESS the
+	// caller set -lanes explicitly, in which case that choice always wins.
+	lanesExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "lanes" {
+			lanesExplicit = true
+		}
+	})
 	if *repo == "" {
 		return exitOperationalError, errors.New("-repo is required")
 	}
@@ -282,6 +294,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	}
 	if err := validateLaneMode(*lanes); err != nil {
 		return exitOperationalError, err
+	}
+	if *minTasks > *n {
+		return exitOperationalError, fmt.Errorf("-min-tasks %d exceeds -n %d", *minTasks, *n)
 	}
 
 	// Task source: exactly one of -tasks (explicit) or -goal (planned). If both
@@ -312,6 +327,28 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		if err != nil {
 			return exitOperationalError, err
 		}
+		// -min-tasks is a fail-safe floor: DefaultPlanPrompt explicitly permits the
+		// planner to return FEWER than -n tasks when the goal doesn't split cleanly,
+		// so a degenerate single-task plan otherwise passes with no signal. Checked
+		// BEFORE any agent runs, same as every other plan validation in planTasks.
+		if *minTasks > 0 && len(tasks) < *minTasks {
+			return exitOperationalError, fmt.Errorf("planner produced %d tasks, -min-tasks %d", len(tasks), *minTasks)
+		}
+		// Fewer tasks than requested is allowed (and not floored out above), but
+		// under-parallelizing should never be silent — surface it on stderr.
+		if len(tasks) < *n {
+			fmt.Fprintf(os.Stderr, "warning: planner produced %d tasks, requested -n %d\n", len(tasks), *n)
+		}
+	}
+
+	// Lane enforcement default: -lanes itself defaults to warn (declared above),
+	// but a PLANNED run (-goal) gets strict by default instead — the planner
+	// already promised a pairwise-disjoint split, and strict is the only mode
+	// that actually preserves that invariant on land. An explicit -lanes always
+	// wins over this. -tasks runs are unaffected (warn, as before).
+	laneMode := *lanes
+	if haveGoal && !lanesExplicit {
+		laneMode = laneStrict
 	}
 
 	p := runParams{
@@ -326,7 +363,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		RepairCmd:       *repairCmd,
 		RepairMax:       *repairMax,
 		Autocommit:      !*noAutocommit,
-		LaneMode:        *lanes,
+		LaneMode:        laneMode,
 		KeepFailed:      *keepFailed,
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
