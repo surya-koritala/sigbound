@@ -482,3 +482,48 @@ func TestRunTasksFileDefaultsWarnLanes(t *testing.T) {
 		t.Fatalf("laneMode=%q, want %q (-tasks runs keep the warn default)", rep.LaneMode, laneWarn)
 	}
 }
+
+// TestRunGoalDryRunPreviewsWithoutAgents: -dry-run -goal runs the planner
+// (the whole point: see the plan before spending any agent calls) and prints
+// the preview, but never spawns the agent. Uses a fake planner script
+// emitting a fixed JSON plan, same pattern as TestRunGoalEndToEnd.
+func TestRunGoalDryRunPreviewsWithoutAgents(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	marker := filepath.Join(t.TempDir(), "agent-ran")
+	planner := planFileCmd(t, mustJSON(t, alphaBetaPlan(t))) // 2 disjoint tasks
+
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-goal", "add alpha and beta helpers",
+		"-planner", planner,
+		"-n", "2",
+		"-agent", "touch " + marker,
+		"-dry-run",
+		"-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK", code)
+	}
+
+	var rep dryRunReport
+	if err := json.Unmarshal(buf.Bytes(), &rep); err != nil {
+		t.Fatalf("parse report: %v\n%s", err, buf.String())
+	}
+	if len(rep.Tasks) != 2 {
+		t.Fatalf("tasks=%d, want 2 (the planner ran and produced the plan)", len(rep.Tasks))
+	}
+	if len(rep.Groups) != 2 {
+		t.Fatalf("groups=%d, want 2 (disjoint plan)", len(rep.Groups))
+	}
+	// -goal defaults -lanes to strict even under -dry-run, same as a real run.
+	if rep.LaneMode != laneStrict {
+		t.Fatalf("laneMode=%q, want %q", rep.LaneMode, laneStrict)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("agent marker exists: -dry-run must never run the agent, even after a real planner run")
+	}
+}

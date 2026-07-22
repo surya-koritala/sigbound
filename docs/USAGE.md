@@ -37,6 +37,7 @@ sig run -repo PATH -base BRANCH
         [-budget D]
         [-logdir DIR]
         [-events FILE]
+        [-dry-run]
         [-json]
 ```
 
@@ -69,6 +70,7 @@ sig run -repo PATH -base BRANCH
 | `-budget` | `0` | Wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (`0` = none). On expiry, outstanding agents are cancelled and fail; integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial. |
 | `-logdir` | — | Write each agent/repair/verify/planner command's **full** stdout+stderr to `<logdir>/<name>.log` (`agent-<id>.log`, `repair-<n>.log`, `verify-<n>.log`, `planner.log`), on top of the truncated tails the report keeps in memory. The directory is created if needed and must be writable — checked before any agent runs, so a bad `-logdir` fails the whole run rather than silently dropping logs partway through. Repeated runs against the same `-logdir` **append** to the same files; there is no per-run rotation. A task's `id` is sanitized for use in the filename (non-alphanumeric characters become `-`), so two exotic ids that sanitize to the same string share one log file. |
 | `-events` | — | Stream one JSON object per line to FILE as the run progresses (see [Events](#events)); `-` writes to stderr. The file is truncated fresh each run. Opening it is checked before any agent runs, same fail-fast policy as `-logdir`; a write failure afterward is best-effort and never fails the run. |
+| `-dry-run` | `false` | Load or plan the tasks, print them plus the predicted OCC partition, then exit — no worktree, agent, verify, or repair ever runs (see [Dry run](#dry-run)). |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
 
 ### Timeouts, retries, and budget
@@ -115,6 +117,24 @@ going unnoticed:
 
 A planned run (`-goal`) also changes the [`-lanes`](#file-lanes) default to
 `strict`; see below.
+
+#### Dry run
+
+`-dry-run` loads the tasks (`-tasks`) or runs the planner (`-goal` — the
+planner still runs; that's the point, seeing the split costs nothing further
+once you've paid for it) and prints them plus the **predicted** partition,
+then exits before creating any worktree or running any agent, `-verify`, or
+`-repair` command. The prediction reuses the same `cell.Partition` grouping
+`sig integrate` runs for real, fed each task's *declared* `files` in place of
+a real `git diff` — a task with no declared `files` is unknown to the
+partitioner and lands alone in its own group. `-agent` is still required (no
+validation changes) but is never invoked. The existing plan-validation
+failures (a bad plan, an unmet `-min-tasks` floor) fail exactly as they would
+without `-dry-run` — that failure IS the preview's value. With `-json`, the
+report is `{"tasks":[...], "groups":[{"tasks":["…"],"files":["…"]}], "parallelism":N, "laneMode":"…"}`,
+where `parallelism` is the number of groups (independent branches that could
+land in parallel; tasks sharing a group would be serialized by the
+integrator).
 
 ### Tasks file
 
