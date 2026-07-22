@@ -36,6 +36,7 @@ sig run -repo PATH -base BRANCH
         [-keep-failed]
         [-budget D]
         [-logdir DIR]
+        [-events FILE]
         [-json]
 ```
 
@@ -67,6 +68,7 @@ sig run -repo PATH -base BRANCH
 | `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. A kept worktree stays registered with git until you remove it: `git worktree remove <path>` (or `git worktree prune` after deleting the directory yourself). With `-agent-retries`, only the LAST failed attempt's worktree is kept — every earlier attempt is torn down as it fails. |
 | `-budget` | `0` | Wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (`0` = none). On expiry, outstanding agents are cancelled and fail; integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial. |
 | `-logdir` | — | Write each agent/repair/verify/planner command's **full** stdout+stderr to `<logdir>/<name>.log` (`agent-<id>.log`, `repair-<n>.log`, `verify-<n>.log`, `planner.log`), on top of the truncated tails the report keeps in memory. The directory is created if needed and must be writable — checked before any agent runs, so a bad `-logdir` fails the whole run rather than silently dropping logs partway through. Repeated runs against the same `-logdir` **append** to the same files; there is no per-run rotation. A task's `id` is sanitized for use in the filename (non-alphanumeric characters become `-`), so two exotic ids that sanitize to the same string share one log file. |
+| `-events` | — | Stream one JSON object per line to FILE as the run progresses (see [Events](#events)); `-` writes to stderr. The file is truncated fresh each run. Opening it is checked before any agent runs, same fail-fast policy as `-logdir`; a write failure afterward is best-effort and never fails the run. |
 | `-json` | `false` | Emit the full JSON report instead of a terse human summary. |
 
 ### Timeouts, retries, and budget
@@ -302,6 +304,37 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   each command's full stdout+stderr log (see `-logdir` above).
 
 Without `-json`, the same run prints a short human summary.
+
+---
+
+## Events
+
+With `-events FILE` (`-` for stderr), `sig run` streams one JSON object per
+line as the run progresses — `{"event":"...","ts":"<RFC3339Nano>",...fields}`.
+This is a **progress feed, not a second report**: it lets you watch a long or
+highly parallel run live (which agent is the long pole, when integrate/verify
+start and finish), but the [JSON report](#json-report) printed at the end
+remains the source of truth for the actual outcome. Lines are written through
+a single mutex-guarded writer, so concurrent agents never interleave a
+partial line; a write failure is best-effort and never fails the run, but a
+FILE that can't be opened at all fails the run before any agent runs, same as
+`-logdir`.
+
+| Event | Fields | When |
+|-------|--------|------|
+| `run_start` | `repo`, `base`, `baseSHA`, `tasks` | Once, right after the base ref resolves. |
+| `agent_start` | `id`, `branch` | Once per task, right before that agent's worktree/command starts. |
+| `agent_done` | `id`, `ok`, `exit`, `attempts`, `wallMs` | Once per task, after all of that task's attempts (including `-agent-retries`) finish. |
+| `integrate_start` | `branches` | Once, before the successfully-committed branches are folded together. |
+| `integrate_done` | `landed`, `flagged`, `resolved`, `finalSHA`, `wallMs` | Once, after integration (before landing). |
+| `verify_start` | `attempt` | Before each `-verify` invocation. `attempt` is `0` pre-repair, `N` after repair round `N` (matches `-logdir`'s `verify-<n>.log`). |
+| `verify_done` | `ok`, `flaky`, `attempt`, `wallMs` | After each `-verify` invocation (including `-verify-retries`). |
+| `repair_start` | `attempt` | Before each `-repair` fixer invocation. |
+| `repair_done` | `attempt`, `verifyOk`, `wallMs` | After that round's fixer AND its follow-up `-verify` both finish; `wallMs` covers the fixer only. |
+| `land` | `sha` | Once, right after the base ref advances (never emitted when nothing lands). |
+| `run_done` | `ok`, `exitCode`, `wallMs` | Once, always last — even on a mid-run operational error. |
+
+`-events` off (the default, empty `-events`) emits nothing at all.
 
 ---
 

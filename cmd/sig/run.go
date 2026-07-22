@@ -197,6 +197,7 @@ type runParams struct {
 	LaneMode        string        // lane enforcement: laneOff | laneWarn | laneStrict
 	KeepFailed      bool          // keep a FAILED agent's worktree on disk instead of removing it
 	LogDir          string        // when set, full per-command stdout+stderr logs are written here (see openLog)
+	EventsPath      string        // when set, one JSON event per line is streamed here as the run progresses ("-" = stderr); see eventEmitter
 	AgentTimeout    time.Duration // per-agent command timeout (0 = none); see runAgent
 	AgentRetries    int           // retry a FAILED agent (bad exit or -agent-timeout, never a lane-strict stray) up to this many more times; see runAgentWithRetries
 	Budget          time.Duration // wall-clock ceiling for the agent phase + integrate + verify (0 = none); see driveRun
@@ -245,7 +246,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run -repo PATH -base BRANCH (-tasks FILE | -goal STRING -planner CMD [-n N] [-min-tasks N]) -agent CMD [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD [-verify-retries N] [-repair CMD [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset)")
@@ -289,6 +290,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	logDir := fs.String("logdir", "", "when set, write each agent/repair/verify/planner command's FULL stdout+stderr to <logdir>/<name>.log "+
 		"(agent-<id>.log, repair-<n>.log, verify-<n>.log, planner.log), in addition to the truncated tails the report keeps in memory. "+
 		"The directory is created if needed and must be writable; checked before any agent runs")
+	events := fs.String("events", "", `when set, stream one JSON object per line to FILE as the run progresses ("-" = stderr), one line per lifecycle event `+
+		`(run_start, agent_start/agent_done, integrate_start/integrate_done, verify_start/verify_done, repair_start/repair_done, land, run_done). `+
+		`The report printed at the end remains the source of truth; events are progress, not a second report. Default "" = off`)
 	asJSON := fs.Bool("json", false, "emit the full JSON report (default: a terse human summary)")
 
 	if err := fs.Parse(argv); err != nil {
@@ -414,6 +418,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		KeepFailed:      *keepFailed,
 		Budget:          *budget,
 		LogDir:          logDirAbs,
+		EventsPath:      *events,
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
 	if err != nil {
@@ -473,9 +478,79 @@ func loadTasks(path string) ([]taskSpec, error) {
 	return tasks, nil
 }
 
+// eventEmitter streams one JSON object per line to its underlying writer as
+// driveRun progresses (see -events), guarded by mu since agents run
+// concurrently in goroutines (driveRun's fan-out below) and must not
+// interleave partial JSON lines. A nil *eventEmitter is a valid no-op
+// receiver (see emit), so every call site can emit unconditionally instead
+// of guarding on -events being set.
+type eventEmitter struct {
+	mu  sync.Mutex
+	enc *json.Encoder
+}
+
+// emit writes one NDJSON line: {"event":name,"ts":<RFC3339Nano>,...fields}.
+// Best-effort, same policy as -logdir's bestEffortWriter: a write failure
+// here must never fail the run, so the encode error is deliberately dropped.
+func (e *eventEmitter) emit(name string, fields map[string]any) {
+	if e == nil {
+		return
+	}
+	rec := make(map[string]any, len(fields)+2)
+	for k, v := range fields {
+		rec[k] = v
+	}
+	rec["event"] = name
+	rec["ts"] = time.Now().Format(time.RFC3339Nano)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_ = e.enc.Encode(rec) //nolint:errcheck // deliberately best-effort; see doc comment
+}
+
+// newEventEmitter opens path for -events and returns the emitter plus a
+// closer to defer. "" disables events entirely (nil emitter — every emit
+// call becomes a no-op). "-" streams to stderr (left open; never closed by
+// the returned closer). Any other value is a file path, freshly truncated
+// (an events stream is this run's own trace, not a log to accumulate across
+// runs like -logdir). An open failure is returned as an error so the run
+// fails early, before any agent runs — same policy as -logdir.
+func newEventEmitter(path string) (*eventEmitter, func(), error) {
+	noop := func() {}
+	switch path {
+	case "":
+		return nil, noop, nil
+	case "-":
+		return &eventEmitter{enc: json.NewEncoder(os.Stderr)}, noop, nil
+	default:
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, noop, fmt.Errorf("-events %s: %w", path, err)
+		}
+		return &eventEmitter{enc: json.NewEncoder(f)}, func() { f.Close() }, nil
+	}
+}
+
 // driveRun executes the full orchestration: fan out agents, integrate, verify.
 // It is separated from flag parsing so tests can drive it in-process.
-func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, error) {
+func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport, err error) {
+	runStart := time.Now()
+	emit, closeEvents, err := newEventEmitter(p.EventsPath)
+	if err != nil {
+		return runReport{}, err
+	}
+	defer closeEvents()
+	// run_done is always the LAST event (see the -events causal-order
+	// guarantee): this defer reads the final rep/err via the named returns
+	// above, so it fires no matter which of driveRun's several return points
+	// was taken. Registered before closeEvents' own defer, so it runs first
+	// (defers are LIFO) — the event is written before the file closes.
+	defer func() {
+		code := exitOperationalError
+		if err == nil {
+			code = runExitCode(rep)
+		}
+		emit.emit("run_done", map[string]any{"ok": code == exitOK, "exitCode": code, "wallMs": time.Since(runStart).Milliseconds()})
+	}()
 	g := gitx.New(p.Repo)
 
 	// Pin the base to a stable commit so every agent forks the same tree and the
@@ -493,7 +568,8 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 	if p.LaneMode == "" {
 		p.LaneMode = laneWarn // default when driven in-process without flag parsing
 	}
-	rep := runReport{Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks, LogDir: p.LogDir}
+	rep = runReport{Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks, LogDir: p.LogDir}
+	emit.emit("run_start", map[string]any{"repo": p.Repo, "base": p.Base, "baseSHA": baseSHA, "tasks": tasks})
 	// Normally wtRoot (and every per-agent worktree under it) is torn down when
 	// the run ends. -keep-failed retains individual failed agents' worktrees
 	// (see runAgent); when any survive, leave wtRoot itself in place too, or
@@ -531,7 +607,12 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			branch := "agent/" + tasks[i].ID
+			emit.emit("agent_start", map[string]any{"id": tasks[i].ID, "branch": branch})
+			agentStart := time.Now()
 			agents[i] = runAgentWithRetries(ctx, g, &admin, wtRoot, baseSHA, p, tasks[i])
+			a := agents[i]
+			emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "exit": a.Exit, "attempts": a.Attempts, "wallMs": time.Since(agentStart).Milliseconds()})
 		}(i)
 	}
 	wg.Wait()
@@ -554,6 +635,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 	// ---- integrate via the shared cell path, WITHOUT landing yet ----
 	// The integrated commit is computed detached; the base ref is advanced only
 	// after -verify passes (below), so a failing verify never lands a broken tree.
+	emit.emit("integrate_start", map[string]any{"branches": branches})
 	start := time.Now()
 	res, err := integrateBranches(ctx, g, p.Base, baseSHA, branches, writeSets, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false)
 	if err != nil {
@@ -577,6 +659,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 		ir.Flagged = append(ir.Flagged, flaggedJSON{Branch: f.Branch, Paths: f.Conflicts})
 	}
 	rep.Integrate = ir
+	emit.emit("integrate_done", map[string]any{"landed": ir.Landed, "flagged": ir.Flagged, "resolved": ir.Resolved, "finalSHA": ir.FinalSHA, "wallMs": ir.WallMs})
 
 	// ---- verify the integrated tree (self-healing via -repair), then land ----
 	// Nothing is on the base ref yet. Land only if verify passes (or is unset);
@@ -585,7 +668,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 	// the head via a repair; FinalSHA reports whatever we computed either way.
 	landSHA := res.FinalSHA
 	if strings.TrimSpace(p.VerifyCmd) != "" {
-		rep.Verify, landSHA = verifyWithRepair(ctx, g, p, res.FinalSHA)
+		rep.Verify, landSHA = verifyWithRepair(ctx, g, p, res.FinalSHA, emit)
 		rep.Integrate.FinalSHA = landSHA
 		if !rep.Verify.OK {
 			// A -budget expiry can kill -verify mid-run (its command context is a
@@ -602,6 +685,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (runReport, er
 		return rep, budgetAwareErr(p, ctx, "land "+short(landSHA), err)
 	}
 	rep.Integrate.FinalSHA = landSHA
+	emit.emit("land", map[string]any{"sha": landSHA})
 	return rep, nil
 }
 
@@ -626,9 +710,15 @@ func budgetAwareErr(p runParams, ctx context.Context, op string, err error) erro
 // stopping as soon as verify passes. It returns the verify verdict (green
 // either first-try or after repair; honestly false if never fixed) and the
 // possibly-advanced head the base ref should point at. If -verify passes on
-// the first try, no repair runs.
-func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string) (verifyJSON, string) {
+// the first try, no repair runs. emit gets a verify_start/verify_done pair
+// around every -verify invocation this call makes (attempt 0 = pre-repair, N
+// = after repair round N, matching -logdir's verify-<n>.log numbering) and a
+// repair_start/repair_done pair around every fixer invocation.
+func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string, emit *eventEmitter) (verifyJSON, string) {
+	emit.emit("verify_start", map[string]any{"attempt": 0})
+	vStart := time.Now()
 	v := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries, p.LogDir, 0)
+	emit.emit("verify_done", map[string]any{"ok": v.OK, "flaky": v.Flaky, "attempt": 0, "wallMs": time.Since(vStart).Milliseconds()})
 	// Green first try (possibly after a retry), or no repair configured/allowed
 	// => done, loop never runs. v already carries Flaky, so it survives here.
 	if v.OK || strings.TrimSpace(p.RepairCmd) == "" || p.RepairMax < 1 {
@@ -640,7 +730,10 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 	ok := false
 	flaky := false
 	for attempt := 1; attempt <= p.RepairMax; attempt++ {
+		emit.emit("repair_start", map[string]any{"attempt": attempt})
+		rStart := time.Now()
 		newHead, touched, rerr := runRepair(ctx, g, p, head, lastOutput, attempt)
+		repairWallMs := time.Since(rStart).Milliseconds()
 		rec := repairAttemptJSON{N: attempt, FilesTouched: touched, VerifyOK: false}
 		if rerr != nil || newHead == head {
 			// Fixer failed to spawn/commit, or produced no change: record the
@@ -649,13 +742,18 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 				lastOutput = tail(lastOutput+"\n[repair attempt "+fmt.Sprintf("%d", attempt)+" error] "+rerr.Error(), 2000)
 			}
 			repairs = append(repairs, rec)
+			emit.emit("repair_done", map[string]any{"attempt": attempt, "verifyOk": rec.VerifyOK, "wallMs": repairWallMs})
 			break
 		}
 		head = newHead
+		emit.emit("verify_start", map[string]any{"attempt": attempt})
+		vStart = time.Now()
 		rv := runVerifyRetry(ctx, g, head, p.VerifyCmd, p.VerifyRetries, p.LogDir, attempt)
+		emit.emit("verify_done", map[string]any{"ok": rv.OK, "flaky": rv.Flaky, "attempt": attempt, "wallMs": time.Since(vStart).Milliseconds()})
 		lastOutput = rv.Output
 		rec.VerifyOK = rv.OK
 		repairs = append(repairs, rec)
+		emit.emit("repair_done", map[string]any{"attempt": attempt, "verifyOk": rec.VerifyOK, "wallMs": repairWallMs})
 		if rv.OK {
 			ok = true
 			flaky = rv.Flaky
