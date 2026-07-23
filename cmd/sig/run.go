@@ -89,6 +89,13 @@ type perAgentJSON struct {
 	// off, or -resume was on but the branch was missing or a stale no-op (the
 	// agent committed nothing last time) and so got a fresh run.
 	Resumed bool `json:"resumed,omitempty"`
+	// SemanticNote records how -semantic go's analysis fared for this branch:
+	// "analyzed" on success (whether or not it found anything), or
+	// "skipped: <reason>" when it could not be confidently analyzed (a
+	// non-Go file in the branch's write-set, a parse failure, a git read
+	// error) — see branchSemanticWriteSet. Always empty (and omitted from
+	// JSON) when -semantic isn't "go", and for any agent that didn't OK.
+	SemanticNote string `json:"semanticNote,omitempty"`
 }
 
 // integrateJSON is the cell integrator's result, projected for the report.
@@ -107,6 +114,12 @@ type integrateJSON struct {
 	// reflects the FINAL landed subset, not the full pre-bisect set. Empty (and
 	// omitted from JSON) on any run where bisect didn't drop anything.
 	DroppedByBisect []string `json:"droppedByBisect,omitempty"`
+	// SemanticEdges names the branch pairs -semantic go's symbol-level
+	// analysis merged into the same partition group despite disjoint
+	// write-sets (see computeSemanticEdges) — the edges fed into
+	// cell.WithSemanticEdges before Partition ran. Empty (and omitted from
+	// JSON) when -semantic isn't "go", or when it found nothing to merge.
+	SemanticEdges [][2]string `json:"semanticEdges,omitempty"`
 }
 
 // verifyJSON records whether/-how the -verify command fared on the integrated
@@ -298,10 +311,16 @@ func runExitCode(rep runReport) int {
 
 // runParams is the resolved configuration for one driver run.
 type runParams struct {
-	Repo            string
-	Base            string
-	Strategy        string
-	Assert          bool // paranoid overlay-vs-merge-tree cross-check (see cell.WithAssert)
+	Repo     string
+	Base     string
+	Strategy string
+	Assert   bool // paranoid overlay-vs-merge-tree cross-check (see cell.WithAssert)
+	// Semantic is -semantic: semanticGo runs the opt-in Go symbol-level
+	// analysis (see computeSemanticEdges) between the agent phase and
+	// integrate; semanticOff (or "", the in-process default for a caller
+	// that builds runParams directly without flag parsing) skips it
+	// entirely — today's path-only partitioning, unchanged.
+	Semantic        string
 	AgentCmd        string
 	PlannerCmd      string // recorded on the report for provenance only; driveRun itself never plans — planning already happened by the time it's called
 	ResolverCmd     string
@@ -403,7 +422,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-semantic go|off] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset); -publish succeeded or was unset")
@@ -439,6 +458,13 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	strategy := fs.String("strategy", cell.StrategyOverlay, "integration strategy: "+strings.Join(cell.AvailableStrategies(), ", "))
 	assert := fs.Bool("assert", false, "paranoid cross-check for -strategy overlay: independently recompute the combine via merge-tree and error (never land) on any tree mismatch. "+
 		"Roughly doubles integration cost (it re-merges everything); for paranoia/CI, not routine use")
+	semantic := fs.String("semantic", semanticOff, "opt-in, Go-only, best-effort semantic conflict detector (see docs/USAGE.md's Semantic conflicts (Go) section). go: after the agents finish, parse "+
+		"(go/parser + go/ast, stdlib only -- no type-checking) every changed .go file's base and branch versions and extract each branch's declared-changed and newly-referenced symbols; "+
+		"any branch pair a conservative name-based overlap rule flags is merged into the SAME partition group (report.integrate.semanticEdges), so they serialize through the normal "+
+		"overlap path instead of landing in independent parallel groups -- catching a signature change in one file colliding with a new caller in another DISJOINT file, which path-only "+
+		"partitioning can never see and -verify only catches after the fact. Every analyzed branch gets report.perAgent[].semanticNote; a branch that cannot be confidently analyzed (a "+
+		"non-Go file in its changes, a parse failure, a git read error) simply contributes no edges -- this NEVER fails the run, and -verify remains the source of truth either way. "+
+		"off (default): today's path-only partitioning, unchanged")
 	resolverCmd := fs.String("resolver", "", "optional conflict resolver command (see `sig integrate -h`); reads SIGBOUND_BASE/SIGBOUND_OURS/SIGBOUND_THEIRS/SIGBOUND_PATH, writes the resolved body to stdout")
 	resolverTimeout := fs.Duration("resolver-timeout", 30*time.Second, "per-conflict timeout for -resolver (0 = none)")
 	verifyCmd := fs.String("verify", "", "optional command run (via `sh -c`) in a detached checkout of the integrated tree; non-zero exit => verify failed")
@@ -606,6 +632,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	if err := validateStrategy(*strategy); err != nil {
 		return exitOperationalError, err
 	}
+	if err := validateSemanticMode(*semantic); err != nil {
+		return exitOperationalError, err
+	}
 	if err := validateLaneMode(*lanes); err != nil {
 		return exitOperationalError, err
 	}
@@ -755,6 +784,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Base:            *base,
 		Strategy:        *strategy,
 		Assert:          *assert,
+		Semantic:        *semantic,
 		AgentCmd:        *agentCmd,
 		PlannerCmd:      *plannerCmd,
 		AgentTimeout:    *agentTimeout,
@@ -1163,6 +1193,24 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		}(i)
 	}
 	wg.Wait()
+
+	// -semantic go: the opt-in Go symbol-level analysis (see
+	// computeSemanticEdges), run BETWEEN the agent phase and integrate — every
+	// agent's ACTUAL write-set (a.Files) is already known, and nothing has
+	// been folded together yet, so its edges can still steer partitioning
+	// (see cell.WithSemanticEdges below). NEVER fails the run: a branch that
+	// cannot be confidently analyzed just contributes no edges (fail-open).
+	var semanticEdges [][2]string
+	if p.Semantic == semanticGo {
+		var notes map[string]string
+		semanticEdges, notes = computeSemanticEdges(ctx, g, baseSHA, agents)
+		for i := range agents {
+			if note, ok := notes[agents[i].Branch]; ok {
+				agents[i].SemanticNote = note
+			}
+		}
+		emit.emit("semantic_done", map[string]any{"edges": semanticEdges, "notes": notes})
+	}
 	rep.PerAgent = agents
 
 	// Only branches the agent actually committed to (exit 0, head advanced) are
@@ -1191,20 +1239,21 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if p.EnvMode == envModeScoped {
 		resolverEnv = slotEnv(envModeScoped, p.EnvResolver, nil)
 	}
-	res, err := integrateBranches(ctx, c, p.Base, baseSHA, branches, writeSets, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false, resolverEnv)
+	res, err := integrateBranches(ctx, c, p.Base, baseSHA, branches, writeSets, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false, resolverEnv, semanticEdges)
 	if err != nil {
 		return rep, budgetAwareErr(p, ctx, "integrate", err)
 	}
 	wall := time.Since(start)
 
 	ir := integrateJSON{
-		Strategy: res.Strategy,
-		Groups:   res.Groups,
-		Landed:   res.Landed,
-		Resolved: res.AutoMerged,
-		FinalSHA: res.FinalSHA,
-		WallMs:   wall.Milliseconds(),
-		Flagged:  []flaggedJSON{},
+		Strategy:      res.Strategy,
+		Groups:        res.Groups,
+		Landed:        res.Landed,
+		Resolved:      res.AutoMerged,
+		FinalSHA:      res.FinalSHA,
+		WallMs:        wall.Milliseconds(),
+		Flagged:       []flaggedJSON{},
+		SemanticEdges: semanticEdges,
 	}
 	if ir.Landed == nil {
 		ir.Landed = []string{}
@@ -2319,6 +2368,9 @@ func writeRunSummary(w io.Writer, r runReport) error {
 		if a.WorktreeKept != "" {
 			fmt.Fprintf(w, "    kept worktree: %s\n", a.WorktreeKept)
 		}
+		if a.SemanticNote != "" {
+			fmt.Fprintf(w, "    semantic: %s\n", a.SemanticNote)
+		}
 	}
 	fmt.Fprintf(w, "integrate: strategy=%s groups=%d landed=%d flagged=%d resolved=%d final=%s (%dms)\n",
 		r.Integrate.Strategy, r.Integrate.Groups, len(r.Integrate.Landed),
@@ -2328,6 +2380,9 @@ func writeRunSummary(w io.Writer, r runReport) error {
 	}
 	if len(r.Integrate.DroppedByBisect) > 0 {
 		fmt.Fprintf(w, "  dropped by bisect: %v\n", r.Integrate.DroppedByBisect)
+	}
+	if len(r.Integrate.SemanticEdges) > 0 {
+		fmt.Fprintf(w, "  semantic edges: %v\n", r.Integrate.SemanticEdges)
 	}
 	if r.Verify.Ran {
 		v := "PASS"

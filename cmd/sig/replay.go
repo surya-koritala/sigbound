@@ -145,8 +145,13 @@ func runReplay(w io.Writer, argv []string) (int, error) {
 	}
 
 	// Re-integrate the exact recorded inputs. land=false: replay is read-only
-	// and never moves any ref, matching `sig integrate -no-land`.
-	res, err := integrateBranches(ctx, c, rep.Base, rep.BaseSHA, branches, writeSets, strategy, rep.ResolverCmd, replayResolverTimeout, false, false, nil)
+	// and never moves any ref, matching `sig integrate -no-land`. No semantic
+	// edges: a semantic edge only ever unions two genuinely path-disjoint
+	// branches into one SERIALIZED group instead of two parallel ones, which
+	// changes HOW they combine, never the resulting tree (their edits stay
+	// non-overlapping either way) — replay reproduces the original run's
+	// recorded FinalSHA correctly without recomputing them.
+	res, err := integrateBranches(ctx, c, rep.Base, rep.BaseSHA, branches, writeSets, strategy, rep.ResolverCmd, replayResolverTimeout, false, false, nil, nil)
 	if err != nil {
 		return exitReplayRepoState, fmt.Errorf("re-integrate: %w", err)
 	}

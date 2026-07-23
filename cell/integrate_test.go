@@ -238,6 +238,47 @@ func TestIntegrateOverlapAutoMerges(t *testing.T) {
 	}
 }
 
+// TestIntegrateWithSemanticEdgesMergesGroups is the cell-level seam test for
+// -semantic go (see cmd/sig's computeSemanticEdges): two agents that touch
+// DISJOINT files (no path overlap, 2 groups under plain Partition) but are
+// named by an extra semantic edge must land in the SAME group instead — and,
+// since the underlying edit is genuinely disjoint, still produce the exact
+// same final tree as the ungrouped run (a semantic edge changes HOW branches
+// combine, never WHAT lands).
+func TestIntegrateWithSemanticEdgesMergesGroups(t *testing.T) {
+	ctx := context.Background()
+	g, pool, base := scenario(t, 4)
+	changes := spawnAgents(t, pool, base, 2, nil) // fully path-disjoint
+
+	baseline := NewIntegrator(pool.Git())
+	occBaseline, err := baseline.IntegrateOCC(ctx, base, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if occBaseline.Groups != 2 {
+		t.Fatalf("baseline groups=%d, want 2 (path-disjoint)", occBaseline.Groups)
+	}
+
+	semantic := NewIntegrator(pool.Git()).WithSemanticEdges([][2]string{{changes[0].Branch, changes[1].Branch}})
+	occSemantic, err := semantic.IntegrateOCC(ctx, base, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if occSemantic.Groups != 1 {
+		t.Fatalf("semantic groups=%d, want 1 (edge merges the pair)", occSemantic.Groups)
+	}
+	if len(occSemantic.Landed) != 2 || len(occSemantic.Flagged) != 0 {
+		t.Fatalf("semantic landed=%d flagged=%d, want 2/0", len(occSemantic.Landed), len(occSemantic.Flagged))
+	}
+	assertAllLanded(t, g, occSemantic.FinalSHA, 2)
+
+	// Same edits, so the two runs must produce byte-identical trees regardless
+	// of which grouping folded them.
+	if bt, st := treeHash(t, g, occBaseline.FinalSHA), treeHash(t, g, occSemantic.FinalSHA); bt != st {
+		t.Fatalf("trees differ: baseline=%s semantic=%s", bt, st)
+	}
+}
+
 func TestIntegrateConflictFlagged(t *testing.T) {
 	ctx := context.Background()
 	_, pool, base := scenario(t, 6)

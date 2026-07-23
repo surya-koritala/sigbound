@@ -24,6 +24,26 @@ type BranchChange struct {
 // Output is deterministic: groups are ordered by their smallest member index,
 // and members within a group keep the input order.
 func Partition(changes []BranchChange) [][]BranchChange {
+	return partition(changes, nil)
+}
+
+// PartitionSemantic is Partition PLUS extra union edges: pairs of branch
+// names, named by BranchChange.Branch, that some caller-supplied analysis
+// determined overlap despite disjoint write-sets (e.g. cmd/sig's opt-in Go
+// symbol-level semantic conflict detector — see -semantic go). Every edge
+// just feeds the SAME union-find Partition already builds from path overlap;
+// the path-overlap logic itself is untouched. An edge naming a branch not
+// present in changes is silently ignored (fail-open — a caller's analysis
+// may be stale or partial); edges is nil or empty, this is byte-identical to
+// Partition.
+func PartitionSemantic(changes []BranchChange, edges [][2]string) [][]BranchChange {
+	return partition(changes, edges)
+}
+
+// partition is the shared implementation behind Partition/PartitionSemantic:
+// union by path overlap, THEN union by the extra edges (if any), so semantic
+// edges can only ever COARSEN the path-based grouping, never split it.
+func partition(changes []BranchChange, edges [][2]string) [][]BranchChange {
 	n := len(changes)
 	if n == 0 {
 		return nil
@@ -45,6 +65,20 @@ func Partition(changes []BranchChange) [][]BranchChange {
 				uf.union(i, j)
 			} else {
 				owner[p] = i
+			}
+		}
+	}
+
+	if len(edges) > 0 {
+		byName := make(map[string]int, n)
+		for i := range changes {
+			byName[changes[i].Branch] = i
+		}
+		for _, e := range edges {
+			i, iok := byName[e[0]]
+			j, jok := byName[e[1]]
+			if iok && jok {
+				uf.union(i, j)
 			}
 		}
 	}

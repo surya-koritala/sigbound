@@ -89,6 +89,10 @@ type Integrator struct {
 	seq      int64    // unique suffix for scratch porcelain worktrees
 	resolver Resolver // optional conflict resolver; nil => flag on conflict (default)
 	assert   bool     // opt-in overlay-vs-merge-tree cross-check; see WithAssert
+	// semanticEdges are extra cross-branch union edges fed into PartitionSemantic
+	// on top of path overlap; see WithSemanticEdges. Nil (the default) leaves
+	// partitioning exactly path-based.
+	semanticEdges [][2]string
 }
 
 // NewIntegrator builds an Integrator over the main repo's git handle.
@@ -130,6 +134,19 @@ func (in *Integrator) WithResolver(r Resolver) *Integrator {
 // mergetree/occ strategies, so only overlay needs this.
 func (in *Integrator) WithAssert() *Integrator {
 	in.assert = true
+	return in
+}
+
+// WithSemanticEdges feeds extra cross-branch grouping edges into the OCC
+// strategies' partition step (see PartitionSemantic): pairs of branch names
+// a caller's own analysis determined overlap despite disjoint write-sets
+// (e.g. cmd/sig's opt-in Go symbol-level semantic conflict detector, -semantic
+// go), so they still serialize through the normal overlap path (fold +
+// merge-tree + resolver) instead of landing in independent parallel groups.
+// Ignored by IntegrateNaive/IntegratePorcelain, which never partition. Nil
+// (the default) leaves partitioning exactly path-based, as before.
+func (in *Integrator) WithSemanticEdges(edges [][2]string) *Integrator {
+	in.semanticEdges = edges
 	return in
 }
 
@@ -196,7 +213,7 @@ func (in *Integrator) IntegrateNaive(ctx context.Context, base string, changes [
 //     step guaranteed conflict-free.
 func (in *Integrator) IntegrateOCC(ctx context.Context, base string, changes []BranchChange) (IntegrationResult, error) {
 	start := time.Now()
-	groups := Partition(changes)
+	groups := PartitionSemantic(changes, in.semanticEdges)
 
 	res := IntegrationResult{Strategy: "occ", Groups: len(groups), MaxBatch: len(groups)}
 	for _, g := range groups {
@@ -501,7 +518,7 @@ func recordErr(mu *sync.Mutex, dst *error, err error) {
 //     opts into one, at roughly double the cost.
 func (in *Integrator) IntegrateOverlay(ctx context.Context, base string, changes []BranchChange) (IntegrationResult, error) {
 	start := time.Now()
-	groups := Partition(changes)
+	groups := PartitionSemantic(changes, in.semanticEdges)
 	res := IntegrationResult{Strategy: StrategyOverlay, Groups: len(groups), MaxBatch: len(groups)}
 	for _, g := range groups {
 		if len(g) > res.LargestGroup {

@@ -100,7 +100,12 @@ func usage(w *os.File) {
 // type's own default (the full os.Environ(), today's behavior), non-nil is a
 // caller-scoped base environment (see `sig run`'s -env-mode). `sig integrate`
 // and `sig replay` always pass nil — -env-mode is a `sig run`-only flag.
-func integrateBranches(ctx context.Context, c *cell.Cell, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool, resolverEnv []string) (cell.IntegrationResult, error) {
+//
+// semanticEdges are extra cross-branch grouping edges from -semantic go (see
+// computeSemanticEdges), fed straight into cell.WithSemanticEdges so
+// PartitionSemantic unions them on top of path overlap. `sig integrate` and
+// `sig replay` always pass nil — -semantic is a `sig run`-only flag.
+func integrateBranches(ctx context.Context, c *cell.Cell, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool, resolverEnv []string, semanticEdges [][2]string) (cell.IntegrationResult, error) {
 	var need []string
 	for _, b := range branches {
 		// Contract: omit the key (or map it to nil) to request recompute; an
@@ -133,6 +138,9 @@ func integrateBranches(ctx context.Context, c *cell.Cell, baseRef, baseSHA strin
 	}
 	if assert {
 		opts = append(opts, func(in *cell.Integrator) { in.WithAssert() })
+	}
+	if len(semanticEdges) > 0 {
+		opts = append(opts, func(in *cell.Integrator) { in.WithSemanticEdges(semanticEdges) })
 	}
 	if cmd := strings.TrimSpace(resolverCmd); cmd != "" {
 		// Same shell-wrapped CommandResolver the integrate command uses, so the
@@ -223,7 +231,7 @@ func runIntegrate(argv []string) error {
 	// Hand the batch to the shared integrate path (partition, parallel folding,
 	// optional resolver, and landing are entirely the cell's job).
 	start := time.Now()
-	res, err := integrateBranches(ctx, c, *base, baseSHA, branches, nil, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand, nil)
+	res, err := integrateBranches(ctx, c, *base, baseSHA, branches, nil, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand, nil, nil)
 	if err != nil {
 		return err
 	}
