@@ -32,6 +32,8 @@ jobs:
         include:
           - target: FuzzParsePlan
             pkg: ./cmd/sig/
+          - target: FuzzExtractFileSymbols
+            pkg: ./cmd/sig/
           - target: FuzzRelSafe
             pkg: ./cmd/sig/
           - target: FuzzSlugSafe

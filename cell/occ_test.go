@@ -130,6 +130,66 @@ func TestPartitionDisjointnessInvariant(t *testing.T) {
 	}
 }
 
+func TestPartitionSemanticEmptyEdgesMatchesPartition(t *testing.T) {
+	// PartitionSemantic with nil/empty edges must be byte-identical to Partition.
+	in := []BranchChange{
+		bc("a", "hotX", "pa"),
+		bc("b", "pb"),
+		bc("c", "hotX", "pc"),
+	}
+	want := groupBranches(Partition(in))
+	if got := groupBranches(PartitionSemantic(in, nil)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("PartitionSemantic(in, nil) = %v, want %v", got, want)
+	}
+	if got := groupBranches(PartitionSemantic(in, [][2]string{})); !reflect.DeepEqual(got, want) {
+		t.Fatalf("PartitionSemantic(in, []) = %v, want %v", got, want)
+	}
+}
+
+func TestPartitionSemanticMergesDisjointBranches(t *testing.T) {
+	// a/b/c are pairwise path-disjoint -> 3 singleton groups under plain
+	// Partition. An edge a<->c must union them into one group, leaving b alone.
+	in := []BranchChange{
+		bc("a", "f1"),
+		bc("b", "f2"),
+		bc("c", "f3"),
+	}
+	got := groupBranches(PartitionSemantic(in, [][2]string{{"a", "c"}}))
+	want := [][]string{{"a", "c"}, {"b"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestPartitionSemanticTransitiveThroughPathAndEdge(t *testing.T) {
+	// a and b already share a path (one group); an edge b<->c fuses c in too,
+	// even though c is path-disjoint from both.
+	in := []BranchChange{
+		bc("a", "hot"),
+		bc("b", "hot"),
+		bc("c", "f3"),
+	}
+	got := groupBranches(PartitionSemantic(in, [][2]string{{"b", "c"}}))
+	want := [][]string{{"a", "b", "c"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestPartitionSemanticUnknownBranchIgnored(t *testing.T) {
+	// An edge naming a branch absent from changes must be silently ignored
+	// (fail-open), never a panic or an error.
+	in := []BranchChange{
+		bc("a", "f1"),
+		bc("b", "f2"),
+	}
+	got := groupBranches(PartitionSemantic(in, [][2]string{{"a", "ghost"}, {"ghost1", "ghost2"}}))
+	want := [][]string{{"a"}, {"b"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
 func TestPartitionLargeDeterministic(t *testing.T) {
 	// Same input twice must yield identical grouping.
 	var in []BranchChange

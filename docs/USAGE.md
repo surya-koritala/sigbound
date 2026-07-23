@@ -30,7 +30,7 @@ sig run [-config PATH]
         -repo PATH -base BRANCH
         (-tasks FILE | -goal STRING (-planner CMD | -planner-preset NAME) [-n N] [-min-tasks N] | -resume -manifest FILE)
         (-agent CMD | -agent-preset NAME) [-agent-timeout D] [-agent-retries N]
-        [-strategy overlay] [-assert]
+        [-strategy overlay] [-assert] [-semantic go|off]
         [-resolver CMD] [-resolver-timeout D]
         [(-verify CMD | -verify-preset NAME) [-verify-retries N] [-verify-impact CMD]
           [-verify-cache] [-verify-bisect]
@@ -70,6 +70,7 @@ sig run [-config PATH]
 | `-agent-retries` | `0` | Retry a FAILED agent (bad exit or `-agent-timeout`) up to N more times, each in a fresh worktree off the same base. A lane-strict out-of-lane failure is never retried — that's a plan violation, not a timing fluke. |
 | `-strategy` | `overlay` | Integration strategy: `overlay`, `mergetree`, `naive`, `porcelain` (see [Strategies](#strategies)). |
 | `-assert` | `false` | Paranoid cross-check for `-strategy overlay`: independently recompute the combine via `merge-tree` and error out (nothing lands) on any tree mismatch. Roughly doubles integration cost (it re-merges everything); for paranoia/CI, not routine use. |
+| `-semantic` | `off` | Opt-in, Go-only, best-effort semantic conflict detector (see [Semantic conflicts (Go)](#semantic-conflicts-go)). `go`: parse each changed `.go` file and merge any branch pair a conservative name-based overlap rule flags into the same partition group. `off`: today's path-only partitioning, unchanged. |
 | `-resolver` | — | Conflict-resolver command; low-confidence cases are flagged, never guessed. |
 | `-resolver-timeout` | `30s` | Per-conflict timeout for `-resolver` (`0` = none). |
 | `-verify` | — | Command run in a detached checkout of the integrated tree; non-zero exit = merge fails and does not land. |
@@ -301,6 +302,76 @@ the summary and JSON report show every dropped group, so a partial land is
 never silent. A bisect that salvages nothing keeps exit **`3`** (verify
 failed), exactly like an un-bisected red run.
 
+### Semantic conflicts (Go)
+
+`-strategy`'s partition (see [Strategies](#strategies)) only reasons about
+**paths** — two branches land in independent parallel groups whenever their
+write-sets are disjoint, even when they touch completely different files. That
+is usually right, but not always: a branch that changes function `F`'s
+signature in `a.go` and a branch that adds a brand-new call to `F` in `b.go`
+are path-disjoint and merge with **zero textual conflict** — then the build
+breaks. `-verify` still catches this (that is its job), but only after the
+fact, once the whole batch has already landed together.
+
+```bash
+sig run ... -semantic go
+```
+
+`-semantic go` is an OPT-IN, Go-only, best-effort pass that runs **after** the
+agents finish and **before** integration. For every branch, it parses (via
+`go/parser`/`go/ast` — stdlib only, no type-checking) the base and branch
+versions of every changed `.go` file and extracts two symbol sets, both
+qualified by directory (Go's own package-per-directory convention stands in
+for a real package identity, since nothing here loads the module):
+
+- **Declared** — top-level funcs (including receiver-qualified methods, e.g.
+  `(*Cell).Integrate`), types, consts, and vars that were ADDED, REMOVED, or
+  had their signature/underlying type change.
+- **Referenced** — identifiers newly called or selected that resolve, by
+  NAME, to a symbol elsewhere in this module: a bare call `F(...)` is
+  attributed to the calling file's own package; a selector call `pkg.F(...)`
+  is attributed to `pkg`'s package only when its import path is inside this
+  module (an external or stdlib import never matches, so it never creates an
+  edge).
+
+**The rule.** If branch A declared-changed symbol `S` and branch B newly
+references `S` — or also declared-changed `S` — the two branches are
+semantically overlapping: they are unioned into the SAME partition group,
+exactly the union-find `-strategy` already builds from path overlap, so they
+serialize through the normal overlap path (fold + `merge-tree` + `-resolver`)
+instead of landing in independent parallel groups.
+`report.integrate.semanticEdges` lists every branch pair the analysis merged
+this way; `report.perAgent[].semanticNote` records `"analyzed"` or why a
+branch was skipped (see [JSON report](#json-report)).
+
+**Precision limits — read this before trusting it.** There is no
+type-checking (`go/types` is deliberately not used: loading a whole module's
+type information is slow, and the entire point of this pass is a cheap,
+best-effort signal, not a second compiler) and no scope resolution, so
+matching is by NAME alone. A local variable or parameter that happens to
+share a name with a package-level symbol elsewhere can produce a false edge
+(over-serializing — never a correctness risk, just a missed parallelism
+opportunity); a method call through a receiver variable (`t.M()`) is **not**
+resolved at all, since telling `t`'s type apart from an arbitrary identifier
+needs type information this pass does not have — only bare calls and
+package-qualified selectors are. This trades recall for cost and honesty:
+**`-verify` remains the source of truth either way** — a symbol-level
+collision this pass misses is still caught exactly as it is today, by
+`-verify` going red on the combined tree.
+
+**Fails open, always.** A parse failure, a non-Go file in a branch's
+write-set, or a git read error means that ONE branch contributes NO semantic
+edges — never a reason to fail the run, and never a reason to keep that
+branch from integrating on its path-based merits alone. `-semantic off`
+(the default) skips the analysis entirely: partitioning stays exactly today's
+path-only behavior, byte-for-byte.
+
+**`-dry-run` composes, with one caveat.** `-dry-run` previews the predicted
+partition before any agent has run, so there is no branch content yet to
+analyze — its preview stays PATH-ONLY even with `-semantic go` set (see
+[Dry run](#dry-run)). The semantic pass only ever runs as part of an actual
+`sig run`.
+
 ### Planning
 
 The prompt the planner receives explicitly allows it to return **fewer** than
@@ -335,6 +406,12 @@ report is `{"tasks":[...], "groups":[{"tasks":["…"],"files":["…"]}], "parall
 where `parallelism` is the number of groups (independent branches that could
 land in parallel; tasks sharing a group would be serialized by the
 integrator).
+
+`-dry-run` composes with `-semantic go`, but the preview stays **path-only**:
+`-semantic go`'s analysis needs each branch's actual committed content (see
+[Semantic conflicts (Go)](#semantic-conflicts-go)), and `-dry-run` exits
+before any agent — hence any branch — exists. The predicted `groups` above
+reflect `cell.Partition` alone, never `cell.PartitionSemantic`.
 
 ### Tasks file
 
@@ -1004,14 +1081,16 @@ With `-json`, `sig run` prints a full report. Top-level shape:
     "ok": true, "exit": 0, "autocommitted": false,
     "declaredFiles": ["…"], "actualFiles": ["…"],
     "inLane": true, "strayed": [], "stderr": "",
-    "worktreeKept": "", "timedOut": false, "attempts": 1, "resumed": false
+    "worktreeKept": "", "timedOut": false, "attempts": 1, "resumed": false,
+    "semanticNote": "analyzed"
   } ],
   "strategy": "overlay",
   "integrate": {
     "strategy": "overlay", "groups": 3,
     "landed": ["…"], "flagged": [], "resolved": 0,
     "finalSHA": "…", "wallMs": 12,
-    "droppedByBisect": ["agent/…"]
+    "droppedByBisect": ["agent/…"],
+    "semanticEdges": [ ["agent/a", "agent/b"] ]
   },
   "verify": {
     "ran": true, "ok": true, "attempts": 1, "repaired": false, "flaky": false,
@@ -1042,6 +1121,11 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   for any task `-resume` still ran fresh (a missing or stale no-op branch).
 - `integrate.resolved` — overlapping branches that still landed (auto-merged or
   resolver-resolved).
+- `integrate.semanticEdges` and `perAgent[].semanticNote` are present iff
+  `-semantic go` was set (see [Semantic conflicts (Go)](#semantic-conflicts-go)).
+  `semanticEdges` lists the branch pairs the analysis merged into one
+  partition group; `semanticNote` is `"analyzed"` or a `"skipped: …"` reason
+  for that one branch. Both are empty/omitted on a run without `-semantic go`.
 - `verify.ok` is the bottom line: `false` means nothing was landed onto `-base`.
 - `verify.scope`/`verify.impactedPkgs` are present iff `-verify-impact` was
   set (see [Scoped verification](#scoped-verification)); `scope` is `"full"`
@@ -1100,6 +1184,7 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 | `run_start` | `repo`, `base`, `baseSHA`, `tasks` | Once, right after the base ref resolves. |
 | `agent_start` | `id`, `branch` | Once per task, right before that agent's worktree/command starts. |
 | `agent_done` | `id`, `ok`, `exit`, `attempts`, `files`, `inLane`, `wallMs`, `resumed`* | Once per task, after all of that task's attempts (including `-agent-retries`) finish. *`resumed` is present (`true`) only for a task `-resume` reused outright — see [Resume](#resume) — with `wallMs=0` since no agent command ran; absent for every ordinary task. |
+| `semantic_done` | `edges`, `notes` | Once, only when `-semantic go` is set (see [Semantic conflicts (Go)](#semantic-conflicts-go)) — after every agent finishes, before integration starts. |
 | `integrate_start` | `branches` | Once, before the successfully-committed branches are folded together. |
 | `integrate_done` | `landed`, `flagged`, `resolved`, `finalSHA`, `wallMs` | Once, after integration (before landing). |
 | `verify_start` | `attempt` | Before each `-verify` invocation. `attempt` is `0` pre-repair, `N` after repair round `N` (matches `-logdir`'s `verify-<n>.log`). |

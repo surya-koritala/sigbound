@@ -4,8 +4,10 @@ package main
 // the auto-planner's plan JSON (parsePlan — arbitrary model output, the highest
 // value target here), the path-validation predicates it depends on (relSafe,
 // slugSafe), the -config flags-file parser (parseConfigFile — an external
-// text file, hand-edited or generated), and -verify-impact's `go list -json`
-// output parser (parseGoListJSON — an external command's stdout). parsePlan is
+// text file, hand-edited or generated), -verify-impact's `go list -json`
+// output parser (parseGoListJSON — an external command's stdout), and
+// -semantic go's Go source extractor (extractFileSymbols — a git blob
+// holding whatever an agent committed). parsePlan is
 // the gate that decides whether a run ever starts, so it must reject every
 // malformed/hostile plan without panicking; relSafe/slugSafe are the safety
 // predicates that keep a declared path from escaping the repo or a slug from
@@ -196,6 +198,38 @@ func FuzzParseConfigFile(f *testing.F) {
 				t.Fatalf("accepted entry with non-positive line number: %+v", e)
 			}
 		}
+	})
+}
+
+// FuzzExtractFileSymbols fuzzes -semantic go's Go source extractor with
+// arbitrary bytes standing in for a git blob's content — exactly what it
+// parses in production, since it is pointed at whatever an agent committed,
+// sight unseen. go/parser's OWN errors are expected and fine (an agent can
+// commit genuinely malformed Go); the one hard requirement is that this never
+// panics, since a crash here would take down the whole `sig run` instead of
+// just failing that one branch open (see extractFileSymbols/parseGoSource's
+// doc comments, and branchSemanticWriteSet's fail-open contract).
+func FuzzExtractFileSymbols(f *testing.F) {
+	f.Add([]byte(""))                           // empty file (the add/delete side of a diff)
+	f.Add([]byte("package p\n\nfunc F() {}\n")) // well-formed, minimal
+	f.Add([]byte("package p\n\nfunc F(x int) int { return F(x) }\n"))
+	f.Add([]byte("package p\n\nimport \"other/pkg\"\n\nfunc F() { pkg.G() }\n")) // undeclared import name (parses fine; extraction just won't resolve it)
+	f.Add([]byte("this is not { go code at all"))                                // parse error
+	f.Add([]byte("package p\n\nfunc F(" + strings.Repeat("(", 5000)))            // deeply nested / unbalanced parens
+	f.Add([]byte("package p\xff\xfe\x00\n\nfunc F() {}\n"))                      // invalid UTF-8
+	f.Add(bytes.Repeat([]byte("a"), 20000))                                      // large, no valid Go structure at all
+	f.Add([]byte("package p\n\nfunc (t *T) M() {}\nfunc (u U) N() {}\n"))        // receiver-qualified methods
+	f.Add([]byte("package p\n\ntype T struct{}\nconst C = 1\nvar V, W = 1, 2\n"))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		syms, err := extractFileSymbols("pkg", "example.com/mod", data)
+		if err != nil {
+			if len(syms.declared) != 0 || len(syms.refs) != 0 {
+				t.Fatalf("error case returned non-empty symbols: %+v", syms)
+			}
+			return // rejecting malformed/hostile source is fine, as long as it did not panic
+		}
+		_ = syms // parsed successfully; no further invariant to check beyond "did not panic"
 	})
 }
 

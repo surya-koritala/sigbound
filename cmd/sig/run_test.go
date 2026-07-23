@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -247,6 +248,175 @@ func TestDriveRunAssertHealthy(t *testing.T) {
 	}
 }
 
+// makeSemanticGoRepo extends makeGoRepo with a.go (declaring F) and b.go (a
+// caller stub that does NOT yet call F) already committed at base — the
+// motivating -semantic go scenario's starting point: one agent will change
+// F's signature in a.go, another will add a genuinely incompatible call to F
+// in the DISJOINT file b.go.
+func makeSemanticGoRepo(t *testing.T) (*gitx.Git, string) {
+	t.Helper()
+	g, repo := makeGoRepo(t)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package main\n\nfunc F() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "b.go"), []byte("package main\n\nfunc UseF() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.CommitAll(ctx, "add a.go/b.go"); err != nil {
+		t.Fatal(err)
+	}
+	return g, repo
+}
+
+// semanticScenarioTasks is the motivating scenario's two path-disjoint tasks:
+// ta changes F's signature in a.go, tb adds a new call to F (the OLD,
+// zero-arg form) in b.go — a real cross-file signature/caller mismatch that
+// leaves a.go and b.go individually valid but the combined tree broken.
+func semanticScenarioTasks(t *testing.T) []taskSpec {
+	return []taskSpec{
+		{ID: "ta", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"a.go": "package main\n\nfunc F(x int) int { return x }\n"},
+		})},
+		{ID: "tb", Prompt: mustJSON(t, map[string]any{
+			"write": map[string]string{"b.go": "package main\n\nfunc UseF() int { return F() }\n"},
+		})},
+	}
+}
+
+// TestDriveRunSemanticGoGroupsCrossFileSignatureConflict is the motivating
+// scenario end to end, WITH -semantic go: branch ta changes F's signature in
+// a.go; branch tb adds a brand-new call to F in the path-DISJOINT file b.go.
+// Plain path partitioning would land them in parallel groups (they touch
+// different files); -semantic go must instead recognize the symbol-level
+// overlap, merge them into ONE partition group (report.integrate.groups==1,
+// semanticEdges names the pair), and route them through the normal
+// fold+merge-tree path — the merge itself still stays textually clean (the
+// files never touch the same lines), so the build only breaks once -verify
+// runs on the combined tree, exactly as the no-flag case does too (see
+// TestDriveRunSemanticOffKeepsPathOnlyPartitioning): -verify remains the
+// source of truth either way, -semantic only changes HOW the pair combines
+// and what the report/events record about it.
+func TestDriveRunSemanticGoGroupsCrossFileSignatureConflict(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeSemanticGoRepo(t)
+	agent := buildTestAgent(t)
+	eventsPath := filepath.Join(t.TempDir(), "events.ndjson")
+
+	p := runParams{
+		Repo:       repo,
+		Base:       "main",
+		Strategy:   "overlay",
+		AgentCmd:   agent,
+		VerifyCmd:  "go build ./...",
+		Semantic:   semanticGo,
+		EventsPath: eventsPath,
+	}
+	rep, err := driveRun(ctx, p, semanticScenarioTasks(t))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	for _, a := range rep.PerAgent {
+		if !a.OK {
+			t.Fatalf("agent %s not ok: exit=%d stderr=%q", a.ID, a.Exit, a.Stderr)
+		}
+		if a.SemanticNote != "analyzed" {
+			t.Fatalf("agent %s semanticNote=%q, want analyzed", a.ID, a.SemanticNote)
+		}
+	}
+
+	// ---- semantically merged into ONE group, both land (no textual conflict) ----
+	if rep.Integrate.Groups != 1 {
+		t.Fatalf("groups=%d, want 1 (ta/tb merged by the semantic edge despite disjoint paths)", rep.Integrate.Groups)
+	}
+	if len(rep.Integrate.Landed) != 2 || len(rep.Integrate.Flagged) != 0 {
+		t.Fatalf("landed=%d flagged=%d, want 2/0 (a.go/b.go never share a line, so no textual conflict)", len(rep.Integrate.Landed), len(rep.Integrate.Flagged))
+	}
+	wantEdges := [][2]string{{"agent/ta", "agent/tb"}}
+	if !reflect.DeepEqual(rep.Integrate.SemanticEdges, wantEdges) {
+		t.Fatalf("semanticEdges=%v, want %v", rep.Integrate.SemanticEdges, wantEdges)
+	}
+
+	// ---- -verify still catches the genuinely broken build ----
+	if !rep.Verify.Ran || rep.Verify.OK {
+		t.Fatalf("verify ran=%v ok=%v, want ran/red (F's signature and its new caller disagree)", rep.Verify.Ran, rep.Verify.OK)
+	}
+
+	// ---- events: semantic_done fires with the edge, after agents/before integrate ----
+	events, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(events)), "\n")
+	semIdx, integrateStartIdx := -1, -1
+	for i, line := range lines {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("bad event line %d: %v", i, err)
+		}
+		switch rec["event"] {
+		case "semantic_done":
+			semIdx = i
+			edges, _ := rec["edges"].([]any)
+			if len(edges) != 1 {
+				t.Fatalf("semantic_done edges=%v, want 1 pair", edges)
+			}
+		case "integrate_start":
+			integrateStartIdx = i
+		}
+	}
+	if semIdx < 0 {
+		t.Fatal("no semantic_done event")
+	}
+	if integrateStartIdx < 0 || semIdx >= integrateStartIdx {
+		t.Fatalf("semantic_done (line %d) must fire before integrate_start (line %d)", semIdx, integrateStartIdx)
+	}
+}
+
+// TestDriveRunSemanticOffKeepsPathOnlyPartitioning is the SAME motivating
+// scenario WITHOUT -semantic (the default, "off"): today's behavior. a.go and
+// b.go are path-disjoint, so they land in 2 independent groups, no
+// semanticEdges/semanticNote appear anywhere in the report, and -verify still
+// catches the broken build — just later, after the whole batch already
+// landed together, exactly as issue #58's brief describes.
+func TestDriveRunSemanticOffKeepsPathOnlyPartitioning(t *testing.T) {
+	ctx := context.Background()
+	_, repo := makeSemanticGoRepo(t)
+	agent := buildTestAgent(t)
+
+	p := runParams{
+		Repo:      repo,
+		Base:      "main",
+		Strategy:  "overlay",
+		AgentCmd:  agent,
+		VerifyCmd: "go build ./...",
+		// Semantic left at the zero value ("") -- same as an explicit "off".
+	}
+	rep, err := driveRun(ctx, p, semanticScenarioTasks(t))
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if rep.Integrate.Groups != 2 {
+		t.Fatalf("groups=%d, want 2 (path-disjoint, no semantic analysis)", rep.Integrate.Groups)
+	}
+	if len(rep.Integrate.SemanticEdges) != 0 {
+		t.Fatalf("semanticEdges=%v, want none (-semantic off)", rep.Integrate.SemanticEdges)
+	}
+	for _, a := range rep.PerAgent {
+		if a.SemanticNote != "" {
+			t.Fatalf("agent %s semanticNote=%q, want empty (-semantic off)", a.ID, a.SemanticNote)
+		}
+	}
+	if len(rep.Integrate.Landed) != 2 || len(rep.Integrate.Flagged) != 0 {
+		t.Fatalf("landed=%d flagged=%d, want 2/0", len(rep.Integrate.Landed), len(rep.Integrate.Flagged))
+	}
+	// -verify still catches it, late: the combined tree is the SAME broken
+	// tree either way, path-only partitioning just didn't see it coming.
+	if !rep.Verify.Ran || rep.Verify.OK {
+		t.Fatalf("verify ran=%v ok=%v, want ran/red", rep.Verify.Ran, rep.Verify.OK)
+	}
+}
+
 // TestIntegrateBranchesReusesPrecomputedWriteSets is the correctness anchor for
 // the writeSets param. The write-set only drives OCC PARTITIONING (which
 // branches are treated as overlapping); actual landed content always comes
@@ -303,7 +473,7 @@ func TestIntegrateBranchesReusesPrecomputedWriteSets(t *testing.T) {
 		"agent/x": {"fake-shared.txt"},
 		"agent/y": {"fake-shared.txt"},
 	}
-	res, err := integrateBranches(ctx, c, "main", base, branches, lying, "overlay", "", 0, false, false, nil)
+	res, err := integrateBranches(ctx, c, "main", base, branches, lying, "overlay", "", 0, false, false, nil, nil)
 	if err != nil {
 		t.Fatalf("integrateBranches (lying writeSets): %v", err)
 	}
@@ -316,7 +486,7 @@ func TestIntegrateBranchesReusesPrecomputedWriteSets(t *testing.T) {
 
 	// No precomputed data at all: the batched fallback must compute the real,
 	// disjoint write-sets and partition the same two branches into 2 groups.
-	res, err = integrateBranches(ctx, c, "main", base, branches, nil, "overlay", "", 0, false, false, nil)
+	res, err = integrateBranches(ctx, c, "main", base, branches, nil, "overlay", "", 0, false, false, nil, nil)
 	if err != nil {
 		t.Fatalf("integrateBranches (nil writeSets): %v", err)
 	}
@@ -3269,6 +3439,57 @@ func TestRunRunUnknownAgentPresetFailsBeforeAnyAgent(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Fatalf("report=%q, want no report written (nothing should have run)", buf.String())
+	}
+}
+
+// TestRunRunSemanticRejectsUnknownValue: an unrecognized -semantic value
+// fails before any agent runs, same fail-fast posture as -strategy/-lanes.
+func TestRunRunSemanticRejectsUnknownValue(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo, "-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent", "true", "-semantic", "bogus",
+	})
+	if err == nil || !strings.Contains(err.Error(), "-semantic") {
+		t.Fatalf("err=%v, want a -semantic complaint", err)
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("report=%q, want no report written (nothing should have run)", buf.String())
+	}
+}
+
+// TestRunRunSemanticFlagWiresIntoReport: -semantic go parsed off argv reaches
+// driveRun (proven end-to-end by the resulting semanticEdges/groups, the same
+// motivating scenario as TestDriveRunSemanticGoGroupsCrossFileSignatureConflict
+// but this time going through actual flag parsing).
+func TestRunRunSemanticFlagWiresIntoReport(t *testing.T) {
+	_, repo := makeSemanticGoRepo(t)
+	agent := buildTestAgent(t)
+	tasksPath := tasksFileFor(t, semanticScenarioTasks(t))
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo, "-base", "main", "-tasks", tasksPath,
+		"-agent", agent, "-verify", "go build ./...", "-semantic", "go", "-json",
+	})
+	if err != nil {
+		t.Fatalf("runRun: %v", err)
+	}
+	if code != exitVerifyFailed {
+		t.Fatalf("code=%d, want exitVerifyFailed (build is genuinely broken)", code)
+	}
+	var rep runReport
+	if jerr := json.Unmarshal(buf.Bytes(), &rep); jerr != nil {
+		t.Fatalf("parse report: %v\n%s", jerr, buf.String())
+	}
+	if rep.Integrate.Groups != 1 {
+		t.Fatalf("groups=%d, want 1 (-semantic go merged ta/tb)", rep.Integrate.Groups)
+	}
+	if len(rep.Integrate.SemanticEdges) != 1 {
+		t.Fatalf("semanticEdges=%v, want 1 pair", rep.Integrate.SemanticEdges)
 	}
 }
 
