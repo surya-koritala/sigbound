@@ -347,7 +347,8 @@ type MergeResult struct {
 // other failure returns an error.
 func (g *Git) Merge(ctx context.Context, msg string, refs ...string) (MergeResult, error) {
 	args := append([]string{"merge", "--no-edit", "--no-gpg-sign", "-m", msg}, refs...)
-	if _, err := g.run(ctx, args...); err == nil {
+	_, mergeErr := g.run(ctx, args...)
+	if mergeErr == nil {
 		return MergeResult{OK: true}, nil
 	}
 	// Non-zero exit: distinguish a real conflict from an operational error.
@@ -356,8 +357,11 @@ func (g *Git) Merge(ctx context.Context, msg string, refs ...string) (MergeResul
 		return MergeResult{}, cerr
 	}
 	if len(conflicts) == 0 {
-		// Not a conflict (e.g. octopus refused, bad ref). Surface as error.
-		return MergeResult{}, fmt.Errorf("merge %v failed without recorded conflicts", refs)
+		// Not a conflict (e.g. octopus refused, bad ref, index.lock
+		// contention). Surface git's own stderr (carried on mergeErr via
+		// g.run's %s-wrapped message) instead of swallowing it — a merge
+		// failure a human can't see is unfixable when it flakes.
+		return MergeResult{}, fmt.Errorf("merge %v failed without recorded conflicts: %w", refs, mergeErr)
 	}
 	if _, err := g.run(ctx, "merge", "--abort"); err != nil {
 		return MergeResult{}, fmt.Errorf("merge --abort after conflict: %w", err)

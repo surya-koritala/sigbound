@@ -502,8 +502,16 @@ func TestMergeBadRefError(t *testing.T) {
 		t.Fatal(err)
 	}
 	ig := g.At(intDir)
-	if _, err := ig.Merge(ctx, "m", "no-such-branch"); err == nil {
+	_, err := ig.Merge(ctx, "m", "no-such-branch")
+	if err == nil {
 		t.Fatal("merging a non-existent ref should surface an error")
+	}
+	// The "failed without recorded conflicts" error must carry git's actual
+	// stderr, not just that path — otherwise an operational failure (bad
+	// ref, index.lock, octopus refusal) is unfixable when it flakes: there's
+	// nothing to read (see issue #69).
+	if !contains(err.Error(), "not something we can merge") {
+		t.Fatalf("error should surface git's stderr, got: %v", err)
 	}
 }
 
