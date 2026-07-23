@@ -33,7 +33,7 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
   only (`sig run` stays uncapped), entirely opt-in via server flags (`0` =
   unlimited, byte-identical to before). Quotas are hosted-side ceilings
   enforced at `POST /runs` before a run starts: `-max-agents-per-run`
-  rejects an over-cap agent count with `400`; `-max-run-seconds` caps every
+  rejects an over-cap agent count with `400`; `-max-run-time` caps every
   run's `-budget` via `min(request, server)` — a request can only make its
   own budget stricter, never laxer; `-max-concurrent-runs` rejects with
   `429` once N runs are in flight across ALL cells, on top of the existing
@@ -78,6 +78,16 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
   a minimal base environment plus its own `SIGBOUND_*` vars, with per-slot
   `-env-*` allowlists (exact names and `NAME_*` families) for anything extra.
   Default `inherit` is unchanged.
+- **`-semantic go`** — an opt-in, Go-only, best-effort symbol-level conflict
+  detector. It runs after the agents finish and before integration, parsing
+  (stdlib `go/parser`/`go/ast`, no type-checking) each changed `.go` file to
+  find branches that declared-changed or referenced the same symbol by name;
+  any such pair is unioned into the same partition group so it serializes
+  through the normal overlap path instead of landing independently. Fails
+  open on any parse or git-read error (that one branch just contributes no
+  semantic edges); the default `-semantic off` leaves today's path-only
+  partitioning byte-for-byte unchanged. See
+  [docs/USAGE.md](docs/USAGE.md) "Semantic conflicts (Go)".
 
 ### Fixed
 

@@ -816,13 +816,13 @@ func TestServeMaxConcurrentRunsReleasedOnError(t *testing.T) {
 	}
 }
 
-// TestServeMaxRunSecondsClampsBudget exercises buildParams' min() directly:
+// TestServeMaxRunTimeClampsBudget exercises buildParams' min() directly:
 // a request asking for MORE than the server ceiling is clamped down to it; a
 // request asking for LESS keeps its own, stricter budget; a request setting
 // no budget at all inherits the ceiling.
-func TestServeMaxRunSecondsClampsBudget(t *testing.T) {
+func TestServeMaxRunTimeClampsBudget(t *testing.T) {
 	_, repo := makeGoRepo(t)
-	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxRunSeconds: 30})
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxRunTime: 30 * time.Second})
 	if err != nil {
 		t.Fatalf("newServer: %v", err)
 	}
@@ -852,13 +852,13 @@ func TestServeMaxRunSecondsClampsBudget(t *testing.T) {
 	}
 }
 
-// TestServeMaxRunSecondsAppliesEndToEnd proves the clamp actually reaches
+// TestServeMaxRunTimeAppliesEndToEnd proves the clamp actually reaches
 // driveRun: a request sets no -budget at all, the server's 1s ceiling alone
 // must cut a 5s -verify sleep short, exactly like TestDriveRunVerifyKilledByBudget
 // at the driveRun layer.
-func TestServeMaxRunSecondsAppliesEndToEnd(t *testing.T) {
+func TestServeMaxRunTimeAppliesEndToEnd(t *testing.T) {
 	_, repo := makeGoRepo(t)
-	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxRunSeconds: 1})
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxRunTime: 1 * time.Second})
 	if err != nil {
 		t.Fatalf("newServer: %v", err)
 	}
@@ -880,7 +880,7 @@ func TestServeMaxRunSecondsAppliesEndToEnd(t *testing.T) {
 	final := pollRun(t, ts, "", created.RunID)
 	elapsed := time.Since(start)
 	if elapsed > 4*time.Second {
-		t.Fatalf("run took %s; -max-run-seconds 1 should have cut the 5s verify sleep short", elapsed)
+		t.Fatalf("run took %s; -max-run-time 1s should have cut the 5s verify sleep short", elapsed)
 	}
 	if final.Report == nil || !strings.Contains(final.Report.Verify.Output, "budget") {
 		t.Fatalf("verify output should name the exhausted budget, got report=%+v", final.Report)
@@ -895,7 +895,7 @@ func TestServeQuotasOffIsUnlimited(t *testing.T) {
 	_, repo := makeGoRepo(t)
 	s, err := newServer(context.Background(), serverConfig{
 		repos: []string{repo}, envMode: envModeInherit,
-		maxAgentsPerRun: 0, maxRunSeconds: 0, maxConcurrentRuns: 0,
+		maxAgentsPerRun: 0, maxRunTime: 0, maxConcurrentRuns: 0,
 	})
 	if err != nil {
 		t.Fatalf("newServer: %v", err)
