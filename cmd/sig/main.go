@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/surya-koritala/sigbound/cell"
-	"github.com/surya-koritala/sigbound/internal/gitx"
 )
 
 func main() {
@@ -81,11 +80,12 @@ func usage(w *os.File) {
 }
 
 // integrateBranches computes each branch's write-set versus baseSHA and hands the
-// batch to cell.Integrator — the ONE integration code path in this binary. Both
-// `sig integrate` and `sig run` call it, so the driver never reimplements
-// partition / parallel folding / conflict handling / landing; it only supplies
-// the branch names and the same resolver/strategy/assert knobs. When land is
-// true the base branch ref is advanced to the integrated commit.
+// batch to the cell's integrator — the ONE integration code path in this binary.
+// `sig integrate`, `sig run`, and `sig replay` all call it through a cell.Cell,
+// so the driver never reimplements partition / parallel folding / conflict
+// handling / landing; it only supplies the branch names and the same
+// resolver/strategy/assert knobs. When land is true the base branch ref is
+// advanced to the integrated commit.
 //
 // writeSets carries any ALREADY-COMPUTED write-sets (branch -> paths), e.g.
 // `sig run`'s runAgent already ran `git diff` per agent for lane enforcement —
@@ -100,7 +100,7 @@ func usage(w *os.File) {
 // type's own default (the full os.Environ(), today's behavior), non-nil is a
 // caller-scoped base environment (see `sig run`'s -env-mode). `sig integrate`
 // and `sig replay` always pass nil — -env-mode is a `sig run`-only flag.
-func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool, resolverEnv []string) (cell.IntegrationResult, error) {
+func integrateBranches(ctx context.Context, c *cell.Cell, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool, resolverEnv []string) (cell.IntegrationResult, error) {
 	var need []string
 	for _, b := range branches {
 		// Contract: omit the key (or map it to nil) to request recompute; an
@@ -112,7 +112,7 @@ func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string
 	var computed map[string][]string
 	if len(need) > 0 {
 		var err error
-		computed, err = g.DiffNameOnlyBatch(ctx, baseSHA, need)
+		computed, err = c.Git().DiffNameOnlyBatch(ctx, baseSHA, need)
 		if err != nil {
 			return cell.IntegrationResult{}, fmt.Errorf("batch write-sets: %w", err)
 		}
@@ -127,23 +127,24 @@ func integrateBranches(ctx context.Context, g *gitx.Git, baseRef, baseSHA string
 		changes = append(changes, cell.BranchChange{Branch: b, WriteSet: cell.NewWriteSet(paths...)})
 	}
 
-	in := cell.NewIntegrator(g)
+	var opts []func(*cell.Integrator)
 	if land {
-		in = in.WithLandRef("refs/heads/" + baseRef)
+		opts = append(opts, func(in *cell.Integrator) { in.WithLandRef("refs/heads/" + baseRef) })
 	}
 	if assert {
-		in = in.WithAssert()
+		opts = append(opts, func(in *cell.Integrator) { in.WithAssert() })
 	}
 	if cmd := strings.TrimSpace(resolverCmd); cmd != "" {
 		// Same shell-wrapped CommandResolver the integrate command uses, so the
 		// SIGBOUND_BASE/SIGBOUND_OURS/SIGBOUND_THEIRS/SIGBOUND_PATH contract is identical.
-		in = in.WithResolver(&cell.CommandResolver{
+		r := &cell.CommandResolver{
 			Args:    []string{"sh", "-c", cmd},
 			Timeout: resolverTimeout,
 			Env:     resolverEnv,
-		})
+		}
+		opts = append(opts, func(in *cell.Integrator) { in.WithResolver(r) })
 	}
-	return in.Integrate(ctx, baseSHA, changes, strategy)
+	return c.Integrate(ctx, baseSHA, changes, strategy, opts...)
 }
 
 // flaggedJSON is one branch the engine set aside for a human, with the paths
@@ -203,18 +204,18 @@ func runIntegrate(argv []string) error {
 	}
 
 	ctx := context.Background()
-	// Cheap preflight: git present + version >= 2.38, before touching the
-	// repo. See runRun's identical check for why (the engine hard-depends on
-	// merge-tree/overlay plumbing from git 2.38 onward); `sig doctor` has the
-	// full live probe.
-	if err := gitx.CheckMinVersion(ctx, "git"); err != nil {
+	// Open the cell for this repo: it runs the same cheap preflight (git present
+	// + version >= 2.38, the merge-tree/overlay plumbing the engine hard-depends
+	// on from 2.38 onward — `sig doctor` has the full live probe), confirms the
+	// repo, and owns the git handle the integration runs through.
+	c, err := cell.Open(*repo)
+	if err != nil {
 		return err
 	}
-	g := gitx.New(*repo)
 
 	// Resolve the base branch to a stable commit SHA so the merge-base is fixed
 	// even as we advance the branch ref at the end.
-	baseSHA, err := g.RevParse(ctx, *base)
+	baseSHA, err := c.Git().RevParse(ctx, *base)
 	if err != nil {
 		return fmt.Errorf("resolve base %q in %s: %w", *base, *repo, err)
 	}
@@ -222,7 +223,7 @@ func runIntegrate(argv []string) error {
 	// Hand the batch to the shared integrate path (partition, parallel folding,
 	// optional resolver, and landing are entirely the cell's job).
 	start := time.Now()
-	res, err := integrateBranches(ctx, g, *base, baseSHA, branches, nil, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand, nil)
+	res, err := integrateBranches(ctx, c, *base, baseSHA, branches, nil, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand, nil)
 	if err != nil {
 		return err
 	}

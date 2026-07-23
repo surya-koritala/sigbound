@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/surya-koritala/sigbound/cell"
 	"github.com/surya-koritala/sigbound/internal/gitx"
 )
 
@@ -272,6 +273,10 @@ func TestIntegrateBranchesReusesPrecomputedWriteSets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	c, err := cell.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	mkBranch := func(branch, file string) {
 		wt := filepath.Join(t.TempDir(), branch)
@@ -298,7 +303,7 @@ func TestIntegrateBranchesReusesPrecomputedWriteSets(t *testing.T) {
 		"agent/x": {"fake-shared.txt"},
 		"agent/y": {"fake-shared.txt"},
 	}
-	res, err := integrateBranches(ctx, g, "main", base, branches, lying, "overlay", "", 0, false, false, nil)
+	res, err := integrateBranches(ctx, c, "main", base, branches, lying, "overlay", "", 0, false, false, nil)
 	if err != nil {
 		t.Fatalf("integrateBranches (lying writeSets): %v", err)
 	}
@@ -311,7 +316,7 @@ func TestIntegrateBranchesReusesPrecomputedWriteSets(t *testing.T) {
 
 	// No precomputed data at all: the batched fallback must compute the real,
 	// disjoint write-sets and partition the same two branches into 2 groups.
-	res, err = integrateBranches(ctx, g, "main", base, branches, nil, "overlay", "", 0, false, false, nil)
+	res, err = integrateBranches(ctx, c, "main", base, branches, nil, "overlay", "", 0, false, false, nil)
 	if err != nil {
 		t.Fatalf("integrateBranches (nil writeSets): %v", err)
 	}

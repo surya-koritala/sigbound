@@ -97,6 +97,21 @@ The engine lives in `cell/`; the git plumbing (shell-outs only, no go-git) in
 `internal/gitx/`; the CLI, planner, lane enforcement, and repair loop in
 `cmd/sig/`; the benchmark harness in `bench/` and `cmd/sigbench/`.
 
+### Architecture: the Cell
+
+A `cell.Cell` (`cell/cell.go`) is one repo's unit of work: it owns that repo's
+git handle, serializes the repo's worktree-admin steps behind one mutex, and
+runs integrations against it under a stable id. **One repo = one cell = the unit
+of horizontal scale.** Because independent repos have fully disjoint object
+stores and refs, N repos are N cells side by side in one process with zero
+cross-cell coordination — different cells run fully in parallel, while a single
+cell serializes only its own admin steps (the property `TestConcurrentCells…`
+pins under `-race`). `sig run` opens and drives exactly one cell; the future
+service layer (`sig serve`) will hold many, keyed by id, and route each run to
+the cell that owns its repo. Two cells on the *same* repo are allowed but
+pointless — they don't share the in-process mutex, so only git's on-disk locking
+separates them; the sharding unit is the whole repo, so don't.
+
 ## Ground rules
 
 - **Build on top of git; never rebuild git.** Worktrees, branches, and
