@@ -1052,7 +1052,16 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		}
 		emit.emit("run_done", map[string]any{"ok": code == exitOK, "exitCode": code, "wallMs": time.Since(runStart).Milliseconds()})
 	}()
-	g := gitx.New(p.Repo)
+	// One repo = one cell: the cell owns this run's git handle and serializes
+	// its worktree-admin steps (the admin machinery that used to live ad hoc
+	// right here). runRun already ran the same preflight, so Open is a cheap
+	// revalidation; a future sig serve will Open the cell once and drive many
+	// runs through it.
+	c, err := cell.Open(p.Repo)
+	if err != nil {
+		return runReport{}, err
+	}
+	g := c.Git()
 
 	// Pin the base to a stable commit so every agent forks the same tree and the
 	// merge-base stays fixed even after we advance the branch ref.
@@ -1125,7 +1134,6 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 
 	// ---- fan out: one agent per task, each in its own isolated worktree ----
 	agents := make([]perAgentJSON, len(tasks))
-	var admin sync.Mutex // serialize git worktree add/remove admin steps
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, max(1, runtime.GOMAXPROCS(0)))
 	for i := range tasks {
@@ -1141,7 +1149,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			// baseSHA) before falling through, so the fresh run below can
 			// create it the ordinary way. See resumeAgent's doc comment.
 			if p.Resume {
-				if a, reused := resumeAgent(ctx, g, &admin, branch, baseSHA, p, tasks[i]); reused {
+				if a, reused := resumeAgent(ctx, c, branch, baseSHA, p, tasks[i]); reused {
 					agents[i] = a
 					emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "resumed": true, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "wallMs": int64(0)})
 					return
@@ -1149,7 +1157,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			}
 			emit.emit("agent_start", map[string]any{"id": tasks[i].ID, "branch": branch})
 			agentStart := time.Now()
-			agents[i] = runAgentWithRetries(ctx, g, &admin, wtRoot, baseSHA, p, tasks[i])
+			agents[i] = runAgentWithRetries(ctx, c, wtRoot, baseSHA, p, tasks[i])
 			a := agents[i]
 			emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "wallMs": time.Since(agentStart).Milliseconds()})
 		}(i)
@@ -1183,7 +1191,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if p.EnvMode == envModeScoped {
 		resolverEnv = slotEnv(envModeScoped, p.EnvResolver, nil)
 	}
-	res, err := integrateBranches(ctx, g, p.Base, baseSHA, branches, writeSets, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false, resolverEnv)
+	res, err := integrateBranches(ctx, c, p.Base, baseSHA, branches, writeSets, p.Strategy, p.ResolverCmd, p.ResolverTimeout, p.Assert, false, resolverEnv)
 	if err != nil {
 		return rep, budgetAwareErr(p, ctx, "integrate", err)
 	}
@@ -1911,12 +1919,12 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 // a.Attempts records the total number of tries actually made (1 when the
 // first try succeeded, failed terminally, or no retries were configured,
 // matching today's report shape).
-func runAgentWithRetries(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec) perAgentJSON {
+func runAgentWithRetries(ctx context.Context, c *cell.Cell, wtRoot, baseSHA string, p runParams, t taskSpec) perAgentJSON {
 	var a perAgentJSON
 	created := false
 	for attempt := 1; ; attempt++ {
 		var wtCreated bool
-		a, wtCreated = runAgent(ctx, g, admin, wtRoot, baseSHA, p, t, created)
+		a, wtCreated = runAgent(ctx, c, wtRoot, baseSHA, p, t, created)
 		a.Attempts = attempt
 		if wtCreated {
 			created = true
@@ -1928,9 +1936,7 @@ func runAgentWithRetries(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wt
 		// Retrying: this attempt didn't end the loop, so its kept worktree (if
 		// any) isn't the final answer — remove it instead of leaking it.
 		if a.WorktreeKept != "" {
-			admin.Lock()
-			_ = g.WorktreeRemove(context.WithoutCancel(ctx), a.WorktreeKept)
-			admin.Unlock()
+			_ = c.RemoveWorktree(context.WithoutCancel(ctx), a.WorktreeKept)
 		}
 	}
 }
@@ -1956,7 +1962,8 @@ func runAgentWithRetries(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wt
 // WorktreeAddReset succeeded THIS call; runAgentWithRetries latches it into
 // its own created for the next attempt, and also treats wtCreated==false as
 // terminal (never retried) since a failed add can't be fixed by retrying.
-func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseSHA string, p runParams, t taskSpec, created bool) (a perAgentJSON, wtCreated bool) {
+func runAgent(ctx context.Context, c *cell.Cell, wtRoot, baseSHA string, p runParams, t taskSpec, created bool) (a perAgentJSON, wtCreated bool) {
+	g := c.Git()
 	branch := "agent/" + t.ID
 	// InLane defaults true (not the zero value) so a failure that never reaches
 	// the lane-enforcement block below — e.g. WorktreeAdd itself failing —
@@ -1964,15 +1971,9 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 	a = perAgentJSON{ID: t.ID, Branch: branch, Files: []string{}, InLane: true}
 	dir := filepath.Join(wtRoot, "wt-"+sanitizeID(t.ID))
 
-	admin.Lock()
-	var err error
-	if created {
-		err = g.WorktreeAddReset(ctx, dir, branch, baseSHA)
-	} else {
-		err = g.WorktreeAdd(ctx, dir, branch, baseSHA)
-	}
-	admin.Unlock()
-	if err != nil {
+	// The cell serializes this worktree add against every other agent's admin
+	// step on this repo (created => reset a branch THIS run already made).
+	if err := c.AddWorktree(ctx, dir, branch, baseSHA, created); err != nil {
 		a.Exit = -1
 		a.Stderr = "worktree add: " + err.Error()
 		return a, false
@@ -1984,12 +1985,10 @@ func runAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, wtRoot, baseS
 			a.WorktreeKept = dir
 			return
 		}
-		admin.Lock()
 		// WithoutCancel: teardown must happen even when ctx is already dead (a
 		// -budget or -agent-timeout expiry) — an agent's admin cleanup is not
 		// itself subject to either, only the agent command is (see actx below).
-		_ = g.WorktreeRemove(context.WithoutCancel(ctx), dir)
-		admin.Unlock()
+		_ = c.RemoveWorktree(context.WithoutCancel(ctx), dir)
 	}()
 
 	// -agent-timeout scopes ONLY the agent command below, not the worktree
@@ -2159,17 +2158,18 @@ func applyLaneEnforcement(a *perAgentJSON, t taskSpec, p runParams) {
 //     again — with a.Resumed=true and the same lane enforcement (see
 //     applyLaneEnforcement) a freshly-run agent would get.
 //
-// admin is locked only around the delete (an admin-level git ref mutation,
-// same posture as the worktree add/remove steps it's already shared with).
-func resumeAgent(ctx context.Context, g *gitx.Git, admin *sync.Mutex, branch, baseSHA string, p runParams, t taskSpec) (perAgentJSON, bool) {
+// The stale-branch delete is an admin-level git ref mutation, so it goes
+// through the cell (DeleteBranch), serialized against every other agent's
+// worktree add/remove on this repo — the same posture it had under the shared
+// admin mutex.
+func resumeAgent(ctx context.Context, c *cell.Cell, branch, baseSHA string, p runParams, t taskSpec) (perAgentJSON, bool) {
+	g := c.Git()
 	head, err := g.RevParse(ctx, branch)
 	if err != nil {
 		return perAgentJSON{}, false // no surviving branch: run fresh
 	}
 	if head == baseSHA {
-		admin.Lock()
-		_ = g.BranchDelete(ctx, branch)
-		admin.Unlock()
+		_ = c.DeleteBranch(ctx, branch)
 		return perAgentJSON{}, false // stale no-op branch: cleared, run fresh
 	}
 

@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/cell"
 )
 
 // sig replay's own exit codes — distinct from `sig run`'s (see the constants
@@ -91,10 +91,14 @@ func runReplay(w io.Writer, argv []string) (int, error) {
 	}
 
 	ctx := context.Background()
-	if err := gitx.CheckMinVersion(ctx, "git"); err != nil {
+	// Open the cell for the recorded repo: it runs the same git preflight
+	// (>= 2.38) and confirms the repo, then owns the git handle replay's
+	// read-only re-integration and verify checkout run through.
+	c, err := cell.Open(rep.Repo)
+	if err != nil {
 		return exitReplayRepoState, err
 	}
-	g := gitx.New(rep.Repo)
+	g := c.Git()
 
 	// The recorded base SHA and every succeeded agent's recorded SHA must
 	// still resolve to real objects in THIS repo. A branch can be deleted (and
@@ -142,7 +146,7 @@ func runReplay(w io.Writer, argv []string) (int, error) {
 
 	// Re-integrate the exact recorded inputs. land=false: replay is read-only
 	// and never moves any ref, matching `sig integrate -no-land`.
-	res, err := integrateBranches(ctx, g, rep.Base, rep.BaseSHA, branches, writeSets, strategy, rep.ResolverCmd, replayResolverTimeout, false, false, nil)
+	res, err := integrateBranches(ctx, c, rep.Base, rep.BaseSHA, branches, writeSets, strategy, rep.ResolverCmd, replayResolverTimeout, false, false, nil)
 	if err != nil {
 		return exitReplayRepoState, fmt.Errorf("re-integrate: %w", err)
 	}
