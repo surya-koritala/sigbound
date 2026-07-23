@@ -900,6 +900,108 @@ integration's own determinism actually backs.
 
 ---
 
+## Distributed workflow (bundles)
+
+Everything above runs on one machine: agents commit branches into one repo and
+`sig integrate` folds them there. `sig export` / `sig import` split that across
+machines using git's own **bundles** — the on-top-of-git, host-free way to move
+objects. A bundle is one ordinary file; there is no server and no custom
+protocol.
+
+The pattern is **worker → coordinator**:
+
+- A **worker** machine runs its agents against its own clone and `sig export`s
+  the resulting branches into a bundle file.
+- A **coordinator** machine `sig import`s that bundle and then folds and lands
+  the imported branches centrally with `sig integrate` — same engine, same
+  conflict safety (real conflicts flagged, never guessed) as a single-machine
+  run.
+
+**No networking here.** sigbound builds the two ends; the file moves by whatever
+means you already have — `scp`, a shared/NFS directory, an S3 or CI-artifact
+`get`. If you can copy a file between the two machines, you have the transport.
+
+### `sig export`
+
+```
+sig export -repo PATH -bundle FILE -branches b1,b2,.. [-json]
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-repo` | — | The worker's git repository. |
+| `-bundle` | — | Path of the bundle file to write. |
+| `-branches` | — | Comma-separated branch names to export. Each is bundled with its complete history, so the file imports into any repo with nothing to pre-satisfy. |
+| `-json` | off | Emit the result as JSON. |
+
+Branches are validated to exist **before** anything is written — a typo is a
+clean error naming the missing branch, not a half-written bundle.
+
+### `sig import`
+
+```
+sig import -repo PATH -bundle FILE [-from WORKER_ID] [-json]
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-repo` | — | The coordinator's git repository. |
+| `-bundle` | — | Path of the bundle file to import. |
+| `-from` | bundle filename stem | Worker id; namespaces the imported branches. |
+| `-json` | off | Emit the result as JSON. |
+
+**The namespace is the safety property.** Every imported branch lands as
+`imported/<worker-id>/<original-branch>` — a bundle carrying `main` or
+`agent/foo` can therefore **never** move the coordinator's `main` or clobber a
+local `agent/*` branch. Import writes refs *only* under
+`refs/heads/imported/<worker-id>/` and nowhere else. (`git bundle unbundle`
+imports objects but writes no refs of its own, so the only refs that ever appear
+are the namespaced ones sigbound creates.)
+
+The bundle is **verified before** it is unbundled, so a corrupt or truncated
+bundle fails loudly and imports nothing. Re-importing the same bundle under the
+same worker id is idempotent (the objects are already present and the namespaced
+refs are set to the same commits).
+
+Imported branches are just branch names, so they feed straight into the ordinary
+`sig integrate` — there is no separate "integrate a bundle" path:
+
+```
+sig integrate -repo COORD -base main -branches imported/w1/agent/t1,imported/w1/agent/t2
+```
+
+### End-to-end example
+
+```sh
+#!/bin/sh
+set -eu
+
+# --- on the WORKER: run agents, then bundle their branches ---
+sig run -repo /work/clone -base main -tasks tasks.json -agent ./agent -no-land
+sig export -repo /work/clone -bundle /tmp/worker-a.bundle \
+  -branches agent/t1,agent/t2,agent/t3
+
+# --- move the file by any means you like (no server involved) ---
+scp /tmp/worker-a.bundle coordinator:/tmp/worker-a.bundle
+
+# --- on the COORDINATOR: import under a namespace, then integrate + land ---
+sig import -repo /srv/main -bundle /tmp/worker-a.bundle -from worker-a -json
+# imported/worker-a/agent/t1, imported/worker-a/agent/t2, imported/worker-a/agent/t3
+
+sig integrate -repo /srv/main -base main \
+  -branches imported/worker-a/agent/t1,imported/worker-a/agent/t2,imported/worker-a/agent/t3
+```
+
+The result is identical to integrating those branches on the worker itself —
+the transport is lossless (the imported trees are byte-for-byte the worker's).
+`sig integrate` folds and lands with the same in-object-store engine as a
+single-machine run: non-conflicting branches land, real conflicts are flagged
+rather than guessed. (Landing gated on a `-verify` command is a `sig run`
+feature; run your build/test as a follow-up step if you want the coordinator to
+gate on it.)
+
+---
+
 ## `sig doctor`
 
 Checks that `git` is new enough and that the plumbing sigbound depends on —

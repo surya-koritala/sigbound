@@ -10,6 +10,17 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ### Added
 
+- **`sig export` / `sig import`** — git-bundle object transport for distributed
+  runs. A worker `sig export -bundle FILE -branches a,b,c` packs branches into
+  one bundle file (git's native, server-free offline transport); a coordinator
+  `sig import -bundle FILE [-from WORKER_ID]` verifies and unbundles it, landing
+  every carried branch under an isolated `imported/<worker>/<branch>` namespace —
+  so a bundle can never move the coordinator's `main` or clobber a local
+  `agent/*` ref. Imported branches feed the existing `sig integrate` unchanged.
+  The bundle is verified before unbundling (a corrupt bundle imports nothing),
+  and the round-trip is lossless (imported trees are byte-for-byte the worker's).
+  Moving the file is out of scope — use scp/NFS/artifacts. See
+  [docs/USAGE.md](docs/USAGE.md) "Distributed workflow (bundles)".
 - **`-env-mode scoped`** — per-slot environment scoping: each command slot gets
   a minimal base environment plus its own `SIGBOUND_*` vars, with per-slot
   `-env-*` allowlists (exact names and `NAME_*` families) for anything extra.
