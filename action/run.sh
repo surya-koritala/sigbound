@@ -36,7 +36,13 @@ build_sig_run_args() {
   # printf (run directly by xargs, no shell in between) and read back into
   # an array, so shell metacharacters like $(...), `...`, and ; land as
   # inert literal argv entries instead of being interpreted.
-  if [ -n "${INPUT_EXTRA_ARGS:-}" ]; then
+  # The guard strips whitespace before testing: a whitespace-only value must
+  # skip tokenizing entirely, because GNU xargs (Linux runners) runs printf
+  # once even on empty input, emitting one phantom empty token — BSD xargs
+  # (macOS) does not, which is how this survived local testing.
+  local extra_stripped="${INPUT_EXTRA_ARGS:-}"
+  extra_stripped="${extra_stripped//[[:space:]]/}"
+  if [ -n "$extra_stripped" ]; then
     local extra=()
     while IFS= read -r -d '' tok; do
       extra+=("$tok")
