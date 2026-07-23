@@ -18,8 +18,13 @@
 //
 // AUTH: if the env var named by -token-env (default SIGBOUND_SERVE_TOKEN) is
 // set, every request must carry `Authorization: Bearer <token>` (constant-time
-// compared). If it is unset AND the bind is loopback, auth is off (dev mode). A
-// non-loopback bind REQUIRES the token — serve refuses to start without it.
+// compared) — EXCEPT the /ui and /ui/ shell itself (see handleUI): a browser
+// navigation there can never carry that header, so the static, data-free page
+// is served unauthenticated and carries the token on its own fetches after.
+// Every /runs/... data endpoint (including /ui's own /runs/.../flagged data)
+// stays gated. If the token env var is unset AND the bind is loopback, auth is
+// off entirely (dev mode). A non-loopback bind REQUIRES the token — serve
+// refuses to start without it.
 //
 // Endpoints (JSON in, JSON out):
 //
@@ -30,6 +35,15 @@
 //	GET  /runs/{id}/events -> the run's events.ndjson (application/x-ndjson)
 //	GET  /runs/{id}/usage  -> that run's metering record (see usage.go)
 //	GET  /usage            -> usage totals across all run history, + a per-cell rollup
+//	GET  /runs/{id}/flagged                    -> {runId, cell, flagged:[{branch, paths}]}
+//	GET  /runs/{id}/flagged/{branch}/{path...} -> {path, base, ours, theirs, baseSHA} (three sides)
+//	GET  /ui (and /ui/)    -> the read-only conflict-review HTML page (see handleUI)
+//
+// The /flagged endpoints + /ui are the conflict-review surface (issue #62): a
+// READ-ONLY view of the branches a run flagged (real conflicts a resolver
+// declined, or none was set) so a human can inspect the three sides before
+// resolving on the CLI. They add NO landing path — nothing merges or lands from
+// the browser; the safe pattern stays sig run/integrate.
 //
 // One run per cell at a time: a second POST for a cell whose run is still in
 // flight gets 409 Conflict (a run moves the base ref; serializing is the only
@@ -49,6 +63,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -69,6 +84,13 @@ import (
 	"github.com/surya-koritala/sigbound/cell"
 	"github.com/surya-koritala/sigbound/internal/gitx"
 )
+
+// uiHTML is the single self-contained conflict-review page served at GET /ui.
+// Vanilla HTML+CSS+JS, no framework, no external asset — CSP-safe and works
+// offline (a daemon may be air-gapped). See handleUI and docs/USAGE.md.
+//
+//go:embed ui.html
+var uiHTML []byte
 
 // serveMaxBody bounds a POST /runs body so a client can't stream an unbounded
 // request into the daemon. A run request is a handful of small fields; 1 MiB is
@@ -215,11 +237,29 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /runs/{id}", s.handleGetRun)
 	mux.HandleFunc("GET /runs/{id}/events", s.handleRunEvents)
 	mux.HandleFunc("GET /runs/{id}/usage", s.handleRunUsage)
+	// Conflict-review surface (issue #62): the flagged-branch listing, the
+	// three-sides detail for one flagged path, and the read-only HTML page that
+	// renders them. The /runs/.../flagged* endpoints are gated exactly like every
+	// other data route below. /ui and /ui/ are special-cased OUT of that gate
+	// (see the dispatch below): a browser navigation can never carry an
+	// Authorization header, so gating the page itself would 401 before the page
+	// — and its own token field — ever loads. That's safe because handleUI's
+	// shell is static and data-free: it fetches every run/flagged/etc. through
+	// authenticated requests carrying a token typed into its own sessionStorage
+	// field, so serving the shell unauthenticated leaks nothing.
+	mux.HandleFunc("GET /runs/{id}/flagged", s.handleFlagged)
+	mux.HandleFunc("GET /runs/{id}/flagged/{rest...}", s.handleFlaggedDetail)
+	mux.HandleFunc("GET /ui", s.handleUI)
+	mux.HandleFunc("GET /ui/", s.handleUI)
 	mux.HandleFunc("GET /usage", s.handleUsageAggregate)
 	if s.token == "" {
 		return mux
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ui" || r.URL.Path == "/ui/" {
+			mux.ServeHTTP(w, r)
+			return
+		}
 		if !s.authOK(r) {
 			writeErr(w, http.StatusUnauthorized, "unauthorized: send Authorization: Bearer <token>")
 			return
@@ -722,6 +762,193 @@ func (s *server) handleUsageAggregate(w http.ResponseWriter, r *http.Request) {
 		total.addTotals(cu)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"totals": total, "cells": cells})
+}
+
+// ---- conflict-review surface (issue #62) ----
+
+// locateRun resolves a run id to its cell and durable directory: the live
+// record (this process) is authoritative and cheap; otherwise a disk scan finds
+// a prior process's run. Same live-then-disk shape handleGetRun/handleRunUsage
+// use, factored so the flagged endpoints share it.
+func (s *server) locateRun(id string) (*registeredCell, string, bool) {
+	s.mu.Lock()
+	rec := s.runs[id]
+	var cellID, dir string
+	if rec != nil {
+		cellID, dir = rec.cellID, rec.dir
+	}
+	s.mu.Unlock()
+	if rec != nil {
+		return s.byKey[cellID], dir, true
+	}
+	return s.findRunDir(id)
+}
+
+// flaggedListResponse is GET /runs/{id}/flagged: the run's flagged branches and
+// their conflicted paths, straight from the persisted report — the allowlist the
+// detail endpoint validates against.
+type flaggedListResponse struct {
+	RunID   string        `json:"runId"`
+	Cell    string        `json:"cell"`
+	Flagged []flaggedJSON `json:"flagged"`
+}
+
+// handleFlagged lists a run's flagged branches + conflicted paths. 404s an
+// unknown run and a run with no persisted report yet (still running, or errored
+// before integrate) — the flagged set only exists once a run completed integrate.
+func (s *server) handleFlagged(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRunID(id) {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
+	rc, dir, ok := s.locateRun(id)
+	if !ok || rc == nil {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
+	rep, err := readRunReport(dir)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no report for this run yet (still running, or it never reached integrate)")
+		return
+	}
+	flagged := rep.Integrate.Flagged
+	if flagged == nil {
+		flagged = []flaggedJSON{}
+	}
+	writeJSON(w, http.StatusOK, flaggedListResponse{RunID: id, Cell: rc.cell.ID(), Flagged: flagged})
+}
+
+// flaggedDetailResponse is GET /runs/{id}/flagged/{branch}/{path...}: the three
+// sides of one conflicted path. base is the run's base commit, ours the landed
+// integrated tree, theirs the flagged branch's recorded tip — all read as blobs
+// from the object store. A side is JSON null when the path is absent there (an
+// add/delete conflict) or its recorded commit is no longer resolvable.
+type flaggedDetailResponse struct {
+	Path    string  `json:"path"`
+	Base    *string `json:"base"`
+	Ours    *string `json:"ours"`
+	Theirs  *string `json:"theirs"`
+	BaseSHA string  `json:"baseSHA,omitempty"`
+}
+
+// handleFlaggedDetail returns the three sides for ONE conflicted path. The path
+// is not read from the filesystem: {branch}/{path...} must EXACTLY equal a
+// branch+"/"+path pair recorded in this run's flagged set (an allowlist from the
+// report), so a request for any path NOT flagged — a traversal, an absolute
+// path, or a real repo file that wasn't flagged — 404s and reads nothing. The
+// three blob versions are then resolved from the recorded commit OIDs (base =
+// report.baseSHA, ours = report.integrate.finalSHA, theirs = the flagged
+// branch's recorded per-agent SHA) in ONE `git cat-file --batch` (BlobsBatch);
+// a spec that doesn't resolve is simply absent from the map => that side null.
+func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRunID(id) {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
+	rc, dir, ok := s.locateRun(id)
+	if !ok || rc == nil {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
+	rep, err := readRunReport(dir)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "no report for this run yet (still running, or it never reached integrate)")
+		return
+	}
+
+	// Allowlist: rest must EXACTLY match a recorded flagged branch + "/" + path.
+	// Exact equality is the whole safety property — no filesystem lookup, no path
+	// cleaning, no prefix guessing decides what gets read; only a pair the run
+	// itself flagged can ever match.
+	rest := r.PathValue("rest")
+	var branch, path string
+	found := false
+	for _, f := range rep.Integrate.Flagged {
+		for _, p := range f.Paths {
+			if rest == f.Branch+"/"+p {
+				branch, path = f.Branch, p
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "no such flagged path for this run")
+		return
+	}
+
+	// theirs' commit: the flagged branch's tip the run recorded (per-agent SHA).
+	branchSHA := ""
+	for _, a := range rep.PerAgent {
+		if a.Branch == branch {
+			branchSHA = a.SHA
+			break
+		}
+	}
+
+	// One cat-file --batch resolves every side's blob. An empty recorded SHA is
+	// never turned into a spec (":path" would resolve against the index, not what
+	// we mean) — that side stays null.
+	specs := make([]string, 0, 3)
+	sideSpec := map[string]string{}
+	addSide := func(name, sha string) {
+		if sha == "" {
+			return
+		}
+		spec := sha + ":" + path
+		sideSpec[name] = spec
+		specs = append(specs, spec)
+	}
+	addSide("base", rep.BaseSHA)
+	addSide("ours", rep.Integrate.FinalSHA)
+	addSide("theirs", branchSHA)
+
+	contents, err := rc.cell.Git().BlobsBatch(r.Context(), specs)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "read blobs: "+err.Error())
+		return
+	}
+	side := func(name string) *string {
+		spec, ok := sideSpec[name]
+		if !ok {
+			return nil
+		}
+		v, present := contents[spec]
+		if !present {
+			return nil
+		}
+		return &v
+	}
+	writeJSON(w, http.StatusOK, flaggedDetailResponse{
+		Path:    path,
+		Base:    side("base"),
+		Ours:    side("ours"),
+		Theirs:  side("theirs"),
+		BaseSHA: rep.BaseSHA,
+	})
+}
+
+// handleUI serves the single self-contained conflict-review page (uiHTML). A
+// strict CSP declares the page needs NOTHING external — same-origin fetches
+// only, inline script/style (the page IS one inline file), no remote src of any
+// kind — so it renders on an air-gapped daemon and can never be made to pull a
+// third-party asset. The shell is served UNAUTHENTICATED even when a token is
+// set (it is data-free — a browser navigation cannot carry a bearer token, so
+// gating it would make the page unreachable); every /runs data endpoint the
+// page fetches stays gated, and the page carries the pasted token on those
+// fetches.
+func (s *server) handleUI(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Content-Security-Policy", "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'")
+	h.Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	w.Write(uiHTML) //nolint:errcheck // response body; nothing to recover on a write error
 }
 
 // ---- request -> runParams ----

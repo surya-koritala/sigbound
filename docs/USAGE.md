@@ -1121,6 +1121,9 @@ All requests and responses are JSON (events are NDJSON).
 | `GET /runs/{id}/events` | The run's `events.ndjson` as written so far (`Content-Type: application/x-ndjson`) — the same lifecycle events `sig run -events` emits. |
 | `GET /runs/{id}/usage` | That run's metering record. `404` until the run has written a report. |
 | `GET /usage` | Usage totals across all run history, plus a per-cell rollup. |
+| `GET /runs/{id}/flagged` | `{runId, cell, flagged:[{branch, paths}]}` — the branches this run flagged and each one's conflicted paths (see [Conflict review UI](#conflict-review-ui)). `404` until the run has a report. |
+| `GET /runs/{id}/flagged/{branch}/{path...}` | `{path, base, ours, theirs, baseSHA}` — the three sides of one conflicted path. A side is `null` when the path is absent there (an add/delete conflict). `{branch}/{path...}` must **exactly** match a flagged pair from the listing above; anything else is `404` and reads nothing. |
+| `GET /ui` (and `/ui/`) | The read-only conflict-review HTML page (see [Conflict review UI](#conflict-review-ui)). |
 
 The `POST /runs` body mirrors `sig run`'s flags by name (camelCased); durations
 are Go duration strings (`"30s"`, `"2m"`). `cell` is a cell id (from `/health`)
@@ -1140,6 +1143,44 @@ fully in parallel — that repo-level sharding is the whole point of registering
 several. Run history is durable per cell under `.git/sigbound/runs/<runId>/`
 (`report.json`, `events.ndjson`), the same `.git/sigbound` storage `-verify-cache`
 uses; `rm -rf .git/sigbound` resets it and it never shows up in `git status`.
+
+### Conflict review UI
+
+When a run flags branches — a real conflict a `-resolver` declined, or none was
+set — Sigbound's fail-safe **flags, never guesses**: those branches don't land,
+and a human decides. `sig serve` surfaces exactly that, so you can **see** what
+was flagged without leaving the daemon or digging blobs out of git by hand.
+
+Open **`GET /ui`** (e.g. `http://127.0.0.1:7777/ui`) in a browser. The page lists
+runs; pick one to see its flagged branches, then a branch's path to see the
+**three sides side by side — `base` | `ours` (the landed tree) | `theirs` (the
+flagged branch)**. It's a single self-contained HTML page: vanilla HTML/CSS/JS,
+**no framework, no CDN, no external asset of any kind**, so it works offline on an
+air-gapped daemon. File contents are rendered with `textContent` only (never
+`innerHTML`), so agent-generated code in a conflicted file can't inject anything.
+
+This surface is **strictly read-only.** It does not resolve, merge, or land
+anything from the browser — that would be a new landing path, which Sigbound
+deliberately does not have. Resolving a flagged branch stays a CLI act: re-run
+with a `-resolver`, or land it yourself with `sig run` / `sig integrate`. The UI
+just shows you the data so you can make that call.
+
+The same data is available as JSON — `GET /runs/{id}/flagged` for the listing and
+`GET /runs/{id}/flagged/{branch}/{path...}` for one path's three sides (see
+[Endpoints](#endpoints)). The path is validated against the run's own flagged set
+(an allowlist), so the endpoint can only ever read a path that was actually
+flagged — never an arbitrary file.
+
+**Auth in the browser.** The `/ui` shell is served unauthenticated even when a
+token is set — it is data-free (all run data comes from the gated `/runs`
+endpoints), and a browser navigation cannot carry a bearer token, so gating the
+page itself would only make it unreachable. In the default posture — loopback
+bind, **no token** — everything just works. If the daemon sets a token, the page
+has a field to paste it: it's kept in `sessionStorage` and sent as
+`Authorization: Bearer` on every data fetch (never in a URL). This is a
+localhost single-user tool, not a multi-tenant auth system; for a token-protected
+or exposed daemon, the reverse proxy you already put in front of it (see above) is
+the right place to handle browser auth.
 
 ### Graceful shutdown
 

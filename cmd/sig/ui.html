@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sigbound — Conflict Review</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --line: #ddd;
+    --panel: #f6f6f6; --accent: #0b6; --flag: #b40; --sel: #e8f0ff;
+    --code-bg: #fbfbfb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c; --fg: #e6e6e6; --muted: #9aa0a6; --line: #333;
+      --panel: #1e2127; --accent: #2ea; --flag: #f86; --sel: #24303f;
+      --code-bg: #0f1115;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  header {
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .tokrow { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  input[type=password] {
+    padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px;
+    background: var(--bg); color: var(--fg); width: 220px;
+  }
+  button {
+    padding: 4px 10px; border: 1px solid var(--line); border-radius: 4px;
+    background: var(--panel); color: var(--fg); cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  main { display: grid; grid-template-columns: 260px 300px 1fr; gap: 0; height: calc(100vh - 54px); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; } }
+  .col { overflow: auto; padding: 10px 12px; border-right: 1px solid var(--line); }
+  .col h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
+  .row {
+    padding: 6px 8px; border-radius: 4px; cursor: pointer; border: 1px solid transparent;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .row:hover { background: var(--panel); }
+  .row.sel { background: var(--sel); border-color: var(--accent); }
+  .row .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .row .meta { color: var(--muted); font-size: 12px; }
+  .status-done { color: var(--accent); }
+  .status-error { color: var(--flag); }
+  .status-running { color: var(--muted); }
+  .flag-branch { font-weight: 600; margin: 10px 0 4px; word-break: break-all; }
+  .path { padding: 4px 8px; border-radius: 4px; cursor: pointer; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
+  .path:hover { background: var(--panel); }
+  .path.sel { background: var(--sel); }
+  .panes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  @media (max-width: 1200px) { .panes { grid-template-columns: 1fr; } }
+  .pane { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; display: flex; flex-direction: column; min-height: 120px; }
+  .pane .cap { padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line); font-weight: 600; font-size: 12px; }
+  .pane pre {
+    margin: 0; padding: 10px; overflow: auto; background: var(--code-bg); flex: 1;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre; tab-size: 4;
+  }
+  .pane .absent { color: var(--muted); font-style: italic; padding: 10px; }
+  .empty { color: var(--muted); padding: 20px 12px; }
+  .note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .err { color: var(--flag); padding: 10px 12px; white-space: pre-wrap; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sigbound — Conflict Review</h1>
+  <div class="tokrow">
+    <input id="token" type="password" placeholder="bearer token (if the daemon sets one)" autocomplete="off">
+    <button id="saveTok">Save</button>
+    <button id="reload">Reload runs</button>
+  </div>
+</header>
+<main>
+  <div class="col" id="runsCol">
+    <h2>Runs</h2>
+    <div id="runs"></div>
+  </div>
+  <div class="col" id="flaggedCol">
+    <h2>Flagged branches</h2>
+    <div id="flagged"><div class="empty">Select a run.</div></div>
+  </div>
+  <div class="col" id="detailCol" style="border-right:none">
+    <h2>Three sides</h2>
+    <div class="note">Read-only. Resolve conflicts with <code>sig run</code> / <code>sig integrate</code> on the CLI — this surface never merges or lands.</div>
+    <div id="detail"><div class="empty">Select a flagged path.</div></div>
+  </div>
+</main>
+<script>
+"use strict";
+// Single-user localhost daemon. If the daemon was started with a bearer token,
+// paste it above; it is kept in sessionStorage and sent as Authorization on every
+// fetch (never in a URL). Not a multi-tenant auth system — see docs/USAGE.md.
+const TOKKEY = "sigbound_token";
+const $ = (id) => document.getElementById(id);
+
+function getToken() { return sessionStorage.getItem(TOKKEY) || ""; }
+
+async function api(path) {
+  const headers = {};
+  const tok = getToken();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  const resp = await fetch(path, { headers });
+  if (!resp.ok) throw new Error("HTTP " + resp.status + " — " + path);
+  return resp.json();
+}
+
+// flaggedURL encodes each segment but keeps the slashes that separate the
+// branch name and repo path, so the server sees exactly branch + "/" + path.
+function flaggedURL(runId, branch, path) {
+  const segs = (branch + "/" + path).split("/").map(encodeURIComponent);
+  return "/runs/" + encodeURIComponent(runId) + "/flagged/" + segs.join("/");
+}
+
+let state = { runId: null, branch: null, path: null };
+
+// el builds a DOM node with text set via textContent — NEVER innerHTML — so
+// agent-generated file contents, branch names, and paths can never inject markup.
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+async function loadRuns() {
+  const box = $("runs");
+  clear(box);
+  box.appendChild(el("div", "empty", "Loading…"));
+  try {
+    const data = await api("/runs");
+    clear(box);
+    if (!data.runs || data.runs.length === 0) {
+      box.appendChild(el("div", "empty", "No runs yet."));
+      return;
+    }
+    for (const r of data.runs) {
+      const row = el("div", "row");
+      row.appendChild(el("div", "mono", r.id));
+      const meta = el("div", "meta");
+      meta.appendChild(el("span", "status-" + r.status, r.status));
+      meta.appendChild(document.createTextNode("  ·  cell " + r.cell));
+      row.appendChild(meta);
+      row.addEventListener("click", () => selectRun(r.id, row));
+      box.appendChild(row);
+    }
+  } catch (e) {
+    clear(box);
+    box.appendChild(el("div", "err", String(e.message || e)));
+  }
+}
+
+function markSel(container, chosen) {
+  for (const c of container.children) c.classList.remove("sel");
+  if (chosen) chosen.classList.add("sel");
+}
+
+async function selectRun(runId, row) {
+  state = { runId, branch: null, path: null };
+  markSel($("runs"), row);
+  clear($("detail"));
+  $("detail").appendChild(el("div", "empty", "Select a flagged path."));
+  const box = $("flagged");
+  clear(box);
+  box.appendChild(el("div", "empty", "Loading…"));
+  try {
+    const data = await api("/runs/" + encodeURIComponent(runId) + "/flagged");
+    clear(box);
+    if (!data.flagged || data.flagged.length === 0) {
+      box.appendChild(el("div", "empty", "No flagged branches — nothing to review."));
+      return;
+    }
+    for (const f of data.flagged) {
+      box.appendChild(el("div", "flag-branch", f.branch));
+      for (const p of (f.paths || [])) {
+        const item = el("div", "path", p);
+        item.addEventListener("click", () => selectPath(runId, f.branch, p, item));
+        box.appendChild(item);
+      }
+    }
+  } catch (e) {
+    clear(box);
+    box.appendChild(el("div", "err", String(e.message || e)));
+  }
+}
+
+function pane(caption, value) {
+  const p = el("div", "pane");
+  p.appendChild(el("div", "cap", caption));
+  if (value == null) {
+    p.appendChild(el("div", "absent", "(absent on this side — add/delete conflict)"));
+  } else {
+    // textContent: the ONLY safe sink for agent-generated file bytes.
+    p.appendChild(el("pre", null, value));
+  }
+  return p;
+}
+
+async function selectPath(runId, branch, path, item) {
+  state = { runId, branch, path };
+  const flaggedBox = $("flagged");
+  for (const c of flaggedBox.querySelectorAll(".path")) c.classList.remove("sel");
+  if (item) item.classList.add("sel");
+  const box = $("detail");
+  clear(box);
+  box.appendChild(el("div", "empty", "Loading…"));
+  try {
+    const d = await api(flaggedURL(runId, branch, path));
+    clear(box);
+    const head = el("div", "note");
+    head.appendChild(el("span", "mono", branch));
+    head.appendChild(document.createTextNode("  ·  " + d.path + (d.baseSHA ? ("  ·  base " + d.baseSHA.slice(0, 10)) : "")));
+    box.appendChild(head);
+    const panes = el("div", "panes");
+    panes.appendChild(pane("base", d.base));
+    panes.appendChild(pane("ours (landed)", d.ours));
+    panes.appendChild(pane("theirs (flagged branch)", d.theirs));
+    box.appendChild(panes);
+  } catch (e) {
+    clear(box);
+    box.appendChild(el("div", "err", String(e.message || e)));
+  }
+}
+
+$("saveTok").addEventListener("click", () => {
+  const v = $("token").value.trim();
+  if (v) sessionStorage.setItem(TOKKEY, v); else sessionStorage.removeItem(TOKKEY);
+  loadRuns();
+});
+$("reload").addEventListener("click", loadRuns);
+$("token").addEventListener("keydown", (e) => { if (e.key === "Enter") $("saveTok").click(); });
+
+$("token").value = getToken();
+loadRuns();
+</script>
+</body>
+</html>
