@@ -1873,6 +1873,14 @@ func runVerifyRetry(ctx context.Context, g *gitx.Git, wtPath string, p runParams
 	start := time.Now()
 	v := runVerify(ctx, g, wtPath, p, changedFiles, logDir, logAttempt)
 	invocations := 1
+	// A cache hit (v.Cached) never actually spawns the -verify command, so it
+	// must not count as an invocation — see verifyJSON's doc comment ("the
+	// total number of times the -verify command itself was ACTUALLY run").
+	// Cached implies OK, which stops the retry loop below before it starts,
+	// so this is the only place a cache hit can land.
+	if v.Cached {
+		invocations = 0
+	}
 	for attempt := 0; !v.OK && attempt < retries; attempt++ {
 		v = runVerify(ctx, g, wtPath, p, changedFiles, logDir, logAttempt)
 		invocations++
@@ -1881,9 +1889,15 @@ func runVerifyRetry(ctx context.Context, g *gitx.Git, wtPath string, p runParams
 		}
 	}
 	// Invocations/WallMs cover every -verify command run in THIS call (the
-	// initial attempt plus every retry) — see verifyJSON's doc comment.
+	// initial attempt plus every retry) — see verifyJSON's doc comment. A
+	// cache hit spent no wall time actually running -verify, so it reports 0
+	// rather than the reset/clean/cache-lookup overhead around it.
 	v.Invocations = invocations
-	v.WallMs = time.Since(start).Milliseconds()
+	if v.Cached {
+		v.WallMs = 0
+	} else {
+		v.WallMs = time.Since(start).Milliseconds()
+	}
 	return v
 }
 
