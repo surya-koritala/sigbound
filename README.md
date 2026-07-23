@@ -3,7 +3,7 @@
 Run multiple AI coding agents on one repository in parallel, and merge their work automatically — landing only changes that build and pass your tests.
 
 [![build](https://img.shields.io/badge/build-passing-brightgreen)](#testing)
-[![tests](https://img.shields.io/badge/tests-165-brightgreen)](#testing)
+[![tests](https://img.shields.io/badge/tests-306-brightgreen)](#testing)
 [![coverage](https://img.shields.io/badge/coverage-83%25-brightgreen)](#testing)
 [![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -91,6 +91,14 @@ That drops `-resolver` and `-repair` from the first example rather than presetti
 
 That invocation is long and doesn't change much run to run — put your standing flags in `sig.conf` (one `key=value` per line; see [Config file](docs/USAGE.md#config-file)) and just pass `-config sig.conf -tasks ...` from then on.
 
+### `sig serve`: an HTTP run API
+
+`sig serve -repos /path/a,/path/b` runs the same engine behind a small local daemon: `POST /runs` starts a run, `GET /runs/{id}` polls it, and a read-only `/ui` page lets you inspect any branch a run flagged for human review. It binds loopback by default, ships no TLS or user model, and adds no new landing path — it drives the exact same `-verify`-gated engine `sig run` does. See [`sig serve`](docs/USAGE.md#sig-serve).
+
+### `sig export` / `sig import`: multi-machine runs
+
+Splitting a batch across machines? A worker runs its agents locally and `sig export`s the resulting branches into one git-bundle file; a coordinator `sig import`s the bundle into an isolated namespace and folds it in with `sig integrate`, same as any local branch. See [Distributed workflow (bundles)](docs/USAGE.md#distributed-workflow-bundles).
+
 ## Documentation
 
 [`docs/USAGE.md`](docs/USAGE.md) is the complete reference: every `sig run`, `sig integrate`, and `sigbench` flag, the full set of `SIGBOUND_*` environment variables passed to each command, and the JSON report shape. [`examples/`](examples/) has a runnable quickstart.
@@ -151,9 +159,9 @@ go run ./cmd/sigbench -sweep -runs 5 -warmup 1
 
 ## Testing
 
-- 165 tests, including end-to-end runs against real git repositories.
+- 306 tests, including end-to-end runs against real git repositories.
 - Coverage: 83% on the integration engine, 90% on the git plumbing.
-- 11 fuzz targets covering every parser of git and model output. Fuzzing found and fixed a bug in the `ls-tree` parser that could have produced a silently incorrect merged tree; the triggering input is kept as a regression test.
+- 16 fuzz targets covering every parser of git and model output. Fuzzing found and fixed a bug in the `ls-tree` parser that could have produced a silently incorrect merged tree; the triggering input is kept as a regression test.
 
 ```bash
 go test -race ./...
@@ -161,11 +169,9 @@ go test -race ./...
 
 ## Status
 
-Working: the engine, the `sig` CLI, and the benchmark, verified on real repositories.
+Working: the engine, the `sig` CLI, the benchmark, multi-machine execution (`sig export`/`sig import` bundles), and `sig serve` — an HTTP run API with a read-only conflict-review UI — all verified on real repositories.
 
-Not yet: multi-machine execution, a UI, or a hosted service.
-
-Sigbound builds on top of git and does not aim to become a git host.
+Sigbound builds on top of git and does not aim to become a git host: `sig serve` runs and lets you inspect work over a repo you already host, it does not host repos, review pull requests, or replace your forge.
 
 ## License
 

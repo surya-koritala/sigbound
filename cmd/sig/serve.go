@@ -51,7 +51,7 @@
 //
 // QUOTAS: managed-layer ceilings, all opt-in via server flags (0 = unlimited,
 // today's behavior byte-identical): -max-agents-per-run (400 on POST /runs
-// before any run starts), -max-run-seconds (a request's -budget, capped via
+// before any run starts), -max-run-time (a request's -budget, capped via
 // min()), -max-concurrent-runs (429 across ALL cells, on top of the per-cell
 // 409). METERING is always on — a usage.json is written alongside every
 // run's report.json, derived from data driveRun already tracks. Neither is a
@@ -131,11 +131,11 @@ type server struct {
 	// opt-in via server flags: 0 = unlimited, today's (#60) behavior
 	// byte-identical. maxAgentsPerRun and maxConcurrentRuns are enforced in
 	// handleCreateRun BEFORE a run starts (no run dir, no cell slot held on
-	// rejection); maxRunSeconds is folded into a request's -budget via
+	// rejection); maxRunTime is folded into a request's -budget via
 	// min() in buildParams — a request can only make its own budget
 	// stricter, never laxer than the server ceiling.
 	maxAgentsPerRun   int
-	maxRunSeconds     int
+	maxRunTime        time.Duration
 	maxConcurrentRuns int
 
 	mu         sync.Mutex
@@ -175,7 +175,7 @@ type serverConfig struct {
 	// Managed-layer quotas; see server.maxAgentsPerRun's doc comment. 0 (the
 	// zero value) is unlimited on every one of these.
 	maxAgentsPerRun   int
-	maxRunSeconds     int
+	maxRunTime        time.Duration
 	maxConcurrentRuns int
 }
 
@@ -198,7 +198,7 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		envPlanner:        cfg.envPlanner,
 		envPublish:        cfg.envPublish,
 		maxAgentsPerRun:   cfg.maxAgentsPerRun,
-		maxRunSeconds:     cfg.maxRunSeconds,
+		maxRunTime:        cfg.maxRunTime,
 		maxConcurrentRuns: cfg.maxConcurrentRuns,
 		byKey:             map[string]*registeredCell{},
 		busy:              map[string]bool{},
@@ -1027,14 +1027,13 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 	if err != nil {
 		return runParams{}, zeroPlan, fmt.Errorf("budget: %w", err)
 	}
-	// Quota: -max-run-seconds caps -budget at this server's ceiling. A
+	// Quota: -max-run-time caps -budget at this server's ceiling. A
 	// request can only make its own budget STRICTER, never laxer than the
 	// server's: an unset/0 request budget (unlimited) becomes the ceiling,
 	// and a request budget already under the ceiling is left alone.
-	if s.maxRunSeconds > 0 {
-		serverBudget := time.Duration(s.maxRunSeconds) * time.Second
-		if budget <= 0 || serverBudget < budget {
-			budget = serverBudget
+	if s.maxRunTime > 0 {
+		if budget <= 0 || s.maxRunTime < budget {
+			budget = s.maxRunTime
 		}
 	}
 	publishTimeout, err := parseDur(req.PublishTimeout, 120*time.Second)
@@ -1335,7 +1334,7 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	// Managed-layer quotas (see docs/USAGE.md "Quotas and metering"), all
 	// opt-in: 0 = unlimited, byte-identical to today's (#60) behavior.
 	maxAgentsPerRun := fs.Int("max-agents-per-run", 0, "quota: reject (400) a POST /runs whose agent count exceeds N, before any run starts. For a -goal request the target -n is checked (the true count isn't known until planning runs). 0 = unlimited (default)")
-	maxRunSeconds := fs.Int("max-run-seconds", 0, "quota: cap every run's -budget at N seconds; a request's own shorter -budget always wins (min of the two). 0 = unlimited (default)")
+	maxRunTime := fs.Duration("max-run-time", 0, "quota: cap every run's -budget at this duration (e.g. 10m); a request's own shorter -budget always wins (min of the two). 0 = unlimited (default)")
 	maxConcurrentRuns := fs.Int("max-concurrent-runs", 0, "quota: reject (429) a POST /runs once N runs are in flight across ALL cells, on top of the existing per-cell 409. 0 = unlimited (default)")
 
 	if err := fs.Parse(argv); err != nil {
@@ -1384,7 +1383,7 @@ func runServe(w io.Writer, argv []string) (int, error) {
 		envPlanner:        splitCSV(*envPlanner),
 		envPublish:        splitCSV(*envPublish),
 		maxAgentsPerRun:   *maxAgentsPerRun,
-		maxRunSeconds:     *maxRunSeconds,
+		maxRunTime:        *maxRunTime,
 		maxConcurrentRuns: *maxConcurrentRuns,
 	})
 	if err != nil {

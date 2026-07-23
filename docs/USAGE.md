@@ -741,9 +741,12 @@ was green or never set. It never runs on a run that failed verify, had no
 agent succeed, or landed nothing (every branch flagged as a conflict).
 
 Sigbound stays host-agnostic on purpose — it never calls `gh`, `glab`, or any
-other host CLI itself (see the top-level [How it works](../README.md#how-it-works)
-guarantee that `sig` never starts a server or acts as a git host). `-publish`
-shells out to whatever your repo already uses instead.
+other host CLI itself, and the `sig run`/`-publish` path itself never starts a
+server or acts as a git host (see the top-level [How it works](../README.md#how-it-works)
+overview). `sig serve` is a separate, explicit opt-in daemon (see [`sig
+serve`](#sig-serve)) — running it is a deliberate choice, never a side effect
+of `sig run` or `-publish`. `-publish` shells out to whatever your repo
+already uses instead.
 
 The **full JSON run report** (the same document `-json` prints and `-manifest`
 writes to disk) is piped to the command's **stdin** — its own `publish` field
@@ -1089,7 +1092,7 @@ sig serve -repos /path/a,/path/b [-addr HOST:PORT] [-token-env NAME] [-allow-rem
 | `-env-mode` | `scoped` | Environment given to every run's commands. Defaults to **scoped** here (a daemon must not leak its environment by default), unlike `sig run`'s `inherit`. Set once by the operator; a request may narrow it per run but never widen the allowlists. See [Scoped environments](#scoped-environments). |
 | `-env-agent` … `-env-publish` | — | Per-slot allowlists for `-env-mode scoped`, exactly as on `sig run`. Operator-set: a request never chooses what env the daemon's commands see. |
 | `-max-agents-per-run` | `0` (unlimited) | Reject (`400`) a `POST /runs` whose agent count exceeds N, before any run starts. See [Quotas and metering](#quotas-and-metering). |
-| `-max-run-seconds` | `0` (unlimited) | Cap every run's `-budget` at N seconds. See [Quotas and metering](#quotas-and-metering). |
+| `-max-run-time` | `0` (unlimited) | Cap every run's `-budget` at this duration (e.g. `10m`). See [Quotas and metering](#quotas-and-metering). |
 | `-max-concurrent-runs` | `0` (unlimited) | Reject (`429`) a `POST /runs` once N runs are in flight across ALL cells. See [Quotas and metering](#quotas-and-metering). |
 
 ### Posture — single-user, single-process
@@ -1201,7 +1204,7 @@ via the same `-budget` machinery that already bounds a run in flight:
 | Flag | Enforcement |
 |------|-------------|
 | `-max-agents-per-run` | The request's agent count exceeds N → `400`. For an explicit `tasks` request the count is exact; for a `goal` (planner) request the true count isn't known until planning runs asynchronously, so the only synchronously-available number — `n`, the planner's already-validated/defaulted target — is checked instead. A BYO planner that ignores `n` is outside what serve can check before starting. |
-| `-max-run-seconds` | Folded into the run's `-budget` via `min(request budget, N seconds)` — a request can only make its own budget **stricter**, never laxer than the server's ceiling. An unset/zero request budget (unlimited) becomes exactly the ceiling. |
+| `-max-run-time` | Folded into the run's `-budget` via `min(request budget, server ceiling)` — a request can only make its own budget **stricter**, never laxer than the server's ceiling. An unset/zero request budget (unlimited) becomes exactly the ceiling. |
 | `-max-concurrent-runs` | N runs already in flight **across ALL cells** → `429 Too Many Requests`, naming the limit. This is on top of the existing per-cell `409` (one run per cell) — different cells can still each hold a slot up to N total. The counter is released on every run's completion, success or operational error alike (a `defer`, so it can't leak even on a panic). |
 
 A quota rejection composes cleanly with everything else: it happens strictly
@@ -1241,7 +1244,7 @@ never sees a token), not a bill itself.
 
 ```sh
 # Cap agent count, wall clock, and total concurrency:
-sig serve -repos /work/api -max-agents-per-run 20 -max-run-seconds 900 -max-concurrent-runs 4
+sig serve -repos /work/api -max-agents-per-run 20 -max-run-time 15m -max-concurrent-runs 4
 
 # Over the cap: 400, no run started.
 curl -s localhost:7777/runs -d '{"cell":"/work/api","tasks":[...25 tasks...],"agent":"..."}'
