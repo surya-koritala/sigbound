@@ -24,7 +24,7 @@
 // Endpoints (JSON in, JSON out):
 //
 //	GET  /health           -> {ok, version, cells:[{id, repo}]}
-//	POST /runs             -> 202 {runId,...}; runs ASYNC via driveRun
+//	POST /runs             -> Content-Type: application/json required; 202 {runId,...}; runs ASYNC via driveRun
 //	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}
 //	GET  /runs/{id}        -> {status: running|done|error, report?}
 //	GET  /runs/{id}/events -> the run's events.ndjson (application/x-ndjson)
@@ -287,6 +287,10 @@ type planSpec struct {
 }
 
 func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, serveMaxBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -615,9 +619,17 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 	if err := validateLaneMode(lanes); err != nil {
 		return runParams{}, zeroPlan, err
 	}
-	// Env policy: server default, request may narrow to an explicit mode.
+	// Env policy: server default, request may narrow to an explicit mode but
+	// never widen it. A scoped server must stay scoped no matter what a
+	// request asks for -- inherit would hand every BYO command (agent/
+	// resolver/verify/repair/planner/publish) the daemon's full environment,
+	// secrets included (issue #60). Widening the other direction (server
+	// inherit, request scoped) is always allowed: that's narrowing.
 	envMode := s.envMode
 	if m := strings.TrimSpace(req.EnvMode); m != "" {
+		if s.envMode == envModeScoped && m == envModeInherit {
+			return runParams{}, zeroPlan, errors.New("envMode: a request cannot widen the server's scoped env-mode to inherit")
+		}
 		envMode = m
 	}
 	if err := validateEnvMode(envMode); err != nil {

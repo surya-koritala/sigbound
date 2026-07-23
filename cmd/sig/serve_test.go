@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +45,9 @@ func doJSON(t *testing.T, method, url, token string, body any, out any) int {
 	req, err := http.NewRequest(method, url, rdr)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -392,6 +397,7 @@ func TestServeBadRequests(t *testing.T) {
 
 	// Malformed JSON is a 400 too.
 	req, _ := http.NewRequest("POST", ts.URL+"/runs", strings.NewReader("{not json"))
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -399,6 +405,18 @@ func TestServeBadRequests(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("malformed JSON status %d, want 400", resp.StatusCode)
+	}
+
+	// A non-JSON Content-Type is 415, before the body is even parsed.
+	req2, _ := http.NewRequest("POST", ts.URL+"/runs", strings.NewReader("{}"))
+	req2.Header.Set("Content-Type", "text/plain")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("wrong Content-Type status %d, want 415", resp2.StatusCode)
 	}
 
 	// An unknown run id is 404.
@@ -568,5 +586,64 @@ func TestServeRealListenerGracefulShutdown(t *testing.T) {
 	}
 	if st := diskStatus(dir); st == "" {
 		t.Fatal("interrupted run wrote no terminal report/error marker")
+	}
+}
+
+// TestServeScopedEnvIsRealDefault is the regression guard for issue #60: a
+// server built with the REAL scoped default (not newTestServer's hardcoded
+// envMode: inherit) must (a) reject a request that tries to widen envMode to
+// inherit, and (b) never let a normal scoped run's agent see a daemon-only
+// secret env var.
+func TestServeScopedEnvIsRealDefault(t *testing.T) {
+	_, repo := makeGoRepo(t)
+
+	const secretName = "SIGBOUND_TEST_DAEMON_SECRET"
+	t.Setenv(secretName, "daemon-secret-value")
+
+	dumpFile := filepath.Join(t.TempDir(), "env.txt")
+	agent := "env > " + dumpFile + " && " + writeFileAgent("served.txt")
+
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeScoped})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler())
+	t.Cleanup(ts.Close)
+
+	// (a) a request cannot widen the server's scoped default to inherit.
+	var body map[string]string
+	code := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:    repo,
+		Tasks:   []taskSpec{{ID: "widen"}},
+		Agent:   agent,
+		EnvMode: envModeInherit,
+	}, &body)
+	if code != http.StatusBadRequest {
+		t.Fatalf("widen envMode: status %d, want 400 (body %v)", code, body)
+	}
+	if !strings.Contains(body["error"], "cannot widen") {
+		t.Fatalf("widen envMode error %q, want it to mention widening", body["error"])
+	}
+
+	// (b) a normal scoped run's agent does not see the daemon's secret.
+	var created struct{ RunID string }
+	code = doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:  repo,
+		Tasks: []taskSpec{{ID: "scoped"}},
+		Agent: agent,
+	}, &created)
+	if code != http.StatusAccepted {
+		t.Fatalf("POST /runs status %d, want 202", code)
+	}
+	final := pollRun(t, ts, "", created.RunID)
+	if final.Status != "done" {
+		t.Fatalf("run status %q (error=%q), want done", final.Status, final.Error)
+	}
+	data, err := os.ReadFile(dumpFile)
+	if err != nil {
+		t.Fatalf("read agent env dump: %v", err)
+	}
+	if strings.Contains(string(data), secretName) {
+		t.Fatalf("scoped agent's env leaked the daemon secret:\n%s", data)
 	}
 }
