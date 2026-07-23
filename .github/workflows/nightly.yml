@@ -83,7 +83,9 @@ jobs:
           retention-days: 30
 
   # The full -race suite on the oldest and newest supported Go, same as
-  # ci.yml's race job but without the -short/fast constraints CI implies.
+  # ci.yml's race job (which has no -short flag either); the only delta here
+  # is -count=1, which disables Go's test result caching so every run is
+  # actually re-executed instead of possibly reporting a cached pass.
   race-matrix:
     name: race (go ${{ matrix.go }})
     runs-on: ubuntu-latest
@@ -107,14 +109,10 @@ jobs:
   # The full sigbench A/B sweep: all strategies, both overlap knobs, plus a
   # conflict-heavy variant sigbench's own -conflict flag exposes.
   #
-  # sigbench's -sweep mode never sets a non-zero exit code on a correctness
-  # failure at an individual sweep point (runSweep only logs "[sweep]
-  # CORRECTNESS FAILURE ..." to stderr and keeps going) — only its
-  # non-sweep, single-config mode calls os.Exit(2) via gateOK. So the sweep
-  # step greps the captured output for the sweep's own failure line and for
-  # a "NO"/"FAIL"/"ERR" cell in the trees-eq/correct table columns; the
-  # conflict-heavy step runs in non-sweep mode where the exit code alone is
-  # authoritative.
+  # sigbench's -sweep mode now propagates a failed sweep point to a non-zero
+  # exit code (main exits 2, same as the non-sweep path's gateOK check), so
+  # the exit code from `go run` is the real gate here. The grep below is
+  # belt-and-suspenders only, in case the exit-code plumbing ever regresses.
   bench-correctness:
     name: bench correctness sweep
     runs-on: ubuntu-latest
@@ -130,9 +128,17 @@ jobs:
 
       - name: A/B correctness sweep (all strategies, both overlap knobs)
         run: |
+          # pipefail is on by default for GitHub Actions' bash steps, which
+          # combined with -e would abort right at the pipe below (skipping
+          # our own error message) the moment `go run` exits non-zero.
+          # Turn it off just for this line so we can check the real exit
+          # code ourselves and print something useful first.
+          set +o pipefail
           go run ./cmd/sigbench -sweep -runs 3 -warmup 1 2>&1 | tee sweep.log
-          if grep -q 'CORRECTNESS FAILURE' sweep.log || grep -Pq '\tNO\t|\tFAIL\t|\tERR\t' sweep.log; then
-            echo "sigbench: correctness failure detected in sweep output (see above)" >&2
+          status=${PIPESTATUS[0]}
+          set -o pipefail
+          if [ "$status" -ne 0 ] || grep -q 'CORRECTNESS FAILURE' sweep.log; then
+            echo "sigbench: correctness failure detected (exit=$status, see above)" >&2
             exit 1
           fi
 

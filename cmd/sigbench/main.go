@@ -52,9 +52,14 @@ func main() {
 	ctx := context.Background()
 
 	if *sweep {
-		if err := runSweep(ctx, strategies, *runs, *warmup, *seed); err != nil {
+		failed, err := runSweep(ctx, strategies, *runs, *warmup, *seed)
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "sigbench: sweep error:", err)
 			os.Exit(1)
+		}
+		if failed {
+			fmt.Fprintln(os.Stderr, "sigbench: CORRECTNESS FAILURE")
+			os.Exit(2)
 		}
 		return
 	}
@@ -86,7 +91,9 @@ func main() {
 
 // runSweep prints the headline A/B table: agents {8,32,64,128,256} × overlap
 // {0.1, 0.5} at files=2000, conflict=0 (all changes must land), for each strategy.
-func runSweep(ctx context.Context, strategies []string, runs, warmup int, seed int64) error {
+// It returns failed=true if any sweep point failed correctness (gateOK), so the
+// caller can exit non-zero the same way the non-sweep path does.
+func runSweep(ctx context.Context, strategies []string, runs, warmup int, seed int64) (failed bool, err error) {
 	agentCounts := []int{8, 32, 64, 128, 256}
 	overlaps := []float64{0.1, 0.5}
 	for _, ov := range overlaps {
@@ -95,18 +102,19 @@ func runSweep(ctx context.Context, strategies []string, runs, warmup int, seed i
 			cfg := bench.Config{Agents: n, Files: 2000, Overlap: ov, Conflict: 0, HotFiles: 1, Seed: seed}
 			ab, err := bench.RunAB(ctx, cfg, strategies, warmup, runs)
 			if err != nil {
-				return fmt.Errorf("agents=%d overlap=%.2f: %w", n, ov, err)
+				return failed, fmt.Errorf("agents=%d overlap=%.2f: %w", n, ov, err)
 			}
 			results = append(results, ab)
 			fmt.Fprintf(os.Stderr, "  [sweep] done agents=%d overlap=%.2f commits/s=%.0f\n", n, ov, ab.CommitsPerSec)
 			if !gateOK(ab, strategies) {
+				failed = true
 				fmt.Fprintf(os.Stderr, "  [sweep] CORRECTNESS FAILURE at agents=%d overlap=%.2f\n", n, ov)
 			}
 		}
 		bench.FormatSweep(os.Stdout, fmt.Sprintf("overlap=%.2f files=2000 conflict=0 seed=%d runs=%d warmup=%d",
 			ov, seed, runs, warmup), results, strategies)
 	}
-	return nil
+	return failed, nil
 }
 
 // gateOK is true when every measured strategy stayed correct and, where
