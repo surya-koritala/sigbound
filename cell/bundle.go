@@ -82,7 +82,7 @@ func (c *Cell) Import(ctx context.Context, bundlePath, workerID string) ([]Impor
 		workerID = bundleStem(bundlePath)
 	}
 	if !workerIDSafe(workerID) {
-		return nil, fmt.Errorf("import: unsafe worker id %q (allowed: letters, digits, '.', '_', '-'; not '.'/'..' )", workerID)
+		return nil, fmt.Errorf("import: unsafe worker id %q (allowed: letters, digits, '.', '_', '-'; not '.', and no '..' anywhere)", workerID)
 	}
 	// Verify BEFORE unbundling — the required gate against a corrupt/forged
 	// bundle. Only after it passes do we import objects.
@@ -124,11 +124,15 @@ func bundleStem(path string) string {
 }
 
 // workerIDSafe keeps the worker id a single safe ref component: it becomes part
-// of refs/heads/imported/<id>/…, so it must not be empty, be "."/"..", or carry
-// a slash, whitespace, or any character outside [A-Za-z0-9._-]. Mirrors cmd/sig's
+// of refs/heads/imported/<id>/…, so it must not be empty, be ".", carry a "..",
+// or carry a slash, whitespace, or any character outside [A-Za-z0-9._-]. The ".."
+// check is rejected up front rather than left to git: git refuses any ref
+// component containing ".." (e.g. worker id "a..b"), but only once the ref is
+// actually composed after unbundling — a confusing mid-import "invalid ref
+// format" instead of a clean error naming the bad worker id. Mirrors cmd/sig's
 // slugSafe (no regexp dependency).
 func workerIDSafe(id string) bool {
-	if id == "" || id == "." || id == ".." {
+	if id == "" || id == "." || strings.Contains(id, "..") {
 		return false
 	}
 	for _, r := range id {

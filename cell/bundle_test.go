@@ -354,7 +354,7 @@ func TestWorkerIDValidation(t *testing.T) {
 			t.Fatalf("workerIDSafe(%q) = false, want true", ok)
 		}
 	}
-	for _, bad := range []string{"", ".", "..", "a/b", "has space", "up/../down", "emoji😀"} {
+	for _, bad := range []string{"", ".", "..", "a/b", "has space", "up/../down", "emoji😀", "..evil", "a..b", "..."} {
 		if workerIDSafe(bad) {
 			t.Fatalf("workerIDSafe(%q) = true, want false", bad)
 		}

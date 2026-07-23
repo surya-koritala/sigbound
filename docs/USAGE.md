@@ -972,6 +972,12 @@ sig integrate -repo COORD -base main -branches imported/w1/agent/t1,imported/w1/
 
 ### End-to-end example
 
+`sig integrate` on its own has no verify gate — unlike `sig run -verify`, it
+folds and lands (or, with `-no-land`, folds and stops) without ever running a
+build or test command. On a coordinator that's importing branches it didn't
+build itself, land only what you've verified: integrate detached with
+`-no-land`, test the printed `finalSHA`, and land only on green.
+
 ```sh
 #!/bin/sh
 set -eu
@@ -984,21 +990,44 @@ sig export -repo /work/clone -bundle /tmp/worker-a.bundle \
 # --- move the file by any means you like (no server involved) ---
 scp /tmp/worker-a.bundle coordinator:/tmp/worker-a.bundle
 
-# --- on the COORDINATOR: import under a namespace, then integrate + land ---
+# --- on the COORDINATOR: import under a namespace ---
 sig import -repo /srv/main -bundle /tmp/worker-a.bundle -from worker-a -json
 # imported/worker-a/agent/t1, imported/worker-a/agent/t2, imported/worker-a/agent/t3
 
+# --- integrate WITHOUT landing: fold the branches, leave the result detached ---
+sig integrate -repo /srv/main -base main -no-land -json \
+  -branches imported/worker-a/agent/t1,imported/worker-a/agent/t2,imported/worker-a/agent/t3 \
+  > /tmp/integrate.json
+finalSHA=$(jq -r .finalSHA /tmp/integrate.json)
+
+# --- verify the integrated tree BEFORE it ever touches main ---
+git -C /srv/main worktree add /tmp/verify-worktree "$finalSHA"
+( cd /tmp/verify-worktree && ./run-tests.sh )   # your build/test command
+git -C /srv/main worktree remove /tmp/verify-worktree
+
+# --- land only on green: re-run integrate now that it's verified ---
 sig integrate -repo /srv/main -base main \
   -branches imported/worker-a/agent/t1,imported/worker-a/agent/t2,imported/worker-a/agent/t3
+# ...or, since you already have the exact tree tested, advance the ref directly:
+git -C /srv/main update-ref refs/heads/main "$finalSHA"
 ```
 
 The result is identical to integrating those branches on the worker itself —
 the transport is lossless (the imported trees are byte-for-byte the worker's).
-`sig integrate` folds and lands with the same in-object-store engine as a
+`sig integrate` folds with the same in-object-store engine as a
 single-machine run: non-conflicting branches land, real conflicts are flagged
-rather than guessed. (Landing gated on a `-verify` command is a `sig run`
-feature; run your build/test as a follow-up step if you want the coordinator to
-gate on it.)
+rather than guessed.
+
+Re-running `sig integrate` a second time (without `-no-land`) recomputes and
+lands the identical tree because folding is deterministic — the second run
+isn't redoing the test, just publishing the SHA you already verified;
+advancing the ref by hand with `git update-ref` does the same thing without
+paying for a second fold. Either way, nothing lands on `main` until the
+`finalSHA` you tested is the `finalSHA` you land. Centrally-gated landing —
+the coordinator itself running the `-verify` command, the way `sig run` does
+on a single machine — is the serve layer's job (issue #60, not yet built);
+until then, this `-no-land` → verify → land pattern is how you keep
+sigbound's verify-gated-landing promise on a coordinator.
 
 ---
 
