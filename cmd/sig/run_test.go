@@ -1288,6 +1288,12 @@ func TestDriveRunVerifyRetries(t *testing.T) {
 	if !rep1.Verify.Flaky {
 		t.Fatal("verify.flaky=false, want true (passed only on the 2nd invocation)")
 	}
+	if rep1.Verify.Invocations != 2 {
+		t.Fatalf("verify.invocations=%d, want 2 (the failing first try + the retry that passed)", rep1.Verify.Invocations)
+	}
+	if rep1.Verify.WallMs <= 0 {
+		t.Fatalf("verify.wallMs=%d, want > 0 (two real command invocations)", rep1.Verify.WallMs)
+	}
 	if mainSHA, err := gitx.New(repo1).RevParse(ctx, "main"); err != nil || mainSHA != rep1.Integrate.FinalSHA {
 		t.Fatalf("flaky-but-green run must still land: main=%s finalSHA=%s err=%v", mainSHA, rep1.Integrate.FinalSHA, err)
 	}
@@ -1309,6 +1315,9 @@ func TestDriveRunVerifyRetries(t *testing.T) {
 	}
 	if rep0.Verify.Flaky {
 		t.Fatal("verify.flaky=true with -verify-retries 0, want false")
+	}
+	if rep0.Verify.Invocations != 1 {
+		t.Fatalf("verify.invocations=%d, want 1 (no retry configured)", rep0.Verify.Invocations)
 	}
 	if code := runExitCode(rep0); code != exitVerifyFailed {
 		t.Fatalf("runExitCode=%d, want exitVerifyFailed", code)
@@ -1550,6 +1559,14 @@ func TestDriveRunRepairSucceeds(t *testing.T) {
 	}
 	if !contains(last.FilesTouched, "repair_fix.go") {
 		t.Fatalf("repair filesTouched=%v, want repair_fix.go", last.FilesTouched)
+	}
+	// One repair round -> two -verify invocations total: the initial failing
+	// attempt plus the post-repair re-verify that passed.
+	if v.Invocations != 2 {
+		t.Fatalf("verify.invocations=%d, want 2 (initial fail + post-repair re-verify)", v.Invocations)
+	}
+	if v.WallMs <= 0 {
+		t.Fatalf("verify.wallMs=%d, want > 0", v.WallMs)
 	}
 
 	// The fix must LAND: base branch advanced to the repaired head, whose tree
@@ -2424,6 +2441,12 @@ func TestDriveRunVerifyCacheHitsOnIdenticalTree(t *testing.T) {
 	if n := countLines(t, marker); n != 1 {
 		t.Fatalf("verify command ran %d time(s) after run #1, want 1", n)
 	}
+	if rep1.Verify.Invocations != 1 {
+		t.Fatalf("run #1: invocations=%d, want 1 (one real -verify invocation)", rep1.Verify.Invocations)
+	}
+	if rep1.Verify.WallMs <= 0 {
+		t.Fatalf("run #1: wallMs=%d, want > 0 (a real -verify invocation ran)", rep1.Verify.WallMs)
+	}
 
 	p2 := p
 	p2.Base = "main2"
@@ -2436,6 +2459,17 @@ func TestDriveRunVerifyCacheHitsOnIdenticalTree(t *testing.T) {
 	}
 	if n := countLines(t, marker); n != 1 {
 		t.Fatalf("verify command ran %d time(s) after run #2, want still 1 (a cache hit must skip the command entirely)", n)
+	}
+	// A cache hit never actually spawns -verify, so it must not be counted as
+	// an invocation nor contribute wall time — see verifyJSON's doc comment
+	// ("the total number of times the -verify command itself was ACTUALLY
+	// run"). This is what flows into sig serve's usage.json verifyAttempts/
+	// verifyWallMs (issue #61 metering); a cache hit must not overcount those.
+	if rep2.Verify.Invocations != 0 {
+		t.Fatalf("run #2 (cached): invocations=%d, want 0 (the -verify command was never spawned)", rep2.Verify.Invocations)
+	}
+	if rep2.Verify.WallMs != 0 {
+		t.Fatalf("run #2 (cached): wallMs=%d, want 0 (no -verify command ran to spend wall time on)", rep2.Verify.WallMs)
 	}
 
 	// Confirm the premise the whole test rests on: the two runs really did

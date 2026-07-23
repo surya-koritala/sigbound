@@ -1088,6 +1088,9 @@ sig serve -repos /path/a,/path/b [-addr HOST:PORT] [-token-env NAME] [-allow-rem
 | `-allow-remote` | `false` | Permit a non-loopback `-addr`. Serve ships no TLS and no user model — you accept responsibility for a TLS-terminating, access-controlled proxy in front of it. |
 | `-env-mode` | `scoped` | Environment given to every run's commands. Defaults to **scoped** here (a daemon must not leak its environment by default), unlike `sig run`'s `inherit`. Set once by the operator; a request may narrow it per run but never widen the allowlists. See [Scoped environments](#scoped-environments). |
 | `-env-agent` … `-env-publish` | — | Per-slot allowlists for `-env-mode scoped`, exactly as on `sig run`. Operator-set: a request never chooses what env the daemon's commands see. |
+| `-max-agents-per-run` | `0` (unlimited) | Reject (`400`) a `POST /runs` whose agent count exceeds N, before any run starts. See [Quotas and metering](#quotas-and-metering). |
+| `-max-run-seconds` | `0` (unlimited) | Cap every run's `-budget` at N seconds. See [Quotas and metering](#quotas-and-metering). |
+| `-max-concurrent-runs` | `0` (unlimited) | Reject (`429`) a `POST /runs` once N runs are in flight across ALL cells. See [Quotas and metering](#quotas-and-metering). |
 
 ### Posture — single-user, single-process
 
@@ -1114,8 +1117,10 @@ All requests and responses are JSON (events are NDJSON).
 | `GET /health` | `{ok, version, cells:[{id, repo}]}` |
 | `POST /runs` | Start a run. Returns **202** `{runId, cell, status}` immediately; the run executes asynchronously. |
 | `GET /runs` | `{runs:[{id, cell, status, startedAt, finalSHA?}]}`, newest first. |
-| `GET /runs/{id}` | `{id, cell, status, startedAt, report?}` — `status` is `running`, `done`, or `error`; the full run report is present once `done`. |
+| `GET /runs/{id}` | `{id, cell, status, startedAt, report?, usage?}` — `status` is `running`, `done`, or `error`; the full run report is present once `done`, and `usage` alongside it (see [Quotas and metering](#quotas-and-metering)). |
 | `GET /runs/{id}/events` | The run's `events.ndjson` as written so far (`Content-Type: application/x-ndjson`) — the same lifecycle events `sig run -events` emits. |
+| `GET /runs/{id}/usage` | That run's metering record. `404` until the run has written a report. |
+| `GET /usage` | Usage totals across all run history, plus a per-cell rollup. |
 
 The `POST /runs` body mirrors `sig run`'s flags by name (camelCased); durations
 are Go duration strings (`"30s"`, `"2m"`). `cell` is a cell id (from `/health`)
@@ -1141,6 +1146,72 @@ uses; `rm -rf .git/sigbound` resets it and it never shows up in `git status`.
 `SIGINT`/`SIGTERM` stops accepting new requests, cancels every in-flight run's
 context (they honor it via the same `-budget` machinery), lets them write their
 final reports, and exits. A second `Ctrl-C` hard-kills.
+
+### Quotas and metering
+
+A **managed-layer** feature on `serve` only — `sig run` is untouched and stays
+uncapped. Everything here is **opt-in** via server flags; leave them all at
+their default (`0`) and behavior is byte-identical to before this existed.
+
+**Quotas** are hosted-side ceilings, enforced at `POST /runs` **before a run
+starts** (no run directory created, no cell slot held) and, for wall clock,
+via the same `-budget` machinery that already bounds a run in flight:
+
+| Flag | Enforcement |
+|------|-------------|
+| `-max-agents-per-run` | The request's agent count exceeds N → `400`. For an explicit `tasks` request the count is exact; for a `goal` (planner) request the true count isn't known until planning runs asynchronously, so the only synchronously-available number — `n`, the planner's already-validated/defaulted target — is checked instead. A BYO planner that ignores `n` is outside what serve can check before starting. |
+| `-max-run-seconds` | Folded into the run's `-budget` via `min(request budget, N seconds)` — a request can only make its own budget **stricter**, never laxer than the server's ceiling. An unset/zero request budget (unlimited) becomes exactly the ceiling. |
+| `-max-concurrent-runs` | N runs already in flight **across ALL cells** → `429 Too Many Requests`, naming the limit. This is on top of the existing per-cell `409` (one run per cell) — different cells can still each hold a slot up to N total. The counter is released on every run's completion, success or operational error alike (a `defer`, so it can't leak even on a panic). |
+
+A quota rejection composes cleanly with everything else: it happens strictly
+before the per-cell busy check and the run directory is created, so a
+rejected request leaves **zero** trace on disk and never touches a cell's
+run slot.
+
+**Metering** is a per-run usage record, always on (it costs nothing — every
+number is derived from data `driveRun`'s report already tracks, plus the one
+wall-clock bracket only `serve` itself can measure). It's written as
+`usage.json` alongside `report.json` under the run's directory, so it
+survives a restart the same way. Fields:
+
+| Field | Meaning |
+|-------|---------|
+| `agentsTotal` / `agentsOk` / `agentsFailed` | Per-agent outcome counts. |
+| `integrateWallMs` | `report.integrate.wallMs`, unchanged. |
+| `verifyAttempts` | Total `-verify` command invocations: the initial attempt's `-verify-retries` loop, plus one per repair round that reached a re-verify. |
+| `repairAttempts` | Repair rounds actually run (`report.verify.attempts`). |
+| `verifyWallMs` | Summed wall time of every invocation counted in `verifyAttempts`. |
+| `totalWallMs` | The run's full wall clock as `serve` saw it — `POST /runs` acceptance to the run's terminal write. For a `goal` run this includes planning time, which `driveRun`'s own report never sees. |
+| `landed` | The base ref actually advanced. **Not** the same as `report.integrate.finalSHA != report.baseSHA` — `finalSHA` is populated with the *integrated* tree even when `-verify` fails and nothing is ever written to the ref. |
+| `reportBytes` | Size of `report.json` on disk. |
+
+`GET /runs/{id}/usage` returns one run's record (`404` until it exists — a
+still-running run, or one that errored before any agent ran, has none). It's
+also embedded in `GET /runs/{id}` as `usage`. `GET /usage` aggregates every
+run in history into `{totals, cells: [{cell, repo, usage}]}` — sums of every
+field above (`landed`/`runs` as counts) — for the fleet-wide "how much did
+this cost to run" story.
+
+**This is not a biller.** There is no price, currency, unit cost, or external
+metering call anywhere in `sig serve` — `usage.json` is the DATA layer a
+hosted product would meter on (engine work: agents run, integrate/verify wall
+time, repair rounds — the honest billable unit for a BYO-model engine that
+never sees a token), not a bill itself.
+
+```sh
+# Cap agent count, wall clock, and total concurrency:
+sig serve -repos /work/api -max-agents-per-run 20 -max-run-seconds 900 -max-concurrent-runs 4
+
+# Over the cap: 400, no run started.
+curl -s localhost:7777/runs -d '{"cell":"/work/api","tasks":[...25 tasks...],"agent":"..."}'
+# -> 400 {"error":"agent count 25 exceeds this server's max-agents-per-run 20"}
+
+# One run's usage record:
+curl -s localhost:7777/runs/20260722T164530Z-a1b2c3d4e5f6/usage | jq
+
+# Fleet-wide totals:
+curl -s localhost:7777/usage | jq '.totals'
+```
 
 ### curl examples
 
@@ -1338,7 +1409,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   "verify": {
     "ran": true, "ok": true, "attempts": 1, "repaired": false, "flaky": false,
     "scope": "impact", "impactedPkgs": ["./a", "./b"], "cached": false,
-    "output": "…",
+    "output": "…", "invocations": 2, "wallMs": 340,
     "repairs": [ { "n": 1, "filesTouched": ["…"], "verifyOk": true } ],
     "bisect": {
       "ran": true, "attempts": 4,
@@ -1377,6 +1448,13 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   prior pass instead of actually running the command (see [Cache](#cache));
   always `false` when `-verify-cache` isn't set, and never `true` for a
   failing verdict.
+- `verify.invocations`/`verify.wallMs` count and time every actual `-verify`
+  command run: the initial attempt's `-verify-retries` loop, plus one more
+  per repair round that reached a re-verify. Both are `0` when `-verify`
+  wasn't set. `-verify-bisect`'s own probes are **not** folded in here — they
+  have their own count in `verify.bisect.attempts`. `sig serve`'s per-run
+  usage record (see [Quotas and metering](#quotas-and-metering)) is built
+  from these.
 - `verify.bisect` is present iff `-verify-bisect` ran (the full tree failed
   and there were ≥ 2 groups to bisect — see [Verify bisect](#verify-bisect)).
   `landedGroups`/`droppedGroups` list the branch names per group that landed

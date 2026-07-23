@@ -26,12 +26,23 @@
 //	GET  /health           -> {ok, version, cells:[{id, repo}]}
 //	POST /runs             -> Content-Type: application/json required; 202 {runId,...}; runs ASYNC via driveRun
 //	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}
-//	GET  /runs/{id}        -> {status: running|done|error, report?}
+//	GET  /runs/{id}        -> {status: running|done|error, report?, usage?}
 //	GET  /runs/{id}/events -> the run's events.ndjson (application/x-ndjson)
+//	GET  /runs/{id}/usage  -> that run's metering record (see usage.go)
+//	GET  /usage            -> usage totals across all run history, + a per-cell rollup
 //
 // One run per cell at a time: a second POST for a cell whose run is still in
 // flight gets 409 Conflict (a run moves the base ref; serializing is the only
 // honest semantics). DIFFERENT cells run fully in parallel — the sharding payoff.
+//
+// QUOTAS: managed-layer ceilings, all opt-in via server flags (0 = unlimited,
+// today's behavior byte-identical): -max-agents-per-run (400 on POST /runs
+// before any run starts), -max-run-seconds (a request's -budget, capped via
+// min()), -max-concurrent-runs (429 across ALL cells, on top of the per-cell
+// 409). METERING is always on — a usage.json is written alongside every
+// run's report.json, derived from data driveRun already tracks. Neither is a
+// biller: no price, currency, or external metering call. See docs/USAGE.md's
+// "Quotas and metering" section.
 package main
 
 import (
@@ -94,10 +105,22 @@ type server struct {
 	cells []*registeredCell
 	byKey map[string]*registeredCell // cell id AND absolute repo path -> cell
 
-	mu   sync.Mutex
-	busy map[string]bool       // cell id -> a run is in flight (per-cell 409)
-	runs map[string]*runRecord // runId -> live record for THIS process
-	wg   sync.WaitGroup        // in-flight run goroutines, waited on shutdown
+	// Managed-layer quotas (see docs/USAGE.md "Quotas and metering"), all
+	// opt-in via server flags: 0 = unlimited, today's (#60) behavior
+	// byte-identical. maxAgentsPerRun and maxConcurrentRuns are enforced in
+	// handleCreateRun BEFORE a run starts (no run dir, no cell slot held on
+	// rejection); maxRunSeconds is folded into a request's -budget via
+	// min() in buildParams — a request can only make its own budget
+	// stricter, never laxer than the server ceiling.
+	maxAgentsPerRun   int
+	maxRunSeconds     int
+	maxConcurrentRuns int
+
+	mu         sync.Mutex
+	busy       map[string]bool       // cell id -> a run is in flight (per-cell 409)
+	activeRuns int                   // runs in flight across ALL cells (maxConcurrentRuns' 429 counter)
+	runs       map[string]*runRecord // runId -> live record for THIS process
+	wg         sync.WaitGroup        // in-flight run goroutines, waited on shutdown
 }
 
 // runRecord is the in-memory truth for a run started by THIS process. Disk
@@ -126,6 +149,12 @@ type serverConfig struct {
 	envRepair   []string
 	envPlanner  []string
 	envPublish  []string
+
+	// Managed-layer quotas; see server.maxAgentsPerRun's doc comment. 0 (the
+	// zero value) is unlimited on every one of these.
+	maxAgentsPerRun   int
+	maxRunSeconds     int
+	maxConcurrentRuns int
 }
 
 // newServer opens every repo as a cell (fail-fast on any bad repo) and resolves
@@ -137,18 +166,21 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		return nil, errors.New("-repos is required (comma-separated repo paths)")
 	}
 	s := &server{
-		token:       cfg.token,
-		baseCtx:     baseCtx,
-		envMode:     cfg.envMode,
-		envAgent:    cfg.envAgent,
-		envResolver: cfg.envResolver,
-		envVerify:   cfg.envVerify,
-		envRepair:   cfg.envRepair,
-		envPlanner:  cfg.envPlanner,
-		envPublish:  cfg.envPublish,
-		byKey:       map[string]*registeredCell{},
-		busy:        map[string]bool{},
-		runs:        map[string]*runRecord{},
+		token:             cfg.token,
+		baseCtx:           baseCtx,
+		envMode:           cfg.envMode,
+		envAgent:          cfg.envAgent,
+		envResolver:       cfg.envResolver,
+		envVerify:         cfg.envVerify,
+		envRepair:         cfg.envRepair,
+		envPlanner:        cfg.envPlanner,
+		envPublish:        cfg.envPublish,
+		maxAgentsPerRun:   cfg.maxAgentsPerRun,
+		maxRunSeconds:     cfg.maxRunSeconds,
+		maxConcurrentRuns: cfg.maxConcurrentRuns,
+		byKey:             map[string]*registeredCell{},
+		busy:              map[string]bool{},
+		runs:              map[string]*runRecord{},
 	}
 	ctx := context.Background()
 	for _, repo := range cfg.repos {
@@ -182,6 +214,8 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /runs", s.handleListRuns)
 	mux.HandleFunc("GET /runs/{id}", s.handleGetRun)
 	mux.HandleFunc("GET /runs/{id}/events", s.handleRunEvents)
+	mux.HandleFunc("GET /runs/{id}/usage", s.handleRunUsage)
+	mux.HandleFunc("GET /usage", s.handleUsageAggregate)
 	if s.token == "" {
 		return mux
 	}
@@ -333,13 +367,40 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Quota: -max-agents-per-run, checked before anything is acquired or
+	// created (see server.maxAgentsPerRun's doc comment) — a rejection here
+	// starts no run at all. For an explicit -tasks request the count is
+	// exact; for a -goal (planner) request the true count isn't known until
+	// planning runs asynchronously, so the only synchronously-available
+	// number is N, the planner's already-validated/defaulted target count
+	// (plan.n) — a BYO planner that ignores N is outside what serve can
+	// check before starting.
+	if s.maxAgentsPerRun > 0 {
+		agentCount := len(req.Tasks)
+		if haveGoal {
+			agentCount = plan.n
+		}
+		if agentCount > s.maxAgentsPerRun {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("agent count %d exceeds this server's max-agents-per-run %d", agentCount, s.maxAgentsPerRun))
+			return
+		}
+	}
+
 	// Acquire the cell's run slot and create the run's durable directory before
 	// returning 202, so the events endpoint can be polled the instant the
-	// caller has the runId. A cell already running rejects with 409.
+	// caller has the runId. A cell already running rejects with 409. Quota:
+	// -max-concurrent-runs, a global ceiling across ALL cells on top of that
+	// per-cell 409 — checked under the same lock, before the run dir is
+	// created, so a 429 here starts no run either.
 	s.mu.Lock()
 	if s.busy[rc.cell.ID()] {
 		s.mu.Unlock()
 		writeErr(w, http.StatusConflict, fmt.Sprintf("a run is already in progress for cell %s (%s); one run per cell at a time", rc.cell.ID(), rc.cell.Repo()))
+		return
+	}
+	if s.maxConcurrentRuns > 0 && s.activeRuns >= s.maxConcurrentRuns {
+		s.mu.Unlock()
+		writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("this server's max-concurrent-runs %d is already in flight; try again once a run finishes", s.maxConcurrentRuns))
 		return
 	}
 	runID := newRunID()
@@ -350,6 +411,7 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.busy[rc.cell.ID()] = true
+	s.activeRuns++
 	rec := &runRecord{id: runID, cellID: rc.cell.ID(), repo: rc.cell.Repo(), dir: dir, status: "running", startedAt: time.Now()}
 	s.runs[runID] = rec
 	s.wg.Add(1)
@@ -371,9 +433,13 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 // -budget machinery already honors.
 func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan planSpec, haveGoal bool) {
 	defer s.wg.Done()
+	// Releases the cell slot AND the global concurrency counter on every
+	// return path — including a panic unwinding through here — so
+	// -max-concurrent-runs never wedges on an error.
 	defer func() {
 		s.mu.Lock()
 		s.busy[rec.cellID] = false
+		s.activeRuns--
 		s.mu.Unlock()
 	}()
 
@@ -397,11 +463,20 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 		// runRun's partial-report emit) before recording the error.
 		if len(rep.PerAgent) > 0 {
 			writeRunReport(rec.dir, rep)
+			// A driveRun error only ever originates before or exactly at
+			// landing (see driveRun's err returns), so the ref never
+			// advanced — Landed is unconditionally false here, unlike
+			// computeUsage's report-field heuristic (accurate only for a
+			// completed, non-erroring driveRun return, i.e. the path below).
+			u := computeUsage(&rep, time.Since(rec.startedAt).Milliseconds(), reportFileSize(rec.dir))
+			u.Landed = false
+			writeRunUsage(rec.dir, u)
 		}
 		s.failRun(rec, err.Error())
 		return
 	}
 	writeRunReport(rec.dir, rep)
+	writeRunUsage(rec.dir, computeUsage(&rep, time.Since(rec.startedAt).Milliseconds(), reportFileSize(rec.dir)))
 	s.mu.Lock()
 	rec.status = "done"
 	rec.finalSHA = rep.Integrate.FinalSHA
@@ -417,7 +492,11 @@ func (s *server) failRun(rec *runRecord, msg string) {
 }
 
 // runStatusResponse is GET /runs/{id}'s body. Report is the full runReport,
-// present only once the run is done (read from report.json).
+// present only once the run is done (read from report.json). Usage is the
+// run's metering record (see usage.go), present whenever usage.json was
+// written — i.e. whenever Report is, plus a run that errored with a partial
+// report (see execRun) — nil (omitted) on a still-running run or one that
+// wrote no report at all.
 type runStatusResponse struct {
 	ID        string     `json:"id"`
 	Cell      string     `json:"cell"`
@@ -425,6 +504,7 @@ type runStatusResponse struct {
 	StartedAt string     `json:"startedAt,omitempty"`
 	Error     string     `json:"error,omitempty"`
 	Report    *runReport `json:"report,omitempty"`
+	Usage     *UsageJSON `json:"usage,omitempty"`
 }
 
 func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
@@ -478,6 +558,9 @@ func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			errMsg = readRunErrorMsg(dir)
 		}
 		resp.Error = errMsg
+	}
+	if u, err := readRunUsage(dir); err == nil {
+		resp.Usage = u
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -578,6 +661,69 @@ func (s *server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 	w.Write(data) //nolint:errcheck // response body; nothing to recover on a write error
 }
 
+// handleRunUsage serves one run's metering record (see usage.go). 404s the
+// same way an unknown run does when the id doesn't resolve to any run dir,
+// and separately 404s (with a distinguishing message) when the dir exists
+// but usage.json doesn't yet — a still-running run, or one that errored
+// before any agent ran (see execRun's writeRunUsage gating).
+func (s *server) handleRunUsage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRunID(id) {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
+	s.mu.Lock()
+	rec := s.runs[id]
+	var dir string
+	if rec != nil {
+		dir = rec.dir
+	}
+	s.mu.Unlock()
+	if rec == nil {
+		_, fdir, ok := s.findRunDir(id)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "unknown run")
+			return
+		}
+		dir = fdir
+	}
+	u, err := readRunUsage(dir)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, fmt.Sprintf("usage not available for run %s (not yet completed, or no report was written)", id))
+		return
+	}
+	writeJSON(w, http.StatusOK, u)
+}
+
+// handleUsageAggregate serves GET /usage: usage totals across every run in
+// history that has a usage record, plus a per-cell rollup — the "metering"
+// story (see docs/USAGE.md "Quotas and metering"). Same disk scan shape as
+// handleListRuns, unlocked (usage.json is read-only, immutable once written).
+func (s *server) handleUsageAggregate(w http.ResponseWriter, r *http.Request) {
+	type cellUsage struct {
+		Cell  string      `json:"cell"`
+		Repo  string      `json:"repo"`
+		Usage usageTotals `json:"usage"`
+	}
+	var total usageTotals
+	cells := make([]cellUsage, 0, len(s.cells))
+	for _, rc := range s.cells {
+		var cu usageTotals
+		names, _ := os.ReadDir(rc.runsDir) // missing dir => no runs yet
+		for _, de := range names {
+			if !de.IsDir() {
+				continue
+			}
+			if u, err := readRunUsage(filepath.Join(rc.runsDir, de.Name())); err == nil {
+				cu.addUsage(*u)
+			}
+		}
+		cells = append(cells, cellUsage{Cell: rc.cell.ID(), Repo: rc.cell.Repo(), Usage: cu})
+		total.addTotals(cu)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"totals": total, "cells": cells})
+}
+
 // ---- request -> runParams ----
 
 // buildParams validates a runRequest the way runRun validates its flags (reusing
@@ -653,6 +799,16 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 	budget, err := parseDur(req.Budget, 0)
 	if err != nil {
 		return runParams{}, zeroPlan, fmt.Errorf("budget: %w", err)
+	}
+	// Quota: -max-run-seconds caps -budget at this server's ceiling. A
+	// request can only make its own budget STRICTER, never laxer than the
+	// server's: an unset/0 request budget (unlimited) becomes the ceiling,
+	// and a request budget already under the ceiling is left alone.
+	if s.maxRunSeconds > 0 {
+		serverBudget := time.Duration(s.maxRunSeconds) * time.Second
+		if budget <= 0 || serverBudget < budget {
+			budget = serverBudget
+		}
 	}
 	publishTimeout, err := parseDur(req.PublishTimeout, 120*time.Second)
 	if err != nil {
@@ -949,6 +1105,11 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	envRepair := fs.String("env-repair", "", "-env-mode scoped: same as -env-agent, for -repair")
 	envPlanner := fs.String("env-planner", "", "-env-mode scoped: same as -env-agent, for -planner")
 	envPublish := fs.String("env-publish", "", "-env-mode scoped: same as -env-agent, for -publish")
+	// Managed-layer quotas (see docs/USAGE.md "Quotas and metering"), all
+	// opt-in: 0 = unlimited, byte-identical to today's (#60) behavior.
+	maxAgentsPerRun := fs.Int("max-agents-per-run", 0, "quota: reject (400) a POST /runs whose agent count exceeds N, before any run starts. For a -goal request the target -n is checked (the true count isn't known until planning runs). 0 = unlimited (default)")
+	maxRunSeconds := fs.Int("max-run-seconds", 0, "quota: cap every run's -budget at N seconds; a request's own shorter -budget always wins (min of the two). 0 = unlimited (default)")
+	maxConcurrentRuns := fs.Int("max-concurrent-runs", 0, "quota: reject (429) a POST /runs once N runs are in flight across ALL cells, on top of the existing per-cell 409. 0 = unlimited (default)")
 
 	if err := fs.Parse(argv); err != nil {
 		if err == flag.ErrHelp {
@@ -986,15 +1147,18 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	defer stop()
 
 	s, err := newServer(baseCtx, serverConfig{
-		repos:       repos,
-		token:       token,
-		envMode:     *envMode,
-		envAgent:    splitCSV(*envAgent),
-		envResolver: splitCSV(*envResolver),
-		envVerify:   splitCSV(*envVerify),
-		envRepair:   splitCSV(*envRepair),
-		envPlanner:  splitCSV(*envPlanner),
-		envPublish:  splitCSV(*envPublish),
+		repos:             repos,
+		token:             token,
+		envMode:           *envMode,
+		envAgent:          splitCSV(*envAgent),
+		envResolver:       splitCSV(*envResolver),
+		envVerify:         splitCSV(*envVerify),
+		envRepair:         splitCSV(*envRepair),
+		envPlanner:        splitCSV(*envPlanner),
+		envPublish:        splitCSV(*envPublish),
+		maxAgentsPerRun:   *maxAgentsPerRun,
+		maxRunSeconds:     *maxRunSeconds,
+		maxConcurrentRuns: *maxConcurrentRuns,
 	})
 	if err != nil {
 		return exitOperationalError, err

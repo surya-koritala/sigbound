@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -645,5 +646,418 @@ func TestServeScopedEnvIsRealDefault(t *testing.T) {
 	}
 	if strings.Contains(string(data), secretName) {
 		t.Fatalf("scoped agent's env leaked the daemon secret:\n%s", data)
+	}
+}
+
+// ---- Quotas and metering (issue #61) ----
+
+// perTaskAgent is an agent command that writes one file named after its own
+// task id ($SIGBOUND_TASK_ID.txt), so N tasks in one run never collide on
+// the same path the way a shared writeFileAgent(name) call would.
+const perTaskAgent = `printf 'hi\n' > "$SIGBOUND_TASK_ID.txt"`
+
+func manyTasks(n int) []taskSpec {
+	tasks := make([]taskSpec, n)
+	for i := range tasks {
+		tasks[i] = taskSpec{ID: fmt.Sprintf("t%d", i)}
+	}
+	return tasks
+}
+
+// TestServeMaxAgentsPerRunRejects: a request whose agent count exceeds
+// -max-agents-per-run is rejected 400 before any run starts (no run dir
+// created); a request within the cap still succeeds normally.
+func TestServeMaxAgentsPerRunRejects(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxAgentsPerRun: 1})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler())
+	t.Cleanup(ts.Close)
+
+	var body map[string]string
+	code := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:  repo,
+		Tasks: manyTasks(2),
+		Agent: perTaskAgent,
+	}, &body)
+	if code != http.StatusBadRequest {
+		t.Fatalf("over-cap POST status %d, want 400 (body %v)", code, body)
+	}
+	if !strings.Contains(body["error"], "max-agents-per-run") {
+		t.Fatalf("error %q, want it to name max-agents-per-run", body["error"])
+	}
+	// No run was started: the cell's runs dir has no entries at all.
+	names, _ := os.ReadDir(s.cells[0].runsDir)
+	if len(names) != 0 {
+		t.Fatalf("run dir(s) created despite the quota rejection: %v", names)
+	}
+
+	// A request AT the cap still succeeds normally.
+	var created struct{ RunID string }
+	code = doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:  repo,
+		Tasks: manyTasks(1),
+		Agent: perTaskAgent,
+	}, &created)
+	if code != http.StatusAccepted {
+		t.Fatalf("at-cap POST status %d, want 202", code)
+	}
+	final := pollRun(t, ts, "", created.RunID)
+	if final.Status != "done" {
+		t.Fatalf("at-cap run status %q, want done", final.Status)
+	}
+}
+
+// TestServeMaxConcurrentRuns429 proves -max-concurrent-runs is a GLOBAL
+// ceiling across ALL cells, distinct from the existing per-cell 409: cell B
+// is completely idle, yet a POST to it is rejected 429 while the global cap
+// (met by cell A's in-flight run) is exhausted. Once A finishes, the slot
+// frees and a new run — even on a different cell — is accepted again.
+func TestServeMaxConcurrentRuns429(t *testing.T) {
+	_, repoA := makeGoRepo(t)
+	_, repoB := makeGoRepo(t)
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repoA, repoB}, envMode: envModeInherit, maxConcurrentRuns: 1})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler())
+	t.Cleanup(ts.Close)
+
+	var runA struct{ RunID string }
+	code := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:  repoA,
+		Tasks: []taskSpec{{ID: "a1"}},
+		Agent: "sleep 1 && " + writeFileAgent("a.txt"),
+	}, &runA)
+	if code != http.StatusAccepted {
+		t.Fatalf("run A status %d, want 202", code)
+	}
+
+	var body map[string]string
+	code = doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:  repoB,
+		Tasks: []taskSpec{{ID: "b1"}},
+		Agent: writeFileAgent("b.txt"),
+	}, &body)
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("cell-B POST while A in flight: status %d, want 429 (body %v)", code, body)
+	}
+	if !strings.Contains(body["error"], "max-concurrent-runs") {
+		t.Fatalf("error %q, want it to name max-concurrent-runs", body["error"])
+	}
+	// The rejected request never started a run on cell B either.
+	bCell := s.byKey[repoB]
+	names, _ := os.ReadDir(bCell.runsDir)
+	if len(names) != 0 {
+		t.Fatalf("cell B run dir(s) created despite the 429: %v", names)
+	}
+
+	pollRun(t, ts, "", runA.RunID)
+
+	var runB struct{ RunID string }
+	code = doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:  repoB,
+		Tasks: []taskSpec{{ID: "b2"}},
+		Agent: writeFileAgent("b2.txt"),
+	}, &runB)
+	if code != http.StatusAccepted {
+		t.Fatalf("post-completion cell-B POST status %d, want 202 (slot should have freed)", code)
+	}
+	final := pollRun(t, ts, "", runB.RunID)
+	if final.Status != "done" {
+		t.Fatalf("run B status %q, want done", final.Status)
+	}
+}
+
+// TestServeMaxConcurrentRunsReleasedOnError proves the global counter is
+// released even when a run ends in an OPERATIONAL ERROR (not just a normal
+// completion) — driveRun errors out immediately on an unresolvable -base,
+// well before any agent runs, so this exercises the defer in execRun, not
+// the ordinary success tail.
+func TestServeMaxConcurrentRunsReleasedOnError(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxConcurrentRuns: 1})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler())
+	t.Cleanup(ts.Close)
+
+	var created struct{ RunID string }
+	code := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:  repo,
+		Base:  "no-such-branch-at-all",
+		Tasks: []taskSpec{{ID: "t1"}},
+		Agent: writeFileAgent("x.txt"),
+	}, &created)
+	if code != http.StatusAccepted {
+		t.Fatalf("POST status %d, want 202", code)
+	}
+	final := pollRun(t, ts, "", created.RunID)
+	if final.Status != "error" {
+		t.Fatalf("status %q, want error (an unresolvable -base fails driveRun operationally)", final.Status)
+	}
+
+	// If the counter weren't released on that error path, this would 429.
+	var created2 struct{ RunID string }
+	code = doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:  repo,
+		Tasks: []taskSpec{{ID: "t2"}},
+		Agent: writeFileAgent("y.txt"),
+	}, &created2)
+	if code != http.StatusAccepted {
+		t.Fatalf("post-error POST status %d, want 202 (concurrency counter should have been released)", code)
+	}
+	final2 := pollRun(t, ts, "", created2.RunID)
+	if final2.Status != "done" {
+		t.Fatalf("recovery run status %q, want done", final2.Status)
+	}
+}
+
+// TestServeMaxRunSecondsClampsBudget exercises buildParams' min() directly:
+// a request asking for MORE than the server ceiling is clamped down to it; a
+// request asking for LESS keeps its own, stricter budget; a request setting
+// no budget at all inherits the ceiling.
+func TestServeMaxRunSecondsClampsBudget(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxRunSeconds: 30})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	rc := s.byKey[repo]
+
+	cases := []struct {
+		name   string
+		budget string
+		want   time.Duration
+	}{
+		{"request asks for more than the ceiling", "60s", 30 * time.Second},
+		{"request asks for less: its own budget wins", "10s", 10 * time.Second},
+		{"request sets no budget: the ceiling applies", "", 30 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p, _, err := s.buildParams(runRequest{
+				Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Agent: "true", Budget: c.budget,
+			}, rc.cell.Repo(), false)
+			if err != nil {
+				t.Fatalf("buildParams: %v", err)
+			}
+			if p.Budget != c.want {
+				t.Fatalf("budget=%s, want %s", p.Budget, c.want)
+			}
+		})
+	}
+}
+
+// TestServeMaxRunSecondsAppliesEndToEnd proves the clamp actually reaches
+// driveRun: a request sets no -budget at all, the server's 1s ceiling alone
+// must cut a 5s -verify sleep short, exactly like TestDriveRunVerifyKilledByBudget
+// at the driveRun layer.
+func TestServeMaxRunSecondsAppliesEndToEnd(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxRunSeconds: 1})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler())
+	t.Cleanup(ts.Close)
+
+	var created struct{ RunID string }
+	code := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:   repo,
+		Tasks:  []taskSpec{{ID: "t1"}},
+		Agent:  writeFileAgent("x.txt"),
+		Verify: "sleep 5",
+	}, &created)
+	if code != http.StatusAccepted {
+		t.Fatalf("POST status %d, want 202", code)
+	}
+
+	start := time.Now()
+	final := pollRun(t, ts, "", created.RunID)
+	elapsed := time.Since(start)
+	if elapsed > 4*time.Second {
+		t.Fatalf("run took %s; -max-run-seconds 1 should have cut the 5s verify sleep short", elapsed)
+	}
+	if final.Report == nil || !strings.Contains(final.Report.Verify.Output, "budget") {
+		t.Fatalf("verify output should name the exhausted budget, got report=%+v", final.Report)
+	}
+}
+
+// TestServeQuotasOffIsUnlimited: with every quota left at its zero value
+// (unlimited), a run whose agent count would trip any of the caps tested
+// above still succeeds exactly as it did before quotas existed (#60) — the
+// byte-identical-when-off guarantee.
+func TestServeQuotasOffIsUnlimited(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	s, err := newServer(context.Background(), serverConfig{
+		repos: []string{repo}, envMode: envModeInherit,
+		maxAgentsPerRun: 0, maxRunSeconds: 0, maxConcurrentRuns: 0,
+	})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler())
+	t.Cleanup(ts.Close)
+
+	var created struct{ RunID string }
+	code := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:   repo,
+		Tasks:  manyTasks(5),
+		Agent:  perTaskAgent,
+		Verify: "true",
+	}, &created)
+	if code != http.StatusAccepted {
+		t.Fatalf("POST status %d, want 202", code)
+	}
+	final := pollRun(t, ts, "", created.RunID)
+	if final.Status != "done" || final.Report == nil || !final.Report.Verify.OK || len(final.Report.PerAgent) != 5 {
+		t.Fatalf("run = %+v, want a clean 5-agent landed run", final)
+	}
+}
+
+// TestServeUsageRecordMatchesKnownRun builds a run with a KNOWN shape (one
+// agent that succeeds, one that fails outright, and a -verify that fails
+// once then passes under -verify-retries) and checks the usage record's
+// numbers against it exactly, both from GET /runs/{id}/usage and embedded in
+// GET /runs/{id}.
+func TestServeUsageRecordMatchesKnownRun(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	_, ts := newTestServer(t, "", repo)
+
+	marker := filepath.Join(t.TempDir(), "verify-marker")
+	flakyVerify := "test -f '" + marker + "' || { touch '" + marker + "'; exit 1; }"
+	agent := `if [ "$SIGBOUND_TASK_ID" = "ok1" ]; then printf 'hi\n' > ok.txt; else exit 1; fi`
+
+	var created struct{ RunID string }
+	code := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:          repo,
+		Tasks:         []taskSpec{{ID: "ok1"}, {ID: "bad1"}},
+		Agent:         agent,
+		Verify:        flakyVerify,
+		VerifyRetries: 1,
+	}, &created)
+	if code != http.StatusAccepted {
+		t.Fatalf("POST status %d, want 202", code)
+	}
+	final := pollRun(t, ts, "", created.RunID)
+	if final.Status != "done" {
+		t.Fatalf("status %q (error=%q), want done", final.Status, final.Error)
+	}
+	if !final.Report.Verify.OK || !final.Report.Verify.Flaky {
+		t.Fatalf("expected a flaky-but-green verify, got %+v", final.Report.Verify)
+	}
+
+	var u UsageJSON
+	if code := doJSON(t, "GET", ts.URL+"/runs/"+created.RunID+"/usage", "", nil, &u); code != http.StatusOK {
+		t.Fatalf("GET usage status %d", code)
+	}
+	want := UsageJSON{
+		AgentsTotal:    2,
+		AgentsOK:       1,
+		AgentsFailed:   1,
+		VerifyAttempts: 2, // the failing first attempt + the retry that passed
+		RepairAttempts: 0, // no -repair configured
+		Landed:         true,
+	}
+	if u.AgentsTotal != want.AgentsTotal || u.AgentsOK != want.AgentsOK || u.AgentsFailed != want.AgentsFailed {
+		t.Fatalf("agent counts = %+v, want total=%d ok=%d failed=%d", u, want.AgentsTotal, want.AgentsOK, want.AgentsFailed)
+	}
+	if u.VerifyAttempts != want.VerifyAttempts {
+		t.Fatalf("verifyAttempts=%d, want %d", u.VerifyAttempts, want.VerifyAttempts)
+	}
+	if u.RepairAttempts != want.RepairAttempts {
+		t.Fatalf("repairAttempts=%d, want %d", u.RepairAttempts, want.RepairAttempts)
+	}
+	if u.Landed != want.Landed {
+		t.Fatalf("landed=%v, want %v", u.Landed, want.Landed)
+	}
+	if u.VerifyWallMs <= 0 {
+		t.Fatalf("verifyWallMs=%d, want > 0", u.VerifyWallMs)
+	}
+	if u.TotalWallMs <= 0 {
+		t.Fatalf("totalWallMs=%d, want > 0", u.TotalWallMs)
+	}
+	if u.ReportBytes <= 0 {
+		t.Fatalf("reportBytes=%d, want > 0", u.ReportBytes)
+	}
+
+	// GET /runs/{id} embeds the identical record.
+	if final.Usage == nil || *final.Usage != u {
+		t.Fatalf("GET /runs/{id} usage = %+v, want it to match GET /runs/{id}/usage %+v", final.Usage, u)
+	}
+}
+
+// TestServeUsageAggregateSumsAcrossRuns runs two separate jobs and checks
+// GET /usage's totals equal the per-run usage records summed, plus a
+// correct single-cell rollup.
+func TestServeUsageAggregateSumsAcrossRuns(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	s, ts := newTestServer(t, "", repo)
+
+	var run1, run2 struct{ RunID string }
+	doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell: repo, Tasks: []taskSpec{{ID: "a1"}}, Agent: writeFileAgent("a.txt"),
+	}, &run1)
+	pollRun(t, ts, "", run1.RunID)
+	doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell: repo, Tasks: manyTasks(2), Agent: perTaskAgent,
+	}, &run2)
+	pollRun(t, ts, "", run2.RunID)
+
+	var u1, u2 UsageJSON
+	if code := doJSON(t, "GET", ts.URL+"/runs/"+run1.RunID+"/usage", "", nil, &u1); code != http.StatusOK {
+		t.Fatalf("GET usage 1 status %d", code)
+	}
+	if code := doJSON(t, "GET", ts.URL+"/runs/"+run2.RunID+"/usage", "", nil, &u2); code != http.StatusOK {
+		t.Fatalf("GET usage 2 status %d", code)
+	}
+
+	var agg struct {
+		Totals usageTotals `json:"totals"`
+		Cells  []struct {
+			Cell  string      `json:"cell"`
+			Repo  string      `json:"repo"`
+			Usage usageTotals `json:"usage"`
+		} `json:"cells"`
+	}
+	if code := doJSON(t, "GET", ts.URL+"/usage", "", nil, &agg); code != http.StatusOK {
+		t.Fatalf("GET /usage status %d", code)
+	}
+
+	if agg.Totals.Runs != 2 {
+		t.Fatalf("totals.runs=%d, want 2", agg.Totals.Runs)
+	}
+	if want := u1.AgentsTotal + u2.AgentsTotal; agg.Totals.AgentsTotal != want {
+		t.Fatalf("totals.agentsTotal=%d, want %d", agg.Totals.AgentsTotal, want)
+	}
+	if want := u1.TotalWallMs + u2.TotalWallMs; agg.Totals.TotalWallMs != want {
+		t.Fatalf("totals.totalWallMs=%d, want %d", agg.Totals.TotalWallMs, want)
+	}
+	if want := u1.ReportBytes + u2.ReportBytes; agg.Totals.ReportBytes != want {
+		t.Fatalf("totals.reportBytes=%d, want %d", agg.Totals.ReportBytes, want)
+	}
+	wantLanded := 0
+	if u1.Landed {
+		wantLanded++
+	}
+	if u2.Landed {
+		wantLanded++
+	}
+	if agg.Totals.Landed != wantLanded {
+		t.Fatalf("totals.landed=%d, want %d", agg.Totals.Landed, wantLanded)
+	}
+
+	if len(agg.Cells) != 1 {
+		t.Fatalf("cells=%v, want exactly 1", agg.Cells)
+	}
+	if agg.Cells[0].Cell != s.cells[0].cell.ID() || agg.Cells[0].Repo != repo {
+		t.Fatalf("cell rollup = %+v, want cell %s repo %s", agg.Cells[0], s.cells[0].cell.ID(), repo)
+	}
+	if agg.Cells[0].Usage.Runs != 2 || agg.Cells[0].Usage.AgentsTotal != agg.Totals.AgentsTotal {
+		t.Fatalf("cell rollup usage = %+v, want it to equal the (single-cell) grand total", agg.Cells[0].Usage)
 	}
 }

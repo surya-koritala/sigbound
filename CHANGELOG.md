@@ -10,6 +10,24 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ### Added
 
+- **`sig serve` quotas and metering** — a managed-layer feature on `serve`
+  only (`sig run` stays uncapped), entirely opt-in via server flags (`0` =
+  unlimited, byte-identical to before). Quotas are hosted-side ceilings
+  enforced at `POST /runs` before a run starts: `-max-agents-per-run`
+  rejects an over-cap agent count with `400`; `-max-run-seconds` caps every
+  run's `-budget` via `min(request, server)` — a request can only make its
+  own budget stricter, never laxer; `-max-concurrent-runs` rejects with
+  `429` once N runs are in flight across ALL cells, on top of the existing
+  per-cell `409`. A rejected request starts no run: no run directory, no
+  cell slot held. Metering is a per-run usage record, always on and derived
+  from data `driveRun`'s report already tracks (agent counts, integrate/
+  verify wall time, repair rounds) plus the run's total wall clock `serve`
+  itself brackets; written as `usage.json` alongside `report.json` so it
+  survives a restart, exposed via `GET /runs/{id}/usage`, embedded in `GET
+  /runs/{id}`, and aggregated fleet-wide via `GET /usage`. This is NOT a
+  biller: no price, currency, or external metering call — it's the data
+  layer a hosted product would meter on. See
+  [docs/USAGE.md](docs/USAGE.md) "Quotas and metering".
 - **`sig serve`** — a thin, single-process HTTP run API over the same `driveRun`
   orchestration `sig run` uses (no engine fork), so the verify gate holds by
   construction: serve adds no new landing path. `sig serve -repos a,b` opens each
