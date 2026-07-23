@@ -49,6 +49,23 @@ CI runs the same checks on every push to a PR: build, `gofmt`, `go vet`, and
 approved — branch protection enforces both. Keep changes small so the gate stays
 fast and the review stays focused.
 
+### Nightly regression
+
+PR CI is deliberately fast (15s fuzz smoke, one `-race` pass) so the gate
+doesn't slow reviews down. A separate scheduled workflow,
+[`.github/workflows/nightly.yml`](.github/workflows/nightly.yml), runs the
+deeper sweep CI can't afford: every `Fuzz*` target for 5 minutes each, the
+full `sigbench -sweep` A/B correctness matrix plus a conflict-heavy variant,
+`-race` on both supported Go versions, and the repo's own shell-tooling
+self-tests. It also runs on demand via `workflow_dispatch`.
+
+It fails loudly rather than filing anything — check the Actions tab for the
+nightly run. If `deep-fuzz` finds a real crasher, the job uploads the
+`testdata/fuzz/<target>/` file it found as a workflow artifact; download it,
+drop it into the corresponding `testdata/fuzz/<target>/` directory in the
+repo, and open a PR that fixes the parser and commits the file as a
+regression seed.
+
 ## Local checks
 
 Run these before opening or updating a PR:
