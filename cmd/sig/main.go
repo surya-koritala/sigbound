@@ -58,6 +58,14 @@ func main() {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "serve":
+		code, err := runServe(os.Stdout, os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sig serve:", err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "export":
 		if err := runExport(os.Stdout, os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "sig export:", err)
@@ -86,6 +94,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  sig replay    -manifest FILE  (deterministically re-integrate a prior run's recorded inputs; see 'sig replay -h')")
 	fmt.Fprintln(w, "  sig export    -repo PATH -bundle FILE -branches b1,b2,..  (bundle branches for a coordinator to import)")
 	fmt.Fprintln(w, "  sig import    -repo PATH -bundle FILE [-from WORKER_ID]  (import a bundle under imported/<worker>/; then 'sig integrate' it)")
+	fmt.Fprintln(w, "  sig serve     -repos PATH[,PATH..] [-addr HOST:PORT]  (HTTP run API over driveRun; see 'sig serve -h')")
 	fmt.Fprintln(w, "  sig doctor    [-repo PATH]")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))

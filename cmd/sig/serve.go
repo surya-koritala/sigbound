@@ -1,0 +1,1042 @@
+// sig serve is a thin, single-process HTTP wrapper over the SAME orchestration
+// driveRun runs — it forks no engine. Point it at one or more git repos and it
+// opens each as a cell at startup; POST /runs drives a run through the exact
+// driveRun machinery `sig run` uses, so the verify-gate promise ("nothing lands
+// unless -verify passes") holds by construction — serve adds no new landing
+// path. Every run's full report and event stream are written under the TARGET
+// repo's .git/sigbound/runs/<runId>/ (the same .git/sigbound storage precedent
+// as -verify-cache), so history survives a restart: the GET endpoints read from
+// disk.
+//
+//	sig serve -addr 127.0.0.1:7777 -repos /path/a,/path/b [-token-env NAME] [-allow-remote]
+//
+// POSTURE: this is a SINGLE-PROCESS, SINGLE-USER daemon, NOT a multi-tenant
+// service. It binds loopback by default and REFUSES a non-loopback -addr unless
+// -allow-remote is also set. It ships no TLS and no user model: if you expose it
+// beyond localhost, putting TLS and network auth in front of it (a reverse
+// proxy) is YOUR job. Auth here is one shared bearer token, nothing more.
+//
+// AUTH: if the env var named by -token-env (default SIGBOUND_SERVE_TOKEN) is
+// set, every request must carry `Authorization: Bearer <token>` (constant-time
+// compared). If it is unset AND the bind is loopback, auth is off (dev mode). A
+// non-loopback bind REQUIRES the token — serve refuses to start without it.
+//
+// Endpoints (JSON in, JSON out):
+//
+//	GET  /health           -> {ok, version, cells:[{id, repo}]}
+//	POST /runs             -> 202 {runId,...}; runs ASYNC via driveRun
+//	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}
+//	GET  /runs/{id}        -> {status: running|done|error, report?}
+//	GET  /runs/{id}/events -> the run's events.ndjson (application/x-ndjson)
+//
+// One run per cell at a time: a second POST for a cell whose run is still in
+// flight gets 409 Conflict (a run moves the base ref; serializing is the only
+// honest semantics). DIFFERENT cells run fully in parallel — the sharding payoff.
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/surya-koritala/sigbound/cell"
+	"github.com/surya-koritala/sigbound/internal/gitx"
+)
+
+// serveMaxBody bounds a POST /runs body so a client can't stream an unbounded
+// request into the daemon. A run request is a handful of small fields; 1 MiB is
+// generous.
+const serveMaxBody = 1 << 20
+
+// registeredCell is one opened cell plus its cached runs directory
+// (<git-common-dir>/sigbound/runs), resolved once at startup so per-request
+// handlers never re-shell `git rev-parse`.
+type registeredCell struct {
+	cell    *cell.Cell
+	runsDir string
+}
+
+// server holds the run registry and per-cell run state for one `sig serve`
+// process. Its zero value is not usable — build it with newServer.
+type server struct {
+	token   string          // "" => auth disabled (only permitted on a loopback bind)
+	baseCtx context.Context // cancelled on shutdown; every in-flight run honors it
+
+	// Environment policy is the OPERATOR's, set once via the server's -env-*
+	// flags and applied to EVERY run — a request never gets to widen it (a
+	// caller must not be able to say "inherit" and read the daemon's whole
+	// env). The one exception the design allows is a request narrowing to a
+	// stricter/explicit -env-mode; see buildParams.
+	envMode     string
+	envAgent    []string
+	envResolver []string
+	envVerify   []string
+	envRepair   []string
+	envPlanner  []string
+	envPublish  []string
+
+	cells []*registeredCell
+	byKey map[string]*registeredCell // cell id AND absolute repo path -> cell
+
+	mu   sync.Mutex
+	busy map[string]bool       // cell id -> a run is in flight (per-cell 409)
+	runs map[string]*runRecord // runId -> live record for THIS process
+	wg   sync.WaitGroup        // in-flight run goroutines, waited on shutdown
+}
+
+// runRecord is the in-memory truth for a run started by THIS process. Disk
+// (report.json / events.ndjson under the run dir) is the durable record the GET
+// endpoints fall back to for runs from a prior process (restart survival).
+type runRecord struct {
+	id        string
+	cellID    string
+	repo      string
+	dir       string
+	status    string // running | done | error
+	startedAt time.Time
+	finalSHA  string
+	errMsg    string
+}
+
+// serverConfig is newServer's input, split out from flag parsing so tests build
+// a server directly (httptest) without a listener or signal loop.
+type serverConfig struct {
+	repos       []string
+	token       string
+	envMode     string
+	envAgent    []string
+	envResolver []string
+	envVerify   []string
+	envRepair   []string
+	envPlanner  []string
+	envPublish  []string
+}
+
+// newServer opens every repo as a cell (fail-fast on any bad repo) and resolves
+// each cell's runs directory once. baseCtx is handed to every run so a shutdown
+// cancel propagates into driveRun (which already honors ctx via its -budget
+// machinery).
+func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
+	if len(cfg.repos) == 0 {
+		return nil, errors.New("-repos is required (comma-separated repo paths)")
+	}
+	s := &server{
+		token:       cfg.token,
+		baseCtx:     baseCtx,
+		envMode:     cfg.envMode,
+		envAgent:    cfg.envAgent,
+		envResolver: cfg.envResolver,
+		envVerify:   cfg.envVerify,
+		envRepair:   cfg.envRepair,
+		envPlanner:  cfg.envPlanner,
+		envPublish:  cfg.envPublish,
+		byKey:       map[string]*registeredCell{},
+		busy:        map[string]bool{},
+		runs:        map[string]*runRecord{},
+	}
+	ctx := context.Background()
+	for _, repo := range cfg.repos {
+		c, err := cell.Open(repo)
+		if err != nil {
+			return nil, fmt.Errorf("open cell %s: %w", repo, err)
+		}
+		if _, dup := s.byKey[c.ID()]; dup {
+			return nil, fmt.Errorf("duplicate repo %s: cell id %s is already registered", repo, c.ID())
+		}
+		common, err := c.Git().GitCommonDir(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("resolve git dir for %s: %w", repo, err)
+		}
+		rc := &registeredCell{cell: c, runsDir: filepath.Join(common, "sigbound", "runs")}
+		s.cells = append(s.cells, rc)
+		s.byKey[c.ID()] = rc
+		s.byKey[c.Repo()] = rc
+	}
+	return s, nil
+}
+
+// handler builds the request router. The enhanced (Go 1.22+) ServeMux does the
+// method + path matching, so there is no hand-rolled routing. When a token is
+// configured every request is bearer-checked first; with no token (dev mode on
+// loopback) the mux is served directly.
+func (s *server) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("POST /runs", s.handleCreateRun)
+	mux.HandleFunc("GET /runs", s.handleListRuns)
+	mux.HandleFunc("GET /runs/{id}", s.handleGetRun)
+	mux.HandleFunc("GET /runs/{id}/events", s.handleRunEvents)
+	if s.token == "" {
+		return mux
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.authOK(r) {
+			writeErr(w, http.StatusUnauthorized, "unauthorized: send Authorization: Bearer <token>")
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// authOK constant-time-compares the request's bearer token against the
+// configured one. Only reached when a token is set (see handler). A missing or
+// malformed header, or any mismatch (including a length mismatch, which
+// ConstantTimeCompare reports as 0 without leaking length via timing), fails.
+func (s *server) authOK(r *http.Request) bool {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if !strings.HasPrefix(h, prefix) {
+		return false
+	}
+	got := strings.TrimSpace(h[len(prefix):])
+	return subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
+}
+
+// ---- endpoints ----
+
+func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	type cellInfo struct {
+		ID   string `json:"id"`
+		Repo string `json:"repo"`
+	}
+	cells := make([]cellInfo, len(s.cells))
+	for i, rc := range s.cells {
+		cells[i] = cellInfo{ID: rc.cell.ID(), Repo: rc.cell.Repo()}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"version": Version,
+		"cells":   cells,
+	})
+}
+
+// runRequest is the POST /runs body. Fields mirror `sig run`'s flags by name
+// (camelCased); durations are Go duration strings ("30s", "2m"). Unknown fields
+// are rejected (see handleCreateRun) so a typo'd knob fails loudly instead of
+// silently doing nothing. Environment policy is deliberately NOT here — it is
+// the operator's, set on the server (see server.envMode) — except EnvMode, which
+// a request may set to override the server default per the documented posture.
+type runRequest struct {
+	Cell string `json:"cell"` // cell id OR repo path (required)
+	Base string `json:"base"` // default "main"
+
+	Tasks []taskSpec `json:"tasks"` // explicit tasks (mutually exclusive with goal)
+	Goal  string     `json:"goal"`  // natural-language goal for the planner
+
+	Planner        string `json:"planner"`        // required with goal (no preset expansion in serve)
+	N              int    `json:"n"`              // planner target task count (default 4)
+	MinTasks       int    `json:"minTasks"`       // plan floor (0 = none)
+	PlannerTimeout string `json:"plannerTimeout"` // default 120s
+
+	Agent        string `json:"agent"` // required
+	AgentTimeout string `json:"agentTimeout"`
+	AgentRetries int    `json:"agentRetries"`
+
+	Strategy string `json:"strategy"` // default overlay
+	Assert   bool   `json:"assert"`
+	Semantic string `json:"semantic"` // off | go (default off)
+
+	Resolver        string `json:"resolver"`
+	ResolverTimeout string `json:"resolverTimeout"` // default 30s
+
+	Verify        string `json:"verify"`
+	VerifyImpact  string `json:"verifyImpact"` // requires verify
+	VerifyRetries int    `json:"verifyRetries"`
+	VerifyCache   bool   `json:"verifyCache"`
+	VerifyBisect  bool   `json:"verifyBisect"` // requires verify
+
+	Repair    string `json:"repair"`
+	RepairMax int    `json:"repairMax"` // default 2
+
+	NoAutocommit bool   `json:"noAutocommit"`
+	Lanes        string `json:"lanes"` // off | warn | strict
+	KeepFailed   bool   `json:"keepFailed"`
+	Budget       string `json:"budget"`
+	Notes        bool   `json:"notes"`
+
+	Publish        string `json:"publish"`
+	PublishTimeout string `json:"publishTimeout"` // default 120s
+
+	EnvMode string `json:"envMode"` // overrides the server default when set
+}
+
+// planSpec carries the goal-planning inputs buildParams parses so the async run
+// goroutine can plan (planTasks) without re-parsing/re-validating.
+type planSpec struct {
+	goal           string
+	plannerCmd     string
+	n              int
+	minTasks       int
+	plannerTimeout time.Duration
+}
+
+func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, serveMaxBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	var req runRequest
+	if err := dec.Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+
+	rc := s.resolveCell(req.Cell)
+	if rc == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("unknown cell %q; known cells: %s", req.Cell, strings.Join(s.cellKeys(), ", ")))
+		return
+	}
+
+	haveTasks := len(req.Tasks) > 0
+	haveGoal := strings.TrimSpace(req.Goal) != ""
+	switch {
+	case haveTasks && haveGoal:
+		writeErr(w, http.StatusBadRequest, "tasks and goal are mutually exclusive; pass exactly one")
+		return
+	case !haveTasks && !haveGoal:
+		writeErr(w, http.StatusBadRequest, "one of tasks or goal is required")
+		return
+	}
+	if strings.TrimSpace(req.Agent) == "" {
+		writeErr(w, http.StatusBadRequest, "agent is required")
+		return
+	}
+	if haveTasks {
+		if err := validateReqTasks(req.Tasks); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+
+	p, plan, err := s.buildParams(req, rc.cell.Repo(), haveGoal)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Acquire the cell's run slot and create the run's durable directory before
+	// returning 202, so the events endpoint can be polled the instant the
+	// caller has the runId. A cell already running rejects with 409.
+	s.mu.Lock()
+	if s.busy[rc.cell.ID()] {
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, fmt.Sprintf("a run is already in progress for cell %s (%s); one run per cell at a time", rc.cell.ID(), rc.cell.Repo()))
+		return
+	}
+	runID := newRunID()
+	dir := filepath.Join(rc.runsDir, runID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		s.mu.Unlock()
+		writeErr(w, http.StatusInternalServerError, "create run dir: "+err.Error())
+		return
+	}
+	s.busy[rc.cell.ID()] = true
+	rec := &runRecord{id: runID, cellID: rc.cell.ID(), repo: rc.cell.Repo(), dir: dir, status: "running", startedAt: time.Now()}
+	s.runs[runID] = rec
+	s.wg.Add(1)
+	s.mu.Unlock()
+
+	p.EventsPath = filepath.Join(dir, "events.ndjson")
+	go s.execRun(rec, p, req.Tasks, plan, haveGoal)
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"runId":  runID,
+		"cell":   rc.cell.ID(),
+		"status": "running",
+	})
+}
+
+// execRun is the async body of a run: plan (if a goal), driveRun, then persist
+// the report (or an error marker) to disk and update the in-memory record. Runs
+// under s.baseCtx, so a shutdown cancel aborts it — the same ctx driveRun's
+// -budget machinery already honors.
+func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan planSpec, haveGoal bool) {
+	defer s.wg.Done()
+	defer func() {
+		s.mu.Lock()
+		s.busy[rec.cellID] = false
+		s.mu.Unlock()
+	}()
+
+	if haveGoal {
+		planned, err := planTasks(s.baseCtx, p.Repo, plan.goal, plan.plannerCmd, plan.n, plan.plannerTimeout, "", p.EnvMode, s.envPlanner)
+		if err != nil {
+			s.failRun(rec, "plan: "+err.Error())
+			return
+		}
+		if plan.minTasks > 0 && len(planned) < plan.minTasks {
+			s.failRun(rec, fmt.Sprintf("planner produced %d tasks, minTasks %d", len(planned), plan.minTasks))
+			return
+		}
+		tasks = planned
+	}
+
+	rep, err := driveRun(s.baseCtx, p, tasks)
+	if err != nil {
+		// A mid-run failure can still leave real work on agent/<id> branches;
+		// persist whatever driveRun assembled (same recovery posture as
+		// runRun's partial-report emit) before recording the error.
+		if len(rep.PerAgent) > 0 {
+			writeRunReport(rec.dir, rep)
+		}
+		s.failRun(rec, err.Error())
+		return
+	}
+	writeRunReport(rec.dir, rep)
+	s.mu.Lock()
+	rec.status = "done"
+	rec.finalSHA = rep.Integrate.FinalSHA
+	s.mu.Unlock()
+}
+
+func (s *server) failRun(rec *runRecord, msg string) {
+	writeRunError(rec.dir, msg, rec.startedAt, rec.cellID)
+	s.mu.Lock()
+	rec.status = "error"
+	rec.errMsg = msg
+	s.mu.Unlock()
+}
+
+// runStatusResponse is GET /runs/{id}'s body. Report is the full runReport,
+// present only once the run is done (read from report.json).
+type runStatusResponse struct {
+	ID        string     `json:"id"`
+	Cell      string     `json:"cell"`
+	Status    string     `json:"status"`
+	StartedAt string     `json:"startedAt,omitempty"`
+	Error     string     `json:"error,omitempty"`
+	Report    *runReport `json:"report,omitempty"`
+}
+
+func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRunID(id) {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
+
+	// Live record (this process) is authoritative for a running/error run and
+	// tells us the dir; fall back to a disk scan for runs from a prior process.
+	s.mu.Lock()
+	rec := s.runs[id]
+	var dir, cellID, status, errMsg string
+	var startedAt time.Time
+	if rec != nil {
+		dir, cellID, status, errMsg, startedAt = rec.dir, rec.cellID, rec.status, rec.errMsg, rec.startedAt
+	}
+	s.mu.Unlock()
+
+	if rec == nil {
+		frc, fdir, ok := s.findRunDir(id)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "unknown run")
+			return
+		}
+		dir, cellID = fdir, frc.cell.ID()
+		status = diskStatus(fdir)
+		if status == "" {
+			// A dir with neither report.json nor error.json, not tracked in
+			// memory: an interrupted run from a crashed/restarted process.
+			status = "error"
+			errMsg = "run did not complete (no report on disk)"
+		}
+	}
+
+	resp := runStatusResponse{ID: id, Cell: cellID, Status: status}
+	if !startedAt.IsZero() {
+		resp.StartedAt = startedAt.UTC().Format(time.RFC3339)
+	}
+	if status == "done" {
+		if rep, err := readRunReport(dir); err == nil {
+			resp.Report = rep
+			if resp.StartedAt == "" {
+				resp.StartedAt = rep.StartedAt
+			}
+		}
+	}
+	if status == "error" {
+		if errMsg == "" {
+			errMsg = readRunErrorMsg(dir)
+		}
+		resp.Error = errMsg
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// runListEntry is one row of GET /runs.
+type runListEntry struct {
+	ID        string `json:"id"`
+	Cell      string `json:"cell"`
+	Status    string `json:"status"`
+	StartedAt string `json:"startedAt,omitempty"`
+	FinalSHA  string `json:"finalSHA,omitempty"`
+}
+
+func (s *server) handleListRuns(w http.ResponseWriter, r *http.Request) {
+	// Snapshot live statuses under the lock, then do all disk IO unlocked.
+	s.mu.Lock()
+	live := make(map[string]*runRecord, len(s.runs))
+	for id, rec := range s.runs {
+		live[id] = rec
+	}
+	s.mu.Unlock()
+
+	// ponytail: list reads each done run's report.json for finalSHA; fine for a
+	// single-process daemon over a handful of repos. Add a per-cell index file
+	// if run history ever grows large enough for this scan to matter.
+	var entries []runListEntry
+	for _, rc := range s.cells {
+		names, _ := os.ReadDir(rc.runsDir) // missing dir => no runs yet
+		for _, de := range names {
+			if !de.IsDir() {
+				continue
+			}
+			id := de.Name()
+			dir := filepath.Join(rc.runsDir, id)
+			e := runListEntry{ID: id, Cell: rc.cell.ID()}
+			if rec := live[id]; rec != nil {
+				e.Status = rec.status
+				e.StartedAt = rec.startedAt.UTC().Format(time.RFC3339)
+				e.FinalSHA = rec.finalSHA
+			} else {
+				e.Status = diskStatus(dir)
+				if e.Status == "" {
+					e.Status = "error"
+				}
+			}
+			if e.Status == "done" && e.FinalSHA == "" {
+				if rep, err := readRunReport(dir); err == nil {
+					e.FinalSHA = rep.Integrate.FinalSHA
+					e.StartedAt = rep.StartedAt
+				}
+			}
+			entries = append(entries, e)
+		}
+	}
+	// runIds are timestamp-prefixed, so a descending id sort is newest-first.
+	sort.Slice(entries, func(i, j int) bool { return entries[i].ID > entries[j].ID })
+	if entries == nil {
+		entries = []runListEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": entries})
+}
+
+func (s *server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRunID(id) {
+		writeErr(w, http.StatusNotFound, "unknown run")
+		return
+	}
+	s.mu.Lock()
+	rec := s.runs[id]
+	var dir string
+	if rec != nil {
+		dir = rec.dir
+	}
+	s.mu.Unlock()
+	if rec == nil {
+		_, fdir, ok := s.findRunDir(id)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "unknown run")
+			return
+		}
+		dir = fdir
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "events.ndjson"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			// The run exists but hasn't emitted anything yet — an empty stream,
+			// not an error.
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "read events: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data) //nolint:errcheck // response body; nothing to recover on a write error
+}
+
+// ---- request -> runParams ----
+
+// buildParams validates a runRequest the way runRun validates its flags (reusing
+// the same validate* helpers) and maps it onto a runParams for driveRun, plus a
+// planSpec for the goal path. Environment policy always comes from the server;
+// EnvMode alone may be narrowed by the request. Any validation failure is a 400
+// (returned as an error the caller turns into one).
+func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runParams, planSpec, error) {
+	var zeroPlan planSpec
+
+	base := strings.TrimSpace(req.Base)
+	if base == "" {
+		base = "main"
+	}
+	strategy := strings.TrimSpace(req.Strategy)
+	if strategy == "" {
+		strategy = cell.StrategyOverlay
+	}
+	if err := validateStrategy(strategy); err != nil {
+		return runParams{}, zeroPlan, err
+	}
+	semantic := strings.TrimSpace(req.Semantic)
+	if semantic == "" {
+		semantic = semanticOff
+	}
+	if err := validateSemanticMode(semantic); err != nil {
+		return runParams{}, zeroPlan, err
+	}
+	// Lane default mirrors runRun: warn, except a planned (goal) run defaults to
+	// strict, since the planner already promised a disjoint split.
+	lanes := strings.TrimSpace(req.Lanes)
+	if lanes == "" {
+		if haveGoal {
+			lanes = laneStrict
+		} else {
+			lanes = laneWarn
+		}
+	}
+	if err := validateLaneMode(lanes); err != nil {
+		return runParams{}, zeroPlan, err
+	}
+	// Env policy: server default, request may narrow to an explicit mode.
+	envMode := s.envMode
+	if m := strings.TrimSpace(req.EnvMode); m != "" {
+		envMode = m
+	}
+	if err := validateEnvMode(envMode); err != nil {
+		return runParams{}, zeroPlan, err
+	}
+	if strings.TrimSpace(req.VerifyImpact) != "" && strings.TrimSpace(req.Verify) == "" {
+		return runParams{}, zeroPlan, errors.New("verifyImpact requires verify: it composes WITH verify, which stays the fallback")
+	}
+	if req.VerifyBisect && strings.TrimSpace(req.Verify) == "" {
+		return runParams{}, zeroPlan, errors.New("verifyBisect requires verify: it bisects over verify's verdict on the combined tree")
+	}
+
+	agentTimeout, err := parseDur(req.AgentTimeout, 0)
+	if err != nil {
+		return runParams{}, zeroPlan, fmt.Errorf("agentTimeout: %w", err)
+	}
+	resolverTimeout, err := parseDur(req.ResolverTimeout, 30*time.Second)
+	if err != nil {
+		return runParams{}, zeroPlan, fmt.Errorf("resolverTimeout: %w", err)
+	}
+	budget, err := parseDur(req.Budget, 0)
+	if err != nil {
+		return runParams{}, zeroPlan, fmt.Errorf("budget: %w", err)
+	}
+	publishTimeout, err := parseDur(req.PublishTimeout, 120*time.Second)
+	if err != nil {
+		return runParams{}, zeroPlan, fmt.Errorf("publishTimeout: %w", err)
+	}
+
+	repairMax := req.RepairMax
+	if repairMax <= 0 {
+		repairMax = 2
+	}
+
+	p := runParams{
+		Repo:            repo,
+		Base:            base,
+		Strategy:        strategy,
+		Assert:          req.Assert,
+		Semantic:        semantic,
+		AgentCmd:        req.Agent,
+		PlannerCmd:      strings.TrimSpace(req.Planner),
+		AgentTimeout:    agentTimeout,
+		AgentRetries:    req.AgentRetries,
+		ResolverCmd:     req.Resolver,
+		ResolverTimeout: resolverTimeout,
+		VerifyCmd:       req.Verify,
+		VerifyImpactCmd: req.VerifyImpact,
+		VerifyRetries:   req.VerifyRetries,
+		VerifyCache:     req.VerifyCache,
+		VerifyBisect:    req.VerifyBisect,
+		RepairCmd:       req.Repair,
+		RepairMax:       repairMax,
+		Autocommit:      !req.NoAutocommit,
+		LaneMode:        lanes,
+		KeepFailed:      req.KeepFailed,
+		Budget:          budget,
+		Notes:           req.Notes,
+		PublishCmd:      req.Publish,
+		PublishTimeout:  publishTimeout,
+		EnvMode:         envMode,
+		EnvAgent:        s.envAgent,
+		EnvResolver:     s.envResolver,
+		EnvVerify:       s.envVerify,
+		EnvRepair:       s.envRepair,
+		EnvPublish:      s.envPublish,
+	}
+
+	if !haveGoal {
+		return p, zeroPlan, nil
+	}
+	// Goal path: planner required (serve does no preset expansion), plan
+	// inputs parsed/validated here so the async goroutine only runs the plan.
+	if p.PlannerCmd == "" {
+		return runParams{}, zeroPlan, errors.New("planner is required with goal")
+	}
+	n := req.N
+	if n <= 0 {
+		n = 4
+	}
+	if req.MinTasks > n {
+		return runParams{}, zeroPlan, fmt.Errorf("minTasks %d exceeds n %d", req.MinTasks, n)
+	}
+	plannerTimeout, err := parseDur(req.PlannerTimeout, 120*time.Second)
+	if err != nil {
+		return runParams{}, zeroPlan, fmt.Errorf("plannerTimeout: %w", err)
+	}
+	return p, planSpec{goal: strings.TrimSpace(req.Goal), plannerCmd: p.PlannerCmd, n: n, minTasks: req.MinTasks, plannerTimeout: plannerTimeout}, nil
+}
+
+// ---- lookups & helpers ----
+
+func (s *server) resolveCell(key string) *registeredCell {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
+	if rc := s.byKey[key]; rc != nil {
+		return rc
+	}
+	if abs, err := filepath.Abs(key); err == nil {
+		return s.byKey[abs]
+	}
+	return nil
+}
+
+// cellKeys returns the cell ids, for a "known cells: ..." error message.
+func (s *server) cellKeys() []string {
+	ids := make([]string, len(s.cells))
+	for i, rc := range s.cells {
+		ids[i] = rc.cell.ID()
+	}
+	return ids
+}
+
+// findRunDir locates a run's directory across every cell's runs dir. Used for
+// runs not in this process's memory (a prior process's history). Linear over the
+// registered cells, which is a handful.
+func (s *server) findRunDir(id string) (*registeredCell, string, bool) {
+	for _, rc := range s.cells {
+		dir := filepath.Join(rc.runsDir, id)
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return rc, dir, true
+		}
+	}
+	return nil, "", false
+}
+
+// validRunID guards a run id from the URL before it is joined onto a runs dir:
+// it must be a single safe path component (slugSafe already rejects ""/"."/".."
+// and anything outside [A-Za-z0-9._-]) and bounded in length, so a hostile id
+// can never traverse out of the runs dir. A reject is reported as "unknown run".
+func validRunID(id string) bool {
+	return len(id) <= 128 && slugSafe(id)
+}
+
+// newRunID is a timestamp prefix (second precision, so a lexical sort is
+// chronological) plus 6 random bytes, so two runs in the same second — only ever
+// on DIFFERENT cells, since one cell serializes — never collide.
+func newRunID() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:]) // crypto/rand; a read error only weakens uniqueness, never correctness
+	return time.Now().UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
+}
+
+// validateReqTasks mirrors loadTasks' checks for an inline task array: every id
+// non-empty and unique.
+func validateReqTasks(tasks []taskSpec) error {
+	seen := map[string]bool{}
+	for i, t := range tasks {
+		if strings.TrimSpace(t.ID) == "" {
+			return fmt.Errorf("task %d has an empty id", i)
+		}
+		if seen[t.ID] {
+			return fmt.Errorf("duplicate task id %q", t.ID)
+		}
+		seen[t.ID] = true
+	}
+	return nil
+}
+
+// parseDur parses a Go duration string, treating "" as def.
+func parseDur(s string, def time.Duration) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def, nil
+	}
+	return time.ParseDuration(s)
+}
+
+// ---- durable run storage (.git/sigbound/runs/<id>/) ----
+
+// runErrorFile is error.json's shape: the marker written when a run fails
+// operationally, so a restart can report status=error with the reason instead of
+// mistaking the dir for an interrupted run.
+type runErrorFile struct {
+	Error     string `json:"error"`
+	Cell      string `json:"cell"`
+	StartedAt string `json:"startedAt"`
+}
+
+func writeRunReport(dir string, rep runReport) {
+	data, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sig serve: encode report for %s: %v\n", dir, err)
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, "report.json"), data, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "sig serve: write report %s: %v\n", dir, err)
+	}
+}
+
+func writeRunError(dir, msg string, startedAt time.Time, cellID string) {
+	data, err := json.MarshalIndent(runErrorFile{Error: msg, Cell: cellID, StartedAt: startedAt.UTC().Format(time.RFC3339)}, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, "error.json"), data, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "sig serve: write error marker %s: %v\n", dir, err)
+	}
+}
+
+func readRunReport(dir string) (*runReport, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "report.json"))
+	if err != nil {
+		return nil, err
+	}
+	var rep runReport
+	if err := json.Unmarshal(data, &rep); err != nil {
+		return nil, err
+	}
+	return &rep, nil
+}
+
+func readRunErrorMsg(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, "error.json"))
+	if err != nil {
+		return ""
+	}
+	var e runErrorFile
+	if err := json.Unmarshal(data, &e); err != nil {
+		return ""
+	}
+	return e.Error
+}
+
+// diskStatus reports a run's status from its directory alone: report.json =>
+// done, error.json => error, neither => "" (caller decides — interrupted).
+func diskStatus(dir string) string {
+	if _, err := os.Stat(filepath.Join(dir, "report.json")); err == nil {
+		return "done"
+	}
+	if _, err := os.Stat(filepath.Join(dir, "error.json")); err == nil {
+		return "error"
+	}
+	return ""
+}
+
+// ---- HTTP write helpers ----
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.Encode(v) //nolint:errcheck // response body; nothing to recover on a write error
+}
+
+func writeErr(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// ---- CLI entry + lifecycle ----
+
+// addrIsLoopback reports whether -addr binds only the loopback interface. An
+// empty host (":7777") or 0.0.0.0/:: binds every interface and is NOT loopback;
+// "localhost" and any IP that IsLoopback() is.
+func addrIsLoopback(addr string) (bool, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false, fmt.Errorf("invalid -addr %q: %w", addr, err)
+	}
+	if host == "" {
+		return false, nil
+	}
+	if host == "localhost" {
+		return true, nil
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback(), nil
+	}
+	return false, nil
+}
+
+// serveStartupCheck enforces the network posture before binding: a non-loopback
+// -addr needs -allow-remote (an explicit opt-in past the localhost default) AND
+// a token (a public bind must never be unauthenticated).
+func serveStartupCheck(addr string, allowRemote, tokenSet bool, tokenEnv string) error {
+	loopback, err := addrIsLoopback(addr)
+	if err != nil {
+		return err
+	}
+	if loopback {
+		return nil
+	}
+	if !allowRemote {
+		return fmt.Errorf("refusing to bind non-loopback address %q without -allow-remote: sig serve is a single-user daemon with no TLS and no user model — put a TLS-terminating reverse proxy in front of it and pass -allow-remote to acknowledge that", addr)
+	}
+	if !tokenSet {
+		return fmt.Errorf("refusing to bind non-loopback address %q without an auth token: set the env var named by -token-env (%s) to a shared secret", addr, tokenEnv)
+	}
+	return nil
+}
+
+func runServe(w io.Writer, argv []string) (int, error) {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(fs.Output(), "usage: sig serve -repos PATH[,PATH...] [-addr HOST:PORT] [-token-env NAME] [-allow-remote] [-env-mode inherit|scoped] [-env-agent NAMES] ...")
+		fs.PrintDefaults()
+		fmt.Fprintln(fs.Output(), "\nA single-process, single-user daemon over driveRun. Binds loopback by default;")
+		fmt.Fprintln(fs.Output(), "refuses a non-loopback -addr unless -allow-remote is set, and a non-loopback bind")
+		fmt.Fprintln(fs.Output(), "always requires the -token-env token. See docs/USAGE.md's `sig serve` section.")
+	}
+	addr := fs.String("addr", "127.0.0.1:7777", "host:port to bind; loopback by default. A non-loopback value requires -allow-remote AND the -token-env token")
+	reposCSV := fs.String("repos", "", "comma-separated paths to the git repositories to serve, one cell each (required)")
+	tokenEnv := fs.String("token-env", "SIGBOUND_SERVE_TOKEN", "name of the env var holding the shared bearer token; when that var is set, every request must send Authorization: Bearer <token>. "+
+		"Unset + loopback bind = auth off (dev). A non-loopback bind requires it")
+	allowRemote := fs.Bool("allow-remote", false, "permit a non-loopback -addr. sig serve ships no TLS and no user model; you accept responsibility for putting a TLS-terminating, access-controlled proxy in front of it")
+	// Environment policy is operator-set here (not per request): a caller must
+	// not be able to widen what env the daemon's commands see. Default is
+	// scoped — a daemon must not leak its environment by default (issue #56).
+	envMode := fs.String("env-mode", envModeScoped, "environment given to every run's -agent/-resolver/-verify/-repair/-planner/-publish command: scoped (default for serve — a minimal base env plus SIGBOUND_* plus each -env-* allowlist) "+
+		"or inherit (the full daemon environment, today's `sig run` default). A request may narrow this per run but never widen the allowlists. See docs/USAGE.md's Scoped environments section")
+	envAgent := fs.String("env-agent", "", "-env-mode scoped: comma-separated extra parent-env variable NAMES (or NAME_* globs) passed through to every run's -agent, e.g. ANTHROPIC_API_KEY")
+	envResolver := fs.String("env-resolver", "", "-env-mode scoped: same as -env-agent, for -resolver")
+	envVerify := fs.String("env-verify", "", "-env-mode scoped: same as -env-agent, for -verify")
+	envRepair := fs.String("env-repair", "", "-env-mode scoped: same as -env-agent, for -repair")
+	envPlanner := fs.String("env-planner", "", "-env-mode scoped: same as -env-agent, for -planner")
+	envPublish := fs.String("env-publish", "", "-env-mode scoped: same as -env-agent, for -publish")
+
+	if err := fs.Parse(argv); err != nil {
+		if err == flag.ErrHelp {
+			return exitOK, nil
+		}
+		return exitOperationalError, err
+	}
+	repos := splitCSV(*reposCSV)
+	if len(repos) == 0 {
+		return exitOperationalError, errors.New("-repos is required (comma-separated repo paths)")
+	}
+	if err := validateEnvMode(*envMode); err != nil {
+		return exitOperationalError, err
+	}
+	for _, slot := range []struct{ flag, val string }{
+		{"-env-agent", *envAgent}, {"-env-resolver", *envResolver}, {"-env-verify", *envVerify},
+		{"-env-repair", *envRepair}, {"-env-planner", *envPlanner}, {"-env-publish", *envPublish},
+	} {
+		if err := validateEnvAllow(slot.flag, splitCSV(slot.val)); err != nil {
+			return exitOperationalError, err
+		}
+	}
+	token := os.Getenv(*tokenEnv)
+	if err := serveStartupCheck(*addr, *allowRemote, token != "", *tokenEnv); err != nil {
+		return exitOperationalError, err
+	}
+	// Same cheap git preflight sig run/integrate do before touching a repo.
+	if err := gitx.CheckMinVersion(context.Background(), "git"); err != nil {
+		return exitOperationalError, err
+	}
+
+	// baseCtx cancels on SIGINT/SIGTERM; every in-flight run honors it, so a
+	// shutdown aborts running commands rather than waiting them out.
+	baseCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	s, err := newServer(baseCtx, serverConfig{
+		repos:       repos,
+		token:       token,
+		envMode:     *envMode,
+		envAgent:    splitCSV(*envAgent),
+		envResolver: splitCSV(*envResolver),
+		envVerify:   splitCSV(*envVerify),
+		envRepair:   splitCSV(*envRepair),
+		envPlanner:  splitCSV(*envPlanner),
+		envPublish:  splitCSV(*envPublish),
+	})
+	if err != nil {
+		return exitOperationalError, err
+	}
+
+	// Bind before announcing, so a port already in use is an immediate,
+	// clear operational error rather than a surprise mid-serve.
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return exitOperationalError, err
+	}
+	authDesc := "off (loopback dev mode)"
+	if token != "" {
+		authDesc = "required (bearer token)"
+	}
+	fmt.Fprintf(w, "sig serve %s listening on %s — %d cell(s), auth %s\n", Version, ln.Addr(), len(s.cells), authDesc)
+	for _, rc := range s.cells {
+		fmt.Fprintf(w, "  cell %s  %s\n", rc.cell.ID(), rc.cell.Repo())
+	}
+	return s.serve(w, ln, stop)
+}
+
+// serve runs the HTTP server on ln until s.baseCtx is cancelled (a signal in
+// production) or Serve fails, then gracefully drains: stop accepting, let
+// in-flight runs observe the already-cancelled baseCtx and write their final
+// reports, and exit. stop restores default signal handling so a second Ctrl-C
+// hard-kills instead of blocking on a stuck drain (a test passes a no-op). Split
+// out from runServe so a test can drive the real listener + shutdown path with a
+// context it controls.
+func (s *server) serve(w io.Writer, ln net.Listener, stop func()) (int, error) {
+	srv := &http.Server{Handler: s.handler()}
+	errc := make(chan error, 1)
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			errc <- err
+			return
+		}
+		errc <- nil
+	}()
+
+	select {
+	case err := <-errc:
+		if err != nil {
+			return exitOperationalError, err
+		}
+		return exitOK, nil
+	case <-s.baseCtx.Done():
+		stop()
+		fmt.Fprintln(w, "sig serve: shutting down, draining in-flight runs...")
+		shCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shCtx)
+		s.wg.Wait()
+		fmt.Fprintln(w, "sig serve: stopped")
+		return exitOK, nil
+	}
+}

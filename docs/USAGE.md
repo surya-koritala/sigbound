@@ -1066,6 +1066,118 @@ full picture.
 
 ---
 
+## `sig serve`
+
+A thin HTTP wrapper over the **same** `driveRun` orchestration `sig run` uses —
+it forks no engine. Point it at one or more repos and it opens each as a cell at
+startup; `POST /runs` drives a run through the exact same machinery, so the
+verify gate ("nothing lands unless `-verify` passes") holds by construction:
+serve adds **no new landing path**. Every run's full report and event stream are
+written under the target repo's `.git/sigbound/runs/<runId>/`, so history
+survives a restart — the `GET` endpoints read from disk.
+
+```
+sig serve -repos /path/a,/path/b [-addr HOST:PORT] [-token-env NAME] [-allow-remote] [-env-mode inherit|scoped] [-env-agent NAMES ...]
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-repos` | — | Comma-separated repo paths, one cell each (required). Every repo is opened at startup; a bad repo fails the whole daemon before it binds. |
+| `-addr` | `127.0.0.1:7777` | Host:port to bind. **Loopback by default.** A non-loopback value (`0.0.0.0:…`, a LAN IP, or an empty host like `:7777`) is refused unless `-allow-remote` is also set. |
+| `-token-env` | `SIGBOUND_SERVE_TOKEN` | Name of the env var holding the shared bearer token. When that var is set, every request must send `Authorization: Bearer <token>`. |
+| `-allow-remote` | `false` | Permit a non-loopback `-addr`. Serve ships no TLS and no user model — you accept responsibility for a TLS-terminating, access-controlled proxy in front of it. |
+| `-env-mode` | `scoped` | Environment given to every run's commands. Defaults to **scoped** here (a daemon must not leak its environment by default), unlike `sig run`'s `inherit`. Set once by the operator; a request may narrow it per run but never widen the allowlists. See [Scoped environments](#scoped-environments). |
+| `-env-agent` … `-env-publish` | — | Per-slot allowlists for `-env-mode scoped`, exactly as on `sig run`. Operator-set: a request never chooses what env the daemon's commands see. |
+
+### Posture — single-user, single-process
+
+`sig serve` is a **single-user, single-process daemon, not a multi-tenant
+service.** It has no TLS, no accounts, and one shared bearer token at most. If
+you expose it past localhost, putting TLS and network access control in front of
+it (a reverse proxy) is **your** job. The `-allow-remote` flag exists precisely
+so binding a public interface is a deliberate, acknowledged act.
+
+### Auth model
+
+- **Token set** (the `-token-env` var has a value): every request must carry
+  `Authorization: Bearer <token>`, constant-time compared.
+- **Token unset + loopback bind**: auth is off — dev mode on your own machine.
+- **Non-loopback bind**: a token is **required**; serve refuses to start without
+  one, even with `-allow-remote`.
+
+### Endpoints
+
+All requests and responses are JSON (events are NDJSON).
+
+| Method & path | Purpose |
+|---------------|---------|
+| `GET /health` | `{ok, version, cells:[{id, repo}]}` |
+| `POST /runs` | Start a run. Returns **202** `{runId, cell, status}` immediately; the run executes asynchronously. |
+| `GET /runs` | `{runs:[{id, cell, status, startedAt, finalSHA?}]}`, newest first. |
+| `GET /runs/{id}` | `{id, cell, status, startedAt, report?}` — `status` is `running`, `done`, or `error`; the full run report is present once `done`. |
+| `GET /runs/{id}/events` | The run's `events.ndjson` as written so far (`Content-Type: application/x-ndjson`) — the same lifecycle events `sig run -events` emits. |
+
+The `POST /runs` body mirrors `sig run`'s flags by name (camelCased); durations
+are Go duration strings (`"30s"`, `"2m"`). `cell` is a cell id (from `/health`)
+or a repo path. Provide either `tasks` (an array of `{id, prompt, files?}`) or
+`goal` + `planner` (+ optional `n`, `minTasks`), never both. `agent` is required.
+Unknown fields are rejected, so a typo'd knob fails loudly with a 400.
+
+Environment policy is deliberately **not** a request field (it is the operator's,
+set on the server) except `envMode`, which a request may set to override the
+server default for that run.
+
+### One run per cell
+
+A run moves the base ref, so a cell runs **one at a time**: a second `POST` for a
+cell whose run is still in flight gets **409 Conflict**. Different cells run
+fully in parallel — that repo-level sharding is the whole point of registering
+several. Run history is durable per cell under `.git/sigbound/runs/<runId>/`
+(`report.json`, `events.ndjson`), the same `.git/sigbound` storage `-verify-cache`
+uses; `rm -rf .git/sigbound` resets it and it never shows up in `git status`.
+
+### Graceful shutdown
+
+`SIGINT`/`SIGTERM` stops accepting new requests, cancels every in-flight run's
+context (they honor it via the same `-budget` machinery), lets them write their
+final reports, and exits. A second `Ctrl-C` hard-kills.
+
+### curl examples
+
+```sh
+# Start the daemon over two repos (dev mode, loopback, no token):
+sig serve -repos /work/api,/work/web &
+
+# What's registered?
+curl -s localhost:7777/health | jq
+
+# Start a run on the /work/api cell (addressed by path here):
+curl -s localhost:7777/runs -d '{
+  "cell":  "/work/api",
+  "base":  "main",
+  "tasks": [{"id":"t1","prompt":"add a healthcheck endpoint","files":["health.go"]}],
+  "agent": "claude -p \"$SIGBOUND_TASK\"",
+  "verify":"go build ./... && go test ./..."
+}'
+# -> {"runId":"20260722T164530Z-a1b2c3d4e5f6","cell":"...","status":"running"}
+
+# Poll it, then read the landed report:
+curl -s localhost:7777/runs/20260722T164530Z-a1b2c3d4e5f6 | jq '.status, .report.integrate.finalSHA'
+
+# Follow the event stream:
+curl -s localhost:7777/runs/20260722T164530Z-a1b2c3d4e5f6/events
+
+# List history (survives restarts — it's read from disk):
+curl -s localhost:7777/runs | jq
+
+# With a token (any non-loopback bind requires one):
+export SIGBOUND_SERVE_TOKEN=$(openssl rand -hex 32)
+sig serve -repos /work/api -addr 0.0.0.0:7777 -allow-remote &
+curl -s -H "Authorization: Bearer $SIGBOUND_SERVE_TOKEN" localhost:7777/health
+```
+
+---
+
 ## Strategies
 
 All strategies produce the same final tree for a conflict-free batch and flag
