@@ -1171,10 +1171,13 @@ The same data is available as JSON — `GET /runs/{id}/flagged` for the listing 
 (an allowlist), so the endpoint can only ever read a path that was actually
 flagged — never an arbitrary file.
 
-**Auth in the browser.** `/ui` is behind the same auth as every other route. In
-the default posture — loopback bind, **no token** — it just works. If the daemon
-sets a token, the page has a field to paste it: it's kept in `sessionStorage` and
-sent as `Authorization: Bearer` on every fetch (never in a URL). This is a
+**Auth in the browser.** The `/ui` shell is served unauthenticated even when a
+token is set — it is data-free (all run data comes from the gated `/runs`
+endpoints), and a browser navigation cannot carry a bearer token, so gating the
+page itself would only make it unreachable. In the default posture — loopback
+bind, **no token** — everything just works. If the daemon sets a token, the page
+has a field to paste it: it's kept in `sessionStorage` and sent as
+`Authorization: Bearer` on every data fetch (never in a URL). This is a
 localhost single-user tool, not a multi-tenant auth system; for a token-protected
 or exposed daemon, the reverse proxy you already put in front of it (see above) is
 the right place to handle browser auth.

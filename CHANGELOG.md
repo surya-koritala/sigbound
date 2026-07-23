@@ -26,8 +26,9 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
   render via `textContent` only, so agent-generated code can't inject anything.
   This surface is strictly read-only — it never resolves, merges, or lands from
   the browser; that stays `sig run` / `sig integrate` on the CLI. It composes with
-  the existing auth/loopback posture (auth, when a token is set, applies to `/ui`
-  and the endpoints alike). See [docs/USAGE.md](docs/USAGE.md) "Conflict review UI".
+  the existing auth/loopback posture: the data-free `/ui` shell is served
+  unauthenticated, while the `/runs` data endpoints it fetches stay gated by the
+  token. See [docs/USAGE.md](docs/USAGE.md) "Conflict review UI".
 - **`sig serve` quotas and metering** — a managed-layer feature on `serve`
   only (`sig run` stays uncapped), entirely opt-in via server flags (`0` =
   unlimited, byte-identical to before). Quotas are hosted-side ceilings

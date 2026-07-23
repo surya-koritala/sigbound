@@ -937,8 +937,11 @@ func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
 // strict CSP declares the page needs NOTHING external — same-origin fetches
 // only, inline script/style (the page IS one inline file), no remote src of any
 // kind — so it renders on an air-gapped daemon and can never be made to pull a
-// third-party asset. Auth (when a token is set) applies here exactly as to every
-// other route; the page then carries the bearer token on its own fetches.
+// third-party asset. The shell is served UNAUTHENTICATED even when a token is
+// set (it is data-free — a browser navigation cannot carry a bearer token, so
+// gating it would make the page unreachable); every /runs data endpoint the
+// page fetches stays gated, and the page carries the pasted token on those
+// fetches.
 func (s *server) handleUI(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
 	h.Set("Content-Type", "text/html; charset=utf-8")
