@@ -226,9 +226,20 @@ func TestServeUIPageIsSelfContained(t *testing.T) {
 func TestServeReviewAuthApplies(t *testing.T) {
 	const tok = "review-secret-token-value"
 	ts, final := driveFlaggedRun(t, tok, modifyConflictAgent)
+
+	// /ui and /ui/ are the static, data-free shell (see handleUI): a browser
+	// navigation there can never carry an Authorization header, so they must
+	// load with no token at all — otherwise the page (and its in-page token
+	// field) is unreachable the moment a token is configured.
+	for _, path := range []string{"/ui", "/ui/"} {
+		if code := doJSON(t, "GET", ts.URL+path, "", nil, nil); code != http.StatusOK {
+			t.Fatalf("GET %s without token: status %d, want 200 (data-free shell)", path, code)
+		}
+	}
+
+	// Every actual data endpoint stays gated: 401 without the token, 200 with
+	// it.
 	routes := []string{
-		"/ui",
-		"/ui/",
 		"/runs/" + final.ID + "/flagged",
 		"/runs/" + final.ID + "/flagged/agent/t2/shared.txt",
 	}

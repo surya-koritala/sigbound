@@ -18,8 +18,13 @@
 //
 // AUTH: if the env var named by -token-env (default SIGBOUND_SERVE_TOKEN) is
 // set, every request must carry `Authorization: Bearer <token>` (constant-time
-// compared). If it is unset AND the bind is loopback, auth is off (dev mode). A
-// non-loopback bind REQUIRES the token — serve refuses to start without it.
+// compared) — EXCEPT the /ui and /ui/ shell itself (see handleUI): a browser
+// navigation there can never carry that header, so the static, data-free page
+// is served unauthenticated and carries the token on its own fetches after.
+// Every /runs/... data endpoint (including /ui's own /runs/.../flagged data)
+// stays gated. If the token env var is unset AND the bind is loopback, auth is
+// off entirely (dev mode). A non-loopback bind REQUIRES the token — serve
+// refuses to start without it.
 //
 // Endpoints (JSON in, JSON out):
 //
@@ -234,9 +239,14 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /runs/{id}/usage", s.handleRunUsage)
 	// Conflict-review surface (issue #62): the flagged-branch listing, the
 	// three-sides detail for one flagged path, and the read-only HTML page that
-	// renders them. All READ-ONLY — no resolve/merge/land path (that stays sig
-	// run/integrate on the CLI). Registered on the SAME mux, so the auth wrapper
-	// below covers them exactly as it covers every other route.
+	// renders them. The /runs/.../flagged* endpoints are gated exactly like every
+	// other data route below. /ui and /ui/ are special-cased OUT of that gate
+	// (see the dispatch below): a browser navigation can never carry an
+	// Authorization header, so gating the page itself would 401 before the page
+	// — and its own token field — ever loads. That's safe because handleUI's
+	// shell is static and data-free: it fetches every run/flagged/etc. through
+	// authenticated requests carrying a token typed into its own sessionStorage
+	// field, so serving the shell unauthenticated leaks nothing.
 	mux.HandleFunc("GET /runs/{id}/flagged", s.handleFlagged)
 	mux.HandleFunc("GET /runs/{id}/flagged/{rest...}", s.handleFlaggedDetail)
 	mux.HandleFunc("GET /ui", s.handleUI)
@@ -246,6 +256,10 @@ func (s *server) handler() http.Handler {
 		return mux
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/ui" || r.URL.Path == "/ui/" {
+			mux.ServeHTTP(w, r)
+			return
+		}
 		if !s.authOK(r) {
 			writeErr(w, http.StatusUnauthorized, "unauthorized: send Authorization: Bearer <token>")
 			return
