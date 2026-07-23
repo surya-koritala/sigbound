@@ -10,6 +10,24 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ### Added
 
+- **`sig serve` conflict-review surface** — a read-only, self-contained web UI
+  and JSON endpoints for inspecting the branches a run flagged. When a run flags a
+  branch (a real conflict a `-resolver` declined, or none was set), it doesn't
+  land — a human decides. `GET /runs/{id}/flagged` lists the flagged branches and
+  their conflicted paths; `GET /runs/{id}/flagged/{branch}/{path...}` returns the
+  three sides of one path (`base` | `ours`, the landed tree | `theirs`, the
+  flagged branch), each read as a blob from the object store, with a `null` side
+  for an add/delete conflict. The path is validated against the run's own flagged
+  set (an allowlist), so the endpoint can only ever read a path that was actually
+  flagged — a traversal, an absolute path, or any non-flagged file is `404` and
+  reads nothing. `GET /ui` serves a single embedded HTML page (vanilla HTML/CSS/
+  JS, no framework, no CDN, no external asset — CSP-safe and works offline on an
+  air-gapped daemon) that renders the listing and a three-pane diff; file contents
+  render via `textContent` only, so agent-generated code can't inject anything.
+  This surface is strictly read-only — it never resolves, merges, or lands from
+  the browser; that stays `sig run` / `sig integrate` on the CLI. It composes with
+  the existing auth/loopback posture (auth, when a token is set, applies to `/ui`
+  and the endpoints alike). See [docs/USAGE.md](docs/USAGE.md) "Conflict review UI".
 - **`sig serve` quotas and metering** — a managed-layer feature on `serve`
   only (`sig run` stays uncapped), entirely opt-in via server flags (`0` =
   unlimited, byte-identical to before). Quotas are hosted-side ceilings
