@@ -190,6 +190,42 @@ func FuzzParseGitVersion(f *testing.F) {
 	})
 }
 
+// FuzzParseUnbundleRefs fuzzes the `git bundle unbundle` stdout decoder that
+// BundleUnbundle uses to learn which refs a bundle carried — untrusted output
+// that cell.Import then maps into its namespace, so a crasher (panic) or an
+// accepted garbage line would be a real bug at the transport trust boundary.
+func FuzzParseUnbundleRefs(f *testing.F) {
+	sha256a := strings.Repeat("a", 64)
+	f.Add("")
+	f.Add("\n")
+	f.Add(sha1a + " refs/heads/agent/t1\n")
+	f.Add(sha1a + " refs/heads/agent/t1\n" + sha1b + " refs/heads/agent/t2\n")
+	f.Add(sha256a + " refs/heads/main\n")                          // sha256 oid
+	f.Add(sha1a + " refs/tags/v1\n")                               // a tag ref
+	f.Add("  " + sha1a + "   refs/heads/x  \n")                    // surrounding whitespace
+	f.Add(sha1a + "\n")                                            // oid with no ref (malformed)
+	f.Add("refs/heads/x\n")                                        // ref with no oid (malformed)
+	f.Add("notanoid refs/heads/x\n")                               // non-hex oid
+	f.Add(sha1a + " refs/heads/x extra\n")                         // ref field with a space
+	f.Add("Receiving objects: 100%\n" + sha1a + " refs/heads/x\n") // progress-like noise line
+	f.Add(sha1a + " \xff\xfe\n")                                   // non-UTF8 ref
+
+	f.Fuzz(func(t *testing.T, out string) {
+		refs, err := parseUnbundleRefs(out)
+		if err != nil {
+			return // rejecting a malformed line is fine, as long as it did not panic
+		}
+		for _, r := range refs {
+			if !isHexOID(r.OID) {
+				t.Fatalf("accepted ref with non-oid %q", r.OID)
+			}
+			if r.Ref == "" || strings.ContainsAny(r.Ref, " \t\n") {
+				t.Fatalf("accepted ref name with whitespace or empty: %q", r.Ref)
+			}
+		}
+	})
+}
+
 // FuzzParseLsTreeZ fuzzes the MULTI-record `git ls-tree -z <tree> --
 // <paths...>` decoder that entryModesBatch uses to collapse SpliceBlobs'
 // per-path mode lookups into one spawn.

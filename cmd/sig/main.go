@@ -58,6 +58,16 @@ func main() {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "export":
+		if err := runExport(os.Stdout, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "sig export:", err)
+			os.Exit(1)
+		}
+	case "import":
+		if err := runImport(os.Stdout, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "sig import:", err)
+			os.Exit(1)
+		}
 	case "version", "-v", "--version":
 		runVersion(os.Stdout)
 	case "-h", "--help", "help":
@@ -74,6 +84,8 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  sig integrate -repo PATH -base BRANCH -branches b1,b2,..  (see 'sig integrate -h' for all flags)")
 	fmt.Fprintln(w, "  sig run       -repo PATH -base BRANCH (-tasks FILE | -goal STRING) -agent CMD  (see 'sig run -h' for all flags)")
 	fmt.Fprintln(w, "  sig replay    -manifest FILE  (deterministically re-integrate a prior run's recorded inputs; see 'sig replay -h')")
+	fmt.Fprintln(w, "  sig export    -repo PATH -bundle FILE -branches b1,b2,..  (bundle branches for a coordinator to import)")
+	fmt.Fprintln(w, "  sig import    -repo PATH -bundle FILE [-from WORKER_ID]  (import a bundle under imported/<worker>/; then 'sig integrate' it)")
 	fmt.Fprintln(w, "  sig doctor    [-repo PATH]")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))
