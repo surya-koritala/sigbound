@@ -148,6 +148,15 @@ type integrateJSON struct {
 //     verifycache.go. Always false when -verify-cache isn't set, and never
 //     true for a failing verdict (only passes are ever cached).
 //   - Repairs details each attempt (see repairAttemptJSON).
+//   - Invocations is the total number of times the -verify command itself
+//     was actually run: the initial attempt's -verify-retries loop, plus one
+//     more per repair round that reached a re-verify (see verifyWithRepair
+//     and runVerifyRetry). WallMs is the summed wall time of exactly those
+//     invocations. Both are 0 when -verify wasn't configured (Ran false).
+//     -verify-bisect's own probes are NOT folded in here — they have their
+//     own count in Bisect.Attempts, a deliberately separate accounting.
+//     Metering (sig serve's per-run usage record) is the reason these exist;
+//     see cmd/sig/usage.go.
 type verifyJSON struct {
 	Ran          bool                `json:"ran"`
 	OK           bool                `json:"ok"`
@@ -159,6 +168,8 @@ type verifyJSON struct {
 	Cached       bool                `json:"cached,omitempty"`
 	Output       string              `json:"output"`
 	Repairs      []repairAttemptJSON `json:"repairs,omitempty"`
+	Invocations  int                 `json:"invocations"`
+	WallMs       int64               `json:"wallMs"`
 	// Bisect records -verify-bisect's outcome (see verifyBisect), set only when
 	// -verify-bisect was configured AND the full combined tree failed verify (so
 	// bisect actually ran) — nil (omitted) otherwise. When bisect lands a green
@@ -1508,6 +1519,11 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 	ok := false
 	flaky := false
 	cached := false
+	// verifyInvocations/verifyWallMs accumulate across every -verify phase
+	// this call makes: the initial attempt above, plus each repair round's
+	// re-verify below (see verifyJSON's doc comment).
+	verifyInvocations := v.Invocations
+	verifyWallMs := v.WallMs
 	for attempt := 1; attempt <= p.RepairMax; attempt++ {
 		emit.emit("repair_start", map[string]any{"attempt": attempt})
 		rStart := time.Now()
@@ -1568,6 +1584,8 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 		vStart = time.Now()
 		rv := runVerifyRetry(ctx, g, wtPath, p, changedFiles, p.VerifyRetries, p.LogDir, attempt)
 		emit.emit("verify_done", map[string]any{"ok": rv.OK, "flaky": rv.Flaky, "cached": rv.Cached, "attempt": attempt, "wallMs": time.Since(vStart).Milliseconds()})
+		verifyInvocations += rv.Invocations
+		verifyWallMs += rv.WallMs
 		lastOutput = rv.Output
 		lastScope = rv.Scope
 		lastImpacted = rv.ImpactedPkgs
@@ -1595,6 +1613,8 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 		Cached:       cached,
 		Output:       lastOutput,
 		Repairs:      repairs,
+		Invocations:  verifyInvocations,
+		WallMs:       verifyWallMs,
 	}, head
 }
 
@@ -1850,13 +1870,20 @@ func unionWriteSet(branches []string, writeSets map[string][]string) []string {
 // verify-<n>.log; every retry within this call appends to the same file (see
 // openLog).
 func runVerifyRetry(ctx context.Context, g *gitx.Git, wtPath string, p runParams, changedFiles []string, retries int, logDir string, logAttempt int) verifyJSON {
+	start := time.Now()
 	v := runVerify(ctx, g, wtPath, p, changedFiles, logDir, logAttempt)
+	invocations := 1
 	for attempt := 0; !v.OK && attempt < retries; attempt++ {
 		v = runVerify(ctx, g, wtPath, p, changedFiles, logDir, logAttempt)
+		invocations++
 		if v.OK {
 			v.Flaky = true
 		}
 	}
+	// Invocations/WallMs cover every -verify command run in THIS call (the
+	// initial attempt plus every retry) — see verifyJSON's doc comment.
+	v.Invocations = invocations
+	v.WallMs = time.Since(start).Milliseconds()
 	return v
 }
 

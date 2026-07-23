@@ -1288,6 +1288,12 @@ func TestDriveRunVerifyRetries(t *testing.T) {
 	if !rep1.Verify.Flaky {
 		t.Fatal("verify.flaky=false, want true (passed only on the 2nd invocation)")
 	}
+	if rep1.Verify.Invocations != 2 {
+		t.Fatalf("verify.invocations=%d, want 2 (the failing first try + the retry that passed)", rep1.Verify.Invocations)
+	}
+	if rep1.Verify.WallMs <= 0 {
+		t.Fatalf("verify.wallMs=%d, want > 0 (two real command invocations)", rep1.Verify.WallMs)
+	}
 	if mainSHA, err := gitx.New(repo1).RevParse(ctx, "main"); err != nil || mainSHA != rep1.Integrate.FinalSHA {
 		t.Fatalf("flaky-but-green run must still land: main=%s finalSHA=%s err=%v", mainSHA, rep1.Integrate.FinalSHA, err)
 	}
@@ -1309,6 +1315,9 @@ func TestDriveRunVerifyRetries(t *testing.T) {
 	}
 	if rep0.Verify.Flaky {
 		t.Fatal("verify.flaky=true with -verify-retries 0, want false")
+	}
+	if rep0.Verify.Invocations != 1 {
+		t.Fatalf("verify.invocations=%d, want 1 (no retry configured)", rep0.Verify.Invocations)
 	}
 	if code := runExitCode(rep0); code != exitVerifyFailed {
 		t.Fatalf("runExitCode=%d, want exitVerifyFailed", code)
@@ -1550,6 +1559,14 @@ func TestDriveRunRepairSucceeds(t *testing.T) {
 	}
 	if !contains(last.FilesTouched, "repair_fix.go") {
 		t.Fatalf("repair filesTouched=%v, want repair_fix.go", last.FilesTouched)
+	}
+	// One repair round -> two -verify invocations total: the initial failing
+	// attempt plus the post-repair re-verify that passed.
+	if v.Invocations != 2 {
+		t.Fatalf("verify.invocations=%d, want 2 (initial fail + post-repair re-verify)", v.Invocations)
+	}
+	if v.WallMs <= 0 {
+		t.Fatalf("verify.wallMs=%d, want > 0", v.WallMs)
 	}
 
 	// The fix must LAND: base branch advanced to the repaired head, whose tree
