@@ -10,6 +10,22 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ### Added
 
+- **`sig serve`** — a thin, single-process HTTP run API over the same `driveRun`
+  orchestration `sig run` uses (no engine fork), so the verify gate holds by
+  construction: serve adds no new landing path. `sig serve -repos a,b` opens each
+  repo as a cell; `POST /runs` starts a run asynchronously and returns `202
+  {runId}`, `GET /runs/{id}` returns its status and full report once done, `GET
+  /runs` lists history, and `GET /runs/{id}/events` streams the run's NDJSON
+  events. Each run's report and event stream are written under the target repo's
+  `.git/sigbound/runs/<runId>/` (the same `.git/sigbound` storage `-verify-cache`
+  uses), so history survives a restart — the GET endpoints read from disk. One
+  run per cell at a time (a second concurrent run for a cell is `409 Conflict`);
+  different cells run fully in parallel. Binds loopback by default and refuses a
+  non-loopback `-addr` without `-allow-remote`; a non-loopback bind also requires
+  the shared bearer token (`-token-env`, constant-time compared). It ships no TLS
+  and no user model — a single-user daemon, not a multi-tenant service. Runs
+  default to `-env-mode scoped` (a daemon must not leak its environment). See
+  [docs/USAGE.md](docs/USAGE.md) "`sig serve`".
 - **`sig export` / `sig import`** — git-bundle object transport for distributed
   runs. A worker `sig export -bundle FILE -branches a,b,c` packs branches into
   one bundle file (git's native, server-free offline transport); a coordinator

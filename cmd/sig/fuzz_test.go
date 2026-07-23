@@ -267,3 +267,35 @@ func FuzzParseGoListJSON(f *testing.F) {
 		}
 	})
 }
+
+// FuzzValidRunID asserts sig serve's run-id guard: any id validRunID accepts,
+// when joined onto a runs dir, stays strictly inside it — the property that
+// keeps a hostile GET /runs/{id} from traversing out of .git/sigbound/runs.
+// The id is untrusted (it comes straight off the URL) and is used to build a
+// filesystem path, so it must never escape.
+func FuzzValidRunID(f *testing.F) {
+	f.Add("20260722T164530Z-a1b2c3d4e5f6")
+	f.Add("")
+	f.Add(".")
+	f.Add("..")
+	f.Add("../../etc/passwd")
+	f.Add("a/b")
+	f.Add("a\\b")
+	f.Add("run\x00id")
+	f.Add("....")
+	f.Add(strings.Repeat("a", 500))
+
+	base := filepath.Clean("/srv/repo/.git/sigbound/runs")
+	f.Fuzz(func(t *testing.T, id string) {
+		if !validRunID(id) {
+			return // rejecting is always safe, as long as it did not panic
+		}
+		joined := filepath.Join(base, id)
+		if joined != filepath.Join(base, filepath.Base(joined)) {
+			t.Fatalf("validRunID accepted %q that joins to a multi-segment path %q", id, joined)
+		}
+		if !strings.HasPrefix(joined, base+string(filepath.Separator)) {
+			t.Fatalf("validRunID accepted %q that escapes the runs dir: %q", id, joined)
+		}
+	})
+}
