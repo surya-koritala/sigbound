@@ -58,6 +58,14 @@ func main() {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "log":
+		code, err := runLog(os.Stdout, os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sig log:", err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "replay":
 		code, err := runReplay(os.Stdout, os.Args[2:])
 		if err != nil {
@@ -105,6 +113,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  sig serve     -repos PATH[,PATH..] [-addr HOST:PORT]  (HTTP run API over driveRun; see 'sig serve -h')")
 	fmt.Fprintln(w, "  sig doctor    [-repo PATH]")
 	fmt.Fprintln(w, "  sig gc        -repo PATH [-older-than 72h] [-delete] [-force] [-json]  (sweep debris a crashed run left; dry-run by default; see 'sig gc -h')")
+	fmt.Fprintln(w, "  sig log       -repo PATH [-limit 50] [-sha COMMIT | -task ID] [-json]  (read-only run history + commit provenance; see 'sig log -h')")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))
 }

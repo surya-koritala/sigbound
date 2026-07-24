@@ -461,6 +461,23 @@ func (g *Git) NoteAdd(ctx context.Context, ref, commit string, content []byte) e
 	return nil
 }
 
+// NoteShow returns the note attached to commit under the NAMESPACED ref
+// (`git notes --ref=<ref> show <commit>`), the read side of NoteAdd. ok is
+// false when there is no note for that commit (git exits non-zero) — NOT an
+// error, the same not-found contract as BlobAt's present bool; err is reserved
+// for a git process that could not run at all. ref is a bare name (e.g.
+// "sigbound"), matching NoteAdd.
+func (g *Git) NoteShow(ctx context.Context, ref, commit string) (content string, ok bool, err error) {
+	out, _, code, err := g.runWith(ctx, nil, nil, "notes", "--ref="+ref, "show", commit)
+	if err != nil {
+		return "", false, err
+	}
+	if code != 0 {
+		return "", false, nil // no note for this commit (or unknown commit): not an error
+	}
+	return out, true, nil
+}
+
 // BlobAt returns the contents of path at tree-ish rev (`git cat-file blob
 // rev:path`). present is false when the path is absent at rev (e.g. one side of
 // an add/add or delete/modify conflict) — NOT an error; the caller treats it as
