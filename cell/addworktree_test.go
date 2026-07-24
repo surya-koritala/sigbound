@@ -59,7 +59,7 @@ func TestAddWorktreePopulatesFully(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(t.TempDir(), "wt")
-	if err := c.AddWorktree(ctx, dir, "agent/full", base, false); err != nil {
+	if err := c.AddWorktree(ctx, dir, "agent/full", base, false, nil); err != nil {
 		t.Fatalf("AddWorktree: %v", err)
 	}
 	assertPopulated(t, c, dir, "agent/full", base, 12)
@@ -80,14 +80,14 @@ func TestAddWorktreeLoudFailAndReset(t *testing.T) {
 	root := t.TempDir()
 
 	dirA := filepath.Join(root, "wtA")
-	if err := c.AddWorktree(ctx, dirA, "agent/x", base, false); err != nil {
+	if err := c.AddWorktree(ctx, dirA, "agent/x", base, false, nil); err != nil {
 		t.Fatalf("first add: %v", err)
 	}
 
 	// -b (reset=false) MUST loud-fail on the pre-existing branch, never silently
 	// reset it. The add fails in phase 1, so nothing is registered or left on disk.
 	dirB := filepath.Join(root, "wtB")
-	if err := c.AddWorktree(ctx, dirB, "agent/x", base, false); err == nil {
+	if err := c.AddWorktree(ctx, dirB, "agent/x", base, false, nil); err == nil {
 		t.Fatal("second -b add on existing branch: want loud failure, got nil")
 	}
 	if tracked(c, dirB) {
@@ -103,7 +103,7 @@ func TestAddWorktreeLoudFailAndReset(t *testing.T) {
 		t.Fatalf("remove dirA: %v", err)
 	}
 	dirC := filepath.Join(root, "wtC")
-	if err := c.AddWorktree(ctx, dirC, "agent/x", base, true); err != nil {
+	if err := c.AddWorktree(ctx, dirC, "agent/x", base, true, nil); err != nil {
 		t.Fatalf("reset (-B) add after removal: %v", err)
 	}
 	assertPopulated(t, c, dirC, "agent/x", base, 4)
@@ -145,7 +145,7 @@ func TestAddWorktreePopulateFailureCleansUp(t *testing.T) {
 	c.git = c.git.WithBinary(resetFailingGit(t))
 
 	dir := filepath.Join(t.TempDir(), "wt")
-	err = c.AddWorktree(ctx, dir, "agent/broken", base, false)
+	err = c.AddWorktree(ctx, dir, "agent/broken", base, false, nil)
 	if err == nil {
 		t.Fatal("AddWorktree with a failing populate: want error, got nil")
 	}
@@ -166,6 +166,127 @@ func TestAddWorktreePopulateFailureCleansUp(t *testing.T) {
 	}
 	if list := listWorktrees(t, g.Dir()); strings.Contains(list, dir) {
 		t.Fatalf("git still lists the torn-down worktree %s:\n%s", dir, list)
+	}
+}
+
+// lsFiles returns the worktree's index entries (`git ls-files`, read-only — a
+// plain exec is fine, no hermetic env needed), so a cell test can assert the
+// sparse populate left the index COMPLETE even though only the lane is on disk.
+func lsFiles(t *testing.T, dir string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "ls-files").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git ls-files: %v: %s", err, out)
+	}
+	return string(out)
+}
+
+// TestAddWorktreeSparsePopulate proves the #86 sparse branch of AddWorktree:
+// passing sparsePaths materializes ONLY those paths on disk (not the full base
+// tree), while the index stays COMPLETE (so a commit still yields a whole tree)
+// and the branch/created bookkeeping is identical to the full-checkout path.
+func TestAddWorktreeSparsePopulate(t *testing.T) {
+	ctx := context.Background()
+	g, _, base := scenario(t, 8) // f000.txt .. f007.txt
+	c, err := Open(g.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "wt")
+	lane := []string{"f000.txt", "f003.txt"}
+	if err := c.AddWorktree(ctx, dir, "agent/sparse", base, false, lane); err != nil {
+		t.Fatalf("AddWorktree sparse: %v", err)
+	}
+
+	// Only the lane is on disk; every other base file is absent.
+	for _, f := range lane {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			t.Fatalf("lane file %s not materialized: %v", f, err)
+		}
+	}
+	for _, f := range []string{"f001.txt", "f002.txt", "f007.txt"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); !os.IsNotExist(err) {
+			t.Fatalf("out-of-lane %s should not be on disk (stat err=%v)", f, err)
+		}
+	}
+	// The index still holds every base path (skip-worktree hides the rest), so a
+	// commit here would produce a complete tree, not delete the unmaterialized
+	// files — the property that keeps sparse worktrees correct, not just cheap.
+	idx := lsFiles(t, dir)
+	for i := 0; i < 8; i++ {
+		if want := fmt.Sprintf("f%03d.txt", i); !strings.Contains(idx, want) {
+			t.Fatalf("sparse index missing %s (incomplete index corrupts commits), got:\n%s", want, idx)
+		}
+	}
+	// Branch untouched at base and dir registered — same bookkeeping as full.
+	head, err := c.Git().RevParse(ctx, "agent/sparse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != base {
+		t.Fatalf("branch agent/sparse at %s, want base %s (populate moved the ref)", head, base)
+	}
+	if !tracked(c, dir) {
+		t.Fatal("sparse worktree not registered in created")
+	}
+}
+
+// sparseFailingGit is resetFailingGit's sparse-path analogue: a `git` shim that
+// passes every subcommand through to the real git EXCEPT `sparse-checkout`,
+// which it fails. It lets the locked --no-checkout add succeed but the
+// out-of-lock sparse populate fail deterministically, exercising the SAME
+// teardown+created-consistency cleanup on the #86 sparse path.
+func sparseFailingGit(t *testing.T) string {
+	t.Helper()
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git not on PATH: %v", err)
+	}
+	shim := filepath.Join(t.TempDir(), "git")
+	// gitx always invokes `git -C <dir> <subcommand> ...`, so the subcommand is
+	// $3 — fail exactly `sparse-checkout`, pass everything else through.
+	script := "#!/bin/sh\nif [ \"$3\" = sparse-checkout ]; then echo 'injected sparse populate failure' >&2; exit 1; fi\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(shim, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return shim
+}
+
+// TestAddWorktreeSparsePopulateFailureCleansUp is criterion #3 for the sparse
+// path: when the sparse populate fails, the half-made worktree is torn down,
+// the error surfaces, and the created map is left consistent — identical to the
+// full-checkout failure (TestAddWorktreePopulateFailureCleansUp), proving the
+// #85 cleanup path holds for sparse too.
+func TestAddWorktreeSparsePopulateFailureCleansUp(t *testing.T) {
+	ctx := context.Background()
+	g, _, base := scenario(t, 6)
+	c, err := Open(g.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Swap in the sparse-failing shim AFTER Open's real-git preflight ran.
+	c.git = c.git.WithBinary(sparseFailingGit(t))
+
+	dir := filepath.Join(t.TempDir(), "wt")
+	err = c.AddWorktree(ctx, dir, "agent/sparse-broken", base, false, []string{"f000.txt"})
+	if err == nil {
+		t.Fatal("AddWorktree with a failing sparse populate: want error, got nil")
+	}
+
+	if _, statErr := os.Stat(dir); !os.IsNotExist(statErr) {
+		t.Fatalf("half-made sparse worktree left on disk after populate failure (stat err=%v)", statErr)
+	}
+	if tracked(c, dir) {
+		t.Fatal("half-made sparse worktree still registered in created after populate failure")
+	}
+	c.mu.Lock()
+	n := len(c.created)
+	c.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("created map not empty after a lone failed sparse add: %d entries", n)
+	}
+	if list := listWorktrees(t, g.Dir()); strings.Contains(list, dir) {
+		t.Fatalf("git still lists the torn-down sparse worktree %s:\n%s", dir, list)
 	}
 }
 
@@ -195,7 +316,7 @@ func TestAddWorktreeConcurrent(t *testing.T) {
 			defer wg.Done()
 			dir := filepath.Join(root, fmt.Sprintf("wt-%02d", i))
 			branch := fmt.Sprintf("agent/c%02d", i)
-			errs[i] = c.AddWorktree(ctx, dir, branch, base, false)
+			errs[i] = c.AddWorktree(ctx, dir, branch, base, false, nil)
 			results[i] = made{dir, branch}
 		}(i)
 	}
@@ -234,7 +355,7 @@ func TestAddWorktreeCloseInterleave(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			dir := filepath.Join(root, fmt.Sprintf("wt-%02d", i))
-			_ = c.AddWorktree(ctx, dir, fmt.Sprintf("agent/i%02d", i), base, false)
+			_ = c.AddWorktree(ctx, dir, fmt.Sprintf("agent/i%02d", i), base, false, nil)
 		}(i)
 	}
 	// Hammer Close concurrently with the adds.

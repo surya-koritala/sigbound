@@ -121,17 +121,22 @@ func (c *Cell) Git() *gitx.Git { return c.git }
 //     already created (see gitx.WorktreeAddResetNoCheckout). dir is registered in
 //     created here, still under the lock, so Close/gc can tear down even a
 //     worktree whose populate below fails or is cut short.
-//  2. OUTSIDE the lock: gitx.WorktreePopulate (`git reset --hard`) fills this
-//     worktree's OWN index + files from HEAD. It reads only the shared object
-//     store and moves no ref, so distinct worktrees populate in parallel with no
-//     new race surface — that parallelism is the whole point of the split.
+//  2. OUTSIDE the lock: the worktree's OWN index + files are filled from HEAD.
+//     It reads only the shared object store and moves no ref, so distinct
+//     worktrees populate in parallel with no new race surface — that parallelism
+//     is the whole point of the split. sparsePaths selects HOW: empty (the
+//     default) => gitx.WorktreePopulate (`git reset --hard`), a full checkout of
+//     every base file; non-empty => gitx.WorktreePopulateSparse, which
+//     materializes ONLY those paths on disk (index still complete) — the #86
+//     lane-scoped path. The failure/teardown handling below is identical either
+//     way.
 //
-// The caller's contract is unchanged: a nil return is a fully-populated worktree
-// at dir on branch; a non-nil return leaves NO usable worktree. A populate
-// failure (or a ctx cancelled between the phases) tears the half-made worktree
-// down — best-effort, uncancellable — and forgets it from created before
-// returning the error, so no half-populated tree ever survives as "created OK".
-func (c *Cell) AddWorktree(ctx context.Context, dir, branch, base string, reset bool) error {
+// The caller's contract is unchanged: a nil return is a populated worktree at
+// dir on branch; a non-nil return leaves NO usable worktree. A populate failure
+// (or a ctx cancelled between the phases) tears the half-made worktree down —
+// best-effort, uncancellable — and forgets it from created before returning the
+// error, so no half-populated tree ever survives as "created OK".
+func (c *Cell) AddWorktree(ctx context.Context, dir, branch, base string, reset bool, sparsePaths []string) error {
 	c.mu.Lock()
 	var err error
 	if reset {
@@ -146,7 +151,13 @@ func (c *Cell) AddWorktree(ctx context.Context, dir, branch, base string, reset 
 	c.created[dir] = struct{}{}
 	c.mu.Unlock()
 
-	if err := c.git.At(dir).WorktreePopulate(ctx); err != nil {
+	wt := c.git.At(dir)
+	if len(sparsePaths) > 0 {
+		err = wt.WorktreePopulateSparse(ctx, sparsePaths)
+	} else {
+		err = wt.WorktreePopulate(ctx)
+	}
+	if err != nil {
 		// Half-made worktree: tear it down and forget it (RemoveWorktree drops it
 		// from created too). WithoutCancel so cleanup still runs when ctx is the
 		// very thing that failed the populate between the two phases.

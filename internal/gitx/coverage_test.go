@@ -181,6 +181,109 @@ func TestWorktreeAddSparseAndCheckoutPaths(t *testing.T) {
 	}
 }
 
+// --- WorktreePopulateSparse + AddAllSparse (issue #86) ----------------------
+
+// TestWorktreePopulateSparse proves the #86 sparse populate: a --no-checkout
+// worktree materialized with WorktreePopulateSparse puts ONLY the named paths
+// on disk while the index stays complete, and — the property lane enforcement
+// rides on — an out-of-lane write staged with AddAllSparse still lands in the
+// commit (so a base...head diff surfaces it) WITHOUT the untouched
+// skip-worktree files being dropped as spurious deletions. A pattern that
+// matches nothing in the tree (here go.sum, which this repo lacks) is not an
+// error — it simply materializes nothing.
+func TestWorktreePopulateSparse(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t) // base.txt
+	// A tracked file the lane will NOT include, plus a go.mod, so we can prove
+	// the out-of-lane file stays off disk yet survives in the committed tree.
+	writeFile(t, g.Dir(), "other.txt", "other\n")
+	writeFile(t, g.Dir(), "go.mod", "module x\n")
+	base2, err := g.CommitAll(ctx, "add other + go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = base
+
+	wt := filepath.Join(t.TempDir(), "sparse")
+	if err := g.WorktreeAddNoCheckout(ctx, wt, "sp", base2); err != nil {
+		t.Fatal(err)
+	}
+	wg := g.At(wt)
+
+	// Empty paths is a caller bug, never a silent empty checkout.
+	if err := wg.WorktreePopulateSparse(ctx, nil); err == nil {
+		t.Fatal("WorktreePopulateSparse with no paths: want error, got nil")
+	}
+
+	// Lane = base.txt + module metadata (go.sum absent from this repo).
+	if err := wg.WorktreePopulateSparse(ctx, []string{"base.txt", "go.mod", "go.sum"}); err != nil {
+		t.Fatalf("WorktreePopulateSparse: %v", err)
+	}
+	// Only the lane is on disk...
+	if _, err := os.Stat(filepath.Join(wt, "base.txt")); err != nil {
+		t.Fatalf("lane file base.txt not materialized: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "other.txt")); !os.IsNotExist(err) {
+		t.Fatalf("out-of-lane other.txt should not be on disk: %v", err)
+	}
+	// ...but the index is complete (skip-worktree hides the rest).
+	idx, err := wg.run(ctx, "ls-files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(idx, "base.txt") || !contains(idx, "other.txt") || !contains(idx, "go.mod") {
+		t.Fatalf("sparse index should hold every base path, got %q", idx)
+	}
+
+	// An out-of-lane stray write: AddAllSparse must stage it (so it reaches the
+	// commit and a base...head diff surfaces it) while leaving the untouched
+	// skip-worktree files intact — never staged as deletions.
+	writeFile(t, wt, "base.txt", "base\nedited\n")
+	writeFile(t, wt, "stray.txt", "out of lane\n")
+	if err := wg.AddAllSparse(ctx); err != nil {
+		t.Fatalf("AddAllSparse: %v", err)
+	}
+	sha, err := wg.Commit(ctx, "sparse edit + stray")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The stray is in the diff (so lane enforcement can catch it), and the edit
+	// too.
+	changed, err := g.DiffNameOnly(ctx, base2, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := map[string]bool{}
+	for _, f := range changed {
+		cs[f] = true
+	}
+	if !cs["stray.txt"] || !cs["base.txt"] {
+		t.Fatalf("sparse diff must surface the stray + edit, got %v", changed)
+	}
+	// The committed tree is COMPLETE: other.txt never touched disk yet survives,
+	// go.mod too, and the stray was added — nothing dropped by the sparse add.
+	files, err := g.LsTree(ctx, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f] = true
+	}
+	for _, want := range []string{"base.txt", "other.txt", "go.mod", "stray.txt"} {
+		if !got[want] {
+			t.Fatalf("sparse commit lost/dropped %q, tree=%v", want, files)
+		}
+	}
+	body, _, err := g.BlobAt(ctx, sha, "other.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "other\n" {
+		t.Fatalf("out-of-lane other.txt corrupted in tree: %q", body)
+	}
+}
+
 // --- WorktreeAddDetached ----------------------------------------------------
 
 func TestWorktreeAddDetached(t *testing.T) {

@@ -139,6 +139,33 @@ func (g *Git) CommitAll(ctx context.Context, msg string) (string, error) {
 	return g.Commit(ctx, msg)
 }
 
+// AddAllSparse stages every change like AddAll but adds `--sparse`, so paths
+// OUTSIDE the worktree's sparse-checkout definition are staged too. Plain `git
+// add -A` SKIPS them (a safety default), which in a sparse worktree (see
+// WorktreePopulateSparse) would silently drop an agent's out-of-lane write
+// BEFORE it reached the commit — hiding it from the base...head diff lane
+// enforcement reads, so a stray that must be caught never would be. --sparse
+// keeps that write in the commit so lane enforcement catches it exactly as in a
+// full checkout, and leaves the skip-worktree entries untouched (never staged
+// as spurious deletions just because they're absent from disk). On a non-sparse
+// worktree --sparse is a no-op — plain AddAll's exact behavior.
+func (g *Git) AddAllSparse(ctx context.Context) error {
+	_, err := g.run(ctx, "add", "-A", "--sparse")
+	return err
+}
+
+// CommitAllSparse is CommitAll's sparse-worktree form: it stages with
+// AddAllSparse (so out-of-sparse paths are included, not dropped) then commits.
+// The driver's auto-commit path uses it when an agent ran in a sparse worktree,
+// so an edit-only agent's out-of-lane stray still lands in the branch and is
+// caught by lane enforcement, identically to a full checkout.
+func (g *Git) CommitAllSparse(ctx context.Context, msg string) (string, error) {
+	if err := g.AddAllSparse(ctx); err != nil {
+		return "", err
+	}
+	return g.Commit(ctx, msg)
+}
+
 // HeadSHA returns the SHA of HEAD.
 func (g *Git) HeadSHA(ctx context.Context) (string, error) {
 	return g.run(ctx, "rev-parse", "HEAD")
@@ -243,6 +270,39 @@ func (g *Git) WorktreeAddResetNoCheckout(ctx context.Context, path, branch, base
 func (g *Git) WorktreePopulate(ctx context.Context) error {
 	_, err := g.run(ctx, "reset", "--hard", "-q")
 	return err
+}
+
+// WorktreePopulateSparse materializes a worktree created with
+// WorktreeAddNoCheckout as a SPARSE checkout: it pins the worktree's
+// sparse-checkout patterns to exactly paths, then checks out HEAD so ONLY the
+// files matching those patterns land on disk. The index is still fully
+// populated from HEAD (every base path present, the skip-worktree bit set on
+// the unmaterialized ones), so a later add/commit still produces a COMPLETE,
+// correct tree — only the working directory is partial. This is
+// WorktreePopulate's lane-scoped counterpart in the #85 add/populate split: it
+// runs OUTSIDE the cell lock in place of the full `reset --hard`, trading an
+// O(tree size) checkout for one bounded by len(paths) — the disk + I/O win #86
+// exists for. g must be bound to the worktree dir (use At(dir)).
+//
+// --no-cone matches paths as literal gitignore-style entries (exact files), not
+// cone-mode directory prefixes: a lane of individual files must not drag in each
+// file's whole directory. An empty paths is a caller bug — a no-lane worktree
+// must take the full WorktreePopulate path instead — so it errors rather than
+// silently checking out an empty tree.
+func (g *Git) WorktreePopulateSparse(ctx context.Context, paths []string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("WorktreePopulateSparse: no paths (a no-lane worktree must use WorktreePopulate)")
+	}
+	if _, err := g.run(ctx, append([]string{"sparse-checkout", "set", "--no-cone"}, paths...)...); err != nil {
+		return err
+	}
+	// The worktree was added --no-checkout, so nothing is on disk and its index
+	// is empty; checking out HEAD now fills the index from HEAD and writes only
+	// the sparse set (skip-worktree on the rest) into the working tree.
+	if _, err := g.run(ctx, "checkout", "-q", "HEAD"); err != nil {
+		return err
+	}
+	return nil
 }
 
 // WorktreeAddSparse creates a worktree WITHOUT checking out the tree, then

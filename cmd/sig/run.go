@@ -366,14 +366,24 @@ type runParams struct {
 	EnvRepair       []string
 	EnvPublish      []string
 	VerifyCmd       string
-	VerifyImpactCmd string        // optional command run INSTEAD of -verify when computeImpact can confidently scope to the impacted Go packages; requires VerifyCmd, which stays the fallback on any doubt (see runVerify)
-	VerifyRetries   int           // re-run a FAILING -verify up to this many more times on the same tree before giving up (0 = today's behavior)
-	VerifyCache     bool          // skip -verify when its exact (tree OID, resolved command) pair already has a cached PASS; see verifycache.go. Off by default (opt-in)
-	VerifyBisect    bool          // when the FULL combined tree fails -verify (after -repair, if set), bisect the integration groups and land the largest subset that verifies green; see verifyBisect. Requires VerifyCmd. Off by default
-	RepairCmd       string        // fixer-agent command run when -verify fails (empty => no repair loop)
-	RepairMax       int           // max repair attempts before giving up honestly (default via flag)
-	Autocommit      bool          // commit an agent's uncommitted edits when it made no commit itself
-	LaneMode        string        // lane enforcement: laneOff | laneWarn | laneStrict
+	VerifyImpactCmd string // optional command run INSTEAD of -verify when computeImpact can confidently scope to the impacted Go packages; requires VerifyCmd, which stays the fallback on any doubt (see runVerify)
+	VerifyRetries   int    // re-run a FAILING -verify up to this many more times on the same tree before giving up (0 = today's behavior)
+	VerifyCache     bool   // skip -verify when its exact (tree OID, resolved command) pair already has a cached PASS; see verifycache.go. Off by default (opt-in)
+	VerifyBisect    bool   // when the FULL combined tree fails -verify (after -repair, if set), bisect the integration groups and land the largest subset that verifies green; see verifyBisect. Requires VerifyCmd. Off by default
+	RepairCmd       string // fixer-agent command run when -verify fails (empty => no repair loop)
+	RepairMax       int    // max repair attempts before giving up honestly (default via flag)
+	Autocommit      bool   // commit an agent's uncommitted edits when it made no commit itself
+	LaneMode        string // lane enforcement: laneOff | laneWarn | laneStrict
+	// SparseWorktrees is -sparse-worktrees: when set, an agent whose task
+	// DECLARES files gets a sparse worktree that materializes only its lane
+	// (plus go.mod/go.sum) on disk instead of the full base tree — the #86
+	// disk + I/O optimization for large repos with lane-scoped tasks. A task
+	// with NO declared files still gets a full checkout even when this is on
+	// (there's no lane to scope to); driveRun warns which tasks fell back. Off
+	// by default; composes with -lanes strict, which is what makes an
+	// out-of-lane write (a build that needs an unmaterialized file) a failed
+	// agent rather than a silent partial land. See runAgent and docs/USAGE.md.
+	SparseWorktrees bool
 	KeepFailed      bool          // keep a FAILED agent's worktree on disk instead of removing it
 	LogDir          string        // when set, full per-command stdout+stderr logs are written here (see openLog)
 	EventsPath      string        // when set, one JSON event per line is streamed here as the run progresses ("-" = stderr); see eventEmitter
@@ -551,6 +561,12 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	lanes := fs.String("lanes", laneWarn, "lane enforcement for declared file-sets: off (ignore) | warn (record out-of-lane writes, still land) | strict (out-of-lane => failed agent, not landed). warn is best-effort; strict is the real disjointness guarantee. "+
 		"Default is warn, EXCEPT a planned run (-goal) with -lanes not set explicitly defaults to strict, since the planner already promised a disjoint split")
 	keepFailed := fs.Bool("keep-failed", false, "keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected; the path is printed and recorded in the report. Successful agents' worktrees are always removed")
+	sparseWorktrees := fs.Bool("sparse-worktrees", false, "OPTIMIZATION for large repos with lane-scoped tasks: materialize ONLY each task's declared files (plus go.mod/go.sum) in its worktree "+
+		"instead of a full checkout of the whole base tree. Shrinks worktree-setup time and disk when the tree is much larger than any one lane -- 512 full checkouts of a 2000-file "+
+		"monorepo is real I/O this skips. HONEST LIMIT: a build/agent that reads a file NOT in the task's lane (nor go.mod/go.sum) fails, because that file isn't on disk -- so this is only "+
+		"correct for tasks that genuinely stay within their declared files; declare any other path the build needs in the task's own files. Composes with -lanes strict (an out-of-lane write "+
+		"is still caught and fails the agent, never lands a broken partial). A task that declares NO files is exempt -- it always gets a full checkout (there's no lane to scope to), warned on "+
+		"stderr. Off by default. See docs/USAGE.md's Sparse worktrees section")
 	parallelAgents := fs.Int("parallel-agents", 0, "cap how many agents run concurrently (the fan-out semaphore driveRun gates every agent through). 0 (default): today's behavior, unchanged -- runtime.GOMAXPROCS(0), "+
 		"a CPU-shaped cap that under-uses these I/O-bound model-agent calls (only GOMAXPROCS of a much larger task count ever run at once). Raise it past GOMAXPROCS for more wall-clock throughput, as high as your model "+
 		"provider's rate limits allow (64 concurrent agent calls is a legitimate ask); lower it -- down to 1, fully serial -- to stay under a rate-limited key's concurrent-request ceiling. Must be >= 0")
@@ -858,6 +874,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		RepairMax:       *repairMax,
 		Autocommit:      !*noAutocommit,
 		LaneMode:        laneMode,
+		SparseWorktrees: *sparseWorktrees,
 		KeepFailed:      *keepFailed,
 		ParallelAgents:  *parallelAgents,
 		Budget:          *budget,
@@ -1242,6 +1259,22 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, p.Budget)
 		defer cancel()
+	}
+
+	// -sparse-worktrees only scopes a task that DECLARED files; a task with none
+	// has no lane and falls back to a full checkout even with the flag on. That
+	// fallback must not be silent (the caller asked for sparse and some tasks
+	// won't be), so name the exempt tasks on stderr before any worktree is made.
+	if p.SparseWorktrees {
+		var noLane []string
+		for _, t := range tasks {
+			if len(t.Files) == 0 {
+				noLane = append(noLane, t.ID)
+			}
+		}
+		if len(noLane) > 0 {
+			fmt.Fprintf(os.Stderr, "warning: -sparse-worktrees: %d task(s) declare no files; using a full checkout for %v\n", len(noLane), noLane)
+		}
 	}
 
 	// ---- fan out: one agent per task, each in its own isolated worktree ----
@@ -2153,12 +2186,26 @@ func runAgent(ctx context.Context, c *cell.Cell, wtRoot, baseSHA string, p runPa
 	a = perAgentJSON{ID: t.ID, Branch: branch, Files: []string{}, InLane: true}
 	dir := filepath.Join(wtRoot, "wt-"+sanitizeID(t.ID))
 
+	// -sparse-worktrees: a task that DECLARES files gets a worktree holding only
+	// its lane (plus Go module metadata every build reads) on disk; the index is
+	// still complete, so commits produce whole trees and lane enforcement is
+	// unaffected. A task with NO declared files has no lane to scope to and falls
+	// back to a full checkout even when the flag is on (driveRun warns which
+	// tasks did). Anything a build needs beyond the lane must be declared in the
+	// task's files — an undeclared read fails, which is the whole point (it
+	// composes with -lanes strict). See sparsePathsFor.
+	sparse := p.SparseWorktrees && len(t.Files) > 0
+	var sparsePaths []string
+	if sparse {
+		sparsePaths = sparsePathsFor(t.Files)
+	}
+
 	// The cell serializes only the no-checkout add against every other agent's
 	// admin step on this repo; the populate runs in parallel (see
 	// cell.AddWorktree). created => reset a branch THIS run already made. Time the
 	// whole setup so the long pole is greppable per-agent and rolled up per-run.
 	setupStart := time.Now()
-	addErr := c.AddWorktree(ctx, dir, branch, baseSHA, created)
+	addErr := c.AddWorktree(ctx, dir, branch, baseSHA, created, sparsePaths)
 	a.SetupMs = time.Since(setupStart).Milliseconds()
 	if addErr != nil {
 		a.Exit = -1
@@ -2253,7 +2300,20 @@ func runAgent(ctx context.Context, c *cell.Cell, wtRoot, baseSHA string, p runPa
 	// are untouched. Disabled by -no-autocommit.
 	if p.Autocommit && runErr == nil && herr == nil && head == baseSHA {
 		if dirty, derr := wt.HasUncommittedChanges(ctx); derr == nil && dirty {
-			if sha, cerr := wt.CommitAll(ctx, "agent: "+t.ID); cerr == nil {
+			// In a sparse worktree, plain `git add -A` SKIPS a path the agent
+			// wrote outside the sparse set, dropping an out-of-lane stray before
+			// it can be committed — and thus hiding it from the base...head diff
+			// lane enforcement reads. CommitAllSparse stages with --sparse so the
+			// stray lands and is caught exactly as in a full checkout (see
+			// gitx.AddAllSparse). Non-sparse agents keep plain CommitAll.
+			var sha string
+			var cerr error
+			if sparse {
+				sha, cerr = wt.CommitAllSparse(ctx, "agent: "+t.ID)
+			} else {
+				sha, cerr = wt.CommitAll(ctx, "agent: "+t.ID)
+			}
+			if cerr == nil {
 				head, herr = sha, nil
 				a.Autocommitted = true
 			}
@@ -2285,6 +2345,23 @@ func runAgent(ctx context.Context, c *cell.Cell, wtRoot, baseSHA string, p runPa
 
 	applyLaneEnforcement(&a, t, p)
 	return a, true
+}
+
+// sparsePathsFor is the on-disk file-set for a -sparse-worktrees worktree: the
+// task's declared lane plus the Go module metadata (go.mod/go.sum) a build
+// reads even when it touches no other file. go.mod/go.sum are matched as
+// literal sparse-checkout patterns, so a repo that lacks them just materializes
+// nothing for them (a non-matching pattern is not an error) — the helper stays
+// correct for a repo with neither. Anything ELSE a build needs must be declared
+// in the task's own files; an undeclared read fails, which is exactly what
+// -sparse-worktrees trades for its disk + I/O win (it composes with -lanes
+// strict). files is assumed non-empty — the caller only builds a sparse
+// worktree for a task that declared a lane.
+func sparsePathsFor(files []string) []string {
+	paths := make([]string, 0, len(files)+2)
+	paths = append(paths, files...)
+	paths = append(paths, "go.mod", "go.sum")
+	return paths
 }
 
 // applyLaneEnforcement compares an agent's ACTUAL write-set (a.Files) against

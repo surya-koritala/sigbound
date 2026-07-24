@@ -579,6 +579,85 @@ func TestDriveRunLaneEnforcement(t *testing.T) {
 	}
 }
 
+// TestDriveRunSparseWorktreeLaneEnforcement is issue #86's core guarantee:
+// -sparse-worktrees materializes ONLY a task's lane on disk, yet lane
+// enforcement still works IDENTICALLY. An edit-only agent that writes OUTSIDE
+// its lane is still caught — strayed is recorded, and under -lanes strict the
+// agent fails and does not land — because the sparse-aware autocommit stages
+// the stray (git add -A --sparse) so the base...head diff surfaces it. The
+// in-lane case still lands, and its landed commit's tree is COMPLETE even
+// though most of it never touched disk — proving sparse is cheap, not lossy.
+func TestDriveRunSparseWorktreeLaneEnforcement(t *testing.T) {
+	ctx := context.Background()
+
+	// Edit-only agents (write files, never commit) so the driver's sparse-aware
+	// autocommit runs — the path that keeps a stray catchable in a sparse
+	// worktree. A self-committing agent using plain `git add` would have its
+	// out-of-sparse stray dropped by git before commit (a documented limit; see
+	// docs/USAGE.md's Sparse worktrees section) — that path never lands the
+	// stray either, but the autocommit path is the one that reports it as caught.
+	strayAgent := `printf 'package main\nfunc a() int { return 1 }\n' > a.go && printf 'package main\nfunc b() int { return 2 }\n' > b.go`
+	task := taskSpec{ID: "lane1", Prompt: "x", Files: []string{"a.go"}}
+
+	// ---- sparse + strict: out-of-lane b.go still caught, not landed ----
+	_, repo := makeGoRepo(t)
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: strayAgent,
+		LaneMode: laneStrict, SparseWorktrees: true, Autocommit: true}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun sparse strict: %v", err)
+	}
+	a := rep.PerAgent[0]
+	if a.OK {
+		t.Fatalf("sparse strict: out-of-lane agent must not be OK (stray uncaught): stderr=%q", a.Stderr)
+	}
+	if a.InLane {
+		t.Fatal("sparse strict: agent should be marked out-of-lane")
+	}
+	if !contains(a.Strayed, "b.go") {
+		t.Fatalf("sparse strict: strayed=%v, want b.go (the stray must be caught in a sparse worktree)", a.Strayed)
+	}
+	if !strings.Contains(a.Stderr, "out-of-lane") {
+		t.Fatalf("sparse strict: out-of-lane reason not recorded: %q", a.Stderr)
+	}
+	if len(rep.Integrate.Landed) != 0 {
+		t.Fatalf("sparse strict: landed=%d, want 0 (out-of-lane agent not landed)", len(rep.Integrate.Landed))
+	}
+
+	// ---- sparse + in-lane: happy path lands, tree stays complete ----
+	inLaneAgent := `printf 'package main\nfunc a() int { return 1 }\n' > a.go`
+	taskIn := taskSpec{ID: "lane2", Prompt: "x", Files: []string{"a.go"}}
+	_, repo2 := makeGoRepo(t)
+	p2 := runParams{Repo: repo2, Base: "main", Strategy: "overlay", AgentCmd: inLaneAgent,
+		LaneMode: laneStrict, SparseWorktrees: true, Autocommit: true}
+	rep2, err := driveRun(ctx, p2, []taskSpec{taskIn})
+	if err != nil {
+		t.Fatalf("driveRun sparse in-lane: %v", err)
+	}
+	a2 := rep2.PerAgent[0]
+	if !a2.OK || !a2.InLane || len(a2.Strayed) != 0 {
+		t.Fatalf("sparse in-lane: want OK/inLane/no-strays; got ok=%v inLane=%v strayed=%v stderr=%q", a2.OK, a2.InLane, a2.Strayed, a2.Stderr)
+	}
+	if len(rep2.Integrate.Landed) != 1 {
+		t.Fatalf("sparse in-lane: landed=%d, want 1", len(rep2.Integrate.Landed))
+	}
+	// The landed tree is COMPLETE: main.go/go.mod/shared.txt survive even though
+	// they were never materialized on disk in the sparse worktree.
+	files, err := gitx.New(repo2).LsTree(ctx, rep2.Integrate.FinalSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f] = true
+	}
+	for _, want := range []string{"a.go", "main.go", "go.mod", "shared.txt"} {
+		if !got[want] {
+			t.Fatalf("sparse land dropped %q from the committed tree, got %v", want, files)
+		}
+	}
+}
+
 // TestDriveRunKeepFailed: -keep-failed retains a FAILED agent's worktree on
 // disk (and names it in the report) instead of tearing it down; without the
 // flag the worktree is removed as before. A successful agent's worktree is

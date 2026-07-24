@@ -7,11 +7,13 @@
 // filesystem and refuses the run up front when it's clearly not going to
 // fit. `sig doctor` surfaces the same numbers as an informational line.
 //
-// Sparse lanes (issue #86, not yet built) would check out only each agent's
-// declared files instead of the full tree, shrinking the true footprint
-// well below this estimate — today's full-checkout WorktreeAdd is exactly
-// what this bounds, so the estimate will get more conservative than
-// necessary once that lands, never less safe.
+// -sparse-worktrees (issue #86) checks out only each agent's declared lane
+// (plus go.mod/go.sum) instead of the full tree, shrinking the true footprint
+// well below this estimate. This preflight still estimates FULL checkouts
+// regardless of that flag, so a -sparse-worktrees run is bounded more
+// conservatively than it needs to be — never less safe, but a genuinely large
+// sparse run it wrongly refuses is exactly what -no-disk-check exists to
+// override.
 package main
 
 import (

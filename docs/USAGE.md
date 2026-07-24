@@ -38,6 +38,7 @@ sig run [-config PATH]
         [-lanes off|warn|strict]
         [-no-autocommit]
         [-keep-failed]
+        [-sparse-worktrees]
         [-parallel-agents N]
         [-budget D]
         [-logdir DIR]
@@ -86,6 +87,7 @@ sig run [-config PATH]
 | `-lanes` | `warn`* | Lane enforcement: `off`, `warn`, or `strict` (see [File lanes](#file-lanes)). *`-goal` runs default to `strict` instead unless `-lanes` is set explicitly. |
 | `-no-autocommit` | `false` | Do **not** commit edits an agent left uncommitted. By default the driver stages and commits them, so edit-only agents still land. |
 | `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. A kept worktree stays registered with git until you remove it: `git worktree remove <path>` (or `git worktree prune` after deleting the directory yourself). With `-agent-retries`, only the LAST failed attempt's worktree is kept — every earlier attempt is torn down as it fails. |
+| `-sparse-worktrees` | `false` | Materialize only each task's declared `files` (plus `go.mod`/`go.sum`) in its worktree instead of a full checkout of the whole base tree — an optimization for large repos with lane-scoped tasks (see [Sparse worktrees](#sparse-worktrees)). A task with no declared `files` always gets a full checkout (warned on stderr). Off by default. |
 | `-parallel-agents` | `0` | Cap how many agents run concurrently — the fan-out semaphore every agent goes through (see [Parallelism](#parallelism)). `0` (default): today's behavior, unchanged — `runtime.GOMAXPROCS(0)`. Must be `>= 0`. |
 | `-budget` | `0` | Wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (`0` = none). On expiry, outstanding agents are cancelled and fail; integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial. |
 | `-no-disk-check` | `false` | Skip the disk-space preflight. By default, before any agent runs, the driver refuses the run (exit 1, no agent started) when task count x checked-out tree size, padded by a 10% safety margin, clearly won't fit free space on the worktree root's filesystem; the check fails OPEN (never blocks the run) whenever the estimate can't be confidently formed, e.g. an unreadable tree or an unsupported platform. |
@@ -1536,6 +1538,54 @@ file, or a plan produced by the planner). `-lanes` controls enforcement:
 - `strict` *(default for planned `-goal` runs, unless `-lanes` is set
   explicitly)* — an out-of-lane write makes the agent a failed agent; its work is
   not landed. This is the real disjointness guarantee.
+
+---
+
+## Sparse worktrees
+
+By default every agent worktree is a **full checkout** of the base tree. On a
+large repo that is real I/O — a 64-agent run on a 2000-file tree writes ~128000
+files to disk just to set up, even when each task's lane is two files.
+
+`-sparse-worktrees` is an **opt-in optimization** for that case: when a task
+**declares `files`**, its worktree materializes on disk only
+
+- the declared lane, plus
+- `go.mod` / `go.sum` (the Go module metadata a build always reads),
+
+while its git **index stays complete** — so a commit still produces a whole,
+correct tree; only the working directory is partial. Setup time and disk both
+shrink toward the size of the lane instead of the whole repo. Off by default.
+
+**Honest limits — read before turning it on:**
+
+- **A build or agent that reads a file NOT in the lane (nor `go.mod`/`go.sum`)
+  fails, because that file is not on disk.** This is the whole point: it
+  composes with `-lanes strict`, which already treats touching anything outside
+  the lane as a failure. If a task genuinely needs another path checked out
+  (a shared header, a generated file, a testdata fixture), **declare it in that
+  task's `files`** — that both materializes it and keeps it inside the lane.
+- **A task that declares no `files` has no lane to scope to**, so it always gets
+  a full checkout even with the flag on. `sig run` names those tasks on stderr
+  (`warning: -sparse-worktrees: N task(s) declare no files ...`) rather than
+  silently downgrading them.
+- **Lane enforcement is unchanged.** An edit-only agent that writes outside its
+  lane is still caught: the driver's auto-commit stages the stray so it shows in
+  the branch's write-set and `-lanes strict` fails the agent, identically to a
+  full checkout. One nuance: an agent that runs `git add`/`git commit` **itself**
+  with a plain `git add -A` will have git *drop* any out-of-sparse file before it
+  is committed — so that write never lands (the disjointness guarantee holds),
+  but it is reported in-lane rather than as a caught stray. Rely on the
+  auto-commit path (the default; don't pass `-no-autocommit`) if you want strays
+  reported.
+- **The disk-space preflight still estimates full checkouts**, so it may refuse a
+  large sparse run that would actually fit. Pass `-no-disk-check` for such a run.
+
+Example — a hand-written tasks file whose lanes are disjoint two-file sets:
+
+```
+sig run -repo . -agent "$AGENT" -tasks tasks.json -lanes strict -sparse-worktrees
+```
 
 ---
 
