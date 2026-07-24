@@ -123,14 +123,14 @@ Each agent works in its own `git worktree`. Non-overlapping branches are merged 
 
 ## Benchmarks
 
-Merging N agents' branches into one repository, on a single laptop. Correctness is verified on every run.
+Merging N agents' branches into one repository, on a single laptop (median of 5 runs, correctness verified on every run).
 
 | Agents | Sigbound | Sequential `git merge` | Speedup |
 |-------:|---------:|-----------------------:|--------:|
-| 64  | 0.3 s | 2.5 s | 8× |
-| 128 | 0.5 s | ~7 s  | 13× |
-| 256 | 0.9 s | ~12 s | 13× |
-| 512 | 1.8 s | 26 s  | 15× |
+| 64  | 0.3 s | 4.5 s  | 17× |
+| 128 | 0.5 s | 8.1 s  | 17× |
+| 256 | 0.8 s | 16.7 s | 22× |
+| 512 | 1.4 s | 35.1 s | 25× |
 
 ![Merge time vs number of agents](docs/bench-mergetax.png)
 
@@ -140,10 +140,11 @@ Sequential merging slows down as agents are added, because each merge changes th
 
 The advantage grows with the number of agents.
 
-Reproduce:
+Reproduce a table row (or the full agents×overlap sweep):
 
 ```bash
-go run ./cmd/sigbench -sweep -runs 5 -warmup 1
+go run ./cmd/sigbench -agents 512 -files 2000 -strategy overlay,porcelain -runs 5 -warmup 2
+go run ./cmd/sigbench -sweep
 ```
 
 ## Comparison
