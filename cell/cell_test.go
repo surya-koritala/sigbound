@@ -22,6 +22,35 @@ func listWorktrees(t *testing.T, repo string) string {
 	return string(out)
 }
 
+// normPath canonicalizes p for comparison against git's worktree output. git
+// reports its own resolved, forward-slashed paths; t.TempDir() can hand back a
+// symlinked /var (macOS: /var vs /private/var) or an 8.3 short name (Windows:
+// RUNNER~1 vs runneradmin). EvalSymlinks collapses both; ToSlash matches git's
+// separators even on Windows. A removed worktree's leaf no longer resolves — the
+// lexical fallback is fine there because git never lists a torn-down worktree,
+// so absence checks still hold. (#94)
+func normPath(t *testing.T, p string) string {
+	t.Helper()
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+	return filepath.ToSlash(filepath.Clean(p))
+}
+
+// worktreeRegistered reports whether git's porcelain worktree list registers
+// dir, matching on canonicalized full paths (normPath) rather than a raw
+// substring so 8.3 short names / symlinked temp dirs don't spuriously miss.
+func worktreeRegistered(t *testing.T, list, dir string) bool {
+	t.Helper()
+	want := normPath(t, dir)
+	for _, line := range strings.Split(list, "\n") {
+		if p, ok := strings.CutPrefix(strings.TrimSpace(line), "worktree "); ok && normPath(t, p) == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestOpenValidation(t *testing.T) {
 	// Bad path: does not exist.
 	if _, err := Open(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
@@ -97,7 +126,7 @@ func TestCellCloseCleansWorktrees(t *testing.T) {
 		if _, err := os.Stat(d); err != nil {
 			t.Fatalf("worktree dir %s should exist before Close: %v", d, err)
 		}
-		if !strings.Contains(before, d) {
+		if !worktreeRegistered(t, before, d) {
 			t.Fatalf("worktree %s missing from `git worktree list` before Close:\n%s", d, before)
 		}
 	}
@@ -112,7 +141,7 @@ func TestCellCloseCleansWorktrees(t *testing.T) {
 		if _, err := os.Stat(d); !os.IsNotExist(err) {
 			t.Fatalf("worktree dir %s should be gone after Close, stat err=%v", d, err)
 		}
-		if strings.Contains(after, d) {
+		if worktreeRegistered(t, after, d) {
 			t.Fatalf("worktree %s still in `git worktree list` after Close:\n%s", d, after)
 		}
 	}

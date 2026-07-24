@@ -165,7 +165,7 @@ func TestAddWorktreePopulateFailureCleansUp(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("created map not empty after a lone failed add: %d entries", n)
 	}
-	if list := listWorktrees(t, g.Dir()); strings.Contains(list, dir) {
+	if list := listWorktrees(t, g.Dir()); worktreeRegistered(t, list, dir) {
 		t.Fatalf("git still lists the torn-down worktree %s:\n%s", dir, list)
 	}
 }
@@ -286,7 +286,7 @@ func TestAddWorktreeSparsePopulateFailureCleansUp(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("created map not empty after a lone failed sparse add: %d entries", n)
 	}
-	if list := listWorktrees(t, g.Dir()); strings.Contains(list, dir) {
+	if list := listWorktrees(t, g.Dir()); worktreeRegistered(t, list, dir) {
 		t.Fatalf("git still lists the torn-down sparse worktree %s:\n%s", dir, list)
 	}
 }
