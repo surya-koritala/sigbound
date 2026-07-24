@@ -81,6 +81,13 @@ type perAgentJSON struct {
 	// including retries (see -agent-retries / runAgentWithRetries). 1 when the
 	// first try succeeded or -agent-retries is 0.
 	Attempts int `json:"attempts,omitempty"`
+	// SetupMs is this agent's worktree-setup wall time — the locked no-checkout
+	// add plus the parallel reset --hard populate (see cell.AddWorktree) — for
+	// the attempt that ended the retry loop. The greppable per-agent view of the
+	// cost issue #85 parallelizes; the run-level rollup is the worktree_setup
+	// event. 0 (and omitted) for a -resume-reused branch, which set up no
+	// worktree at all.
+	SetupMs int64 `json:"setupMs,omitempty"`
 	// Resumed is true iff -resume reused this task's agent/<id> branch
 	// outright instead of running its agent again (see runParams.Resume /
 	// resumeAgent): the branch already differed from the recorded baseSHA, so
@@ -1256,7 +1263,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			if p.Resume {
 				if a, reused := resumeAgent(ctx, c, branch, baseSHA, p, tasks[i]); reused {
 					agents[i] = a
-					emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "resumed": true, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "wallMs": int64(0)})
+					emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "resumed": true, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "setupMs": int64(0), "wallMs": int64(0)})
 					return
 				}
 			}
@@ -1264,10 +1271,31 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			agentStart := time.Now()
 			agents[i] = runAgentWithRetries(ctx, c, wtRoot, baseSHA, p, tasks[i])
 			a := agents[i]
-			emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "wallMs": time.Since(agentStart).Milliseconds()})
+			emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "setupMs": a.SetupMs, "wallMs": time.Since(agentStart).Milliseconds()})
 		}(i)
 	}
 	wg.Wait()
+
+	// Worktree-setup cost, surfaced once per run (issue #85). Each fresh agent's
+	// own setup ms already rides its agent_done line (per-agent, greppable, no new
+	// event at 4096 agents); this single aggregate is the run-level view — how
+	// many worktrees were set up, the summed setup work, and the long-pole single
+	// setup. -resume-reused agents set up no worktree, so they're excluded.
+	var wtCount int
+	var wtTotalMs, wtMaxMs int64
+	for i := range agents {
+		if agents[i].Resumed {
+			continue
+		}
+		wtCount++
+		wtTotalMs += agents[i].SetupMs
+		if agents[i].SetupMs > wtMaxMs {
+			wtMaxMs = agents[i].SetupMs
+		}
+	}
+	if wtCount > 0 {
+		emit.emit("worktree_setup", map[string]any{"count": wtCount, "totalMs": wtTotalMs, "maxMs": wtMaxMs})
+	}
 
 	// -semantic go: the opt-in Go symbol-level analysis (see
 	// computeSemanticEdges), run BETWEEN the agent phase and integrate — every
@@ -2125,11 +2153,16 @@ func runAgent(ctx context.Context, c *cell.Cell, wtRoot, baseSHA string, p runPa
 	a = perAgentJSON{ID: t.ID, Branch: branch, Files: []string{}, InLane: true}
 	dir := filepath.Join(wtRoot, "wt-"+sanitizeID(t.ID))
 
-	// The cell serializes this worktree add against every other agent's admin
-	// step on this repo (created => reset a branch THIS run already made).
-	if err := c.AddWorktree(ctx, dir, branch, baseSHA, created); err != nil {
+	// The cell serializes only the no-checkout add against every other agent's
+	// admin step on this repo; the populate runs in parallel (see
+	// cell.AddWorktree). created => reset a branch THIS run already made. Time the
+	// whole setup so the long pole is greppable per-agent and rolled up per-run.
+	setupStart := time.Now()
+	addErr := c.AddWorktree(ctx, dir, branch, baseSHA, created)
+	a.SetupMs = time.Since(setupStart).Milliseconds()
+	if addErr != nil {
 		a.Exit = -1
-		a.Stderr = "worktree add: " + err.Error()
+		a.Stderr = "worktree add: " + addErr.Error()
 		return a, false
 	}
 	// a is a named return: this defer runs after every downstream update to a

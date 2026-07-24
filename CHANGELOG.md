@@ -23,6 +23,17 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ### Changed
 
+- **Agent worktree creation is no longer fully serial.** The cell lock now
+  covers only the cheap `git worktree add --no-checkout` admin step (branch
+  ref + worktree metadata); the expensive file population runs outside the
+  lock, in parallel across agents, bounded by `-parallel-agents`. Real-run
+  wall time improves ~1.7× at 64–256 agents and worst-case single-worktree
+  setup latency stays flat as fan-out widens. Per-agent setup cost is now
+  visible as `setupMs` on `agent_done` events plus one `worktree_setup`
+  aggregate event per run. Loud-fail semantics on pre-existing branches are
+  unchanged, and a worktree whose population fails is torn down rather than
+  surviving half-made.
+
 - **`POST /runs`'s immediate `202` body now reports `status: "queued"`**
   (previously `"running"`) — it reflects the phase actually recorded at
   accept time, before the run's goroutine has started. The status vocabulary

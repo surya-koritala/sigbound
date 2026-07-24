@@ -109,24 +109,50 @@ func (c *Cell) Repo() string { return c.repo }
 // detached verify/repair worktrees driveRun manages itself, etc.).
 func (c *Cell) Git() *gitx.Git { return c.git }
 
-// AddWorktree creates a worktree at dir on branch off base, serialized against
-// this cell's other admin mutations and tracked so Close can tear it down. When
-// reset is false it uses the loud-fail `git worktree add -b` (never silently
-// resets a pre-existing branch); reset true uses `-B` and is ONLY safe for a
-// branch this same run already created (see gitx.WorktreeAddReset).
+// AddWorktree creates a worktree at dir on branch off base and returns only once
+// its working tree is fully populated. It runs in two phases so the O(tree size)
+// checkout no longer serializes every agent behind this cell's mutex:
+//
+//  1. UNDER c.mu (the SAME serialization the whole add used to hold): `git
+//     worktree add --no-checkout` — the half that mutates shared git state, the
+//     branch ref + packed-refs + .git/worktrees/<name> metadata. When reset is
+//     false it uses the loud-fail `-b` (never silently resets a pre-existing
+//     branch); reset true uses `-B` and is ONLY safe for a branch this same run
+//     already created (see gitx.WorktreeAddResetNoCheckout). dir is registered in
+//     created here, still under the lock, so Close/gc can tear down even a
+//     worktree whose populate below fails or is cut short.
+//  2. OUTSIDE the lock: gitx.WorktreePopulate (`git reset --hard`) fills this
+//     worktree's OWN index + files from HEAD. It reads only the shared object
+//     store and moves no ref, so distinct worktrees populate in parallel with no
+//     new race surface — that parallelism is the whole point of the split.
+//
+// The caller's contract is unchanged: a nil return is a fully-populated worktree
+// at dir on branch; a non-nil return leaves NO usable worktree. A populate
+// failure (or a ctx cancelled between the phases) tears the half-made worktree
+// down — best-effort, uncancellable — and forgets it from created before
+// returning the error, so no half-populated tree ever survives as "created OK".
 func (c *Cell) AddWorktree(ctx context.Context, dir, branch, base string, reset bool) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	var err error
 	if reset {
-		err = c.git.WorktreeAddReset(ctx, dir, branch, base)
+		err = c.git.WorktreeAddResetNoCheckout(ctx, dir, branch, base)
 	} else {
-		err = c.git.WorktreeAdd(ctx, dir, branch, base)
+		err = c.git.WorktreeAddNoCheckout(ctx, dir, branch, base)
 	}
 	if err != nil {
+		c.mu.Unlock()
 		return err
 	}
 	c.created[dir] = struct{}{}
+	c.mu.Unlock()
+
+	if err := c.git.At(dir).WorktreePopulate(ctx); err != nil {
+		// Half-made worktree: tear it down and forget it (RemoveWorktree drops it
+		// from created too). WithoutCancel so cleanup still runs when ctx is the
+		// very thing that failed the populate between the two phases.
+		_ = c.RemoveWorktree(context.WithoutCancel(ctx), dir)
+		return fmt.Errorf("populate worktree %s on %s: %w", dir, branch, err)
+	}
 	return nil
 }
 

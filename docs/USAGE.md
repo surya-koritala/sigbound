@@ -1655,7 +1655,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
     "ok": true, "exit": 0, "autocommitted": false,
     "declaredFiles": ["…"], "actualFiles": ["…"],
     "inLane": true, "strayed": [], "stderr": "",
-    "worktreeKept": "", "timedOut": false, "attempts": 1, "resumed": false,
+    "worktreeKept": "", "timedOut": false, "attempts": 1, "setupMs": 3, "resumed": false,
     "semanticNote": "analyzed"
   } ],
   "strategy": "overlay",
@@ -1699,6 +1699,11 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   branch outright instead of running its agent again (see
   [Resume](#resume)); always `false` on a run without `-resume`, and false
   for any task `-resume` still ran fresh (a missing or stale no-op branch).
+- `perAgent[].setupMs` is that task's worktree-setup wall time in milliseconds —
+  the cell's locked `--no-checkout` add plus its out-of-lock `reset --hard`
+  populate, which run in parallel across agents. Omitted (`0`) for a task
+  `-resume` reused, which set up no worktree. The `worktree_setup`
+  [event](#events) rolls these up per run.
 - `integrate.resolved` — overlapping branches that still landed (auto-merged or
   resolver-resolved).
 - `integrate.semanticEdges` and `perAgent[].semanticNote` are present iff
@@ -1770,7 +1775,8 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 |-------|--------|------|
 | `run_start` | `repo`, `base`, `baseSHA`, `tasks`, `parallelAgents` | Once, right after the base ref resolves. `parallelAgents` is the RESOLVED fan-out cap actually applied (see [Parallelism](#parallelism)) — `-parallel-agents`'s own value when set, else the `GOMAXPROCS`-derived default; always a concrete number here even when `-parallel-agents` wasn't passed. |
 | `agent_start` | `id`, `branch` | Once per task, right before that agent's worktree/command starts. |
-| `agent_done` | `id`, `ok`, `exit`, `attempts`, `files`, `inLane`, `wallMs`, `resumed`* | Once per task, after all of that task's attempts (including `-agent-retries`) finish. *`resumed` is present (`true`) only for a task `-resume` reused outright — see [Resume](#resume) — with `wallMs=0` since no agent command ran; absent for every ordinary task. |
+| `agent_done` | `id`, `ok`, `exit`, `attempts`, `files`, `inLane`, `setupMs`, `wallMs`, `resumed`* | Once per task, after all of that task's attempts (including `-agent-retries`) finish. `setupMs` is that task's worktree-setup wall (the locked `--no-checkout` add plus its parallel `reset --hard` populate) for the attempt that ended the loop. *`resumed` is present (`true`) only for a task `-resume` reused outright — see [Resume](#resume) — with `wallMs=0`/`setupMs=0` since no agent command ran and no worktree was set up; absent for every ordinary task. |
+| `worktree_setup` | `count`, `totalMs`, `maxMs` | Once, right after the agent fan-out finishes. The run-level rollup of per-agent worktree setup — `count` worktrees set up, `totalMs` the summed setup work, `maxMs` the single long pole — so the setup phase's cost is visible at any scale without a per-agent line. Only fresh (non-`-resume`) agents are counted; omitted when every task was resumed. |
 | `semantic_done` | `edges`, `notes` | Once, only when `-semantic go` is set (see [Semantic conflicts (Go)](#semantic-conflicts-go)) — after every agent finishes, before integration starts. |
 | `integrate_start` | `branches` | Once, before the successfully-committed branches are folded together. |
 | `integrate_done` | `landed`, `flagged`, `resolved`, `finalSHA`, `wallMs` | Once, after integration (before landing). |
