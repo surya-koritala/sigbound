@@ -68,7 +68,7 @@ func TestReadTruncationNeverReturnsPartialContent(t *testing.T) {
 			// A bogus huge positive size must be rejected before make() allocates it
 			// (the size cap), not attempted and OOM/panicked.
 			name:   "absurd declared size",
-			stream: "aaaaaaaa blob 999999999999\nx\n",
+			stream: "aaaaaaaa blob 1152921504606846976\nx\n",
 			specs:  []string{"A"},
 		},
 	}
