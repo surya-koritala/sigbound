@@ -1170,6 +1170,29 @@ Environment policy is deliberately **not** a request field (it is the operator's
 set on the server) except `envMode`, which a request may set to override the
 server default for that run.
 
+### Error responses
+
+Every non-2xx response is `{error, code}`: `error` is a human-readable
+message (its wording may change between releases), `code` is a stable,
+machine-readable string a programmatic caller (a retry loop, an SDK) can
+switch on instead of parsing `error`. `code` is **additive** — it was added
+after `error` and existing text is unchanged, so this is SemVer-safe post-1.0.
+The vocabulary:
+
+| `code` | HTTP status | Meaning |
+|--------|-------------|---------|
+| `unauthorized` | 401 | Missing or wrong `Authorization: Bearer` token. |
+| `bad_request` | 400 | Request validation failed (bad JSON, a missing/conflicting field, an invalid duration, etc.). |
+| `cell_not_found` | 400 | `POST /runs`' `cell` doesn't match any registered cell id or repo path. |
+| `env_widen_refused` | 400 | The request's `envMode` tried to widen the server's `scoped` default to `inherit`. |
+| `quota_agents` | 400 | `-max-agents-per-run` exceeded. |
+| `unsupported_media_type` | 415 | `Content-Type` isn't `application/json`. |
+| `cell_busy` | 409 | That cell already has a run in flight (one run per cell at a time). |
+| `quota_concurrency` | 429 | `-max-concurrent-runs` exceeded. |
+| `run_not_found` | 404 | The run id in the path doesn't resolve to any run. |
+| `not_found` | 404 | A known run has no report/usage yet, or a `flagged` path/branch isn't in that run's allowlist — not a run- or cell-lookup failure. |
+| `internal_error` | 500 | An operational failure on the server's side (disk I/O, git), not a caller error. |
+
 ### One run per cell
 
 A run moves the base ref, so a cell runs **one at a time**: a second `POST` for a
@@ -1281,7 +1304,7 @@ sig serve -repos /work/api -max-agents-per-run 20 -max-run-time 15m -max-concurr
 
 # Over the cap: 400, no run started.
 curl -s localhost:7777/runs -d '{"cell":"/work/api","tasks":[...25 tasks...],"agent":"..."}'
-# -> 400 {"error":"agent count 25 exceeds this server's max-agents-per-run 20"}
+# -> 400 {"error":"agent count 25 exceeds this server's max-agents-per-run 20","code":"quota_agents"}
 
 # One run's usage record:
 curl -s localhost:7777/runs/20260722T164530Z-a1b2c3d4e5f6/usage | jq

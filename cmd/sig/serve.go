@@ -266,7 +266,7 @@ func (s *server) handler() http.Handler {
 			return
 		}
 		if !s.authOK(r) {
-			writeErr(w, http.StatusUnauthorized, "unauthorized: send Authorization: Bearer <token>")
+			writeErr(w, http.StatusUnauthorized, "unauthorized: send Authorization: Bearer <token>", codeUnauthorized)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -368,7 +368,7 @@ type planSpec struct {
 
 func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json", codeUnsupportedMediaType)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, serveMaxBody)
@@ -376,13 +376,13 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	dec.DisallowUnknownFields()
 	var req runRequest
 	if err := dec.Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), codeBadRequest)
 		return
 	}
 
 	rc := s.resolveCell(req.Cell)
 	if rc == nil {
-		writeErr(w, http.StatusBadRequest, fmt.Sprintf("unknown cell %q; known cells: %s", req.Cell, strings.Join(s.cellKeys(), ", ")))
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("unknown cell %q; known cells: %s", req.Cell, strings.Join(s.cellKeys(), ", ")), codeCellNotFound)
 		return
 	}
 
@@ -390,26 +390,30 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	haveGoal := strings.TrimSpace(req.Goal) != ""
 	switch {
 	case haveTasks && haveGoal:
-		writeErr(w, http.StatusBadRequest, "tasks and goal are mutually exclusive; pass exactly one")
+		writeErr(w, http.StatusBadRequest, "tasks and goal are mutually exclusive; pass exactly one", codeBadRequest)
 		return
 	case !haveTasks && !haveGoal:
-		writeErr(w, http.StatusBadRequest, "one of tasks or goal is required")
+		writeErr(w, http.StatusBadRequest, "one of tasks or goal is required", codeBadRequest)
 		return
 	}
 	if strings.TrimSpace(req.Agent) == "" {
-		writeErr(w, http.StatusBadRequest, "agent is required")
+		writeErr(w, http.StatusBadRequest, "agent is required", codeBadRequest)
 		return
 	}
 	if haveTasks {
 		if err := validateReqTasks(req.Tasks); err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
+			writeErr(w, http.StatusBadRequest, err.Error(), codeBadRequest)
 			return
 		}
 	}
 
 	p, plan, err := s.buildParams(req, rc.cell.Repo(), haveGoal)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
+		code := codeBadRequest
+		if errors.Is(err, errEnvWidenRefused) {
+			code = codeEnvWidenRefused
+		}
+		writeErr(w, http.StatusBadRequest, err.Error(), code)
 		return
 	}
 
@@ -427,7 +431,7 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			agentCount = plan.n
 		}
 		if agentCount > s.maxAgentsPerRun {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("agent count %d exceeds this server's max-agents-per-run %d", agentCount, s.maxAgentsPerRun))
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("agent count %d exceeds this server's max-agents-per-run %d", agentCount, s.maxAgentsPerRun), codeQuotaAgents)
 			return
 		}
 	}
@@ -441,19 +445,19 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	if s.busy[rc.cell.ID()] {
 		s.mu.Unlock()
-		writeErr(w, http.StatusConflict, fmt.Sprintf("a run is already in progress for cell %s (%s); one run per cell at a time", rc.cell.ID(), rc.cell.Repo()))
+		writeErr(w, http.StatusConflict, fmt.Sprintf("a run is already in progress for cell %s (%s); one run per cell at a time", rc.cell.ID(), rc.cell.Repo()), codeCellBusy)
 		return
 	}
 	if s.maxConcurrentRuns > 0 && s.activeRuns >= s.maxConcurrentRuns {
 		s.mu.Unlock()
-		writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("this server's max-concurrent-runs %d is already in flight; try again once a run finishes", s.maxConcurrentRuns))
+		writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("this server's max-concurrent-runs %d is already in flight; try again once a run finishes", s.maxConcurrentRuns), codeQuotaConcurrency)
 		return
 	}
 	runID := newRunID()
 	dir := filepath.Join(rc.runsDir, runID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		s.mu.Unlock()
-		writeErr(w, http.StatusInternalServerError, "create run dir: "+err.Error())
+		writeErr(w, http.StatusInternalServerError, "create run dir: "+err.Error(), codeInternalError)
 		return
 	}
 	s.busy[rc.cell.ID()] = true
@@ -556,7 +560,7 @@ type runStatusResponse struct {
 func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validRunID(id) {
-		writeErr(w, http.StatusNotFound, "unknown run")
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 		return
 	}
 
@@ -574,7 +578,7 @@ func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	if rec == nil {
 		frc, fdir, ok := s.findRunDir(id)
 		if !ok {
-			writeErr(w, http.StatusNotFound, "unknown run")
+			writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 			return
 		}
 		dir, cellID = fdir, frc.cell.ID()
@@ -672,7 +676,7 @@ func (s *server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validRunID(id) {
-		writeErr(w, http.StatusNotFound, "unknown run")
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 		return
 	}
 	s.mu.Lock()
@@ -685,7 +689,7 @@ func (s *server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 	if rec == nil {
 		_, fdir, ok := s.findRunDir(id)
 		if !ok {
-			writeErr(w, http.StatusNotFound, "unknown run")
+			writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 			return
 		}
 		dir = fdir
@@ -699,7 +703,7 @@ func (s *server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, "read events: "+err.Error())
+		writeErr(w, http.StatusInternalServerError, "read events: "+err.Error(), codeInternalError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
@@ -715,7 +719,7 @@ func (s *server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleRunUsage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validRunID(id) {
-		writeErr(w, http.StatusNotFound, "unknown run")
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 		return
 	}
 	s.mu.Lock()
@@ -728,14 +732,14 @@ func (s *server) handleRunUsage(w http.ResponseWriter, r *http.Request) {
 	if rec == nil {
 		_, fdir, ok := s.findRunDir(id)
 		if !ok {
-			writeErr(w, http.StatusNotFound, "unknown run")
+			writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 			return
 		}
 		dir = fdir
 	}
 	u, err := readRunUsage(dir)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, fmt.Sprintf("usage not available for run %s (not yet completed, or no report was written)", id))
+		writeErr(w, http.StatusNotFound, fmt.Sprintf("usage not available for run %s (not yet completed, or no report was written)", id), codeNotFound)
 		return
 	}
 	writeJSON(w, http.StatusOK, u)
@@ -805,17 +809,17 @@ type flaggedListResponse struct {
 func (s *server) handleFlagged(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validRunID(id) {
-		writeErr(w, http.StatusNotFound, "unknown run")
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 		return
 	}
 	rc, dir, ok := s.locateRun(id)
 	if !ok || rc == nil {
-		writeErr(w, http.StatusNotFound, "unknown run")
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 		return
 	}
 	rep, err := readRunReport(dir)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "no report for this run yet (still running, or it never reached integrate)")
+		writeErr(w, http.StatusNotFound, "no report for this run yet (still running, or it never reached integrate)", codeNotFound)
 		return
 	}
 	flagged := rep.Integrate.Flagged
@@ -850,17 +854,17 @@ type flaggedDetailResponse struct {
 func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validRunID(id) {
-		writeErr(w, http.StatusNotFound, "unknown run")
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 		return
 	}
 	rc, dir, ok := s.locateRun(id)
 	if !ok || rc == nil {
-		writeErr(w, http.StatusNotFound, "unknown run")
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 		return
 	}
 	rep, err := readRunReport(dir)
 	if err != nil {
-		writeErr(w, http.StatusNotFound, "no report for this run yet (still running, or it never reached integrate)")
+		writeErr(w, http.StatusNotFound, "no report for this run yet (still running, or it never reached integrate)", codeNotFound)
 		return
 	}
 
@@ -884,7 +888,7 @@ func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !found {
-		writeErr(w, http.StatusNotFound, "no such flagged path for this run")
+		writeErr(w, http.StatusNotFound, "no such flagged path for this run", codeNotFound)
 		return
 	}
 
@@ -916,7 +920,7 @@ func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
 
 	contents, err := rc.cell.Git().BlobsBatch(r.Context(), specs)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "read blobs: "+err.Error())
+		writeErr(w, http.StatusInternalServerError, "read blobs: "+err.Error(), codeInternalError)
 		return
 	}
 	side := func(name string) *string {
@@ -958,6 +962,14 @@ func (s *server) handleUI(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- request -> runParams ----
+
+// errEnvWidenRefused is buildParams' sentinel for the one env-mode rejection
+// (see below): a request tried to widen the server's scoped env-mode to
+// inherit. handleCreateRun checks it with errors.Is to pick the
+// codeEnvWidenRefused response code instead of the generic codeBadRequest --
+// deliberately a sentinel, not a string match on the error text, so the two
+// stay independent (issue #93).
+var errEnvWidenRefused = errors.New("envMode: a request cannot widen the server's scoped env-mode to inherit")
 
 // buildParams validates a runRequest the way runRun validates its flags (reusing
 // the same validate* helpers) and maps it onto a runParams for driveRun, plus a
@@ -1007,7 +1019,7 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 	envMode := s.envMode
 	if m := strings.TrimSpace(req.EnvMode); m != "" {
 		if s.envMode == envModeScoped && m == envModeInherit {
-			return runParams{}, zeroPlan, errors.New("envMode: a request cannot widen the server's scoped env-mode to inherit")
+			return runParams{}, zeroPlan, errEnvWidenRefused
 		}
 		envMode = m
 	}
@@ -1270,6 +1282,27 @@ func diskStatus(dir string) string {
 
 // ---- HTTP write helpers ----
 
+// Error codes: a stable, machine-readable discriminant alongside every error
+// response's human text (see writeErr). ADDITIVE atop the pre-existing
+// {error} shape -- SemVer-safe (issue #93). Documented as part of the API
+// surface in docs/USAGE.md; treat this vocabulary as frozen-ish -- a
+// programmatic caller (the GitHub Action, an SDK, retry logic) switches on
+// these strings, so a rename is a breaking change even though the field
+// itself is new.
+const (
+	codeUnauthorized         = "unauthorized"           // 401: missing/wrong bearer token
+	codeNotFound             = "not_found"              // 404: generic, not run- or cell-specific
+	codeRunNotFound          = "run_not_found"          // 404: run id doesn't resolve
+	codeCellNotFound         = "cell_not_found"         // 400: POST /runs named an unregistered cell
+	codeCellBusy             = "cell_busy"              // 409: that cell already has a run in flight
+	codeQuotaConcurrency     = "quota_concurrency"      // 429: -max-concurrent-runs exceeded
+	codeQuotaAgents          = "quota_agents"           // 400: -max-agents-per-run exceeded
+	codeEnvWidenRefused      = "env_widen_refused"      // 400: request tried to widen scoped envMode
+	codeBadRequest           = "bad_request"            // 400: everything else validation-shaped
+	codeUnsupportedMediaType = "unsupported_media_type" // 415: Content-Type isn't application/json
+	codeInternalError        = "internal_error"         // 500: an operational failure, not caller error
+)
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1278,8 +1311,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	enc.Encode(v) //nolint:errcheck // response body; nothing to recover on a write error
 }
 
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+func writeErr(w http.ResponseWriter, status int, msg, code string) {
+	writeJSON(w, status, map[string]string{"error": msg, "code": code})
 }
 
 // ---- CLI entry + lifecycle ----

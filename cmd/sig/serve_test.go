@@ -132,9 +132,19 @@ func TestServeAuthMatrix(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			code := doJSON(t, "GET", ts.URL+"/health", c.send, nil, nil)
+			// health's 200 body doesn't decode into map[string]string (it has
+			// non-string fields), so only the 401 cases decode a body.
+			var body map[string]string
+			var out any
+			if c.want == http.StatusUnauthorized {
+				out = &body
+			}
+			code := doJSON(t, "GET", ts.URL+"/health", c.send, nil, out)
 			if code != c.want {
 				t.Fatalf("auth %q: status %d, want %d", c.name, code, c.want)
+			}
+			if c.want == http.StatusUnauthorized && body["code"] != codeUnauthorized {
+				t.Fatalf("auth %q: code %q, want %q", c.name, body["code"], codeUnauthorized)
 			}
 		})
 	}
@@ -270,6 +280,9 @@ func TestServeConcurrentSameCell409(t *testing.T) {
 	if !strings.Contains(second["error"], "already in progress") {
 		t.Fatalf("409 body = %v, want an 'already in progress' message", second)
 	}
+	if second["code"] != codeCellBusy {
+		t.Fatalf("409 code %q, want %q", second["code"], codeCellBusy)
+	}
 
 	// Let the first run finish; the slot frees and a new run is accepted.
 	pollRun(t, ts, "", first.RunID)
@@ -376,18 +389,19 @@ func TestServeBadRequests(t *testing.T) {
 	_, ts := newTestServer(t, "", repo)
 
 	cases := []struct {
-		name string
-		body any
-		want string // substring the error must contain
+		name     string
+		body     any
+		want     string // substring the error must contain
+		wantCode string
 	}{
-		{"unknown cell", runRequest{Cell: "/no/such/repo", Tasks: []taskSpec{{ID: "t1"}}, Agent: "true"}, "unknown cell"},
-		{"tasks and goal", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Goal: "do it", Agent: "true"}, "mutually exclusive"},
-		{"neither tasks nor goal", runRequest{Cell: repo, Agent: "true"}, "one of tasks or goal"},
-		{"missing agent", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}}, "agent is required"},
-		{"empty task id", runRequest{Cell: repo, Tasks: []taskSpec{{ID: ""}}, Agent: "true"}, "empty id"},
-		{"verifyImpact without verify", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Agent: "true", VerifyImpact: "go test ./..."}, "verifyImpact requires verify"},
-		{"bad duration", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Agent: "true", Budget: "notaduration"}, "budget"},
-		{"goal without planner", runRequest{Cell: repo, Goal: "split it", Agent: "true"}, "planner is required"},
+		{"unknown cell", runRequest{Cell: "/no/such/repo", Tasks: []taskSpec{{ID: "t1"}}, Agent: "true"}, "unknown cell", codeCellNotFound},
+		{"tasks and goal", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Goal: "do it", Agent: "true"}, "mutually exclusive", codeBadRequest},
+		{"neither tasks nor goal", runRequest{Cell: repo, Agent: "true"}, "one of tasks or goal", codeBadRequest},
+		{"missing agent", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}}, "agent is required", codeBadRequest},
+		{"empty task id", runRequest{Cell: repo, Tasks: []taskSpec{{ID: ""}}, Agent: "true"}, "empty id", codeBadRequest},
+		{"verifyImpact without verify", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Agent: "true", VerifyImpact: "go test ./..."}, "verifyImpact requires verify", codeBadRequest},
+		{"bad duration", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Agent: "true", Budget: "notaduration"}, "budget", codeBadRequest},
+		{"goal without planner", runRequest{Cell: repo, Goal: "split it", Agent: "true"}, "planner is required", codeBadRequest},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -398,6 +412,9 @@ func TestServeBadRequests(t *testing.T) {
 			}
 			if !strings.Contains(body["error"], c.want) {
 				t.Fatalf("error %q, want it to contain %q", body["error"], c.want)
+			}
+			if body["code"] != c.wantCode {
+				t.Fatalf("code %q, want %q", body["code"], c.wantCode)
 			}
 		})
 	}
@@ -413,6 +430,13 @@ func TestServeBadRequests(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("malformed JSON status %d, want 400", resp.StatusCode)
 	}
+	var malformedBody map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&malformedBody); err != nil {
+		t.Fatal(err)
+	}
+	if malformedBody["code"] != codeBadRequest {
+		t.Fatalf("malformed JSON code %q, want %q", malformedBody["code"], codeBadRequest)
+	}
 
 	// A non-JSON Content-Type is 415, before the body is even parsed.
 	req2, _ := http.NewRequest("POST", ts.URL+"/runs", strings.NewReader("{}"))
@@ -425,10 +449,21 @@ func TestServeBadRequests(t *testing.T) {
 	if resp2.StatusCode != http.StatusUnsupportedMediaType {
 		t.Fatalf("wrong Content-Type status %d, want 415", resp2.StatusCode)
 	}
+	var mediaBody map[string]string
+	if err := json.NewDecoder(resp2.Body).Decode(&mediaBody); err != nil {
+		t.Fatal(err)
+	}
+	if mediaBody["code"] != codeUnsupportedMediaType {
+		t.Fatalf("wrong Content-Type code %q, want %q", mediaBody["code"], codeUnsupportedMediaType)
+	}
 
 	// An unknown run id is 404.
-	if code := doJSON(t, "GET", ts.URL+"/runs/does-not-exist", "", nil, nil); code != http.StatusNotFound {
+	var unknownRunBody map[string]string
+	if code := doJSON(t, "GET", ts.URL+"/runs/does-not-exist", "", nil, &unknownRunBody); code != http.StatusNotFound {
 		t.Fatalf("unknown run status %d, want 404", code)
+	}
+	if unknownRunBody["code"] != codeRunNotFound {
+		t.Fatalf("unknown run code %q, want %q", unknownRunBody["code"], codeRunNotFound)
 	}
 }
 
@@ -631,6 +666,9 @@ func TestServeScopedEnvIsRealDefault(t *testing.T) {
 	if !strings.Contains(body["error"], "cannot widen") {
 		t.Fatalf("widen envMode error %q, want it to mention widening", body["error"])
 	}
+	if body["code"] != codeEnvWidenRefused {
+		t.Fatalf("widen envMode code %q, want %q", body["code"], codeEnvWidenRefused)
+	}
 
 	// (b) a normal scoped run's agent does not see the daemon's secret.
 	var created struct{ RunID string }
@@ -694,6 +732,9 @@ func TestServeMaxAgentsPerRunRejects(t *testing.T) {
 	if !strings.Contains(body["error"], "max-agents-per-run") {
 		t.Fatalf("error %q, want it to name max-agents-per-run", body["error"])
 	}
+	if body["code"] != codeQuotaAgents {
+		t.Fatalf("over-cap code %q, want %q", body["code"], codeQuotaAgents)
+	}
 	// No run was started: the cell's runs dir has no entries at all.
 	names, _ := os.ReadDir(s.cells[0].runsDir)
 	if len(names) != 0 {
@@ -752,6 +793,9 @@ func TestServeMaxConcurrentRuns429(t *testing.T) {
 	}
 	if !strings.Contains(body["error"], "max-concurrent-runs") {
 		t.Fatalf("error %q, want it to name max-concurrent-runs", body["error"])
+	}
+	if body["code"] != codeQuotaConcurrency {
+		t.Fatalf("429 code %q, want %q", body["code"], codeQuotaConcurrency)
 	}
 	// The rejected request never started a run on cell B either.
 	bCell := s.byKey[repoB]
