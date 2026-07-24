@@ -69,6 +69,9 @@ func runDoctor(w io.Writer, argv []string) (int, error) {
 	// estimate that can't be formed never fails doctor, so this runs
 	// unconditionally and never touches allOK.
 	fmt.Fprintln(w, diskInfoLine(ctx, *repo))
+	// Same posture as the disk line above: a debris count that can't be
+	// formed never fails doctor (see gcInfoLine's doc comment).
+	fmt.Fprintln(w, gcInfoLine(ctx, *repo))
 	if !allOK {
 		return exitOperationalError, nil
 	}

@@ -3,9 +3,12 @@ package gitx
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 )
 
 func writeFile(t *testing.T, dir, name, content string) {
@@ -440,5 +443,141 @@ func TestTreeSizeBadRev(t *testing.T) {
 	g, _ := newRepo(t)
 	if _, err := g.TreeSize(ctx, "no-such-ref"); err == nil {
 		t.Fatal("TreeSize: want error for an unresolvable rev")
+	}
+}
+
+// TestWorktreeListPrunableAndPrune proves the pair `sig gc` relies on:
+// WorktreeList annotates a worktree whose directory was removed out from
+// under git as Prunable (and leaves the live one alone), and WorktreePrune
+// actually clears that stale registration without touching the live one.
+func TestWorktreeListPrunableAndPrune(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+
+	liveDir := filepath.Join(t.TempDir(), "live")
+	if err := g.WorktreeAdd(ctx, liveDir, "live", base); err != nil {
+		t.Fatal(err)
+	}
+	deadDir := filepath.Join(t.TempDir(), "dead")
+	if err := g.WorktreeAdd(ctx, deadDir, "dead", base); err != nil {
+		t.Fatal(err)
+	}
+	// git reports its own resolved (symlink-free) paths; t.TempDir() can live
+	// under a symlinked /var on macOS (same trap TestGitCommonDir works
+	// around) — resolve both sides before comparing.
+	liveDir, err := filepath.EvalSymlinks(liveDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadDirResolved, err := filepath.EvalSymlinks(deadDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a killed run: the worktree's directory is gone, but git still
+	// has it registered (that's exactly what `git worktree prune` clears).
+	if err := os.RemoveAll(deadDir); err != nil {
+		t.Fatal(err)
+	}
+	deadDir = deadDirResolved
+
+	entries, err := g.WorktreeList(ctx)
+	if err != nil {
+		t.Fatalf("WorktreeList: %v", err)
+	}
+	byPath := map[string]WorktreeEntry{}
+	for _, e := range entries {
+		byPath[e.Path] = e
+	}
+	if e, ok := byPath[liveDir]; !ok || e.Prunable != "" {
+		t.Fatalf("live worktree %s: got entry %+v ok=%v, want present and NOT prunable", liveDir, e, ok)
+	}
+	dead, ok := byPath[deadDir]
+	if !ok || dead.Prunable == "" {
+		t.Fatalf("dead worktree %s: got entry %+v ok=%v, want present and prunable", deadDir, dead, ok)
+	}
+
+	if err := g.WorktreePrune(ctx); err != nil {
+		t.Fatalf("WorktreePrune: %v", err)
+	}
+	after, err := g.WorktreeList(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range after {
+		if e.Path == deadDir {
+			t.Fatalf("dead worktree %s still registered after WorktreePrune", deadDir)
+		}
+		if e.Path == liveDir {
+			// still there, good
+		}
+	}
+	if _, err := g.RevParse(ctx, "dead"); err != nil {
+		t.Fatalf("branch 'dead' should survive WorktreePrune (only the registration is admin state): %v", err)
+	}
+}
+
+// TestForEachRefCommit proves ForEachRefCommit resolves committer time/SHA
+// for refs under a prefix, matches trailing path components (not a
+// substring), and never returns refs outside the requested prefixes.
+func TestForEachRefCommit(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+
+	mk := func(branch string, when time.Time) string {
+		wt := filepath.Join(t.TempDir(), strings.ReplaceAll(branch, "/", "-"))
+		if err := g.WorktreeAdd(ctx, wt, branch, base); err != nil {
+			t.Fatal(err)
+		}
+		wg := g.At(wt)
+		// hermeticEnv (same package, white-box) pins identity/config the same
+		// way every other gitx call does; GIT_COMMITTER_DATE backdates the
+		// commit this test needs to look old to an age-cutoff sweep.
+		cmd := exec.CommandContext(ctx, "git", "-C", wt, "commit", "-q", "--allow-empty", "--no-gpg-sign",
+			"--date", when.Format(time.RFC3339), "-m", branch)
+		cmd.Env = append(hermeticEnv(), "GIT_COMMITTER_DATE="+when.Format(time.RFC3339))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %s: %v: %s", branch, err, out)
+		}
+		sha, err := wg.HeadSHA(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sha
+	}
+
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	recent := time.Now().Add(-time.Minute)
+	oldSHA := mk("agent/old", old)
+	newSHA := mk("imported/w1/agent/new", recent)
+	// A branch OUTSIDE the requested prefixes must never show up.
+	mk("other", recent)
+	// A branch that merely starts with "agent" but isn't under agent/ must
+	// not match the "refs/heads/agent/" prefix (trailing-component match).
+	mk("agentx", recent)
+
+	refs, err := g.ForEachRefCommit(ctx, "refs/heads/agent/", "refs/heads/imported/")
+	if err != nil {
+		t.Fatalf("ForEachRefCommit: %v", err)
+	}
+	byName := map[string]RefCommit{}
+	for _, r := range refs {
+		byName[r.Name] = r
+	}
+	if len(refs) != 2 {
+		t.Fatalf("refs=%v, want exactly 2 (agent/old, imported/w1/agent/new)", refs)
+	}
+	got, ok := byName["agent/old"]
+	if !ok || got.SHA != oldSHA {
+		t.Fatalf("agent/old = %+v ok=%v, want sha=%s", got, ok, oldSHA)
+	}
+	if !got.CommitTime.Equal(old) {
+		t.Fatalf("agent/old CommitTime=%v, want %v", got.CommitTime, old)
+	}
+	got, ok = byName["imported/w1/agent/new"]
+	if !ok || got.SHA != newSHA {
+		t.Fatalf("imported/w1/agent/new = %+v ok=%v, want sha=%s", got, ok, newSHA)
+	}
+	if !got.CommitTime.Equal(recent.Truncate(time.Second)) {
+		t.Fatalf("imported/w1/agent/new CommitTime=%v, want ~%v", got.CommitTime, recent)
 	}
 }

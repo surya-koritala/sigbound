@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Git targets a single working directory (the main repo or one worktree). All
@@ -251,6 +252,100 @@ func (g *Git) WorktreeAddDetached(ctx context.Context, path, commit string) erro
 func (g *Git) WorktreeRemove(ctx context.Context, path string) error {
 	_, err := g.run(ctx, "worktree", "remove", "--force", "--", path)
 	return err
+}
+
+// WorktreeEntry is one record from `git worktree list --porcelain`. Prunable
+// is non-empty exactly when git considers this worktree's registration stale
+// (its gitdir file points to a directory that no longer exists) — the same
+// determination `git worktree prune` itself acts on — so a caller deciding
+// what WorktreePrune would remove never has to reimplement that logic.
+type WorktreeEntry struct {
+	Path     string
+	Prunable string // reason, e.g. "gitdir file points to non-existent location"; empty when not prunable
+}
+
+// WorktreeList lists every worktree git has registered for this repo
+// (including the main one) via `git worktree list --porcelain`.
+func (g *Git) WorktreeList(ctx context.Context) ([]WorktreeEntry, error) {
+	out, err := g.run(ctx, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	return parseWorktreeListPorcelain(out), nil
+}
+
+// parseWorktreeListPorcelain decodes `git worktree list --porcelain` output:
+// records are separated by a blank line, each starting with a "worktree
+// <path>" line; an optional "prunable <reason>" line, when present, carries
+// the Prunable annotation for the CURRENT record. It is a pure function of
+// untrusted git output and must never panic on malformed input.
+func parseWorktreeListPorcelain(out string) []WorktreeEntry {
+	var entries []WorktreeEntry
+	var cur *WorktreeEntry
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			entries = append(entries, WorktreeEntry{Path: strings.TrimPrefix(line, "worktree ")})
+			cur = &entries[len(entries)-1]
+		case strings.HasPrefix(line, "prunable ") && cur != nil:
+			cur.Prunable = strings.TrimPrefix(line, "prunable ")
+		case line == "":
+			cur = nil
+		}
+	}
+	return entries
+}
+
+// WorktreePrune removes administrative files for every worktree whose
+// directory no longer exists (`git worktree prune`) — the real-deletion half
+// of what WorktreeList's Prunable annotation reports. Used by `sig gc` to
+// clear registrations a killed run left behind (the worktree dir is gone,
+// but git still lists it until this runs).
+func (g *Git) WorktreePrune(ctx context.Context) error {
+	_, err := g.run(ctx, "worktree", "prune")
+	return err
+}
+
+// RefCommit is one ref's short name alongside its target commit's SHA and
+// committer time, as read by ForEachRefCommit.
+type RefCommit struct {
+	Name       string
+	SHA        string
+	CommitTime time.Time
+}
+
+// ForEachRefCommit lists every ref under the given prefixes (each a full
+// "refs/heads/..." path) with its target commit's SHA and committer time, in
+// ONE `git for-each-ref` call. Prefixes match as trailing path components —
+// git's own for-each-ref semantics — so "refs/heads/agent/" matches
+// refs/heads/agent/t1 but not refs/heads/agent2/x. Used by `sig gc` to find
+// agent/* and imported/*/* branches old enough to sweep.
+func (g *Git) ForEachRefCommit(ctx context.Context, prefixes ...string) ([]RefCommit, error) {
+	args := append([]string{"for-each-ref", "--format=%(refname:short)%09%(committerdate:unix)%09%(objectname)"}, prefixes...)
+	out, err := g.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return parseForEachRefCommit(out)
+}
+
+// parseForEachRefCommit decodes ForEachRefCommit's tab-separated output. It
+// is a pure function of untrusted git output and must never panic on
+// malformed input.
+func parseForEachRefCommit(out string) ([]RefCommit, error) {
+	var refs []RefCommit
+	for _, line := range splitLines(out) {
+		fields := strings.Split(line, "\t")
+		if len(fields) != 3 {
+			return nil, fmt.Errorf("for-each-ref: malformed record %q", line)
+		}
+		sec, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("for-each-ref: bad committerdate in %q: %w", line, err)
+		}
+		refs = append(refs, RefCommit{Name: fields[0], SHA: fields[2], CommitTime: time.Unix(sec, 0)})
+	}
+	return refs, nil
 }
 
 // BranchDelete force-deletes a local branch ref (`git branch -D`). Any commit

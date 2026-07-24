@@ -284,6 +284,59 @@ func FuzzParseLsTreeSizesZ(f *testing.F) {
 	})
 }
 
+// FuzzParseWorktreeListPorcelain fuzzes the `git worktree list --porcelain`
+// decoder `sig gc` relies on to find stale worktree registrations.
+func FuzzParseWorktreeListPorcelain(f *testing.F) {
+	f.Add("")
+	f.Add("worktree /repo\nHEAD " + sha1a + "\nbranch refs/heads/main\n\n")
+	f.Add("worktree /repo\nHEAD " + sha1a + "\nbranch refs/heads/main\n\n" +
+		"worktree /repo-wt\nHEAD " + sha1b + "\ndetached\nprunable gitdir file points to non-existent location\n\n")
+	f.Add("prunable no worktree line came first\n")               // annotation before any "worktree" line
+	f.Add("worktree\n")                                           // "worktree" with no path (no trailing space)
+	f.Add("worktree \n")                                          // empty path
+	f.Add("worktree /a\nprunable\n")                              // prunable with no reason text
+	f.Add("worktree /a\n\nprunable after blank line, orphaned\n") // annotation after record already closed
+	f.Add("worktree /a\nworktree /b\n")                           // two worktree lines, no blank line between
+	f.Add("worktree /\xff\xfe\n")                                 // non-UTF8 path
+
+	f.Fuzz(func(t *testing.T, out string) {
+		entries := parseWorktreeListPorcelain(out)
+		for _, e := range entries {
+			// Every record must have started with a "worktree " line, so Path
+			// can never itself contain a newline (it's exactly one line's tail).
+			if strings.ContainsRune(e.Path, '\n') || strings.ContainsRune(e.Prunable, '\n') {
+				t.Fatalf("parsed entry carries an embedded newline: %+v", e)
+			}
+		}
+	})
+}
+
+// FuzzParseForEachRefCommit fuzzes the `git for-each-ref` decoder that `sig
+// gc` uses to age-gate agent/*/imported/*/* branches.
+func FuzzParseForEachRefCommit(f *testing.F) {
+	f.Add("")
+	f.Add("agent/t1\t1577854800\t" + sha1a)
+	f.Add("agent/t1\t1577854800\t" + sha1a + "\nimported/w1/agent/t2\t1784905357\t" + sha1b)
+	f.Add("too\tfew")                                  // too few fields
+	f.Add("a\tb\tc\td")                                // too many fields
+	f.Add("agent/t1\tnotanumber\t" + sha1a)            // bad committerdate
+	f.Add("agent/t1\t-99999999999999999999\t" + sha1a) // committerdate overflow
+	f.Add("agent/t1\t\t" + sha1a)                      // empty committerdate field
+	f.Add("\xff\xfe\t123\t" + sha1a)                   // non-UTF8 name
+
+	f.Fuzz(func(t *testing.T, out string) {
+		refs, err := parseForEachRefCommit(out)
+		if err != nil {
+			return // a rejected malformed record is fine, as long as it did not panic
+		}
+		for _, r := range refs {
+			if strings.ContainsRune(r.Name, '\t') || strings.ContainsRune(r.SHA, '\t') {
+				t.Fatalf("parsed ref carries an embedded tab: %+v", r)
+			}
+		}
+	})
+}
+
 // FuzzParseCatFileBatch fuzzes the `git cat-file --batch` decoder that
 // BlobsBatch uses to collapse the resolver's per-conflict blob reads (3
 // `cat-file blob` forks per path) into one spawn for a whole branch.
