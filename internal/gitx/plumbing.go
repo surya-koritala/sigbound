@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const zeroOID = "0000000000000000000000000000000000000000"
@@ -801,6 +802,100 @@ func (br *BatchReader) Close() error {
 		return nil
 	}
 	br.closed = true
+	_ = br.stdin.Close()
+	return br.cmd.Wait()
+}
+
+// BatchBlobReader wraps one long-running `git cat-file --batch` for reading blob
+// CONTENT — the persistent counterpart to the per-call BlobsBatch spawn. A cell
+// keeps ONE alive for its whole lifetime (see cell.BlobsBatch) so a busy cell —
+// semantic analysis over many branches, the review three-sides endpoint hit
+// repeatedly, a resolver's conflict reads — resolves blobs without a `git`
+// process per operation. It is NOT internally synchronized: the caller (the
+// cell) serializes every Read, which it must, because the --batch wire protocol
+// is strictly sequential (one request line in, one response record out, in
+// order — pipelining two reads would interleave their records).
+type BatchBlobReader struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+}
+
+// NewBatchBlobReader starts a `cat-file --batch` bound to this repo. It is
+// started on a background context, not any request's ctx, because it outlives
+// the call that first needs it (a cell reuses it across operations); its cmd
+// carries a WaitDelay so a wedged git cannot hang Close forever. The caller must
+// Close it to reap the process.
+func (g *Git) NewBatchBlobReader() (*BatchBlobReader, error) {
+	cmd := exec.CommandContext(context.Background(), g.bin, "-C", g.dir, "cat-file", "--batch")
+	cmd.Env = hermeticEnv()
+	cmd.WaitDelay = 2 * time.Second // never let a wedged git hang cell teardown
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &BatchBlobReader{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+}
+
+// Read resolves each spec to its blob content through the SAME persistent
+// process, keyed by the exact spec string — the same map contract as BlobsBatch,
+// including that a spec which is missing or resolves to a non-blob (e.g. a tree)
+// is simply absent from the map (BlobAt's present=false => empty convention).
+//
+// A returned error means the wire stream desynced or a pipe failed: the reader's
+// position is now unknown, so the caller MUST discard it (Close and, if it still
+// wants the answer, fall back to a fresh spawn). It never partially trusts a
+// desynced stream — one bad record fails the whole call.
+func (br *BatchBlobReader) Read(specs []string) (map[string]string, error) {
+	result := make(map[string]string, len(specs))
+	for _, s := range specs {
+		// One spec per line; a literal newline would desync request from response.
+		if strings.Contains(s, "\n") {
+			return nil, fmt.Errorf("cat-file --batch: illegal newline in spec %q", s)
+		}
+		if _, err := io.WriteString(br.stdin, s+"\n"); err != nil {
+			return nil, err
+		}
+		line, err := br.stdout.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		// The header grammar is identical to --batch-check's, so reuse its parser:
+		// "<oid> <type> <size>" for a present object, "<spec> missing" otherwise.
+		_, typ, size, exists, perr := parseBatchCheckLine(line)
+		if perr != nil {
+			return nil, fmt.Errorf("cat-file --batch: %w", perr)
+		}
+		if !exists {
+			continue // missing spec: absent from the map, not an error
+		}
+		if size < 0 { // guard make() below; a real object never reports this
+			return nil, fmt.Errorf("cat-file --batch: negative size in %q", strings.TrimSpace(line))
+		}
+		buf := make([]byte, size+1) // content + git's trailing newline
+		if _, err := io.ReadFull(br.stdout, buf); err != nil {
+			return nil, err
+		}
+		if buf[size] != '\n' {
+			return nil, fmt.Errorf("cat-file --batch: missing trailing newline after %q", strings.TrimSpace(line))
+		}
+		if typ == "blob" {
+			result[s] = string(buf[:size])
+		}
+	}
+	return result, nil
+}
+
+// Close shuts the pipe and reaps the process. Safe to call more than once (a
+// second Wait just returns an already-exited error, which the caller ignores).
+func (br *BatchBlobReader) Close() error {
 	_ = br.stdin.Close()
 	return br.cmd.Wait()
 }

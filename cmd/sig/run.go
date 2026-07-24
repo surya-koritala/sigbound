@@ -1306,7 +1306,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	var semanticEdges [][2]string
 	if p.Semantic == semanticGo {
 		var notes map[string]string
-		semanticEdges, notes = computeSemanticEdges(ctx, g, baseSHA, agents)
+		semanticEdges, notes = computeSemanticEdges(ctx, c, baseSHA, agents)
 		for i := range agents {
 			if note, ok := notes[agents[i].Branch]; ok {
 				agents[i].SemanticNote = note

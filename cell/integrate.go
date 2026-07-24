@@ -89,15 +89,29 @@ type Integrator struct {
 	seq      int64    // unique suffix for scratch porcelain worktrees
 	resolver Resolver // optional conflict resolver; nil => flag on conflict (default)
 	assert   bool     // opt-in overlay-vs-merge-tree cross-check; see WithAssert
+	// blobs reads conflict-side blob content (attemptResolve). It defaults to g
+	// (a per-call cat-file --batch spawn); cell.Integrate points it at the cell so
+	// the reads route through the cell's long-lived daemon instead. Any type with
+	// gitx.BlobsBatch's signature satisfies it, so the default and the daemon are
+	// interchangeable and the fail-open behavior lives entirely in the cell.
+	blobs blobBatcher
 	// semanticEdges are extra cross-branch union edges fed into PartitionSemantic
 	// on top of path overlap; see WithSemanticEdges. Nil (the default) leaves
 	// partitioning exactly path-based.
 	semanticEdges [][2]string
 }
 
-// NewIntegrator builds an Integrator over the main repo's git handle.
+// blobBatcher is the seam attemptResolve reads conflict blobs through: either a
+// raw gitx.Git (a spawn per call) or a cell (its reused cat-file --batch daemon).
+type blobBatcher interface {
+	BlobsBatch(ctx context.Context, specs []string) (map[string]string, error)
+}
+
+// NewIntegrator builds an Integrator over the main repo's git handle. Blob reads
+// default to g's per-call spawn; cell.Integrate overrides blobs with the cell so
+// they route through its daemon.
 func NewIntegrator(g *gitx.Git) *Integrator {
-	return &Integrator{g: g, parallel: max(1, runtime.GOMAXPROCS(0))}
+	return &Integrator{g: g, blobs: g, parallel: max(1, runtime.GOMAXPROCS(0))}
 }
 
 // WithLandRef makes every strategy publish its final commit to ref (e.g.
@@ -402,7 +416,7 @@ func (in *Integrator) attemptResolve(ctx context.Context, mergeBase, ours, their
 	for _, path := range mt.Conflicts {
 		specs = append(specs, mergeBase+":"+path, ours+":"+path, theirs+":"+path)
 	}
-	contents, err := in.g.BlobsBatch(ctx, specs)
+	contents, err := in.blobs.BlobsBatch(ctx, specs)
 	if err != nil {
 		return "", false, err
 	}
