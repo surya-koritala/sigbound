@@ -3,6 +3,7 @@ package gitx
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -17,6 +18,9 @@ import (
 // bounded, Close returns ~2s; a regression (cancel not wired) blocks until the
 // child exits ~8s.
 func TestBatchBlobReaderCloseBoundsStuckProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell-script git shim, not executable on Windows")
+	}
 	dir := t.TempDir()
 	shim := filepath.Join(dir, "git")
 	if err := os.WriteFile(shim, []byte("#!/bin/sh\nexec sleep 8\n"), 0o755); err != nil {
