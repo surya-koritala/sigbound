@@ -413,6 +413,14 @@ type runParams struct {
 	// fail-safe default exists for.
 	NoDiskCheck bool
 	Notes       bool // when the run LANDS, attach the report as a git note under refs/notes/sigbound on the landed commit; see -notes and attachNote
+	// NotesExplicit records whether -notes was set explicitly (on the command
+	// line or via -config). When it wasn't, driveRun defaults Notes ON if the
+	// base tree carries a sigbound.policy file — a repo that declares a landing
+	// policy wants provenance (issue #110). An explicit -notes (true OR false)
+	// always wins over that default. Zero value (false) means "not explicit",
+	// so an in-process caller building runParams directly gets the policy-aware
+	// default too.
+	NotesExplicit bool
 	// PublishCmd, when non-empty, is run ONCE via runPublish after the run
 	// LANDS (base ref advanced; -verify green or unset) — never on a run
 	// that didn't land. cwd = Repo itself (unlike -agent/-verify/-repair,
@@ -882,6 +890,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		LogDir:          logDirAbs,
 		EventsPath:      *events,
 		Notes:           *notes,
+		NotesExplicit:   explicitFlags["notes"],
 		PublishCmd:      *publishCmd,
 		PublishTimeout:  *publishTimeout,
 		Manifest:        manifestPath,
@@ -1187,6 +1196,19 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if p.Resume && baseSHA != p.ResumeBaseSHA {
 		return runReport{}, fmt.Errorf("-resume: base %q is now at %s but the manifest recorded %s — it has moved since that run; re-run fresh instead of resuming onto a different base",
 			p.Base, short(baseSHA), short(p.ResumeBaseSHA))
+	}
+
+	// -notes default flip (issue #110): a base tree that declares a landing
+	// policy (a sigbound.policy file) wants its landings recorded as commit
+	// notes, so default -notes ON when one is present and -notes wasn't set
+	// explicitly. A cheap existence probe at the base SHA — deliberately NOT
+	// coupled to the policy resolver (#108); an explicit -notes (true or false)
+	// already sits in p.Notes and always wins. Best-effort: a git read error
+	// here just leaves the default unchanged, never fails the run.
+	if !p.NotesExplicit && !p.Notes {
+		if _, present, perr := g.BlobAt(ctx, baseSHA, "sigbound.policy"); perr == nil && present {
+			p.Notes = true
+		}
 	}
 
 	wtRoot, err := os.MkdirTemp("", "sig-run-*")

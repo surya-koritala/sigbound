@@ -85,6 +85,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -273,6 +274,12 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("GET /ui", s.handleUI)
 	mux.HandleFunc("GET /ui/", s.handleUI)
 	mux.HandleFunc("GET /usage", s.handleUsageAggregate)
+	// Read-only run-history surface (issue #110), the HTTP mirror of `sig log`.
+	// Both routes call the SAME reader helpers the CLI uses (scanRuns /
+	// resolveProvenance in log.go), so the two can never drift; they sit behind
+	// the same bearer gate and read-only posture as every data route above.
+	mux.HandleFunc("GET /log", s.handleLog)
+	mux.HandleFunc("GET /log/sha/{sha}", s.handleLogSHA)
 	if s.token == "" {
 		return mux
 	}
@@ -800,6 +807,59 @@ func (s *server) handleUsageAggregate(w http.ResponseWriter, r *http.Request) {
 		total.addTotals(cu)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"totals": total, "cells": cells})
+}
+
+// ---- run-history surface (issue #110): the HTTP mirror of `sig log` ----
+
+// logCellRuns is one cell's newest-first run list in GET /log's response. The
+// Runs slice is exactly what `sig log -repo <that cell> -json` renders — same
+// scanRuns call, so the two surfaces cannot drift.
+type logCellRuns struct {
+	Cell string   `json:"cell"`
+	Repo string   `json:"repo"`
+	Runs []logRow `json:"runs"`
+}
+
+// handleLog serves GET /log?limit=N: the newest-first run history for every
+// registered cell, grouped by cell — the read-only mirror of `sig log`. Same
+// lazy per-cell scan as the CLI (scanRuns reads at most N manifests per cell),
+// same rows.
+func (s *server) handleLog(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "limit must be a non-negative integer", codeBadRequest)
+			return
+		}
+		limit = n
+	}
+	cells := make([]logCellRuns, 0, len(s.cells))
+	for _, rc := range s.cells {
+		rows, _ := scanRuns(rc.runsDir, limit)
+		cells = append(cells, logCellRuns{Cell: rc.cell.ID(), Repo: rc.cell.Repo(), Runs: rows})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cells": cells})
+}
+
+// handleLogSHA serves GET /log/sha/<sha>: provenance for one commit — which run
+// landed it, from which task, by which agent — the mirror of `sig log -sha`.
+// It asks each registered cell in turn (resolveProvenance is notes-first, then
+// a manifest walk) and answers with the first that claims the commit; a commit
+// no cell landed is a 404, the HTTP analogue of the CLI's exit 1.
+func (s *server) handleLogSHA(w http.ResponseWriter, r *http.Request) {
+	sha := r.PathValue("sha")
+	if !validCommitArg(sha) {
+		writeErr(w, http.StatusBadRequest, "invalid commit sha: expected 4..64 hex characters", codeBadRequest)
+		return
+	}
+	for _, rc := range s.cells {
+		if p, ok := resolveProvenance(r.Context(), rc.cell.Git(), rc.runsDir, sha); ok {
+			writeJSON(w, http.StatusOK, map[string]any{"cell": rc.cell.ID(), "provenance": p})
+			return
+		}
+	}
+	writeErr(w, http.StatusNotFound, "not landed by sigbound", codeNotFound)
 }
 
 // ---- conflict-review surface (issue #62) ----

@@ -644,6 +644,13 @@ provenance, in two complementary places:
   `-manifest` write, a note failure is best-effort and warned on stderr,
   never a run failure — the landing already happened by the time it runs.
 
+`-notes` defaults **on** when the base tree carries a `sigbound.policy` file — a
+repo that declares a landing policy wants its landings recorded as provenance,
+so you get notes without passing the flag (a cheap existence check at the base
+commit, nothing more). An explicit `-notes` or `-notes=false` always wins over
+that default. Read the recorded history back with [`sig log`](#sig-log), whose
+`-sha` resolves a commit to the run, task, and agent that landed it.
+
 The report's new top-level fields carry that provenance: `strategy` (the
 integration strategy, duplicated here even though `integrate.strategy`
 already has it, so it's readable without integrate having run at all),
@@ -1219,6 +1226,139 @@ manual act, not something `sig gc` decides on your behalf.
 
 ---
 
+## `sig log`
+
+A **read-only** query layer over what runs already record — the `report.json`
+manifests under `.git/sigbound/runs` (`sig serve` writes them; a `sig run`
+`-manifest` file has the identical shape) and the landing notes under
+`refs/notes/sigbound` (see [Provenance](#provenance)). It adds no storage and
+changes nothing a run writes; it only reads the history back.
+
+```
+sig log -repo PATH [-limit 50] [-sha COMMIT | -task ID] [-json]
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-repo` | — | Target git repository (required). |
+| `-limit` | `50` | Max runs in the newest-first list (`0` = all). Ignored with `-sha`/`-task`. |
+| `-sha COMMIT` | — | Provenance for one commit (see below). **Exits 1** if sigbound never landed it. |
+| `-task ID` | — | Follow one task id across every run and resume, oldest-first. |
+| `-json` | `false` | Emit the stable machine shape instead of the human table. |
+
+`-sha` and `-task` are mutually exclusive; with neither, `sig log` prints the
+run list.
+
+### The list
+
+`sig log -repo PATH` lists runs **newest-first** — run ids are timestamp-
+prefixed, so ordering is by id and needs no manifest read. The scan is **lazy**:
+only the `-limit` newest run dirs are opened, so a repo with thousands of runs
+serves `-limit 5` with one directory read plus five manifest reads.
+
+Each row carries the run id, when it started, its status, task and agent counts,
+the resolved agent command, landed/flagged/dropped-by-bisect counts, the verify
+verdict, and the landed commit (short) — shown only when the run actually
+advanced the base ref (`integrate.finalSHA` is populated with the integrated
+tree even on a verify failure that lands nothing). A run dir that crashed
+mid-write — a missing or unparseable `report.json` — still renders, marked
+`incomplete` (`*` in the table, with a footer count); `sig log` never crashes on
+a partial dir and never silently skips one.
+
+Two things the manifest does **not** record, and how `sig log` handles them:
+
+- **Preset names.** A run stores only the RESOLVED command it ran (after
+  `-agent-preset` expansion), never the preset name — so the list shows
+  `agentCmd`, the honest "which agent", not `claude`/`codex`/`aider`.
+- **The `-goal` string** is persisted only for `sig serve` runs (in
+  `request.json`); a CLI `-goal` run records just the planned tasks. So `goal`
+  is usually empty and the task count is the handle.
+
+### `-sha`: commit provenance
+
+`sig log -repo PATH -sha COMMIT` answers *which run landed this commit, from
+which task, by which agent.* Resolution is **notes-first, then a manifest walk**:
+
+1. If the commit carries a `refs/notes/sigbound` landing note, that note (the
+   whole report) answers immediately — and because a note rides with its commit
+   to any clone, this works even when the local ledger has no run dir for it.
+2. Otherwise `sig log` walks the local manifests newest-first, matching the
+   commit against each run's landed integration commit (`integrate.finalSHA`)
+   and every agent branch tip (`perAgent[].sha`).
+
+This is correct for every landing shape:
+
+- **overlay / octopus landings** — a member commit resolves to its task and
+  agent (`member-landed`); the final integration commit resolves to
+  `landed-commit`, naming how many branches combined.
+- **bisect-salvaged subsets** — a landed member resolves to `member-landed`; a
+  member bisect **dropped** (its group failed `-verify`) is still fully
+  attributed as `member-dropped-by-bisect` (its task, agent, run) — reported as
+  "dropped by bisect", never "unknown".
+
+A commit sigbound never landed prints `not landed by sigbound` and **exits 1**.
+
+The ledger is independent of refs: a run still renders, and its commits still
+resolve, after the agent branches it landed have been deleted — `sig log` reads
+`report.json`, never the branches themselves.
+
+### `-task`: one task across runs
+
+`sig log -repo PATH -task ID` follows a task id through the whole history,
+oldest-first — one row per run it appeared in, including every `-resume` that
+re-ran or reused it (`resumed`), with its branch, tip sha, agent exit, verify
+verdict, and whether it landed.
+
+### JSON shape (`-json`)
+
+`-json` is stable, omit-empty, and shares field names with the [run
+report](#json-report) where they overlap — safe to switch on. The **list** is a
+bare array of run objects:
+
+```json
+[
+  {
+    "id": "20260724T170501Z-a1b2c3d4e5f6",
+    "startedAt": "2026-07-24T17:05:03Z",
+    "status": "done",
+    "tasks": 3,
+    "agents": 3,
+    "agentCmd": "claude -p",
+    "strategy": "overlay",
+    "landed": 2,
+    "flagged": 1,
+    "dropped": 0,
+    "verify": "pass",
+    "landedSHA": "1a2b3c4"
+  }
+]
+```
+
+Omit-empty fields appear only when relevant: `goal` (serve `-goal` runs),
+`policyHash` (see below), `error` (error/interrupted runs), `incomplete` (a dir
+that crashed mid-write).
+
+`-sha` emits one provenance object — `{sha, landed, role, runId?, taskId?,
+agent?, branch?, strategy?, verify?, startedAt?, finalSHA?, members?, source}`.
+`role` is one of `landed-commit`, `member-landed`, `member-dropped-by-bisect`,
+`member-flagged`, `member`; `source` is `note` or `manifest` (`runId` is empty
+when only a portable note answered). `-task` emits an array of `{runId,
+startedAt?, branch?, sha?, ok, resumed?, landed, verify?}`.
+
+`policyHash` is surfaced only once a run records one (a future landing-policy
+feature); no run written so far does, so it reads back empty and is omitted —
+`sig log` tolerates its absence and never depends on it.
+
+### Serve mirror
+
+`sig serve` exposes the same reader over HTTP (see [`sig serve`
+endpoints](#endpoints)): `GET /log?limit=N` returns the newest-first list per
+registered cell, and `GET /log/sha/<sha>` returns the same provenance (`404` —
+the HTTP analogue of the CLI's exit 1 — for a commit no cell landed). Both call
+the identical reader the CLI uses, so the two surfaces never drift.
+
+---
+
 ## `sig serve`
 
 A thin HTTP wrapper over the **same** `driveRun` orchestration `sig run` uses —
@@ -1278,6 +1418,8 @@ All requests and responses are JSON (events are NDJSON).
 | `GET /runs/{id}/flagged` | `{runId, cell, flagged:[{branch, paths}]}` — the branches this run flagged and each one's conflicted paths (see [Conflict review UI](#conflict-review-ui)). `404` until the run has a report. |
 | `GET /runs/{id}/flagged/{branch}/{path...}` | `{path, base, ours, theirs, baseSHA}` — the three sides of one conflicted path. A side is `null` when the path is absent there (an add/delete conflict). `{branch}/{path...}` must **exactly** match a flagged pair from the listing above; anything else is `404` and reads nothing. |
 | `GET /ui` (and `/ui/`) | The read-only conflict-review HTML page (see [Conflict review UI](#conflict-review-ui)). |
+| `GET /log` | `{cells:[{cell, repo, runs:[…]}]}` — the newest-first run history per cell, `?limit=N` (default 50). The HTTP mirror of [`sig log`](#sig-log). |
+| `GET /log/sha/{sha}` | `{cell, provenance:{…}}` — which run/task/agent landed `{sha}` (see [`sig log`](#sig-log)). `404` (`not_found`) for a commit no cell landed. |
 
 The `POST /runs` body mirrors `sig run`'s flags by name (camelCased); durations
 are Go duration strings (`"30s"`, `"2m"`). `cell` is a cell id (from `/health`)
