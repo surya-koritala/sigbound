@@ -1286,6 +1286,16 @@ which task, by which agent.* Resolution is **notes-first, then a manifest walk**
    commit against each run's landed integration commit (`integrate.finalSHA`)
    and every agent branch tip (`perAgent[].sha`).
 
+A note is user-writable and rides across clones from untrusted remotes, so it is
+trusted only when it genuinely concerns the queried commit — the commit is that
+run's landed integration commit or one of its recorded member tips. A note that
+doesn't match (a forged or unrelated payload) is ignored and resolution falls
+through to the local manifests, which are ground truth.
+
+The answer is always a single run: when a commit appears in more than one run,
+the note wins if there is one, otherwise the newest run whose manifest records
+the commit; earlier runs are not listed.
+
 This is correct for every landing shape:
 
 - **overlay / octopus landings** — a member commit resolves to its task and

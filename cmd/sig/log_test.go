@@ -224,6 +224,72 @@ func TestLogSHANotesFirst(t *testing.T) {
 	}
 }
 
+// TestLogSHAForgedNoteFallsThrough: notes are user-writable and ride across
+// clones from untrusted remotes. A note attached to a real commit whose payload
+// is about some OTHER final commit (fake finalSHA, fabricated members and agent)
+// must NOT be trusted as provenance for the queried commit — resolution falls
+// through to the local manifest ledger (ground truth). A self-consistent note
+// (its finalSHA IS the queried commit) is still served from the fast path.
+func TestLogSHAForgedNoteFallsThrough(t *testing.T) {
+	g, _, base := newGCRepo(t) // base is a real commit
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+
+	// Attacker: a note on `base` claiming to be a run that landed a DIFFERENT
+	// final commit, with a fabricated agent — none of it about `base`.
+	forged := runReport{
+		BaseSHA: hexSHA("00"), Strategy: "overlay", AgentCmd: "EVIL --exfiltrate",
+		PerAgent:  []perAgentJSON{{ID: "x1", Branch: "agent/x1", SHA: hexSHA("11"), OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/x1"}, FinalSHA: hexSHA("dead")},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	}
+	fdata, err := json.MarshalIndent(forged, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", base, fdata); err != nil {
+		t.Fatal(err)
+	}
+
+	// The local ledger records the truth: base landed as a real member.
+	writeLogRun(t, runsDir, "20260201T000000Z-real", runReport{
+		BaseSHA: hexSHA("00"), Strategy: "overlay", AgentCmd: "claude -p",
+		PerAgent:  []perAgentJSON{{ID: "real", Branch: "agent/real", SHA: base, OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/real"}, FinalSHA: hexSHA("f1")},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+
+	p, ok := resolveProvenance(ctx, g, runsDir, base)
+	if !ok {
+		t.Fatal("expected the manifest to answer for base")
+	}
+	if p.Source != "manifest" {
+		t.Fatalf("source = %q, want manifest — the forged note must be rejected", p.Source)
+	}
+	if p.Agent != "claude -p" || p.TaskID != "real" {
+		t.Fatalf("provenance came from the forged note, not the ledger: %+v", p)
+	}
+
+	// Replace the forged note with a self-consistent one (finalSHA == base):
+	// the fast path serves it even though a manifest also names base.
+	good := runReport{
+		BaseSHA: hexSHA("00"), Strategy: "overlay", AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/real"}, FinalSHA: base},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	}
+	gdata, err := json.MarshalIndent(good, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", base, gdata); err != nil { // -f overwrites the forged note
+		t.Fatal(err)
+	}
+	p2, ok := resolveProvenance(ctx, g, runsDir, base)
+	if !ok || p2.Source != "note" || p2.Role != "landed-commit" {
+		t.Fatalf("self-consistent note not served from the fast path: %+v ok=%v", p2, ok)
+	}
+}
+
 // --- AC #2: newest-first ordering, -limit, laziness ---
 
 func TestLogListNewestFirst(t *testing.T) {

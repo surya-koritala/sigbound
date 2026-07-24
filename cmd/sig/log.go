@@ -311,15 +311,25 @@ func fillRowFromReport(row *logRow, rep *runReport) {
 // walks manifests newest-first and stops at the first match. ok is false only
 // when NO note and NO manifest claims the commit — a commit sigbound never
 // landed.
+//
+// A note is user-writable and rides across clones from untrusted remotes, so
+// its payload is NOT trusted blindly: a note is authoritative only if it
+// genuinely concerns the queried commit — the commit is the run's landed
+// integration commit or one of its recorded member tips (matchProvenance is
+// exactly that test). A forged or unrelated note (one whose finalSHA and members
+// are some other commit) is non-authoritative and falls through to the local
+// manifest ledger, which is ground truth.
 func resolveProvenance(ctx context.Context, g *gitx.Git, runsDir, sha string) (*provenance, bool) {
 	if content, ok, _ := g.NoteShow(ctx, "sigbound", sha); ok {
 		var rep runReport
 		if json.Unmarshal([]byte(content), &rep) == nil {
-			p := provenanceFromFinal(&rep, sha)
-			p.Source = "note" // RunID intentionally left empty: the note is portable, the run dir may not be local
-			return p, true
+			if p := matchProvenance(&rep, sha); p != nil {
+				p.Source = "note" // RunID left empty: the note is portable, the run dir may not be local
+				return p, true
+			}
+			// The note parses but is not about THIS commit — treat it as
+			// non-authoritative and fall through to the manifest walk.
 		}
-		// A note that won't parse as a report is not sigbound's — fall through.
 	}
 	for _, id := range runDirNames(runsDir) {
 		rep, err := readRunReport(filepath.Join(runsDir, id))
