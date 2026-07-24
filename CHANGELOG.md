@@ -8,6 +8,20 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-23
+
+The distributed and service milestone: Sigbound gains its first network daemon
+(`sig serve`), multi-machine transport (`sig export`/`sig import`), a first-class
+`Cell` as the unit of horizontal scale, per-slot environment scoping, and
+symbol-level Go semantic conflict detection — all still on top of plain git, with
+zero module dependencies, and with the verify gate holding on every landing path.
+`sig serve` runs and lets you inspect work over a repo you already host; it is
+not a git host and does not replace your forge.
+
+With 1.0.0 the public interface — the `sig` subcommands and their flags, and the
+`SIGBOUND_*` environment variables — is now covered by Semantic Versioning:
+breaking changes to it require a 2.0.0.
+
 ### Added
 
 - **`sig serve` conflict-review surface** — a read-only, self-contained web UI
@@ -238,7 +252,8 @@ Initial public release.
 - **`sig version`** — reports the version, and the git commit and build date
   when built from a checkout.
 
-[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/surya-koritala/sigbound/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/surya-koritala/sigbound/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/surya-koritala/sigbound/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/surya-koritala/sigbound/releases/tag/v0.1.0
