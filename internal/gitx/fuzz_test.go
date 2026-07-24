@@ -4,7 +4,7 @@ package gitx
 // A parser of untrusted plumbing output must NEVER panic on malformed input — a
 // crasher here would be a real bug. Each target refactors the parse into a pure
 // helper (parseDiffRawZ, parseMergeTreeZ, parseBatchCheckLine, parseLsTreeZ,
-// parseCatFileBatch) so it can be exercised without shelling git, and asserts the parser's own
+// parseLsTreeSizesZ, parseCatFileBatch) so it can be exercised without shelling git, and asserts the parser's own
 // structural invariants in addition to "did not panic". The seed corpora carry
 // real valid outputs plus known-tricky inputs (empty, truncated, embedded NULs,
 // missing/extra fields, non-UTF8) and any crasher found is committed under
@@ -253,6 +253,33 @@ func FuzzParseLsTreeZ(f *testing.F) {
 			if strings.ContainsAny(mode, " \t\n\x00") {
 				t.Fatalf("mode for %q carries whitespace/NUL: %q", path, mode)
 			}
+		}
+	})
+}
+
+// FuzzParseLsTreeSizesZ fuzzes the `git ls-tree -r -l -z <rev>` decoder that
+// TreeSize sums into a disk-space preflight estimate (see cmd/sig's
+// diskPreflight and `sig doctor`'s disk line).
+func FuzzParseLsTreeSizesZ(f *testing.F) {
+	f.Add("")
+	f.Add("\x00")
+	f.Add("100644 blob " + sha1a + "     582\t.github/FUNDING.yml\x00")
+	f.Add("100644 blob " + sha1a + "       0\ta.go\x00100755 blob " + sha1b + "     123\tb.sh\x00")
+	f.Add("160000 commit " + sha1a + "       -\tsubmod\x00") // submodule: size "-"
+	f.Add("no-tab-at-all record\x00")
+	f.Add("\t\x00")                                                               // tab only -> empty fields before tab
+	f.Add("100644 blob " + sha1a + "  notanumber\tbad.txt\x00")                   // non-numeric size
+	f.Add("100644 blob " + sha1a + "  -5\tneg.txt\x00")                           // negative size
+	f.Add("100644 blob " + sha1a + "  999999999999999999999999999\thuge.txt\x00") // size overflow
+	f.Add("100644 blob " + sha1a + "  582\t\xff\xfe\x00")                         // non-UTF8 path
+
+	f.Fuzz(func(t *testing.T, out string) {
+		total, err := parseLsTreeSizesZ(out)
+		if err != nil {
+			return // a rejected malformed record is fine, as long as it did not panic
+		}
+		if total < 0 {
+			t.Fatalf("parseLsTreeSizesZ(%q) = %d, want non-negative", out, total)
 		}
 	})
 }

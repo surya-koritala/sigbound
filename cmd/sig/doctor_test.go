@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -90,6 +91,66 @@ func TestDoctorBadRepoFailsSafe(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "FAIL") {
 		t.Fatalf("expected a FAIL line for a non-repo -repo, got:\n%s", buf.String())
+	}
+}
+
+// TestDoctorDiskLineRenders: the informational disk-space line always
+// appears — on the default (no -repo, falls back to the current directory)
+// AND the -repo path — and never contributes a "FAIL": it's advisory, not
+// one of doctor's pass/fail checks (see diskInfoLine's doc comment).
+func TestDoctorDiskLineRenders(t *testing.T) {
+	var buf bytes.Buffer
+	code, err := runDoctor(&buf, nil)
+	if err != nil {
+		t.Fatalf("runDoctor: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code, buf.String())
+	}
+	if !strings.Contains(buf.String(), "disk:") {
+		t.Fatalf("output missing the disk line:\n%s", buf.String())
+	}
+
+	g, _ := newDoctorRepo(t)
+	var buf2 bytes.Buffer
+	code2, err := runDoctor(&buf2, []string{"-repo", g.Dir()})
+	if err != nil {
+		t.Fatalf("runDoctor -repo: %v\n%s", err, buf2.String())
+	}
+	if code2 != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code2, buf2.String())
+	}
+	if !strings.Contains(buf2.String(), "disk: repo tree") {
+		t.Fatalf("output missing the disk tree-size line for a real -repo:\n%s", buf2.String())
+	}
+
+	// Runs create worktrees under os.TempDir() (see run.go's wtRoot), which
+	// can be a different, smaller filesystem than the repo's (tmpfs /tmp in
+	// CI is the classic trap). When the two free-space readings differ, the
+	// line must surface BOTH — and still never fail doctor, since this stays
+	// informational.
+	origFree := diskFreeBytes
+	tmpDir := os.TempDir()
+	diskFreeBytes = func(path string) (uint64, bool) {
+		if path == tmpDir {
+			return 111, true
+		}
+		return 222, true
+	}
+	t.Cleanup(func() { diskFreeBytes = origFree })
+
+	g3, _ := newDoctorRepo(t)
+	var buf3 bytes.Buffer
+	code3, err := runDoctor(&buf3, []string{"-repo", g3.Dir()})
+	if err != nil {
+		t.Fatalf("runDoctor -repo: %v\n%s", err, buf3.String())
+	}
+	if code3 != exitOK {
+		t.Fatalf("code=%d, want exitOK (differing temp/repo free space must stay informational)\n%s", code3, buf3.String())
+	}
+	out3 := buf3.String()
+	if !strings.Contains(out3, "free on temp:") || !strings.Contains(out3, "free on repo fs:") {
+		t.Fatalf("output missing both temp and repo free-space readings when they differ:\n%s", out3)
 	}
 }
 

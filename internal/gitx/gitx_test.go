@@ -402,3 +402,43 @@ func contains(s, sub string) bool {
 		return false
 	})()
 }
+
+// TestTreeSize locks TreeSize against a fixture tree of known byte lengths —
+// the disk-space preflight estimate (cmd/sig's diskPreflight / `sig doctor`'s
+// disk line) is only as trustworthy as this sum.
+func TestTreeSize(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sub", "deeper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, "a.txt", "12345")          // 5 bytes
+	writeFile(t, dir, "sub/b.txt", "1234567890") // 10 bytes
+	writeFile(t, dir, "sub/deeper/c.txt", "")    // 0 bytes
+	base, err := g.CommitAll(ctx, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := g.TreeSize(ctx, base)
+	if err != nil {
+		t.Fatalf("TreeSize: %v", err)
+	}
+	if want := int64(5 + 10 + 0); got != want {
+		t.Fatalf("TreeSize = %d, want %d", got, want)
+	}
+}
+
+// TestTreeSizeBadRev: an unresolvable rev is a loud error, same as LsTree's
+// existing bad-ref behavior — never a silent 0.
+func TestTreeSizeBadRev(t *testing.T) {
+	ctx := context.Background()
+	g, _ := newRepo(t)
+	if _, err := g.TreeSize(ctx, "no-such-ref"); err == nil {
+		t.Fatal("TreeSize: want error for an unresolvable rev")
+	}
+}

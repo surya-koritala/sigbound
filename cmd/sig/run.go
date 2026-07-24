@@ -382,7 +382,20 @@ type runParams struct {
 	// ceiling. See -parallel-agents.
 	ParallelAgents int
 	Budget         time.Duration // wall-clock ceiling for the agent phase + integrate + verify (0 = none); see driveRun
-	Notes          bool          // when the run LANDS, attach the report as a git note under refs/notes/sigbound on the landed commit; see -notes and attachNote
+	// NoDiskCheck disables the disk-space preflight (see diskPreflight in
+	// diskspace.go): by default, before any agent runs, driveRun estimates
+	// len(tasks) full worktree checkouts against free space on the worktree
+	// root's filesystem and refuses the run outright if that estimate
+	// clearly won't fit. The estimate is necessarily rough (see
+	// diskShortfall) and best-effort (it silently skips rather than blocks
+	// when it can't read a tree size or free space at all) -- -no-disk-check
+	// is the escape hatch for a caller who has already reasoned about their
+	// own headroom and doesn't want the estimate in the way. Off by default:
+	// the check is cheap and the failure mode it prevents (ENOSPC deep into
+	// a run, after real agent-call spend) is exactly the kind of thing a
+	// fail-safe default exists for.
+	NoDiskCheck bool
+	Notes       bool // when the run LANDS, attach the report as a git note under refs/notes/sigbound on the landed commit; see -notes and attachNote
 	// PublishCmd, when non-empty, is run ONCE via runPublish after the run
 	// LANDS (base ref advanced; -verify green or unset) — never on a run
 	// that didn't land. cwd = Repo itself (unlike -agent/-verify/-repair,
@@ -449,7 +462,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-semantic go|off] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-parallel-agents N] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-semantic go|off] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-parallel-agents N] [-budget D] [-no-disk-check] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset); -publish succeeded or was unset")
@@ -536,6 +549,11 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		"provider's rate limits allow (64 concurrent agent calls is a legitimate ask); lower it -- down to 1, fully serial -- to stay under a rate-limited key's concurrent-request ceiling. Must be >= 0")
 	budget := fs.Duration("budget", 0, "wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (0 = none). On expiry, outstanding agents are cancelled and fail; "+
 		"integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial")
+	noDiskCheck := fs.Bool("no-disk-check", false, "skip the disk-space preflight: by default, before any agent runs, the driver estimates len(tasks) full worktree checkouts "+
+		"(task count x checked-out tree size, see `sig doctor`'s disk line for the same numbers) against free space on the worktree root's filesystem, padded by a 10% safety margin, "+
+		"and refuses the run outright (exit 1, no agent ever started) when that clearly won't fit -- catching a large fan-out's ENOSPC up front instead of mid-run, after real agent-call "+
+		"spend. The estimate is necessarily rough (full checkouts today; sparse lanes would shrink it) and fails OPEN when it can't be computed at all (unreadable tree, unsupported platform) "+
+		"-- this flag is the escape hatch for a caller who has already reasoned about their own headroom. Off by default")
 	logDir := fs.String("logdir", "", "when set, write each agent/repair/verify/planner command's FULL stdout+stderr to <logdir>/<name>.log "+
 		"(agent-<id>.log, repair-<n>.log, verify-<n>.log, planner.log), in addition to the truncated tails the report keeps in memory. "+
 		"The directory is created if needed and must be writable; checked before any agent runs")
@@ -836,6 +854,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		KeepFailed:      *keepFailed,
 		ParallelAgents:  *parallelAgents,
 		Budget:          *budget,
+		NoDiskCheck:     *noDiskCheck,
 		LogDir:          logDirAbs,
 		EventsPath:      *events,
 		Notes:           *notes,
@@ -1192,6 +1211,18 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		}
 		os.RemoveAll(wtRoot)
 	}()
+
+	// Disk-space preflight (issue #92): before any agent runs (and so before
+	// any real API spend), refuse a run whose worktree fan-out — one full
+	// checkout of baseSHA per task, about to start below — would plausibly
+	// exhaust the filesystem under wtRoot. See diskPreflight's doc comment
+	// (diskspace.go) for the estimate and its fail-open posture; -no-disk-check
+	// skips this entirely.
+	if !p.NoDiskCheck {
+		if err := diskPreflight(ctx, g, baseSHA, wtRoot, len(tasks)); err != nil {
+			return rep, err
+		}
+	}
 
 	// -budget bounds the rest of driveRun (agent phase + integrate + verify)
 	// with one wall-clock ceiling. Once it fires, every outstanding agent is
