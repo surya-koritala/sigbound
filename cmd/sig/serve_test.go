@@ -273,14 +273,20 @@ func TestServeConcurrentSameCell409(t *testing.T) {
 
 	// Let the first run finish; the slot frees and a new run is accepted.
 	pollRun(t, ts, "", first.RunID)
+	var third struct{ RunID string }
 	code = doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
 		Cell:  repo,
 		Tasks: []taskSpec{{ID: "t3"}},
 		Agent: writeFileAgent("after.txt"),
-	}, nil)
+	}, &third)
 	if code != http.StatusAccepted {
 		t.Fatalf("post-completion POST status %d, want 202", code)
 	}
+	// Drain it to a terminal state before returning: otherwise this run
+	// outlives the test, and its goroutine can still be writing report.json
+	// into the makeGoRepo temp dir after t.TempDir()'s cleanup removes it —
+	// a stderr write (see writeRunReport) racing the test's own teardown.
+	pollRun(t, ts, "", third.RunID)
 }
 
 func TestServeTwoCellsRunConcurrently(t *testing.T) {
