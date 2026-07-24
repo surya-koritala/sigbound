@@ -93,6 +93,37 @@ func TestDoctorBadRepoFailsSafe(t *testing.T) {
 	}
 }
 
+// TestDoctorDiskLineRenders: the informational disk-space line always
+// appears — on the default (no -repo, falls back to the current directory)
+// AND the -repo path — and never contributes a "FAIL": it's advisory, not
+// one of doctor's pass/fail checks (see diskInfoLine's doc comment).
+func TestDoctorDiskLineRenders(t *testing.T) {
+	var buf bytes.Buffer
+	code, err := runDoctor(&buf, nil)
+	if err != nil {
+		t.Fatalf("runDoctor: %v\n%s", err, buf.String())
+	}
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code, buf.String())
+	}
+	if !strings.Contains(buf.String(), "disk:") {
+		t.Fatalf("output missing the disk line:\n%s", buf.String())
+	}
+
+	g, _ := newDoctorRepo(t)
+	var buf2 bytes.Buffer
+	code2, err := runDoctor(&buf2, []string{"-repo", g.Dir()})
+	if err != nil {
+		t.Fatalf("runDoctor -repo: %v\n%s", err, buf2.String())
+	}
+	if code2 != exitOK {
+		t.Fatalf("code=%d, want exitOK\n%s", code2, buf2.String())
+	}
+	if !strings.Contains(buf2.String(), "disk: repo tree") {
+		t.Fatalf("output missing the disk tree-size line for a real -repo:\n%s", buf2.String())
+	}
+}
+
 // newDoctorRepo creates a minimal real repo (one commit) for -repo tests.
 func newDoctorRepo(t *testing.T) (*gitx.Git, string) {
 	t.Helper()

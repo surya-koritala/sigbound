@@ -5163,3 +5163,56 @@ func TestRunRunEnvModeAndAllowlistFlagsWireIntoReport(t *testing.T) {
 		t.Fatalf("-env-agent SIGBOUND_TEST_CANARY did not reach the agent: %+v", env)
 	}
 }
+
+// TestDriveRunDiskPreflightRefuses: with the free-space reading fabricated
+// (via the diskFreeBytes seam, same pattern as openLogFile) to 1 byte —
+// nowhere near enough for even one worktree checkout of the base tree —
+// driveRun refuses the WHOLE run with an actionable error, before any agent
+// starts: PerAgent is empty, proving no agent ran at all.
+func TestDriveRunDiskPreflightRefuses(t *testing.T) {
+	orig := diskFreeBytes
+	diskFreeBytes = func(string) (uint64, bool) { return 1, true }
+	t.Cleanup(func() { diskFreeBytes = orig })
+
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	task := taskSpec{ID: "t1", Prompt: "x"}
+
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: "exit 1"}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err == nil {
+		t.Fatal("driveRun: want an error when the disk preflight estimate exceeds free space")
+	}
+	if !strings.Contains(err.Error(), "disk preflight") {
+		t.Fatalf("error = %v, want it to mention the disk preflight", err)
+	}
+	if len(rep.PerAgent) != 0 {
+		t.Fatalf("PerAgent = %+v, want none — the run must refuse BEFORE any agent starts", rep.PerAgent)
+	}
+}
+
+// TestDriveRunDiskPreflightNoDiskCheckBypasses: the SAME fabricated
+// near-zero free-space reading that makes TestDriveRunDiskPreflightRefuses
+// refuse the run is bypassed entirely by -no-disk-check (NoDiskCheck) — the
+// run proceeds and the agent actually executes and lands.
+func TestDriveRunDiskPreflightNoDiskCheckBypasses(t *testing.T) {
+	orig := diskFreeBytes
+	diskFreeBytes = func(string) (uint64, bool) { return 1, true }
+	t.Cleanup(func() { diskFreeBytes = orig })
+
+	ctx := context.Background()
+	_, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	task := taskSpec{ID: "t1", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"ok.go": "package main\n\nfunc ok() int { return 1 }\n"},
+	})}
+
+	p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent, NoDiskCheck: true}
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if len(rep.PerAgent) != 1 || !rep.PerAgent[0].OK {
+		t.Fatalf("want the agent to actually run and succeed with -no-disk-check, got %+v", rep.PerAgent)
+	}
+}

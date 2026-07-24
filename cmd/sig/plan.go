@@ -580,14 +580,19 @@ func recvTypeName(e ast.Expr) string {
 	return ""
 }
 
-// humanSize renders a byte count compactly (B / KB / MB) for the repo map.
+// humanSize renders a byte count compactly (B / KB / MB / GB) — originally
+// for the repo map's per-file listing, reused by the disk-space preflight
+// (cmd/sig's diskspace.go) where a free-space or multi-worktree estimate
+// routinely lands in GB.
 func humanSize(n int64) string {
 	switch {
 	case n < 1024:
 		return strconv.FormatInt(n, 10) + "B"
 	case n < 1024*1024:
 		return strconv.FormatFloat(float64(n)/1024, 'f', 1, 64) + "KB"
-	default:
+	case n < 1024*1024*1024:
 		return strconv.FormatFloat(float64(n)/(1024*1024), 'f', 1, 64) + "MB"
+	default:
+		return strconv.FormatFloat(float64(n)/(1024*1024*1024), 'f', 1, 64) + "GB"
 	}
 }

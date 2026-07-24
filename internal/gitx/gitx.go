@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -392,6 +393,59 @@ func (g *Git) LsTree(ctx context.Context, rev string) ([]string, error) {
 		return nil, err
 	}
 	return splitLines(out), nil
+}
+
+// TreeSize returns the total size in bytes of every blob in rev's tree,
+// summed recursively via `git ls-tree -r -l -z` (each blob's size field is
+// the object's raw content length, the same number `git cat-file -s` would
+// report for it). This is an upper-bound PROXY for what a full checkout of
+// rev would occupy on disk — filesystem block rounding and similar are
+// ignored — good enough for a preflight estimate, not a byte-exact
+// accounting. Used by cmd/sig's disk-space preflight (`sig run`'s
+// -no-disk-check gate and `sig doctor`'s disk line) to bound N worktrees'
+// worth of checkout against free space before spending any agent call.
+// Submodule entries report size "-" (their content lives in another
+// repository's object store, not this one) and contribute 0.
+func (g *Git) TreeSize(ctx context.Context, rev string) (int64, error) {
+	out, err := g.run(ctx, "ls-tree", "-r", "-l", "-z", rev)
+	if err != nil {
+		return 0, err
+	}
+	return parseLsTreeSizesZ(out)
+}
+
+// parseLsTreeSizesZ sums the blob sizes from `git ls-tree -r -l -z` output.
+// Each record is "<mode> SP <type> SP <oid> SP <size>\t<path>\0" — the size
+// field is space-padded for column alignment in git's own formatting, hence
+// strings.Fields rather than a fixed-width slice. A submodule entry's size is
+// the literal string "-" (git doesn't track a submodule's content size in
+// THIS repository's object store) and contributes 0, not an error. It is a
+// pure function of untrusted git output and must never panic on malformed
+// input. Fuzzed by FuzzParseLsTreeSizesZ.
+func parseLsTreeSizesZ(out string) (int64, error) {
+	var total int64
+	for _, rec := range strings.Split(out, "\x00") {
+		if rec == "" { // trailing empty after final NUL
+			continue
+		}
+		tab := strings.IndexByte(rec, '\t')
+		if tab < 0 {
+			return 0, fmt.Errorf("ls-tree -l: malformed record %q", rec)
+		}
+		fields := strings.Fields(rec[:tab])
+		if len(fields) < 4 {
+			return 0, fmt.Errorf("ls-tree -l: malformed record %q", rec)
+		}
+		if fields[3] == "-" { // submodule: no size in this object store
+			continue
+		}
+		n, err := strconv.ParseInt(fields[3], 10, 64)
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("ls-tree -l: bad size in record %q", rec)
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // MergeTreeResult is the outcome of an in-memory (object-store) 3-way merge.

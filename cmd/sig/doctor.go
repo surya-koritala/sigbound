@@ -65,6 +65,10 @@ func runDoctor(w io.Writer, argv []string) (int, error) {
 		}
 		fmt.Fprintf(w, "%s: ok\n", c.name)
 	}
+	// Informational only (see diskInfoLine's doc comment): a disk-space
+	// estimate that can't be formed never fails doctor, so this runs
+	// unconditionally and never touches allOK.
+	fmt.Fprintln(w, diskInfoLine(ctx, *repo))
 	if !allOK {
 		return exitOperationalError, nil
 	}
