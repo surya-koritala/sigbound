@@ -27,6 +27,7 @@ Cursor's [Origin](https://cursor.com/origin) announced a closed, hosted version 
 - **Verified merges** — nothing lands unless the combined result passes your `-verify` command.
 - **Self-repair** — a merge that breaks the build is sent back to an agent to fix, then re-checked.
 - **File lanes** — each task declares the files it may touch; an agent that strays is rejected.
+- **Landing policy** — a `sigbound.policy` file committed in the repo declares the bar every landing must clear; flags can tighten it, never loosen it.
 - **Bring your own model** — planner, agent, resolver, and repair are each a command you supply.
 - **On top of git** — uses worktrees and `merge-tree`; no server, no lock-in, any host.
 
@@ -105,6 +106,10 @@ That invocation is long and doesn't change much run to run — put your standing
 ### `sig serve`: an HTTP run API
 
 `sig serve -repos /path/a,/path/b` runs the same engine behind a small local daemon: `POST /runs` starts a run, `GET /runs/{id}` polls it, and a read-only `/ui` page lets you inspect any branch a run flagged for human review. It binds loopback by default, ships no TLS or user model, and adds no new landing path — it drives the exact same `-verify`-gated engine `sig run` does. See [`sig serve`](docs/USAGE.md#sig-serve).
+
+### `sigbound.policy`: a repo-owned landing bar
+
+Commit a `sigbound.policy` file at the repo root and both `sig run` and `sig serve` enforce it identically: a required `verify` battery, lane/semantic/assert floors, and agent/budget ceilings the invoker cannot loosen (a flag may only tighten). It is read from the base commit's tree, so the bar is versioned with the code. Paths listed under `ack-paths`, and any change that modifies `sigbound.policy` itself, are held for a human instead of auto-landing. See [Landing policy](docs/USAGE.md#landing-policy).
 
 ### `sig export` / `sig import`: multi-machine runs
 

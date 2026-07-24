@@ -1196,6 +1196,17 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 		EnvVerify:       s.envVerify,
 		EnvRepair:       s.envRepair,
 		EnvPublish:      s.envPublish,
+		// A request field a caller actually set counts as an explicit choice, so
+		// a deliberate weaker lanes/semantic/assert is an error against a
+		// stricter policy (see resolvePolicy), not a silent tighten. A JSON bool
+		// can't distinguish an explicit assert=false from an omitted one, so only
+		// assert=true is treated as explicit; policy's assert=true floor still
+		// tightens an omitted/false request silently, the safe direction.
+		PolicyExplicit: policyExplicit{
+			Lanes:    strings.TrimSpace(req.Lanes) != "",
+			Semantic: strings.TrimSpace(req.Semantic) != "",
+			Assert:   req.Assert,
+		},
 	}
 
 	if !haveGoal {
