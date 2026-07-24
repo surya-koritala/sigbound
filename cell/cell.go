@@ -149,12 +149,22 @@ func (c *Cell) BlobsBatch(ctx context.Context, specs []string) (map[string]strin
 		}
 		c.blob = br
 	}
+	// Bound the read by ctx. An alive-but-silent daemon (accepts the request, never
+	// answers) would otherwise block here forever WHILE HOLDING blobMu, stalling
+	// Close and every other blob read on the cell. AfterFunc Kills the process on
+	// ctx cancellation, which makes the blocked Read error out so the fallback
+	// below engages (and the spawn fallback then honors the cancelled ctx by
+	// failing fast); stop() disarms it on the happy path so a completed call never
+	// kills a healthy daemon.
+	stop := context.AfterFunc(ctx, c.blob.Cancel)
 	m, err := c.blob.Read(specs)
+	stop()
 	if err == nil {
 		return m, nil
 	}
-	// The daemon desynced mid-stream — its position is now unknown. Discard it
-	// (next call restarts a clean one) and satisfy THIS call with a fresh spawn.
+	// The daemon desynced or was cancelled mid-stream — its position/health is now
+	// unknown. Discard it (next call restarts a clean one) and satisfy THIS call
+	// with a fresh spawn (which fails fast if ctx is the thing that was cancelled).
 	_ = c.blob.Close()
 	c.blob = nil
 	return c.git.BlobsBatch(ctx, specs)

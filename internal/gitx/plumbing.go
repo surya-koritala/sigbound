@@ -806,6 +806,13 @@ func (br *BatchReader) Close() error {
 	return br.cmd.Wait()
 }
 
+// maxBlobSize caps a single record's declared size before Read allocates for it,
+// so a bogus huge size in a corrupt/desynced header can't OOM or panic the
+// process on make() — Read errors instead and the caller falls back to a spawn
+// (whose parser bounds the size against the actual buffer). 1 GiB is far above
+// any source blob sigbound reads; a genuine larger blob simply takes the spawn.
+const maxBlobSize = 1 << 30
+
 // BatchBlobReader wraps one long-running `git cat-file --batch` for reading blob
 // CONTENT — the persistent counterpart to the per-call BlobsBatch spawn. A cell
 // keeps ONE alive for its whole lifetime (see cell.BlobsBatch) so a busy cell —
@@ -817,31 +824,47 @@ func (br *BatchReader) Close() error {
 // order — pipelining two reads would interleave their records).
 type BatchBlobReader struct {
 	cmd    *exec.Cmd
+	cancel context.CancelFunc // cancels cmd's context: Kills the process, bounding Read/Close
 	stdin  io.WriteCloser
 	stdout *bufio.Reader
 }
 
-// NewBatchBlobReader starts a `cat-file --batch` bound to this repo. It is
-// started on a background context, not any request's ctx, because it outlives
-// the call that first needs it (a cell reuses it across operations); its cmd
-// carries a WaitDelay so a wedged git cannot hang Close forever. The caller must
-// Close it to reap the process.
+// NewBatchBlobReader starts a `cat-file --batch` bound to this repo. The process
+// outlives the call that first needs it (a cell reuses it across operations), so
+// it is NOT tied to any request ctx; instead it gets its own cancellable context
+// whose cancel (Cancel/Close) Kills it. That cancel is the ONLY thing that bounds
+// a stuck git — WaitDelay alone never fires on a context that is never cancelled.
+// The caller must Close it to reap the process.
 func (g *Git) NewBatchBlobReader() (*BatchBlobReader, error) {
-	cmd := exec.CommandContext(context.Background(), g.bin, "-C", g.dir, "cat-file", "--batch")
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, g.bin, "-C", g.dir, "cat-file", "--batch")
 	cmd.Env = hermeticEnv()
-	cmd.WaitDelay = 2 * time.Second // never let a wedged git hang cell teardown
+	cmd.WaitDelay = 2 * time.Second // bound I/O teardown once the ctx is cancelled
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
+		cancel() // release the context (and any pipes) on a failed start
 		return nil, err
 	}
-	return &BatchBlobReader{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+	return &BatchBlobReader{cmd: cmd, cancel: cancel, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+}
+
+// Cancel Kills the daemon's process, unblocking any in-flight Read. cell.BlobsBatch
+// arms it via context.AfterFunc(ctx, ...) so a request ctx cancellation bounds a
+// Read against an alive-but-silent git; the freed Read then errors and the caller
+// falls back to a fresh spawn. Idempotent.
+func (br *BatchBlobReader) Cancel() {
+	if br.cancel != nil {
+		br.cancel()
+	}
 }
 
 // Read resolves each spec to its blob content through the SAME persistent
@@ -876,8 +899,8 @@ func (br *BatchBlobReader) Read(specs []string) (map[string]string, error) {
 		if !exists {
 			continue // missing spec: absent from the map, not an error
 		}
-		if size < 0 { // guard make() below; a real object never reports this
-			return nil, fmt.Errorf("cat-file --batch: negative size in %q", strings.TrimSpace(line))
+		if size < 0 || size > maxBlobSize { // bound make() below against a bogus size
+			return nil, fmt.Errorf("cat-file --batch: out-of-range size in %q", strings.TrimSpace(line))
 		}
 		buf := make([]byte, size+1) // content + git's trailing newline
 		if _, err := io.ReadFull(br.stdout, buf); err != nil {
@@ -893,9 +916,17 @@ func (br *BatchBlobReader) Read(specs []string) (map[string]string, error) {
 	return result, nil
 }
 
-// Close shuts the pipe and reaps the process. Safe to call more than once (a
-// second Wait just returns an already-exited error, which the caller ignores).
+// Close shuts the pipe and reaps the process, bounded ~2s even against a git that
+// ignores stdin-EOF. It closes stdin first (a real git exits on EOF, so Wait
+// returns in milliseconds), then arms a timer that cancels the process context —
+// which SIGKILLs a stuck child — so Wait can never block forever; a healthy exit
+// stops the timer before it fires. Safe to call more than once (a second Wait
+// just returns an already-exited error, which callers ignore).
 func (br *BatchBlobReader) Close() error {
 	_ = br.stdin.Close()
-	return br.cmd.Wait()
+	t := time.AfterFunc(2*time.Second, br.cancel)
+	err := br.cmd.Wait()
+	t.Stop()
+	br.cancel() // release the context on the healthy path too (idempotent)
+	return err
 }
