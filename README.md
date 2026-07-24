@@ -147,6 +147,10 @@ go run ./cmd/sigbench -agents 512 -files 2000 -strategy overlay,porcelain -runs 
 go run ./cmd/sigbench -sweep
 ```
 
+The fold stays linear well past this table — [`docs/SCALE.md`](docs/SCALE.md)
+carries it out to 4096 agents on two machines, with the observed scaling
+exponent and where the first bottleneck would be.
+
 ## Comparison
 
 | | Parallel agents | Merges the work | AI conflict resolution | Gated on build + test | Self-repair | Open | Available |
