@@ -893,6 +893,78 @@ func TestServeMaxRunTimeAppliesEndToEnd(t *testing.T) {
 	}
 }
 
+// TestServeMaxParallelAgentsClampsRequest exercises buildParams' min()
+// directly, mirroring TestServeMaxRunTimeClampsBudget above: a request
+// asking for MORE than the server ceiling is clamped down to it; a request
+// asking for LESS keeps its own, stricter value; a request setting nothing
+// (<=0, "use the default") inherits the ceiling.
+func TestServeMaxParallelAgentsClampsRequest(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxParallelAgents: 4})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	rc := s.byKey[repo]
+
+	cases := []struct {
+		name           string
+		parallelAgents int
+		want           int
+	}{
+		{"request asks for more than the ceiling", 10, 4},
+		{"request asks for less: its own value wins", 2, 2},
+		{"request sets nothing (0): the ceiling applies", 0, 4},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p, _, err := s.buildParams(runRequest{
+				Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Agent: "true", ParallelAgents: c.parallelAgents,
+			}, rc.cell.Repo(), false)
+			if err != nil {
+				t.Fatalf("buildParams: %v", err)
+			}
+			if p.ParallelAgents != c.want {
+				t.Fatalf("parallelAgents=%d, want %d", p.ParallelAgents, c.want)
+			}
+		})
+	}
+}
+
+// TestServeMaxParallelAgentsAppliesEndToEnd proves the clamp actually reaches
+// driveRun, mirroring TestServeMaxRunTimeAppliesEndToEnd: a request asks for
+// -parallel-agents 4 (an over-ask, more than the server allows) across four
+// tasks, but the server's ceiling of 1 must still force them to run strictly
+// one at a time. Reuses overlapDetectorAgent (run_test.go) to observe real
+// concurrency rather than just the clamped number buildParams computed.
+func TestServeMaxParallelAgentsAppliesEndToEnd(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	s, err := newServer(context.Background(), serverConfig{repos: []string{repo}, envMode: envModeInherit, maxParallelAgents: 1})
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	ts := httptest.NewServer(s.handler())
+	t.Cleanup(ts.Close)
+
+	agentCmd, overlapFile := overlapDetectorAgent(t)
+	var created struct{ RunID string }
+	code := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:           repo,
+		Tasks:          []taskSpec{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}},
+		Agent:          agentCmd,
+		ParallelAgents: 4, // over-ask: the server's ceiling of 1 must still win
+	}, &created)
+	if code != http.StatusAccepted {
+		t.Fatalf("POST status %d, want 202", code)
+	}
+	final := pollRun(t, ts, "", created.RunID)
+	if final.Status != "done" {
+		t.Fatalf("status %q, want done: %+v", final.Status, final)
+	}
+	if _, err := os.Stat(overlapFile); err == nil {
+		t.Fatal("overlap detected despite -max-parallel-agents 1; the server ceiling did not reach driveRun")
+	}
+}
+
 // TestServeQuotasOffIsUnlimited: with every quota left at its zero value
 // (unlimited), a run whose agent count would trip any of the caps tested
 // above still succeeds exactly as it did before quotas existed (#60) — the
@@ -901,7 +973,7 @@ func TestServeQuotasOffIsUnlimited(t *testing.T) {
 	_, repo := makeGoRepo(t)
 	s, err := newServer(context.Background(), serverConfig{
 		repos: []string{repo}, envMode: envModeInherit,
-		maxAgentsPerRun: 0, maxRunTime: 0, maxConcurrentRuns: 0,
+		maxAgentsPerRun: 0, maxRunTime: 0, maxConcurrentRuns: 0, maxParallelAgents: 0,
 	})
 	if err != nil {
 		t.Fatalf("newServer: %v", err)
