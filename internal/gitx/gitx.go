@@ -210,6 +210,41 @@ func (g *Git) WorktreeAddReset(ctx context.Context, path, branch, base string) e
 	return err
 }
 
+// WorktreeAddNoCheckout is WorktreeAdd's two-phase form: it creates the worktree
+// and its `-b` branch (the SAME loud-fail-on-collision rule — never silently
+// resets a pre-existing branch) but STOPS before checking the tree out. The
+// working directory is left empty and the index unpopulated, with HEAD already
+// pointing at branch@base; the caller then runs WorktreePopulate (on a Git bound
+// to path) to materialize it. Splitting the add this way lets a caller hold its
+// serialization lock across only the shared-state half — the branch ref,
+// packed-refs, .git/worktrees/<name> metadata — and populate in parallel; see
+// cell.AddWorktree.
+func (g *Git) WorktreeAddNoCheckout(ctx context.Context, path, branch, base string) error {
+	_, err := g.run(ctx, "worktree", "add", "-q", "--no-checkout", "-b", branch, "--", path, base)
+	return err
+}
+
+// WorktreeAddResetNoCheckout is WorktreeAddReset's no-checkout form (`-B`): same
+// reset-if-branch-exists behavior and the same ONLY-safe-for-a-branch-this-run-
+// already-made caveat as WorktreeAddReset, but stops before checkout like
+// WorktreeAddNoCheckout. Pair it with WorktreePopulate.
+func (g *Git) WorktreeAddResetNoCheckout(ctx context.Context, path, branch, base string) error {
+	_, err := g.run(ctx, "worktree", "add", "-q", "--no-checkout", "-B", branch, "--", path, base)
+	return err
+}
+
+// WorktreePopulate materializes a worktree created with WorktreeAddNoCheckout/
+// WorktreeAddResetNoCheckout: `git reset --hard` fills THIS worktree's own index
+// and working tree from its already-set HEAD (branch@base), reading only the
+// shared, content-addressed object store. It moves no ref (reset targets HEAD,
+// where the branch already is) and touches no other worktree's state, so
+// concurrent populates in distinct worktrees never contend — the O(tree size)
+// checkout runs in parallel. g must be bound to the worktree dir (use At(dir)).
+func (g *Git) WorktreePopulate(ctx context.Context) error {
+	_, err := g.run(ctx, "reset", "--hard", "-q")
+	return err
+}
+
 // WorktreeAddSparse creates a worktree WITHOUT checking out the tree, then
 // populates the index from base via read-tree. The working directory starts
 // empty but the index holds every base path, so a commit that stages only the
