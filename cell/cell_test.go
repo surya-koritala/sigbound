@@ -85,7 +85,7 @@ func TestCellCloseCleansWorktrees(t *testing.T) {
 	var dirs []string
 	for i := 0; i < 3; i++ {
 		dir := filepath.Join(root, fmt.Sprintf("wt-%d", i))
-		if err := c.AddWorktree(ctx, dir, fmt.Sprintf("cell/wt-%d", i), base, false); err != nil {
+		if err := c.AddWorktree(ctx, dir, fmt.Sprintf("cell/wt-%d", i), base, false, nil); err != nil {
 			t.Fatalf("AddWorktree %d: %v", i, err)
 		}
 		dirs = append(dirs, dir)
