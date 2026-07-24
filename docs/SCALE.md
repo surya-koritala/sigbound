@@ -13,7 +13,7 @@ every landed change — `treeHasAllLanded`, the same gate `sigbench` exits
 non-zero on). Reproduce any row with:
 
 ```bash
-go run ./cmd/sigbench -agents 4096 -files 2000 -strategy overlay -runs 3 -warmup 1
+go run ./cmd/sigbench -agents 4096 -files 2000 -strategy overlay,porcelain -runs 3 -warmup 1
 ```
 
 ## Measured
