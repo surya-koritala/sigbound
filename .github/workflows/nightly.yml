@@ -147,6 +147,34 @@ jobs:
       - name: Conflict-heavy correctness (non-sweep; exit code is authoritative)
         run: go run ./cmd/sigbench -agents 128 -overlap 0.5 -conflict 0.3 -runs 3 -warmup 1
 
+  # Upper-range scale smoke: one overlay fold at 2048 agents — the top of the
+  # published range in docs/SCALE.md — with the per-run correctness check on.
+  # This catches a scale regression (a fold that goes wrong or blows up past 1k
+  # branches) that the -sweep above, capped at 256 agents, can't see.
+  #
+  # Deliberately ONE run, no warmup: this is a correctness+liveness gate, not a
+  # timing measurement, so a second pass would only burn minutes. Selecting only
+  # `overlay` keeps it cheap — the correctness check (treeHasAllLanded) is
+  # self-contained, so no super-linear sequential merge is run for comparison.
+  # sigbench exits 2 on a correctness failure (gateOK), so the exit code is the
+  # real gate here, same as the conflict-heavy step above.
+  bench-scale:
+    name: bench scale smoke (2048 agents)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Overlay fold at 2048 agents (exit code is authoritative)
+        run: go run ./cmd/sigbench -agents 2048 -files 2000 -strategy overlay -runs 1 -warmup 0
+
   # The repo's shell-tooling self-tests: offline, no Go toolchain needed.
   ci-selfcheck:
     name: shell tooling self-tests
