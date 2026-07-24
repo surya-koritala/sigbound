@@ -415,6 +415,168 @@ func TestPolicyVerifyBatteryFailingMemberFailsGate(t *testing.T) {
 	}
 }
 
+// bisectPolicyVerify fails the combined tree whenever g2's file is present, so a
+// three-group batch has exactly one bad group for bisect to drop. Same shape the
+// -verify-bisect tests use, but supplied by the POLICY rather than a flag.
+const bisectPolicyVerify = "verify = if [ -f g2.txt ]; then exit 1; fi; exit 0\n"
+
+// TestPolicyVerifyBisectUsesPolicyBattery is N2 case (a): on a repo whose verify
+// comes ONLY from sigbound.policy, `-verify-bisect` with NO -verify flag is
+// accepted (the precondition sees the EFFECTIVE verify) and bisect works end to
+// end — the red group is dropped and the good subset lands.
+func TestPolicyVerifyBisectUsesPolicyBattery(t *testing.T) {
+	requirePOSIXShell(t)
+	ctx := context.Background()
+	agent := buildTestAgent(t)
+	g, repo := makeGoRepo(t)
+	commitPolicy(t, g, repo, bisectPolicyVerify)
+
+	// No -verify anywhere on the command line: the battery is the policy's.
+	rep, code, out := runRunJSON(t, repo, agent, disjointGroupTasks(t, 3), "-verify-bisect")
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK — bisect must run off the policy battery\n%s", code, out)
+	}
+	if rep.Verify.Bisect == nil {
+		t.Fatalf("verify.bisect absent: bisect never ran off the policy battery\n%s", out)
+	}
+	if got := rep.Integrate.DroppedByBisect; len(got) != 1 || got[0] != "agent/g2" {
+		t.Fatalf("droppedByBisect=%v, want [agent/g2]", got)
+	}
+	if got := rep.Integrate.Landed; len(got) != 2 {
+		t.Fatalf("landed=%v, want the two green groups", got)
+	}
+	// The salvaged subset really landed: g0/g1 on main, g2 absent.
+	paths, err := g.LsTree(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(paths, "g0.txt") || !contains(paths, "g1.txt") || contains(paths, "g2.txt") {
+		t.Fatalf("landed tree=%v, want g0+g1 and NOT g2", paths)
+	}
+}
+
+// TestPolicyBisectRejectedWithNoVerifyAnywhere is N2 case (b) plus its serve
+// half: with neither a policy verify nor a -verify flag, -verify-bisect is still
+// rejected loudly — same message and same exit code as before the precondition
+// moved. Covers the -verify-impact variant too (case d's genuine half).
+func TestPolicyBisectRejectedWithNoVerifyAnywhere(t *testing.T) {
+	agent := buildTestAgent(t)
+
+	// --- sig run: no policy at all, no -verify, -verify-bisect ---
+	_, repo := makeGoRepo(t)
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, []taskSpec{taskWrite(t, "a", map[string]string{"a.txt": "x\n"})}),
+		"-agent", agent,
+		"-verify-bisect",
+	})
+	if err == nil || code != exitOperationalError {
+		t.Fatalf("code=%d err=%v, want exitOperationalError for -verify-bisect with no verify anywhere", code, err)
+	}
+	if !strings.Contains(err.Error(), "-verify-bisect requires -verify") {
+		t.Fatalf("err=%q, want the unchanged -verify-bisect precondition message", err)
+	}
+
+	// -verify-impact with no verify anywhere is rejected the same way.
+	buf.Reset()
+	code, err = runRun(&buf, []string{
+		"-repo", repo,
+		"-tasks", tasksFileFor(t, []taskSpec{taskWrite(t, "a", map[string]string{"a.txt": "x\n"})}),
+		"-agent", agent,
+		"-verify-impact", "go test ./...",
+	})
+	if err == nil || code != exitOperationalError || !strings.Contains(err.Error(), "-verify-impact requires -verify") {
+		t.Fatalf("code=%d err=%v, want the -verify-impact precondition rejection", code, err)
+	}
+
+	// --- sig serve: same genuine case, surfaced as the run's recorded error ---
+	_, repoServe := makeGoRepo(t)
+	_, ts := newTestServer(t, "", repoServe)
+	var created struct {
+		RunID string `json:"runId"`
+	}
+	if c := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:         repoServe,
+		Base:         "main",
+		Tasks:        []taskSpec{taskWrite(t, "a", map[string]string{"a.txt": "x\n"})},
+		Agent:        agent,
+		VerifyBisect: true,
+	}, &created); c != http.StatusAccepted {
+		t.Fatalf("POST /runs status %d, want 202", c)
+	}
+	final := pollRun(t, ts, "", created.RunID)
+	if final.Status != "error" || !strings.Contains(final.Error, "-verify-bisect requires -verify") {
+		t.Fatalf("serve status=%q error=%q, want the bisect precondition rejection", final.Status, final.Error)
+	}
+}
+
+// TestPolicyVerifyBisectUsesPolicyBatteryOverServe is N2 case (c): the serve
+// equivalent of (a) — a policy-supplied battery satisfies verifyBisect's
+// precondition over HTTP too, from the same single site.
+func TestPolicyVerifyBisectUsesPolicyBatteryOverServe(t *testing.T) {
+	requirePOSIXShell(t)
+	ctx := context.Background()
+	agent := buildTestAgent(t)
+	g, repo := makeGoRepo(t)
+	commitPolicy(t, g, repo, bisectPolicyVerify)
+
+	_, ts := newTestServer(t, "", repo)
+	var created struct {
+		RunID string `json:"runId"`
+	}
+	if c := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:         repo,
+		Base:         "main",
+		Tasks:        disjointGroupTasks(t, 3),
+		Agent:        agent,
+		VerifyBisect: true, // no verify field: the policy supplies it
+	}, &created); c != http.StatusAccepted {
+		t.Fatalf("POST /runs status %d, want 202", c)
+	}
+	final := pollRun(t, ts, "", created.RunID)
+	if final.Status != "done" || final.Report == nil {
+		t.Fatalf("serve status=%q error=%q, want done (bisect off the policy battery)", final.Status, final.Error)
+	}
+	if got := final.Report.Integrate.DroppedByBisect; len(got) != 1 || got[0] != "agent/g2" {
+		t.Fatalf("serve droppedByBisect=%v, want [agent/g2]", got)
+	}
+	paths, err := g.LsTree(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(paths, "g0.txt") || contains(paths, "g2.txt") {
+		t.Fatalf("serve landed tree=%v, want the green subset only", paths)
+	}
+}
+
+// TestPolicyVerifyImpactAcceptedThenClearedByPolicy is N2 case (d): with a
+// policy battery, -verify-impact is ACCEPTED (never rejected misleadingly) and
+// then cleared by the documented rule that a policy battery must always run in
+// full — so verify runs unscoped and the report shows no impact scoping.
+func TestPolicyVerifyImpactAcceptedThenClearedByPolicy(t *testing.T) {
+	agent := buildTestAgent(t)
+	g, repo := makeGoRepo(t)
+	commitPolicy(t, g, repo, "verify = echo policy-verify\n")
+
+	// -verify-impact with NO -verify flag: previously rejected at parse time.
+	rep, code, out := runRunJSON(t, repo, agent,
+		[]taskSpec{taskWrite(t, "a", map[string]string{"a.txt": "x\n"})},
+		"-verify-impact", "echo impact-should-never-run")
+	if code != exitOK {
+		t.Fatalf("code=%d, want exitOK — the flag must be accepted, then cleared\n%s", code, out)
+	}
+	if !rep.Verify.Ran || !rep.Verify.OK {
+		t.Fatalf("verify=%+v, want the policy battery to have run green", rep.Verify)
+	}
+	// Impact was cleared, not used: Scope stays empty (it is only set when
+	// -verify-impact is actually configured at verify time).
+	if rep.Verify.Scope != "" {
+		t.Fatalf("verify.scope=%q, want empty: a policy battery clears impact scoping", rep.Verify.Scope)
+	}
+	_ = g
+}
+
 // TestPolicyWeakerFlagRejectedBeforeAnyAgent: an EXPLICIT weaker flag against a
 // stricter policy is an operational error, raised before any agent runs (no
 // worktree, no spend), on both the run and serve paths.

@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -259,6 +260,35 @@ func resolvePolicy(pol policy, p *runParams, taskCount int) error {
 	p.Budget = clampCeiling(p.Budget, pol.budget)
 	if pol.maxAgents > 0 && taskCount > pol.maxAgents {
 		return fmt.Errorf("policy %s: max-agents=%d, but this run has %d tasks", policyFileName, pol.maxAgents, taskCount)
+	}
+	return nil
+}
+
+// validateVerifyPreconditions rejects -verify-bisect / -verify-impact when no
+// verify command exists to bisect over or fall back to. It runs in driveRun
+// immediately AFTER resolvePolicy, against the EFFECTIVE p.VerifyCmd, so a
+// verify battery supplied solely by the repo's sigbound.policy satisfies the
+// precondition — a policy-bearing repo can use bisect without passing a
+// redundant -verify. Checking the flag/request at parse time (where this used to
+// live) could not see the policy, since the policy is only readable from the
+// pinned base SHA inside driveRun. Both `sig run` and serve reach this one site.
+//
+// -verify-impact needs no special case for the policy-battery run: resolvePolicy
+// has already CLEARED VerifyImpactCmd whenever the policy contributed a battery
+// (impact runs INSTEAD of verify, so it must never bypass a policy battery), and
+// a cleared impact command trivially satisfies this check — the flag is accepted
+// and then dropped by that documented behavior, never rejected misleadingly. The
+// check still fires for the genuine case: an impact command with no verify
+// anywhere.
+func validateVerifyPreconditions(p runParams) error {
+	if strings.TrimSpace(p.VerifyCmd) != "" {
+		return nil
+	}
+	if strings.TrimSpace(p.VerifyImpactCmd) != "" {
+		return errors.New("-verify-impact requires -verify (or -verify-preset, or a verify line in sigbound.policy): it composes WITH verify, which stays required as the fallback")
+	}
+	if p.VerifyBisect {
+		return errors.New("-verify-bisect requires -verify (or -verify-preset, or a verify line in sigbound.policy): it bisects over verify's verdict on the combined tree")
 	}
 	return nil
 }

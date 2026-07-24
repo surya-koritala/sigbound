@@ -730,12 +730,14 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	if strings.TrimSpace(*agentCmd) == "" {
 		return exitOperationalError, errors.New("-agent is required")
 	}
-	if strings.TrimSpace(*verifyImpactCmd) != "" && strings.TrimSpace(*verifyCmd) == "" {
-		return exitOperationalError, errors.New("-verify-impact requires -verify (or -verify-preset): it composes WITH -verify, which stays required as the fallback")
-	}
-	if *verifyBisect && strings.TrimSpace(*verifyCmd) == "" {
-		return exitOperationalError, errors.New("-verify-bisect requires -verify (or -verify-preset): it bisects over -verify's verdict on the combined tree")
-	}
+	// NOTE: -verify-bisect/-verify-impact's "requires a verify command"
+	// preconditions are NOT checked here. A repo's sigbound.policy can supply the
+	// verify battery, and the policy is only readable from the pinned base SHA
+	// inside driveRun — checking the FLAG here would reject `-verify-bisect` on a
+	// policy-bearing repo whose verify comes solely from the policy, forcing a
+	// redundant -verify. They are validated in driveRun against the EFFECTIVE
+	// verify command instead (see validateVerifyPreconditions), which covers both
+	// this path and serve's from one site.
 	if err := validateStrategy(*strategy); err != nil {
 		return exitOperationalError, err
 	}
@@ -1274,6 +1276,14 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		return runReport{}, err
 	}
 	if err := resolvePolicy(pol, &p, len(tasks)); err != nil {
+		return runReport{}, err
+	}
+	// -verify-bisect/-verify-impact require a verify command to bisect over or
+	// fall back to. Checked HERE, against the EFFECTIVE verify (policy battery
+	// included), not at flag-parse time — a repo whose verify comes solely from
+	// sigbound.policy must be able to use bisect without a redundant -verify.
+	// Still before any agent runs; see validateVerifyPreconditions.
+	if err := validateVerifyPreconditions(p); err != nil {
 		return runReport{}, err
 	}
 	// -parallel-agents: 0 (or unset, e.g. a test building runParams{} directly)

@@ -888,7 +888,15 @@ A CLI flag or a `sig serve` request parameter can make a run STRICTER than the
 policy, never laxer:
 
 - `verify`: a flag `-verify` command is APPENDED to the policy battery — both
-  run (the policy's members plus yours).
+  run (the policy's members plus yours). Each member runs in its own shell and
+  they are ANDed, so any member's failure fails the gate. A policy-supplied
+  battery satisfies `-verify-bisect` and `-verify-impact`'s "requires a verify
+  command" precondition on its own: on a repo whose verify comes only from the
+  policy you can pass `-verify-bisect` with no redundant `-verify`. (With
+  neither a policy verify nor a `-verify` flag, both are still rejected.) Note
+  `-verify-impact` runs a scoped command INSTEAD of verify, so it is dropped
+  whenever the policy contributes a battery — the policy's battery always runs
+  in full rather than being replaced by a narrower command.
 - `lanes` / `semantic` / `assert`: a policy `strict` / `go` / `true` cannot be
   turned off by a flag. An unset flag is raised to the policy floor silently; an
   EXPLICITLY weaker flag (e.g. `-lanes off` against `lanes = strict`) is a loud

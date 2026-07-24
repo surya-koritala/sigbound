@@ -1114,12 +1114,14 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 	if err := validateEnvMode(envMode); err != nil {
 		return runParams{}, zeroPlan, err
 	}
-	if strings.TrimSpace(req.VerifyImpact) != "" && strings.TrimSpace(req.Verify) == "" {
-		return runParams{}, zeroPlan, errors.New("verifyImpact requires verify: it composes WITH verify, which stays the fallback")
-	}
-	if req.VerifyBisect && strings.TrimSpace(req.Verify) == "" {
-		return runParams{}, zeroPlan, errors.New("verifyBisect requires verify: it bisects over verify's verdict on the combined tree")
-	}
+	// verifyBisect/verifyImpact's "requires verify" preconditions are NOT checked
+	// here: the cell's sigbound.policy may supply the verify battery, and that is
+	// only readable from the pinned base SHA inside driveRun. Checking the REQUEST
+	// field here would reject verifyBisect on a policy-bearing cell whose verify
+	// comes solely from the policy. driveRun validates the EFFECTIVE verify
+	// command for both this path and `sig run` from one site (see
+	// validateVerifyPreconditions); a genuine no-verify-anywhere request is still
+	// rejected loudly, as the run's recorded error rather than a 400.
 
 	agentTimeout, err := parseDur(req.AgentTimeout, 0)
 	if err != nil {
