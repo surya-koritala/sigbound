@@ -114,6 +114,7 @@ func TestParsePlanRejects(t *testing.T) {
 // TestCommandPlannerParses: a mock planner command emitting fixed JSON is parsed
 // to tasks.
 func TestCommandPlannerParses(t *testing.T) {
+	requirePOSIXShell(t) // planner command runs via `sh -c`
 	p := &CommandPlanner{
 		Args:    []string{"sh", "-c", `printf '%s' '[{"id":"x1","prompt":"touch x1.go","files":["x1.go"]},{"id":"x2","prompt":"touch x2.go","files":["x2.go"]}]'`},
 		Timeout: 5 * time.Second,
@@ -131,6 +132,7 @@ func TestCommandPlannerParses(t *testing.T) {
 // but returns a DISJOINT plan when asked to re-plan (keyed on SIGBOUND_REPLAN). Plan
 // performs the single automatic re-plan and returns the disjoint tasks.
 func TestCommandPlannerReplansOnOverlap(t *testing.T) {
+	requirePOSIXShell(t)
 	overlap := `[{"id":"a","prompt":"x","files":["shared.go"]},{"id":"b","prompt":"y","files":["shared.go"]}]`
 	disjoint := `[{"id":"a","prompt":"x","files":["a.go"]},{"id":"b","prompt":"y","files":["b.go"]}]`
 	dir := t.TempDir()
@@ -158,6 +160,7 @@ func TestCommandPlannerReplansOnOverlap(t *testing.T) {
 // first attempt and the re-plan makes Plan fail, naming the overlapping path (no
 // run on a plan known to collide).
 func TestCommandPlannerReplanStillOverlapsFails(t *testing.T) {
+	requirePOSIXShell(t)
 	overlap := `[{"id":"a","prompt":"x","files":["shared.go"]},{"id":"b","prompt":"y","files":["shared.go"]}]`
 	// planFileCmd => `cat FILE`, so both the first attempt and the re-plan emit
 	// the same overlapping plan.
@@ -174,6 +177,7 @@ func TestCommandPlannerReplanStillOverlapsFails(t *testing.T) {
 // TestCommandPlannerFailsSafe: a non-zero exit, non-JSON output, or a plan with
 // more tasks than n all return an error rather than a partial plan.
 func TestCommandPlannerFailsSafe(t *testing.T) {
+	requirePOSIXShell(t)
 	nonZero := &CommandPlanner{Args: []string{"sh", "-c", "exit 3"}}
 	if _, err := nonZero.Plan(context.Background(), "g", "r", 4); err == nil {
 		t.Error("non-zero exit: want error, got nil")
@@ -190,6 +194,7 @@ func TestCommandPlannerFailsSafe(t *testing.T) {
 
 // TestCommandPlannerPassesEnv: SIGBOUND_GOAL and SIGBOUND_N reach the command.
 func TestCommandPlannerPassesEnv(t *testing.T) {
+	requirePOSIXShell(t)
 	p := &CommandPlanner{Args: []string{"sh", "-c", `printf '[{"id":"e","prompt":"goal=%s n=%s","files":["e.go"]}]' "$SIGBOUND_GOAL" "$SIGBOUND_N"`}}
 	tasks, err := p.Plan(context.Background(), "my goal", "map", 7)
 	if err != nil {
@@ -204,6 +209,7 @@ func TestCommandPlannerPassesEnv(t *testing.T) {
 // CommandPlanner.EnvMode) hides a variable set in this test process from the
 // planner command, while its own SIGBOUND_* vars still arrive.
 func TestCommandPlannerEnvScopedStripsCanary(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	p := &CommandPlanner{
 		Args:    []string{"sh", "-c", `printf '[{"id":"e","prompt":"canary=[%s] goal=%s","files":["e.go"]}]' "$SIGBOUND_TEST_CANARY" "$SIGBOUND_GOAL"`},
@@ -222,6 +228,7 @@ func TestCommandPlannerEnvScopedStripsCanary(t *testing.T) {
 // value) is -env-mode inherit, today's behavior — the canary reaches the
 // planner command.
 func TestCommandPlannerEnvInheritKeepsCanary(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	p := &CommandPlanner{
 		Args: []string{"sh", "-c", `printf '[{"id":"e","prompt":"canary=[%s]","files":["e.go"]}]' "$SIGBOUND_TEST_CANARY"`},
@@ -238,6 +245,7 @@ func TestCommandPlannerEnvInheritKeepsCanary(t *testing.T) {
 // TestCommandPlannerEnvScopedAllowlistPassesGlob: EnvAllow's NAME_* glob
 // passes a matching parent var through in scoped mode.
 func TestCommandPlannerEnvScopedAllowlistPassesGlob(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	p := &CommandPlanner{
 		Args:     []string{"sh", "-c", `printf '[{"id":"e","prompt":"canary=[%s]","files":["e.go"]}]' "$SIGBOUND_TEST_CANARY"`},
@@ -259,6 +267,7 @@ func TestCommandPlannerEnvScopedAllowlistPassesGlob(t *testing.T) {
 // TestCommandPlannerEnvScopedStripsCanary proves it at the CommandPlanner
 // level directly.
 func TestPlanTasksThreadsEnvModeIntoCommandPlanner(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	dir := t.TempDir()
 	writeRepoFile(t, dir, "main.go", "package main\n\nfunc main() {}\n")

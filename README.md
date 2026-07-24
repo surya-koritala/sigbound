@@ -50,6 +50,14 @@ page](https://github.com/surya-koritala/sigbound/releases).
 Requires Go 1.25+ and the `git` binary (>= 2.38). Run `sig doctor` to check
 your git.
 
+**Platform support.** Linux and macOS (amd64/arm64) are the primary, tested-in-
+anger targets. Windows (amd64) binaries are built, `go vet`-clean, and
+unit-tested on CI (`windows-latest`), but not yet battle-tested. Because `sig`
+runs your planner, agent, resolver, and verify commands through a POSIX shell
+(`sh -c`), Windows needs `sh` on `PATH` — Git for Windows, already required for
+the `git` binary, ships one. The `sig serve` daemon's startup crash-recovery
+relies on unix process semantics and is not yet validated on Windows.
+
 Running in CI? `surya-koritala/sigbound` is also a GitHub Action — see
 [GitHub Action](docs/USAGE.md#github-action) in the docs.
 

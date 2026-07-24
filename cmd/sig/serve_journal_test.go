@@ -209,6 +209,7 @@ func TestServeStartupRecoveryMarksDeadRunInterrupted(t *testing.T) {
 // behind" (recover it) — get this backwards and a startup could stomp on its
 // own in-flight run.
 func TestServeRecoveryProtectsLiveRun(t *testing.T) {
+	requireUnixProcessSemantics(t)
 	runsDir := t.TempDir()
 	runDir := filepath.Join(runsDir, "run1")
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
@@ -234,6 +235,7 @@ func TestServeRecoveryProtectsLiveRun(t *testing.T) {
 // is a prior process's leftover; a live one, ours or not, is still owned by
 // somebody and recovery must never stomp it.
 func TestServeRecoveryProtectsAliveForeignPid(t *testing.T) {
+	requireUnixProcessSemantics(t)
 	runsDir := t.TempDir()
 	runDir := filepath.Join(runsDir, "run1")
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
@@ -260,6 +262,7 @@ func TestServeRecoveryProtectsAliveForeignPid(t *testing.T) {
 // on, so its pid is guaranteed to belong to no process by the time recovery
 // runs) must be recovered to "interrupted".
 func TestServeRecoveryFlipsDeadForeignPid(t *testing.T) {
+	requireUnixProcessSemantics(t)
 	runsDir := t.TempDir()
 	runDir := filepath.Join(runsDir, "run1")
 	if err := os.MkdirAll(runDir, 0o755); err != nil {

@@ -116,6 +116,7 @@ func TestAddWorktreeLoudFailAndReset(t *testing.T) {
 // populate failure without a production seam.
 func resetFailingGit(t *testing.T) string {
 	t.Helper()
+	requirePOSIXShell(t) // the shim is a `#!/bin/sh` script named `git`; Windows can't exec it (issue #94)
 	real, err := exec.LookPath("git")
 	if err != nil {
 		t.Skipf("git not on PATH: %v", err)
@@ -164,7 +165,7 @@ func TestAddWorktreePopulateFailureCleansUp(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("created map not empty after a lone failed add: %d entries", n)
 	}
-	if list := listWorktrees(t, g.Dir()); strings.Contains(list, dir) {
+	if list := listWorktrees(t, g.Dir()); worktreeRegistered(t, list, dir) {
 		t.Fatalf("git still lists the torn-down worktree %s:\n%s", dir, list)
 	}
 }
@@ -285,7 +286,7 @@ func TestAddWorktreeSparsePopulateFailureCleansUp(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("created map not empty after a lone failed sparse add: %d entries", n)
 	}
-	if list := listWorktrees(t, g.Dir()); strings.Contains(list, dir) {
+	if list := listWorktrees(t, g.Dir()); worktreeRegistered(t, list, dir) {
 		t.Fatalf("git still lists the torn-down sparse worktree %s:\n%s", dir, list)
 	}
 }

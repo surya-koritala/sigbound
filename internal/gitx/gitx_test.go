@@ -62,11 +62,14 @@ func TestGitCommonDir(t *testing.T) {
 	// EvalSymlinks: on macOS t.TempDir() lives under a symlinked /var, and
 	// --path-format=absolute resolves it — compare against the same
 	// resolved form rather than asserting byte-identical strings, which
-	// would be a host quirk, not a real behavior difference.
+	// would be a host quirk, not a real behavior difference. ToSlash: git
+	// emits forward slashes even on Windows, EvalSymlinks emits OS-native
+	// separators, so normalize before comparing (no-op off Windows). (#94)
 	want, err := filepath.EvalSymlinks(filepath.Join(g.Dir(), ".git"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	want = filepath.ToSlash(want)
 	got, err := g.GitCommonDir(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -464,15 +467,19 @@ func TestWorktreeListPrunableAndPrune(t *testing.T) {
 	}
 	// git reports its own resolved (symlink-free) paths; t.TempDir() can live
 	// under a symlinked /var on macOS (same trap TestGitCommonDir works
-	// around) — resolve both sides before comparing.
+	// around) — resolve both sides before comparing. ToSlash normalizes the
+	// separator too: git emits forward slashes even on Windows while
+	// EvalSymlinks emits OS-native ones (no-op off Windows). (#94)
 	liveDir, err := filepath.EvalSymlinks(liveDir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	liveDir = filepath.ToSlash(liveDir)
 	deadDirResolved, err := filepath.EvalSymlinks(deadDir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	deadDirResolved = filepath.ToSlash(deadDirResolved)
 	// Simulate a killed run: the worktree's directory is gone, but git still
 	// has it registered (that's exactly what `git worktree prune` clears).
 	if err := os.RemoveAll(deadDir); err != nil {

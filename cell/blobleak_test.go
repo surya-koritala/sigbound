@@ -60,6 +60,9 @@ func countStrayShims(t *testing.T, shim string) int {
 // accumulate fds, goroutines, or zombie processes over many calls — a broken
 // daemon may only forfeit the speedup, never leak.
 func TestBlobsBatchFailOpenBrokenGitNoLeak(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fd counting reads /dev/fd, which does not exist on Windows")
+	}
 	c, base, _ := blobRepo(t)
 	shim := writeShim(t, "#!/bin/sh\nexit 0\n")
 	c.git = c.git.WithBinary(shim)

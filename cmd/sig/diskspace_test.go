@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -101,6 +102,9 @@ func TestDiskPreflightSkipsOnZeroTasks(t *testing.T) {
 // TestDiskInfoLineRendersForRealRepo: the happy path renders all three
 // pieces (tree size, free space, the reference-run estimate) for a real repo.
 func TestDiskInfoLineRendersForRealRepo(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("disk free-space estimation is unix-statfs only; Windows reports 'unknown (unsupported platform)' by design (issue #94)")
+	}
 	ctx := context.Background()
 	g, _ := newDoctorRepo(t)
 	line := diskInfoLine(ctx, g.Dir())

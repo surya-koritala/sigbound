@@ -2,6 +2,7 @@ package gitx
 
 import (
 	"os"
+	"runtime"
 	"testing"
 )
 
@@ -26,6 +27,9 @@ func openFDs(t *testing.T) int {
 // eventually exhaust the process's fd table on a repo with a persistently broken
 // git).
 func TestNewBatchBlobReaderStartFailureNoFDLeak(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fd counting reads /dev/fd, which does not exist on Windows")
+	}
 	g := New(t.TempDir()).WithBinary("/nonexistent/git-binary-xyzzy")
 	// Prime once so any one-time fd allocation is already counted.
 	if _, err := g.NewBatchBlobReader(); err == nil {
