@@ -65,3 +65,42 @@ jobs:
 
       - name: Fuzz strategy agreement (cell)
         run: .github/scripts/fuzz-smoke.sh FuzzStrategiesAgree ./cell/ 15s
+
+  # We ship a windows_amd64 release binary, so it must at least build, vet
+  # clean, and pass the platform-agnostic unit tests on real Windows (issue
+  # #94). This job exercises path handling (worktree/bundle paths, the repo-map
+  # and impact forward-slashing, gc glob patterns) against Windows git and the
+  # Windows filesystem — the substrate the release binary actually runs on.
+  #
+  # Deliberately excluded on Windows:
+  #   - -race: needs a C toolchain; race coverage is already the ubuntu matrix's
+  #     job, and this job's purpose is platform correctness, not re-running race.
+  #   - gofmt: a formatting gate, already enforced on ubuntu; skipped here to
+  #     avoid CRLF checkout false positives.
+  #   - Tests that need a POSIX shell (the driver's `sh -c` agent/verify/
+  #     resolver/planner commands) or unix process semantics (`sig serve`'s
+  #     pidAlive) skip themselves on windows — see requirePOSIXShell /
+  #     requireUnixProcessSemantics / requireUnixExecBit in the test files.
+  #   - The bash-only fuzz-smoke wrapper and the composite GitHub Action stay
+  #     ubuntu-only (they are shell scripts, not Go).
+  windows:
+    name: windows build / vet / test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...

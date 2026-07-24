@@ -116,6 +116,7 @@ func TestAddWorktreeLoudFailAndReset(t *testing.T) {
 // populate failure without a production seam.
 func resetFailingGit(t *testing.T) string {
 	t.Helper()
+	requirePOSIXShell(t) // the shim is a `#!/bin/sh` script named `git`; Windows can't exec it (issue #94)
 	real, err := exec.LookPath("git")
 	if err != nil {
 		t.Skipf("git not on PATH: %v", err)

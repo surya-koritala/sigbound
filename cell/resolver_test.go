@@ -5,11 +5,24 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// requirePOSIXShell skips a resolver test on Windows: every CommandResolver
+// here is driven through `sh -c` with POSIX semantics (git merge-file, `env`,
+// `sleep`, `exit N`), which Windows CI does not provide. The resolver
+// primitive itself is platform-agnostic — it execs whatever argv it is given —
+// so this skips only these shell-scripted tests, not the feature. See #94.
+func requirePOSIXShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("resolver test drives a command via `sh -c`; needs a POSIX shell, unix-only (issue #94)")
+	}
+}
 
 // conflictAgent creates one agent that writes a private file AND rewrites line 5
 // of the shared hot file f000.txt to marker. Two such agents therefore change the
@@ -62,6 +75,7 @@ func unionResolver() *CommandResolver {
 // two conflicting additive edits => the conflicting branch LANDS and the final
 // tree carries BOTH changes.
 func TestResolverUnionLands(t *testing.T) {
+	requirePOSIXShell(t)
 	ctx := context.Background()
 	g, pool, base := scenario(t, 4)
 
@@ -103,6 +117,7 @@ func TestResolverUnionLands(t *testing.T) {
 // non-zero / emits nothing NEVER lands — the branch stays flagged and the final
 // tree is byte-for-byte the same as with no resolver at all (main uncorrupted).
 func TestResolverBadResultFlags(t *testing.T) {
+	requirePOSIXShell(t)
 	ctx := context.Background()
 	g, pool, base := scenario(t, 4)
 
@@ -160,6 +175,7 @@ func TestResolverBadResultFlags(t *testing.T) {
 // TestResolverTimeoutFlags is case (c): a resolver that hangs past its timeout is
 // killed and treated as a decline, so the branch is flagged and main is intact.
 func TestResolverTimeoutFlags(t *testing.T) {
+	requirePOSIXShell(t)
 	ctx := context.Background()
 	g, pool, base := scenario(t, 4)
 
@@ -206,6 +222,7 @@ func TestResolverTimeoutFlags(t *testing.T) {
 // itself, so its own stdout (captured as the "resolved" body) IS the
 // environment it saw — no temp file needed to inspect it.
 func TestCommandResolverEnvFieldScopesEnvironment(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	r := &CommandResolver{
 		Args: []string{"sh", "-c", "env"},
@@ -230,6 +247,7 @@ func TestCommandResolverEnvFieldScopesEnvironment(t *testing.T) {
 // value) is today's behavior, unchanged — the full os.Environ(), same as
 // before this field existed.
 func TestCommandResolverEnvNilKeepsLibraryDefault(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	r := &CommandResolver{Args: []string{"sh", "-c", "env"}}
 	resolved, ok, err := r.Resolve(context.Background(), Conflict{Path: "f.txt"})
@@ -252,6 +270,7 @@ func TestCommandResolverEnvNilKeepsLibraryDefault(t *testing.T) {
 // allocate its own array instead. Run under `go test -race` this also
 // catches the data race directly, not just a wrong-value symptom.
 func TestCommandResolverEnvConcurrentCallsDoNotCorruptEachOther(t *testing.T) {
+	requirePOSIXShell(t)
 	base := make([]string, 1, 8) // len 1, cap 8: deliberate spare capacity
 	base[0] = "PATH=" + os.Getenv("PATH")
 	r := &CommandResolver{Args: []string{"sh", "-c", `printf 'SEEN:%s' "$SIGBOUND_PATH"`}}

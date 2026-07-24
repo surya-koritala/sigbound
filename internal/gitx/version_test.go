@@ -4,9 +4,32 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// requirePOSIXShell skips a test that depends on a POSIX shell — here, the
+// #!/bin/sh fake-git script fakeGitBinary writes. Windows CI ships no such
+// shell. See issue #94.
+func requirePOSIXShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a #!/bin/sh fake git binary; needs a POSIX shell, unix-only (issue #94)")
+	}
+}
+
+// requireUnixExecBit skips a test that asserts git's 100755 executable mode.
+// Git on Windows does not track the filesystem exec bit (core.filemode is
+// effectively false there), so a chmod +x cannot produce a 100755 tree entry.
+// The code under test is platform-agnostic — it preserves whatever mode git
+// recorded — only this fixture's premise is unix-only. See issue #94.
+func requireUnixExecBit(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("asserts a 100755 exec-bit tree entry, which git on Windows does not track from a chmod (issue #94)")
+	}
+}
 
 func TestParseGitVersion(t *testing.T) {
 	cases := []struct {
@@ -96,6 +119,7 @@ func TestCheckMinVersionMissingBinary(t *testing.T) {
 // whatever git happens to be installed in CI.
 func fakeGitBinary(t *testing.T, out string) string {
 	t.Helper()
+	requirePOSIXShell(t)
 	path := filepath.Join(t.TempDir(), "git")
 	script := "#!/bin/sh\necho '" + out + "'\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {

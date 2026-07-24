@@ -1443,6 +1443,14 @@ func recoverStaleRuns(runsDir string, ourPID int) {
 // pidAlive reports whether pid names a currently running process. On Unix,
 // os.FindProcess always succeeds without checking anything; sending signal 0
 // is the standard, side-effect-free way to actually probe existence.
+//
+// Windows note: Process.Signal rejects signal 0 ("not supported by windows"),
+// so this returns false for every pid there, live or dead. `sig serve`'s
+// startup recovery consequently over-reaches on Windows (it would mark even a
+// live sibling run "interrupted") and is not validated on that platform — the
+// primary Windows path is the `sig run` CLI, not the serve daemon. See issue
+// #94; a correct Windows probe (OpenProcess + GetExitCodeProcess) is left as a
+// follow-up rather than pulled into the CI-enablement change.
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false

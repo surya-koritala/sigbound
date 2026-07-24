@@ -848,6 +848,7 @@ func TestBlobsBatch(t *testing.T) {
 // --- SpliceBlobs: mode-preserving resolution + errors -----------------------
 
 func TestSpliceBlobs(t *testing.T) {
+	requireUnixExecBit(t) // asserts exec.sh keeps mode 100755, a unix exec-bit semantics
 	ctx := context.Background()
 	dir := t.TempDir()
 	g := New(dir)

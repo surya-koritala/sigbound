@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,10 +19,39 @@ import (
 	"github.com/surya-koritala/sigbound/internal/gitx"
 )
 
+// requirePOSIXShell skips a test on platforms where sigbound's `sh -c`
+// execution path can't run. The driver invokes every agent, verify, resolver,
+// repair and publish command via `sh -c` with POSIX semantics (`sleep`,
+// `[ -f ]`, `printf >`, `exit N`, `true`); Windows CI builds and unit-tests the
+// binary but ships no POSIX shell, so these end-to-end/driver tests run only on
+// unix. Windows path handling is still exercised on real Windows git by the
+// gitx/cell substrate tests and the pure-unit path tests (RepoMap, impact, gc).
+// See issue #94.
+func requirePOSIXShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("driver integration test: runs agent/verify/resolver commands via `sh -c`; needs a POSIX shell, unix-only (issue #94)")
+	}
+}
+
+// requireUnixProcessSemantics skips a test that depends on the unix process
+// primitives `sig serve`'s crash recovery uses: pidAlive probes a pid with
+// signal 0 (unsupported on Windows, where Process.Signal always errors, so it
+// reports every pid — even a live one — as not alive), and some recovery tests
+// spawn a throwaway `true` process. `sig serve`'s startup recovery is therefore
+// not validated on Windows; see pidAlive's note and issue #94.
+func requireUnixProcessSemantics(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("depends on unix pid-liveness (signal 0) / a `true` helper; `sig serve` recovery is unix-only (issue #94)")
+	}
+}
+
 // buildTestAgent compiles the deterministic sig-testagent helper and returns
 // its binary path, so the driver runs a real subprocess agent (no live LLM).
 func buildTestAgent(t *testing.T) string {
 	t.Helper()
+	requirePOSIXShell(t)
 	bin := filepath.Join(t.TempDir(), "testagent")
 	cmd := exec.Command("go", "build", "-o", bin, "github.com/surya-koritala/sigbound/cmd/sig-testagent")
 	cmd.Env = os.Environ()
@@ -35,6 +65,7 @@ func buildTestAgent(t *testing.T) string {
 // file agents will edit. `go build ./...` on the base tree passes.
 func makeGoRepo(t *testing.T) (*gitx.Git, string) {
 	t.Helper()
+	requirePOSIXShell(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 	g := gitx.New(dir)
@@ -2950,6 +2981,7 @@ func TestBestEffortWriterSwallowsErrors(t *testing.T) {
 // "fixed" subtest confirms bestEffortWriter neutralizes it while still
 // capturing the real output.
 func TestBestEffortWriterKeepsCommandRunCleanOnLogWriteFailure(t *testing.T) {
+	requirePOSIXShell(t) // runs `sh -c` and relies on a chmod-read-only log file
 	t.Run("control: unwrapped failing writer fails a clean exit", func(t *testing.T) {
 		f := openReadOnly(t, filepath.Join(t.TempDir(), "readonly.log"))
 		var buf bytes.Buffer
@@ -4942,6 +4974,7 @@ func envScopedFixture(t *testing.T) (repo, agentEnvOut, verifyEnvOut string) {
 // must NOT reach either the -agent or the -verify command, while the base
 // environment (PATH) and each slot's own SIGBOUND_* vars still do.
 func TestDriveRunEnvScopedStripsCanaryFromAgentAndVerify(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	ctx := context.Background()
 	repo, agentEnvOut, verifyEnvOut := envScopedFixture(t)
@@ -4986,6 +5019,7 @@ func TestDriveRunEnvScopedStripsCanaryFromAgentAndVerify(t *testing.T) {
 // leaving EnvMode unset, its zero value) is today's behavior, unchanged — the
 // full parent environment, canary included, reaches -agent.
 func TestDriveRunEnvInheritKeepsCanaryTodaysBehavior(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	ctx := context.Background()
 
@@ -5016,6 +5050,7 @@ func TestDriveRunEnvInheritKeepsCanaryTodaysBehavior(t *testing.T) {
 // the parent at all is silently skipped, not surfaced as an error or an
 // empty entry.
 func TestDriveRunEnvScopedAllowlistScopesPerSlot(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	ctx := context.Background()
 	repo, agentEnvOut, verifyEnvOut := envScopedFixture(t)
@@ -5053,6 +5088,7 @@ func TestDriveRunEnvScopedAllowlistScopesPerSlot(t *testing.T) {
 // passes every parent var sharing that prefix, e.g. -env-agent
 // SIGBOUND_TEST_* for a family of vars a model CLI expects.
 func TestDriveRunEnvScopedAllowlistGlobSuffix(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Setenv("SIGBOUND_TEST_CANARY", "leak-me")
 	t.Setenv("SIGBOUND_OTHER_NOMATCH", "should-not-match")
 	ctx := context.Background()
