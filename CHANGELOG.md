@@ -8,7 +8,36 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-24
+
+The faster-and-more-reliable milestone: the run pipeline's serial phases go
+parallel (worktree creation, sparse checkouts, bisect probes, a persistent
+blob reader), crashes and leftovers become recoverable (`sig gc`, the serve
+crash journal, disk preflight), Windows gets a CI-tested build, extended-scale
+behavior is documented to 4096 agents with a nightly guard, and installing
+`sig` no longer requires a Go toolchain. Interface changes are additive only;
+zero module dependencies, and the verify gate is untouched on every landing
+path.
+
 ### Added
+
+- **`-parallel-agents`** — an explicit cap on concurrently running agents,
+  shaped for model-backed agents (rate limits, memory) instead of the
+  GOMAXPROCS default that fit CPU-bound work. Serve enforces org quotas by
+  clamping it; the effective value is recorded in the report.
+
+- **`-sparse-worktrees`** (opt-in) — when a task declares `files`, its agent
+  worktree materializes only that lane plus `go.mod`/`go.sum` on disk while
+  the git index stays complete, so commits still produce whole, correct
+  trees. Worktree disk drops ~99% on a 500-file repo (the win grows with tree
+  size) and setup time drops ~30% further. Lane paths are anchored and
+  glob-escaped before `sparse-checkout`; lane enforcement is unchanged;
+  no-lane tasks loudly fall back to a full checkout.
+
+- **`sig gc`** — sweeps stale worktrees, temp dirs, and old `agent/*` /
+  `imported/*` branches left by crashed or interrupted runs. Dry-run by
+  default, age-gated, and refuses to touch anything a live run's manifest
+  still references; a corrupt manifest fails closed.
 
 - **Crash-safe `sig serve` run journal** — every run directory now carries a
   `status.json` phase marker (`queued`/`running`/`done`/`error`/`interrupted`,
@@ -20,6 +49,31 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
   process to `interrupted`, so `GET /runs/{id}` and the `/runs` listing
   report reality instead of `running` forever after a `kill -9`. See
   [docs/USAGE.md](docs/USAGE.md) "Crash recovery".
+
+- **Disk-space preflight** — `sig run` estimates the space an N-agent run
+  needs on the temp filesystem before starting and warns when it does not
+  fit (fail-open: a warning, never a refusal); `sig doctor` reports free
+  space on the filesystem runs actually fill.
+
+- **Machine-readable serve errors** — every serve API error body is now
+  `{"error": ..., "code": ...}` with a stable code vocabulary, so clients can
+  branch on codes instead of parsing prose.
+
+- **Windows support, honestly stated** — a `windows-latest` CI job builds,
+  vets, and unit-tests every push; unix-only tests carry explicit, justified
+  skips. Windows binaries remain not-yet-battle-tested and the README says
+  exactly that.
+
+- **`docs/SCALE.md`** — extended-scale measurements to 4096 agents on two
+  platforms with the observed scaling exponent (linear through 4096; no
+  super-linear bottleneck yet), plus a nightly 2048-agent correctness-checked
+  scale smoke so a scale regression is caught within a day.
+
+- **Install without Go** — the Homebrew tap is live
+  (`brew install surya-koritala/tap/sig`) and `install.sh` fetches the right
+  prebuilt binary for macOS/Linux and verifies its SHA-256 against the
+  release checksums before installing. The only runtime requirement is
+  `git` >= 2.38.
 
 ### Changed
 
@@ -34,12 +88,33 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
   unchanged, and a worktree whose population fails is torn down rather than
   surviving half-made.
 
+- **`-verify-bisect`'s each-alone candidate probes now run concurrently**
+  (bounded at 3), each in its own detached worktree from a serially-created
+  pool, cutting red-batch salvage time from k+1 sequential verifies toward
+  the longest single verify. The union re-verify — the landing gate — stays
+  serial and last, and the salvaged subset is identical to the serial scan's.
+
+- **Blob reads go through one persistent `git cat-file --batch` process per
+  cell** instead of spawning a process per operation — the semantic-analysis
+  phase drops ~84% (708 ms → 113 ms at 50 agents) and the review UI's
+  three-pane endpoint responds without a process spawn per request. Strictly
+  fail-open: any daemon error falls back to the old spawn path (a kill
+  mid-response can never surface truncated content), teardown is bounded at
+  2 s even against a wedged child, and reads honor context cancellation.
+
 - **`POST /runs`'s immediate `202` body now reports `status: "queued"`**
   (previously `"running"`) — it reflects the phase actually recorded at
   accept time, before the run's goroutine has started. The status vocabulary
   gains `queued` and `interrupted` alongside the existing `running`/`done`/
   `error`; this is an additive extension of the lifecycle, not a change to
   any terminal state.
+
+### Fixed
+
+- A flaky serve test that raced its third concurrent run's drain
+  (`TestServeConcurrentSameCell409`) and a class of Windows-only test
+  failures (8.3 short-name path comparisons, unix-only `/dev/fd` and
+  shell-shim assumptions) surfaced by the new Windows CI job.
 
 ## [1.0.0] - 2026-07-23
 
