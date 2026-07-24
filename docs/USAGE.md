@@ -1082,6 +1082,7 @@ git on PATH: ok
 git version >= 2.38: ok
 live probe: merge-tree + overlay plumbing: ok
 disk: repo tree ~2.1MB, free 41.2GB on /tmp (a 512-agent run needs ~1.0GB)
+gc: 1 stale worktree(s), 2 sweepable branch(es), 0 old tempdir(s) (run sig gc)
 ```
 
 The `disk:` line is unconditional (informational, not a pass/fail check — it
@@ -1092,11 +1093,127 @@ repo lives on a different filesystem than the temp directory (a common trap
 in CI, where `/tmp` is a small tmpfs), the line shows both readings instead:
 `free on temp: X (path) · free on repo fs: Y (path)`.
 
+The `gc:` line is the same posture: unconditional and informational, never a
+pass/fail check. It's [`sig gc`](#sig-gc)'s own dry-run plan (default
+`-older-than`, never `-force`), so the counts match exactly what a bare `sig
+gc -repo ... -delete` would remove right now — run `sig gc` to see and act on
+the detail.
+
 `sig run` and `sig integrate` also run the cheap part of this (git present +
 version check) automatically before doing anything, so a too-old git is
 caught before any agent runs; they do **not** run the live probe (it's
 overkill to pay for on every invocation) — run `sig doctor` directly for the
 full picture.
+
+---
+
+## `sig gc`
+
+Sweeps debris a killed or crashed `sig run` (or `sig integrate`/`sig
+verify`/`sig repair`/`sig doctor`) leaves behind: stale git worktree
+registrations, sigbound's own tempdirs under the OS temp directory, and old
+`agent/*`/`imported/*` branches that outlived their run.
+
+```
+sig gc -repo PATH [-older-than 72h] [-delete] [-force] [-json]
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-repo` | *(required)* | Path to the target git repository. |
+| `-older-than` | `72h` | Age cutoff for tempdirs (mtime) and `agent`/`imported` branches (commit date). Ignored by worktree-registration pruning, which is always safe regardless of age. |
+| `-delete` | `false` | Actually remove debris. Without it, `sig gc` only prints what it would remove and changes nothing. |
+| `-force` | `false` | Also delete `agent`/`imported` branches a run manifest under `.git/sigbound/runs` still references (printed as a loud per-branch warning — that run's `-resume` can no longer reuse it). Never bypasses `-older-than`, and has no effect on worktree pruning or tempdirs. |
+| `-json` | `false` | Emit the result as JSON: `{worktreesPruned, tempdirs, branchesDeleted, branchesKept}`. |
+
+**Dry-run by default.** Nothing is ever deleted without `-delete` — a bare
+`sig gc -repo PATH` only prints the plan and exits `0`. `-delete` executes
+the exact same plan it would otherwise have printed, so what you see in a
+dry run is what a follow-up `-delete` run does, never an approximation.
+
+**The deletion boundary.** `sig gc` only ever considers three kinds of
+debris:
+
+1. **Stale worktree registrations** — entries `git worktree list` reports as
+   prunable (their directory is gone). No age gate: a dangling registration
+   is safe to prune the moment it's detected.
+2. **Sigbound tempdirs** under `os.TempDir()` whose mtime is at or before the
+   `-older-than` cutoff — see [Tempdir liveness](#tempdir-liveness-caveat)
+   below for exactly what "old enough" means here.
+3. **`agent/*` and `imported/*` branches** whose commit date is at or before
+   the `-older-than` cutoff **and** aren't referenced by a run manifest under
+   `.git/sigbound/runs` (see below).
+
+Nothing else is ever a candidate. In particular, `sig gc` **never touches**
+the base branch or any branch outside `agent/` and `imported/<worker>/`,
+`refs/notes/sigbound`, or the run history itself under
+`.git/sigbound/runs` — deliberately out of scope, see
+[Run history and notes are out of scope](#run-history-and-notes-are-out-of-scope)
+below.
+
+**Manifest protection and `-force`.** Every `.git/sigbound/runs/*/report.json`
+names the branches `sig run -resume` might still reuse (see
+[Resume](#resume)): each agent's branch, plus any branch a `-verify-bisect`
+run dropped. An old, otherwise-sweepable branch that a manifest still names
+is **kept**, not deleted — deleting it would silently break that run's
+`-resume`. `-force` overrides this protection and deletes it anyway, printed
+with a loud per-branch `FORCED` warning so it's never a silent loss. `-force`
+is **manifest-only**: it does not, and cannot, bypass `-older-than` — a
+branch younger than the cutoff is never a candidate at all, `-force` or not
+— and it has no effect on worktree pruning or tempdirs, which have no
+manifest-protection concept to override.
+
+### Tempdir liveness caveat
+
+A sigbound tempdir (`sig-run-*`, `sig-verify-*`, `sig-bisect-*`,
+`sig-repair-*`, `sig-replay-verify-*`, `sig-int-*`, `sig-resolve-*`,
+`sig-doctor-*` under `os.TempDir()`) is normally removed by its own creator
+(`defer os.RemoveAll`) when the command that made it finishes. What
+`sig gc` finds is what's left after a hard kill (SIGKILL, an OOM kill, a
+crashed machine) skipped that cleanup.
+
+There's no PID file or lock to check, so the directory's mtime is the
+**only** liveness signal `sig gc` has: a tempdir newer than `-older-than` is
+left alone on the theory that its owning process might still be running.
+Be honest about what that does and doesn't prove: **a nested file write
+inside a tempdir does NOT refresh the tempdir's own mtime** — only a change
+to the directory entry itself (creating or removing a direct child) does.
+A long-running agent invocation that's actively writing deep inside its
+worktree, without adding or removing anything directly under the tempdir
+root, can look idle by mtime alone.
+
+In practice this is a narrow, largely theoretical hole: the default
+`-older-than` (`72h`) dwarfs any real run's duration, and the common crash
+case (kill, then immediately investigate) leaves an mtime from seconds ago.
+It only matters if you deliberately pass a tiny `-older-than` (minutes) while
+a run is still actively live — don't do that against a repo with a run in
+flight, or double-check for a live `sig`/agent process first.
+
+### Cross-repo tempdir note
+
+Tempdir scanning is **not scoped to `-repo`**. `sig gc` scans the whole OS
+temp directory (`os.TempDir()`) for anything matching a sigbound pattern,
+regardless of which repo created it — tempdirs carry no repo identity of
+their own (no per-repo subdirectory, no marker file). Running `sig gc -repo
+A -delete` sweeps stale `sig-*` tempdirs left behind by runs against repo B,
+C, or any other repo on the same machine, right alongside `A`'s own. The
+worktree and branch stages, by contrast, only ever look at `-repo`'s own git
+metadata.
+
+### Run history and notes are out of scope
+
+`sig gc` never removes anything under `.git/sigbound/runs` (the durable
+`report.json`/`events.ndjson` history `sig serve` and `-manifest` write —
+see [`sig serve`](#sig-serve) and [Provenance](#provenance)) or the
+`refs/notes/sigbound` namespace `-notes` writes to. Both are the durable
+record of what actually happened; a sweep tool guessing which of those
+records are "old enough to matter" is exactly the kind of judgment call this
+project doesn't make silently. Manifests already double as `sig gc`'s own
+input (they're what makes a branch protected in the first place), so
+deleting them via the same tool that reads them would be circular. If you
+want to prune run history, do it explicitly — `rm -rf .git/sigbound/runs`
+resets it (see [One run per cell](#one-run-per-cell)) — that's a deliberate,
+manual act, not something `sig gc` decides on your behalf.
 
 ---
 

@@ -607,6 +607,7 @@ func TestGCInfoLineNonRepoFailsSoft(t *testing.T) {
 func TestScanTempdirsAgeAndPatternFilter(t *testing.T) {
 	root := t.TempDir()
 	old := makeTempdir(t, root, "sig-repair-*", true)
+	oldDoctor := makeTempdir(t, root, "sig-doctor-*", true)
 	fresh := makeTempdir(t, root, "sig-bisect-*", false)
 
 	// A file (not a dir) that happens to match the glob must be skipped.
@@ -634,8 +635,8 @@ func TestScanTempdirsAgeAndPatternFilter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != old {
-		t.Fatalf("scanTempdirs=%v, want exactly [%s]", got, old)
+	if len(got) != 2 || !containsStr(got, old) || !containsStr(got, oldDoctor) {
+		t.Fatalf("scanTempdirs=%v, want exactly [%s %s]", got, old, oldDoctor)
 	}
 	if containsStr(got, fresh) {
 		t.Fatalf("scanTempdirs=%v must not include the fresh dir %s", got, fresh)

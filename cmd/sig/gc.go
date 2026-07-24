@@ -41,12 +41,19 @@ import (
 const gcDefaultOlderThan = 72 * time.Hour
 
 // gcTempPatterns are the os.TempDir() glob patterns every sigbound tempdir
-// is created under for the lifetime of a single agent/verify/bisect/repair
-// invocation (see run.go's wtRoot/verify/bisect/repair MkdirTemp calls and
-// replay.go's verify tempdir) -- anything matching one of these that
-// survives past a run is debris from a crash, never something else on the
-// machine legitimately created.
-var gcTempPatterns = []string{"sig-run-*", "sig-verify-*", "sig-bisect-*", "sig-repair-*", "sig-replay-verify-*"}
+// is created under for the lifetime of a single agent/verify/bisect/repair/
+// integrate/resolve/doctor invocation (see run.go's wtRoot/verify/bisect/
+// repair MkdirTemp calls, replay.go's verify tempdir, cell/integrate.go's
+// porcelain-strategy tempdir, cell/resolver.go's per-conflict resolver
+// tempdir, and doctor.go's throwaway-repo tempdir) -- every one of these is
+// removed via `defer os.RemoveAll` on the success path, so anything matching
+// one of these patterns that survives past a run is debris from a crash
+// (most commonly SIGKILL, which skips deferred cleanup), never something
+// else on the machine legitimately created.
+var gcTempPatterns = []string{
+	"sig-run-*", "sig-verify-*", "sig-bisect-*", "sig-repair-*", "sig-replay-verify-*",
+	"sig-int-*", "sig-resolve-*", "sig-doctor-*",
+}
 
 // gcBranchPrefixes are the ONLY ref prefixes gc will ever consider removing.
 // Nothing outside these -- most importantly the base branch itself -- is a
