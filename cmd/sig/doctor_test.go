@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -121,6 +122,35 @@ func TestDoctorDiskLineRenders(t *testing.T) {
 	}
 	if !strings.Contains(buf2.String(), "disk: repo tree") {
 		t.Fatalf("output missing the disk tree-size line for a real -repo:\n%s", buf2.String())
+	}
+
+	// Runs create worktrees under os.TempDir() (see run.go's wtRoot), which
+	// can be a different, smaller filesystem than the repo's (tmpfs /tmp in
+	// CI is the classic trap). When the two free-space readings differ, the
+	// line must surface BOTH — and still never fail doctor, since this stays
+	// informational.
+	origFree := diskFreeBytes
+	tmpDir := os.TempDir()
+	diskFreeBytes = func(path string) (uint64, bool) {
+		if path == tmpDir {
+			return 111, true
+		}
+		return 222, true
+	}
+	t.Cleanup(func() { diskFreeBytes = origFree })
+
+	g3, _ := newDoctorRepo(t)
+	var buf3 bytes.Buffer
+	code3, err := runDoctor(&buf3, []string{"-repo", g3.Dir()})
+	if err != nil {
+		t.Fatalf("runDoctor -repo: %v\n%s", err, buf3.String())
+	}
+	if code3 != exitOK {
+		t.Fatalf("code=%d, want exitOK (differing temp/repo free space must stay informational)\n%s", code3, buf3.String())
+	}
+	out3 := buf3.String()
+	if !strings.Contains(out3, "free on temp:") || !strings.Contains(out3, "free on repo fs:") {
+		t.Fatalf("output missing both temp and repo free-space readings when they differ:\n%s", out3)
 	}
 }
 

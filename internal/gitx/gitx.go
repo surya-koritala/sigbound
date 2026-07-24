@@ -398,12 +398,15 @@ func (g *Git) LsTree(ctx context.Context, rev string) ([]string, error) {
 // TreeSize returns the total size in bytes of every blob in rev's tree,
 // summed recursively via `git ls-tree -r -l -z` (each blob's size field is
 // the object's raw content length, the same number `git cat-file -s` would
-// report for it). This is an upper-bound PROXY for what a full checkout of
-// rev would occupy on disk — filesystem block rounding and similar are
-// ignored — good enough for a preflight estimate, not a byte-exact
-// accounting. Used by cmd/sig's disk-space preflight (`sig run`'s
-// -no-disk-check gate and `sig doctor`'s disk line) to bound N worktrees'
-// worth of checkout against free space before spending any agent call.
+// report for it). This slightly UNDERCOUNTS what a full checkout of rev
+// would actually occupy on disk — filesystem block rounding, a worktree's
+// own per-checkout admin files, and packed-object growth as `worktree add`
+// unpacks into the shared store are all ignored — good enough for a
+// preflight estimate, not a byte-exact accounting; callers pad it with a
+// safety margin rather than treating it as an upper bound. Used by cmd/sig's
+// disk-space preflight (`sig run`'s -no-disk-check gate and `sig doctor`'s
+// disk line) to bound N worktrees' worth of checkout against free space
+// before spending any agent call.
 // Submodule entries report size "-" (their content lives in another
 // repository's object store, not this one) and contribute 0.
 func (g *Git) TreeSize(ctx context.Context, rev string) (int64, error) {

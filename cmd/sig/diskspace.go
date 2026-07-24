@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/surya-koritala/sigbound/internal/gitx"
 )
@@ -86,22 +87,43 @@ func diskPreflight(ctx context.Context, g *gitx.Git, baseSHA, wtRoot string, nTa
 // rather than alarming. repoDir is -repo as passed to `sig doctor`; "" (no
 // -repo given) falls back to the current directory, the natural guess for
 // what someone running `sig doctor` from inside their repo means.
+//
+// The free-space reading that matters is the TEMP filesystem's, not the
+// repo's: driveRun creates every worktree under os.MkdirTemp("", ...) (see
+// run.go's wtRoot), which is os.TempDir() — often a different, sometimes far
+// smaller, mount than the repo (tmpfs /tmp in CI is the classic trap). So
+// this reports free space on os.TempDir() as the primary number, and only
+// calls out the repo filesystem's free space too when it actually differs
+// (same mount is the common case and not worth belaboring).
 func diskInfoLine(ctx context.Context, repoDir string) string {
 	dir := repoDir
 	if dir == "" {
 		dir = "."
 	}
 	treeBytes, sizeErr := gitx.New(dir).TreeSize(ctx, "HEAD")
-	free, freeOK := diskFreeBytes(dir)
+	if sizeErr != nil {
+		return fmt.Sprintf("disk: unable to determine repo tree size in %s (%v)", dir, sizeErr)
+	}
+
+	tmpDir := os.TempDir()
+	tempFree, tempOK := diskFreeBytes(tmpDir)
+	repoFree, repoOK := diskFreeBytes(dir)
+	need := treeBytes * referenceAgentRun
 
 	switch {
-	case sizeErr != nil:
-		return fmt.Sprintf("disk: unable to determine repo tree size in %s (%v)", dir, sizeErr)
-	case !freeOK:
-		return fmt.Sprintf("disk: repo tree ~%s; free space unknown on %s (unsupported platform)", humanSize(treeBytes), dir)
-	default:
-		need := treeBytes * referenceAgentRun
+	case tempOK && repoOK && tempFree != repoFree:
+		return fmt.Sprintf("disk: repo tree ~%s, free on temp: %s (%s) · free on repo fs: %s (%s) (a %d-agent run needs ~%s)",
+			humanSize(treeBytes), humanSize(int64(tempFree)), tmpDir, humanSize(int64(repoFree)), dir, referenceAgentRun, humanSize(need))
+	case tempOK:
 		return fmt.Sprintf("disk: repo tree ~%s, free %s on %s (a %d-agent run needs ~%s)",
-			humanSize(treeBytes), humanSize(int64(free)), dir, referenceAgentRun, humanSize(need))
+			humanSize(treeBytes), humanSize(int64(tempFree)), tmpDir, referenceAgentRun, humanSize(need))
+	case repoOK:
+		// Temp filesystem unreadable but the repo's isn't: fall back to it
+		// rather than going silent, even though it's not where runs actually
+		// write — a rough number beats none.
+		return fmt.Sprintf("disk: repo tree ~%s, free %s on %s (a %d-agent run needs ~%s)",
+			humanSize(treeBytes), humanSize(int64(repoFree)), dir, referenceAgentRun, humanSize(need))
+	default:
+		return fmt.Sprintf("disk: repo tree ~%s; free space unknown on %s (unsupported platform)", humanSize(treeBytes), dir)
 	}
 }

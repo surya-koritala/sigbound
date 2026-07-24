@@ -88,6 +88,7 @@ sig run [-config PATH]
 | `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. A kept worktree stays registered with git until you remove it: `git worktree remove <path>` (or `git worktree prune` after deleting the directory yourself). With `-agent-retries`, only the LAST failed attempt's worktree is kept — every earlier attempt is torn down as it fails. |
 | `-parallel-agents` | `0` | Cap how many agents run concurrently — the fan-out semaphore every agent goes through (see [Parallelism](#parallelism)). `0` (default): today's behavior, unchanged — `runtime.GOMAXPROCS(0)`. Must be `>= 0`. |
 | `-budget` | `0` | Wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (`0` = none). On expiry, outstanding agents are cancelled and fail; integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial. |
+| `-no-disk-check` | `false` | Skip the disk-space preflight. By default, before any agent runs, the driver refuses the run (exit 1, no agent started) when task count x checked-out tree size, padded by a 10% safety margin, clearly won't fit free space on the worktree root's filesystem; the check fails OPEN (never blocks the run) whenever the estimate can't be confidently formed, e.g. an unreadable tree or an unsupported platform. |
 | `-logdir` | — | Write each agent/repair/verify/planner command's **full** stdout+stderr to `<logdir>/<name>.log` (`agent-<id>.log`, `repair-<n>.log`, `verify-<n>.log`, `planner.log`), on top of the truncated tails the report keeps in memory. The directory is created if needed and must be writable — checked before any agent runs, so a bad `-logdir` fails the whole run rather than silently dropping logs partway through. Repeated runs against the same `-logdir` **append** to the same files; there is no per-run rotation. A task's `id` is sanitized for use in the filename (non-alphanumeric characters become `-`), so two exotic ids that sanitize to the same string share one log file. |
 | `-events` | — | Stream one JSON object per line to FILE as the run progresses (see [Events](#events)); `-` writes to stderr. The file is truncated fresh each run. Opening it is checked before any agent runs, same fail-fast policy as `-logdir`; a write failure afterward is best-effort and never fails the run. |
 | `-manifest` | — | Write the full JSON report to FILE at the end of the run, independent of `-json` (see [Provenance](#provenance)). FILE's directory is created if needed and checked writable before any agent runs, same fail-fast policy as `-logdir`; a write failure AFTER the run completes is best-effort and warned on stderr — by then real work may already be landed. With `-resume`, this SAME flag also names the prior run's manifest to resume FROM (see [Resume](#resume)). |
@@ -1080,7 +1081,16 @@ $ sig doctor
 git on PATH: ok
 git version >= 2.38: ok
 live probe: merge-tree + overlay plumbing: ok
+disk: repo tree ~2.1MB, free 41.2GB on /tmp (a 512-agent run needs ~1.0GB)
 ```
+
+The `disk:` line is unconditional (informational, not a pass/fail check — it
+never contributes to doctor's exit code) and reports free space on the OS
+temp directory, since that's the filesystem `sig run` actually creates
+worktrees under (`os.MkdirTemp`), not necessarily the repo's own. When the
+repo lives on a different filesystem than the temp directory (a common trap
+in CI, where `/tmp` is a small tmpfs), the line shows both readings instead:
+`free on temp: X (path) · free on repo fs: Y (path)`.
 
 `sig run` and `sig integrate` also run the cheap part of this (git present +
 version check) automatically before doing anything, so a too-old git is
