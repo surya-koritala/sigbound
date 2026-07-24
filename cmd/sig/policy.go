@@ -200,9 +200,10 @@ func parsePolicy(data []byte) (policy, error) {
 // stricter-only: flags may tighten policy, never loosen it.
 //
 //   - verify: the flag/request verify command is APPENDED to the policy battery
-//     (both run). Members are ANDed in file order, each in its own subshell so a
-//     member's shell operators keep their intended precedence and a failing
-//     member fails the whole gate — the -verify invariant, never weakened.
+//     (both run). Members are ANDed in file order, each run in its own nested
+//     `sh -c` (see joinVerifyBattery) so an untrusted member's metacharacters
+//     cannot escape to mask another member's failure, and any member's failure
+//     fails the whole gate — the -verify invariant, never weakened.
 //   - lanes/semantic/assert: policy strict/go/true is a FLOOR. An unset flag is
 //     silently raised to it; an EXPLICIT weaker flag is a loud error naming both
 //     sources and values.
@@ -283,20 +284,41 @@ func policyReport(pol policy) *policyJSON {
 	return out
 }
 
-// joinVerifyBattery ANDs the battery members into one `sh -c` command. Each
-// member runs in its own subshell so a member's own && / || keep their intended
-// precedence (POSIX && and || are equal-precedence, left-associative, so a bare
-// join could let one member's || swallow the next member's failure — a way to
-// land red, which must never happen). A single member needs no wrapping.
+// joinVerifyBattery composes the battery into one command string that the run's
+// existing `sh -c <cmd>` verify path executes. A member is UNTRUSTED shell
+// (an invoker's -verify, or a repo's own policy line), so it must NOT be
+// textually embedded into a compound command: a member like `true ) ; ( true`
+// would break out of any surrounding wrapping and append a top-level statement
+// whose exit 0 masks a prior member's failure — landing red, the one thing the
+// verify gate must never allow. Instead each member runs in its OWN nested
+// `sh -c '<member>'`, single-quote-escaped so every metacharacter stays confined
+// to that nested shell, and the nested shells are ANDed: any member's non-zero
+// exit short-circuits the chain and fails the gate. A single member is passed
+// through verbatim — no composition, so byte-identical to a plain -verify.
+//
+// ponytail: per-member failure REPORTING (naming which member failed) needs the
+// members run as separate exec invocations in Go, threaded through the whole
+// verify/cache/bisect/impact path — a large diff for a report-only nicety. Kept
+// as a single string here so those paths are unchanged; add per-member reporting
+// when the review-UI need is real.
 func joinVerifyBattery(members []string) string {
 	if len(members) == 1 {
 		return members[0]
 	}
-	wrapped := make([]string, len(members))
+	parts := make([]string, len(members))
 	for i, m := range members {
-		wrapped[i] = "( " + m + " )"
+		parts[i] = "sh -c " + shellQuote(m)
 	}
-	return strings.Join(wrapped, " && ")
+	return strings.Join(parts, " && ")
+}
+
+// shellQuote wraps s in single quotes for POSIX sh, escaping any embedded single
+// quote as the standard '\” sequence (close-quote, escaped quote, reopen). The
+// result passes s to a nested `sh -c` verbatim with every other character
+// literal, so a battery member's metacharacters cannot escape into the composed
+// command (see joinVerifyBattery).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // laneRank orders the lane modes by strictness so a policy floor can be

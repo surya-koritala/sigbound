@@ -835,6 +835,9 @@ memory.
 A repo can own its own landing bar. Commit a `sigbound.policy` file at the
 repository root declaring what a landing REQUIRES, and both `sig run` and
 `sig serve` enforce it identically — the repo, not the invoker, sets the bar.
+Policy is enforced by `sig run` and `sig serve` only; [`sig integrate`](#sig-integrate)
+is the raw integration primitive and applies no policy — feed it branches you
+have already gated.
 
 The file is a flat `KEY = VALUE` file, the SAME format as
 [`sig.conf`](#config-file): `#` comments, blank lines, and one `key = value`
@@ -906,7 +909,12 @@ event, and the `sig serve` review UI — exactly like a merge conflict today.
   glob is held (`policy: ack required for <path>`).
 - **self-protection**: a landing whose changes modify `sigbound.policy` itself
   is held (`policy: run modifies sigbound.policy`) — a change cannot loosen the
-  bar that gates it.
+  bar that gates it. This applies only when a policy already EXISTS at the base:
+  CREATING a `sigbound.policy` where none existed is not held and lands through
+  the normal verify + flag path like any other file. A policy is monotonically
+  at least as strict as no policy, so a first policy can only RAISE the bar for
+  future runs, never loosen the one that gated its own landing — there is
+  nothing to loosen. Only editing (or deleting) an existing policy is held.
 
 Because integration groups are entangled by write-set overlap, the WHOLE group
 containing a held branch is held together; disjoint clean groups still integrate,

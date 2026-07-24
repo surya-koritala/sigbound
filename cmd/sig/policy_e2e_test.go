@@ -319,6 +319,102 @@ func TestPolicySelfModificationHeld(t *testing.T) {
 	}
 }
 
+// TestPolicyVerifyBatteryInjectionBypass reproduces the reviewer's proven gate
+// bypass: a policy that forbids all landing (verify = false) plus an invoker
+// -verify crafted to break out of the composition (`true ) ; ( true`) must NOT
+// land — the policy member's failure short-circuits the ANDed chain, each member
+// confined to its own nested sh. A regression against the old textual-wrap
+// composition, which reported OK and landed. Both the run and serve paths.
+func TestPolicyVerifyBatteryInjectionBypass(t *testing.T) {
+	ctx := context.Background()
+	agent := buildTestAgent(t)
+	const injection = "true ) ; ( true"
+
+	// --- sig run ---
+	g, repo := makeGoRepo(t)
+	commitPolicy(t, g, repo, "verify = false\n") // nothing may EVER land
+	baseBefore, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, code, _ := runRunJSON(t, repo, agent,
+		[]taskSpec{taskWrite(t, "a", map[string]string{"a.txt": "x\n"})}, "-verify", injection)
+	if rep.Verify.OK {
+		t.Fatalf("verify.OK=true — the injection masked the policy member's failure (BYPASS): %+v", rep.Verify)
+	}
+	if code != exitVerifyFailed {
+		t.Fatalf("code=%d, want exitVerifyFailed (%d): nothing may land", code, exitVerifyFailed)
+	}
+	baseAfter, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseAfter != baseBefore {
+		t.Fatalf("main advanced %s -> %s: the change LANDED despite verify=false (BYPASS)", baseBefore, baseAfter)
+	}
+
+	// --- sig serve (crafted POST /runs) ---
+	gs, repoServe := makeGoRepo(t)
+	commitPolicy(t, gs, repoServe, "verify = false\n")
+	serveBefore, err := gs.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ts := newTestServer(t, "", repoServe)
+	var created struct {
+		RunID string `json:"runId"`
+	}
+	if c := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:   repoServe,
+		Base:   "main",
+		Tasks:  []taskSpec{taskWrite(t, "a", map[string]string{"a.txt": "x\n"})},
+		Agent:  agent,
+		Verify: injection,
+	}, &created); c != http.StatusAccepted {
+		t.Fatalf("POST /runs status %d, want 202", c)
+	}
+	final := pollRun(t, ts, "", created.RunID)
+	if final.Report == nil || final.Report.Verify.OK {
+		t.Fatalf("serve: verify.OK true or no report — injection bypass on the serve path: %+v", final.Report)
+	}
+	// The ref is the source of truth for "did it land": Integrate.Landed lists
+	// branches folded into the CANDIDATE tree and is populated even on a verify
+	// failure, so it is not a landing signal.
+	serveAfter, err := gs.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if serveAfter != serveBefore {
+		t.Fatalf("serve: main advanced %s -> %s despite verify=false (BYPASS)", serveBefore, serveAfter)
+	}
+}
+
+// TestPolicyVerifyBatteryFailingMemberFailsGate: a legitimate multi-member
+// battery ANDs correctly — a genuine failure in ANY member (here the second
+// policy line) fails the gate and lands nothing, even though the first member
+// passes.
+func TestPolicyVerifyBatteryFailingMemberFailsGate(t *testing.T) {
+	ctx := context.Background()
+	agent := buildTestAgent(t)
+	g, repo := makeGoRepo(t)
+	commitPolicy(t, g, repo, "verify = true\nverify = false\n") // member 2 always fails
+	before, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, code, _ := runRunJSON(t, repo, agent, []taskSpec{taskWrite(t, "a", map[string]string{"a.txt": "x\n"})})
+	if rep.Verify.OK || code != exitVerifyFailed {
+		t.Fatalf("verify.OK=%v code=%d, want a failing gate when any battery member fails", rep.Verify.OK, code)
+	}
+	after, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("main advanced despite a failing battery member")
+	}
+}
+
 // TestPolicyWeakerFlagRejectedBeforeAnyAgent: an EXPLICIT weaker flag against a
 // stricter policy is an operational error, raised before any agent runs (no
 // worktree, no spend), on both the run and serve paths.

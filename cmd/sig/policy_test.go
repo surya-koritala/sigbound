@@ -207,6 +207,30 @@ func TestResolvePolicyVerifyAppend(t *testing.T) {
 	}
 }
 
+// TestJoinVerifyBatteryConfinesMetacharacters pins the injection-safe
+// composition: a single member passes through verbatim; multiple members each
+// run in their own single-quote-escaped nested `sh -c`, so a member's parens /
+// semicolons / quotes stay confined and cannot escape to mask another member's
+// failure (the shell-injection gate bypass fixed after review).
+func TestJoinVerifyBatteryConfinesMetacharacters(t *testing.T) {
+	if got := joinVerifyBattery([]string{"go test ./..."}); got != "go test ./..." {
+		t.Fatalf("single member = %q, want verbatim pass-through", got)
+	}
+	// The exact reviewer-proven injection string must be quoted whole, not
+	// embedded as live shell.
+	got := joinVerifyBattery([]string{"false", "true ) ; ( true"})
+	want := `sh -c 'false' && sh -c 'true ) ; ( true'`
+	if got != want {
+		t.Fatalf("injection case = %q, want %q", got, want)
+	}
+	// A single quote inside a member is escaped as '\'' so the wrapping holds.
+	got = joinVerifyBattery([]string{"a'b", "c"})
+	want = `sh -c 'a'\''b' && sh -c 'c'`
+	if got != want {
+		t.Fatalf("quote-escape case = %q, want %q", got, want)
+	}
+}
+
 // TestResolvePolicyTightenOnly is the invoker-cannot-weaken core, per key class:
 // an unset flag is raised to the policy floor silently; an EXPLICIT weaker flag
 // is a loud error naming both sources.
