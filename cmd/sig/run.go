@@ -1750,6 +1750,20 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 // far fewer probes on a batch with only a handful of bad groups.
 const bisectAloneMax = 6
 
+// bisectParallelMin is the group count at or above which the each-alone probes'
+// -verify commands run CONCURRENTLY (over a small serially-created worktree pool)
+// instead of serially on a single reused worktree. Below it (k==1) there is
+// nothing to overlap, so the serial path is used and no extra worktree is spent.
+// A worktree-add is ~tens of ms; a -verify is seconds-to-minutes, so overlapping
+// k independent verifies is a clear win for any k>=2.
+const bisectParallelMin = 2
+
+// bisectParallelCap bounds how many each-alone probes verify AT ONCE (capped
+// again by k). The probes compete with their own -verify commands for CPU, so a
+// small fixed cap is right — this is CPU-bound work, unlike -parallel-agents'
+// I/O-bound model calls, which is why it does not reuse that knob.
+const bisectParallelCap = 3
+
 // verifyBisect is -verify-bisect's last resort, reached only after the FULL
 // combined tree failed -verify and any -repair on it was already exhausted. The
 // integration groups (res.GroupHeads / res.GroupBranches — the disjoint folded
@@ -1797,7 +1811,7 @@ func verifyBisect(ctx context.Context, g *gitx.Git, p runParams, base string, re
 	if err := g.WorktreeAddDetached(ctx, wtPath, base); err != nil {
 		return bisectSalvagedNothing(rep, branches, bj, "bisect checkout "+short(base)+": "+err.Error(), emit)
 	}
-	defer func() { _ = g.WorktreeRemove(ctx, wtPath) }()
+	defer removeBisectWorktree(ctx, g, wtPath)
 
 	// eval overlays a subset of group heads onto base, commits, and verifies that
 	// candidate tree, recording the attempt count, last commit, and last output
@@ -1827,9 +1841,27 @@ func verifyBisect(ctx context.Context, g *gitx.Git, p runParams, base string, re
 		return v.OK
 	}
 
-	good := bisectGoodGroups(eval, k)
+	var good []int
+	if k >= bisectParallelMin && k <= bisectAloneMax {
+		// Each-alone is embarrassingly parallel: k independent verifies. Run the
+		// (expensive) verifies concurrently, bounded — they compete with their own
+		// -verify commands for CPU — instead of one at a time on the shared wtPath,
+		// then set attempts to the probe count for the union's logAttempt below.
+		// The per-probe worktrees are created serially, not concurrently (see
+		// bisectAloneParallel). The verdicts are a deterministic function of the
+		// per-group results, so the good set is identical to the serial scan; only
+		// wall time changes.
+		good, lastOutput = bisectAloneParallel(ctx, g, p, base, heads, branches, writeSets, k, dir, emit)
+		attempts = k
+	} else {
+		// k==1 (nothing to overlap) or k>bisectAloneMax (binary split): serial,
+		// reusing wtPath via eval. See bisectGoodGroups.
+		good = bisectGoodGroups(eval, k)
+	}
 	// Re-verify the union of the individually-green groups — the EXACT tree that
-	// would land — before landing anything. Short-circuits when nothing was green.
+	// would land — before landing anything. Stays SERIAL and LAST on wtPath: it is
+	// the landing gate and must evaluate the exact tree that lands. Short-circuits
+	// when nothing was green.
 	unionOK := len(good) > 0 && eval(good)
 	bj.Attempts = attempts
 
@@ -1931,6 +1963,112 @@ func splitGood(eval func([]int) bool, subset []int) []int {
 	}
 	mid := len(subset) / 2
 	return append(splitGood(eval, subset[:mid]), splitGood(eval, subset[mid:])...)
+}
+
+// bisectAloneParallel runs the each-alone phase of -verify-bisect: it probes each
+// of the k groups by itself — overlay that group's head onto base, commit, and
+// -verify — running only the (expensive, seconds-to-minutes) -verify commands
+// CONCURRENTLY, at most bisectParallelCap at once. That overlap is the entire
+// win. The per-probe detached worktrees are NOT created concurrently: concurrent
+// `git worktree add`/`remove` race git's shared .git/worktrees admin state (a
+// worktree-add is only ~tens of ms, negligible next to a verify), so a small pool
+// of min(k, cap) worktrees is created SERIALLY up front, reused across the k
+// probes (verifyCandidate resets + re-checks each before use, so reuse is safe),
+// and torn down SERIALLY after. It returns the ascending indices of the
+// individually-green groups (identical to the serial each-alone scan — a
+// deterministic function of the per-group verdicts, only wall time differs) plus
+// the LAST group's -verify output, matching the serial scan's lastOutput (used
+// only for the salvage-nothing diagnostic when no group was green; a green union
+// re-verify overwrites it in the caller). Each probe's logAttempt is its group
+// index+1, exactly the number the serial scan's eval would have assigned it, so
+// -logdir's verify-<n>.log names are unchanged.
+func bisectAloneParallel(ctx context.Context, g *gitx.Git, p runParams, base string, heads []string, branches [][]string, writeSets map[string][]string, k int, dir string, emit *eventEmitter) ([]int, string) {
+	outs := make([]string, k)
+
+	// Serial create: stand up a pool of min(k, cap) detached worktrees one at a
+	// time (never concurrent `git worktree add`). The pool doubles as the worktree
+	// handout for the parallel probes below — a probe blocks until one is free, so
+	// with cap == pool size no probe ever waits.
+	w := min(bisectParallelCap, k)
+	pool := make(chan string, w)
+	wts := make([]string, 0, w)
+	for i := 0; i < w; i++ {
+		wt := filepath.Join(dir, fmt.Sprintf("p%d", i))
+		if err := g.WorktreeAddDetached(ctx, wt, base); err != nil {
+			// Can't stand up the pool — salvage nothing, exactly as the shared
+			// wtPath add failing at the top of verifyBisect would. Tear down what we
+			// did create (serially, surfacing any cleanup error) before returning.
+			for _, done := range wts {
+				removeBisectWorktree(ctx, g, done)
+			}
+			return nil, "bisect checkout " + short(base) + ": " + err.Error()
+		}
+		wts = append(wts, wt)
+		pool <- wt
+	}
+	// Serial teardown, last.
+	defer func() {
+		for _, wt := range wts {
+			removeBisectWorktree(ctx, g, wt)
+		}
+	}()
+
+	probe := func(i int) bool {
+		subGroups := [][]string{branches[i]}
+		commit, cerr := overlayCandidate(ctx, g, base, []string{heads[i]})
+		if cerr != nil {
+			outs[i] = "bisect overlay: " + cerr.Error()
+			emit.emit("bisect_attempt", map[string]any{"groups": subGroups, "ok": false})
+			return false
+		}
+		wt := <-pool
+		defer func() { pool <- wt }()
+		v := verifyCandidate(ctx, g, wt, p, commit, unionWriteSet(branches[i], writeSets), i+1)
+		outs[i] = v.Output
+		emit.emit("bisect_attempt", map[string]any{"groups": subGroups, "ok": v.OK})
+		return v.OK
+	}
+	good := evalAloneParallel(k, w, probe)
+	return good, outs[k-1]
+}
+
+// removeBisectWorktree tears down a -verify-bisect probe worktree, surfacing any
+// cleanup error on stderr instead of swallowing it: a failed remove leaks a
+// .git/worktrees admin entry (sig gc reclaims it later), and silence hides that
+// signal. Best-effort — the leak never changes the run's exit code.
+func removeBisectWorktree(ctx context.Context, g *gitx.Git, wt string) {
+	if err := g.WorktreeRemove(ctx, wt); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: -verify-bisect worktree cleanup %s: %v\n", wt, err)
+	}
+}
+
+// evalAloneParallel probes indices 0..k-1 concurrently, at most limit at once,
+// and returns the ascending indices whose probe returned green. probe(i) must
+// be safe to call from its own goroutine (the caller hands each running probe a
+// distinct worktree and writes only slot i of any shared slice). The result depends only
+// on which probes are green, never on scheduling — the same verdicts always
+// yield the same ascending set — so a parallel run matches the serial scan.
+func evalAloneParallel(k, limit int, probe func(i int) bool) []int {
+	oks := make([]bool, k)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, limit)
+	for i := 0; i < k; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			oks[i] = probe(i)
+		}(i)
+	}
+	wg.Wait()
+	var good []int
+	for i, ok := range oks {
+		if ok {
+			good = append(good, i)
+		}
+	}
+	return good
 }
 
 // overlayCandidate builds a -verify-bisect candidate commit: overlay the given

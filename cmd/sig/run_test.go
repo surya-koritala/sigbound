@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1931,6 +1932,55 @@ func TestDriveRunVerifyBisectLandsGreenSubset(t *testing.T) {
 	}
 }
 
+// TestDriveRunVerifyBisectParallelDeterministic drives the REAL parallel
+// each-alone bisect path — real detached worktrees, real concurrent -verify
+// commands — repeatedly, and asserts the salvaged subset is the SAME every time
+// and equals the serial verdict. The middle group (g1) is the broken one, so the
+// green set {g0, g2} is non-contiguous: an ordering or shared-state bug in the
+// concurrent scan (caught here or by -race) would surface as a wrong or
+// run-varying subset. k=3 forces the parallel path (bisectParallelMin=2), and the
+// verify keys purely on file presence, so the serial each-alone verdict is
+// exactly {g0, g2} — the reference this test pins the parallel path to.
+func TestDriveRunVerifyBisectParallelDeterministic(t *testing.T) {
+	ctx := context.Background()
+	agent := buildTestAgent(t) // reused across reps; only the repo advances
+
+	want := []string{"agent/g0", "agent/g2"}
+	const reps = 5
+	for rep := 0; rep < reps; rep++ {
+		g, repo := makeGoRepo(t) // fresh base per rep (each run lands a subset)
+		p := runParams{
+			Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
+			// Broken iff g1.txt (the MIDDLE group) is present in the candidate.
+			VerifyCmd:    `if [ -f g1.txt ]; then exit 1; fi; exit 0`,
+			VerifyBisect: true,
+		}
+		r, err := driveRun(ctx, p, disjointGroupTasks(t, 3))
+		if err != nil {
+			t.Fatalf("rep %d: driveRun: %v", rep, err)
+		}
+		if !r.Verify.OK {
+			t.Fatalf("rep %d: verify.ok=false; bisect should salvage {g0,g2}: %q", rep, r.Verify.Output)
+		}
+		// Landed is built in ascending group order, so it is already [g0 g2].
+		if got := r.Integrate.Landed; !reflect.DeepEqual(got, want) {
+			t.Fatalf("rep %d: integrate.landed=%v, want %v (parallel scan must match the serial verdict)", rep, got, want)
+		}
+		if got := r.Integrate.DroppedByBisect; len(got) != 1 || got[0] != "agent/g1" {
+			t.Fatalf("rep %d: integrate.droppedByBisect=%v, want [agent/g1]", rep, got)
+		}
+		// Cross-check the landed tree: the two green groups' files present, the
+		// dropped one's absent — the exact tree that lands, every rep.
+		paths, err := g.LsTree(ctx, "main")
+		if err != nil {
+			t.Fatalf("rep %d: %v", rep, err)
+		}
+		if !contains(paths, "g0.txt") || !contains(paths, "g2.txt") || contains(paths, "g1.txt") {
+			t.Fatalf("rep %d: landed tree=%v, want g0.txt+g2.txt without g1.txt", rep, paths)
+		}
+	}
+}
+
 // TestDriveRunVerifyBisectLandsNothingWhenAllBroken: every group fails verify on
 // its own, so bisect can salvage NOTHING — the base must not advance and the run
 // keeps exit 3.
@@ -2331,6 +2381,54 @@ func TestSplitGood(t *testing.T) {
 		got := bisectGoodGroups(eval, tc.k)
 		if fmt.Sprintf("%v", got) != fmt.Sprintf("%v", tc.want) {
 			t.Errorf("bisectGoodGroups(k=%d, bad=%v)=%v, want %v", tc.k, tc.bad, got, tc.want)
+		}
+	}
+}
+
+// TestEvalAloneParallelDeterministic pins the concurrent each-alone search: the
+// good set it returns is exactly the ascending indices whose probe is green,
+// independent of how the probes are scheduled. Each probe finishes in REVERSE
+// index order (higher indices sleep less) to force out-of-order completion, and
+// the whole run is repeated so a scheduling-dependent bug (or shared-slice data
+// race, caught by -race) would surface. It also asserts the concurrency never
+// exceeds the cap.
+func TestEvalAloneParallelDeterministic(t *testing.T) {
+	cases := []struct {
+		k    int
+		bad  map[int]bool
+		want []int
+	}{
+		{k: 2, bad: map[int]bool{1: true}, want: []int{0}},
+		{k: 3, bad: map[int]bool{1: true}, want: []int{0, 2}},
+		{k: 5, bad: map[int]bool{}, want: []int{0, 1, 2, 3, 4}},
+		{k: 6, bad: map[int]bool{0: true, 2: true, 5: true}, want: []int{1, 3, 4}},
+		{k: 4, bad: map[int]bool{0: true, 1: true, 2: true, 3: true}, want: nil},
+	}
+	for _, tc := range cases {
+		limit := min(bisectParallelCap, tc.k)
+		for rep := 0; rep < 30; rep++ {
+			var inFlight, maxSeen int64
+			probe := func(i int) bool {
+				n := atomic.AddInt64(&inFlight, 1)
+				for {
+					m := atomic.LoadInt64(&maxSeen)
+					if n <= m || atomic.CompareAndSwapInt64(&maxSeen, m, n) {
+						break
+					}
+				}
+				// Higher indices finish sooner, so completion order is the reverse
+				// of index order — the good set must not depend on it.
+				time.Sleep(time.Duration(tc.k-i) * 200 * time.Microsecond)
+				atomic.AddInt64(&inFlight, -1)
+				return !tc.bad[i]
+			}
+			got := evalAloneParallel(tc.k, limit, probe)
+			if fmt.Sprintf("%v", got) != fmt.Sprintf("%v", tc.want) {
+				t.Fatalf("evalAloneParallel(k=%d, bad=%v)=%v, want %v", tc.k, tc.bad, got, tc.want)
+			}
+			if int(maxSeen) > limit {
+				t.Fatalf("k=%d: %d probes ran at once, cap is %d", tc.k, maxSeen, limit)
+			}
 		}
 	}
 }
