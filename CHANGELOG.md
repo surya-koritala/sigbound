@@ -8,6 +8,28 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+### Added
+
+- **Crash-safe `sig serve` run journal** — every run directory now carries a
+  `status.json` phase marker (`queued`/`running`/`done`/`error`/`interrupted`,
+  plus `pid` and an explanatory note) written atomically at each transition,
+  and a `request.json` snapshot of the exact POSTed body, journaled the
+  instant `POST /runs` accepts the request — before its goroutine even
+  starts. On startup, `sig serve` scans every registered cell's runs
+  directory and rewrites any run left `queued`/`running` by a now-dead owning
+  process to `interrupted`, so `GET /runs/{id}` and the `/runs` listing
+  report reality instead of `running` forever after a `kill -9`. See
+  [docs/USAGE.md](docs/USAGE.md) "Crash recovery".
+
+### Changed
+
+- **`POST /runs`'s immediate `202` body now reports `status: "queued"`**
+  (previously `"running"`) — it reflects the phase actually recorded at
+  accept time, before the run's goroutine has started. The status vocabulary
+  gains `queued` and `interrupted` alongside the existing `running`/`done`/
+  `error`; this is an additive extension of the lifecycle, not a change to
+  any terminal state.
+
 ## [1.0.0] - 2026-07-23
 
 The distributed and service milestone: Sigbound gains its first network daemon

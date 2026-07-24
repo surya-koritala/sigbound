@@ -1341,8 +1341,15 @@ report that run as `{status: "interrupted"}` — plus whatever `events.ndjson`
 it managed to stream before dying — instead of `running` forever, which is
 what happened before this existed. `usage.json` is never fabricated: if the
 run never got far enough to write one, `usage` is simply absent from the
-response. A run this SAME process is still actively running is never touched
-by that startup scan, live or not — only a prior process's leftovers are.
+response. Any run whose recorded pid is still alive is left alone by that
+startup scan entirely — that covers both a run this same process is still
+actively doing and a sibling `sig serve` daemon's live run sharing the same
+runs directory; only a run whose recorded pid no longer belongs to any
+process gets flipped to `interrupted`. (On a system that recycles pids fast
+enough, a dead run's pid could already belong to some unrelated process by
+the time recovery runs, in which case it's left alone rather than recovered
+— a narrow, best-effort window, consistent with this feature's posture
+elsewhere, not a correctness guarantee.)
 
 `sig serve` does **not** auto-resume an interrupted run — that would mean
 guessing what to do with partial work, which cuts against the fail-safe

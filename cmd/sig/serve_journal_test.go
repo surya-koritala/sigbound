@@ -227,17 +227,20 @@ func TestServeRecoveryProtectsLiveRun(t *testing.T) {
 	}
 }
 
-// TestServeRecoveryMarksForeignPidEvenIfAlive checks the OTHER half of
-// recoverStaleRuns' condition: a recorded pid that differs from ourPID is
-// treated as a prior process's leftover regardless of whether that pid
-// happens to still resolve to something alive (here, it's os.Getpid() —
-// definitely alive — but recoverStaleRuns is told a DIFFERENT pid is "us").
-func TestServeRecoveryMarksForeignPidEvenIfAlive(t *testing.T) {
+// TestServeRecoveryProtectsAliveForeignPid checks the OTHER half of
+// recoverStaleRuns' condition: a recorded pid that differs from ourPID but
+// still resolves to a live process (a sibling `sig serve` daemon sharing the
+// same runs dir, for instance) must be left alone. Only a dead recorded pid
+// is a prior process's leftover; a live one, ours or not, is still owned by
+// somebody and recovery must never stomp it.
+func TestServeRecoveryProtectsAliveForeignPid(t *testing.T) {
 	runsDir := t.TempDir()
 	runDir := filepath.Join(runsDir, "run1")
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// os.Getpid() is definitely alive (it's us), but recoverStaleRuns is told
+	// a DIFFERENT pid is "us" -- simulating a sibling daemon's live run.
 	plantRunStatus(t, runDir, "running", os.Getpid())
 
 	recoverStaleRuns(runsDir, os.Getpid()+1)
@@ -246,8 +249,37 @@ func TestServeRecoveryMarksForeignPidEvenIfAlive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if sf.Status != "running" {
+		t.Fatalf("status = %q, want running (recorded pid is alive, so it's not ours to touch)", sf.Status)
+	}
+}
+
+// TestServeRecoveryFlipsDeadForeignPid is the direct unit-level counterpart
+// of TestServeRecoveryProtectsAliveForeignPid: a recorded pid that differs
+// from ourPID AND is genuinely dead (spawned, run to completion, and waited
+// on, so its pid is guaranteed to belong to no process by the time recovery
+// runs) must be recovered to "interrupted".
+func TestServeRecoveryFlipsDeadForeignPid(t *testing.T) {
+	runsDir := t.TempDir()
+	runDir := filepath.Join(runsDir, "run1")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("spawn+wait short-lived process: %v", err)
+	}
+	deadPID := cmd.Process.Pid
+	plantRunStatus(t, runDir, "running", deadPID)
+
+	recoverStaleRuns(runsDir, os.Getpid())
+
+	sf, err := readRunStatus(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if sf.Status != "interrupted" {
-		t.Fatalf("status = %q, want interrupted (recorded pid != our own pid)", sf.Status)
+		t.Fatalf("status = %q, want interrupted (recorded pid is dead)", sf.Status)
 	}
 }
 

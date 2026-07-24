@@ -1398,15 +1398,27 @@ func writeRunRequest(dir string, req runRequest) {
 
 // recoverStaleRuns is newServer's startup recovery pass over one cell's runs
 // dir: a run whose status.json still says queued/running belongs to a dead
-// owner — its recorded PID is gone, or simply isn't ourPID (a fresh process
-// never reuses its predecessor's PID, so in real use this is every
-// pre-existing queued/running entry, every time) — so no goroutine of this
-// process will ever move it to a terminal state. Rewriting it to
-// "interrupted" here, before the server accepts its first request, is what
-// keeps GET from reporting "running" forever after a kill -9. ourPID is a
-// parameter (not read via os.Getpid() inside) so a test can plant a
-// status.json claiming to be a live run of "this process" without actually
-// running as that PID.
+// owner if its recorded PID no longer resolves to a live process. A dead
+// owner's entry gets rewritten to "interrupted" here, before the server
+// accepts its first request -- that's what keeps GET from reporting
+// "running" forever after a kill -9. A LIVE recorded PID is left alone
+// unconditionally, whether it's our own PID (a run this same process is
+// still doing -- restart recovery doesn't run mid-process, but the test
+// suite plants this case directly) or a sibling daemon's (multiple `sig
+// serve` processes can share a runs dir; recovery must never stomp another
+// daemon's in-flight run just because it isn't ours). ourPID is accepted as
+// a parameter (not read via os.Getpid() inside) purely so a test can name a
+// specific "this process" pid without actually running as it; the recovery
+// decision itself no longer depends on it.
+//
+// Accepted residual: pidAlive only checks that SOME process holds sf.PID
+// right now, not that it's the same process that wrote the status. On a
+// system that recycles PIDs fast enough, a genuinely dead owner's pid could
+// already belong to an unrelated process by the time recovery runs, and that
+// run would be false-positived as still alive and left "running"/"queued"
+// forever (until manually inspected -- see docs/USAGE.md's "Crash recovery"
+// section). This is a narrow window and consistent with the rest of this
+// file's best-effort posture, not a correctness guarantee.
 func recoverStaleRuns(runsDir string, ourPID int) {
 	entries, err := os.ReadDir(runsDir)
 	if err != nil {
@@ -1421,8 +1433,8 @@ func recoverStaleRuns(runsDir string, ourPID int) {
 		if err != nil || (sf.Status != "queued" && sf.Status != "running") {
 			continue // no status.json, or already terminal -- nothing to do
 		}
-		if sf.PID == ourPID && pidAlive(sf.PID) {
-			continue // a live run of THIS process -- never touch it
+		if pidAlive(sf.PID) {
+			continue // owning process still alive -- ours or a sibling daemon's, never touch it
 		}
 		writeRunStatus(dir, "interrupted", fmt.Sprintf("recovered at startup: owning process (pid %d) is gone", sf.PID))
 	}
