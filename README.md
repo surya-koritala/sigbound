@@ -33,8 +33,11 @@ Cursor's [Origin](https://cursor.com/origin) announced a closed, hosted version 
 ## Install
 
 ```bash
-# Homebrew (macOS/Linux) — available once the tap is published
+# Homebrew (macOS/Linux)
 brew install surya-koritala/tap/sig
+
+# installer script — fetches the right prebuilt binary and verifies its checksum
+curl -fsSL https://raw.githubusercontent.com/surya-koritala/sigbound/main/install.sh | sh
 
 # go install
 go install github.com/surya-koritala/sigbound/cmd/sig@latest
@@ -44,11 +47,11 @@ git clone https://github.com/surya-koritala/sigbound && cd sigbound
 go build -o sig ./cmd/sig
 ```
 
-Prebuilt archives (with checksums) are on the [releases
-page](https://github.com/surya-koritala/sigbound/releases).
+Prebuilt archives (with checksums) for macOS, Linux, and Windows are on the
+[releases page](https://github.com/surya-koritala/sigbound/releases).
 
-Requires Go 1.25+ and the `git` binary (>= 2.38). Run `sig doctor` to check
-your git.
+The only runtime requirement is the `git` binary (>= 2.38) — run `sig doctor`
+to check. Go 1.25+ is needed only when building from source.
 
 Running in CI? `surya-koritala/sigbound` is also a GitHub Action — see
 [GitHub Action](docs/USAGE.md#github-action) in the docs.
