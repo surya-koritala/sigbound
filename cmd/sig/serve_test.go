@@ -208,7 +208,7 @@ func TestServeCreateRunHappyPath(t *testing.T) {
 	if code != http.StatusAccepted {
 		t.Fatalf("POST /runs status %d, want 202", code)
 	}
-	if created.RunID == "" || created.Status != "running" {
+	if created.RunID == "" || created.Status != "queued" {
 		t.Fatalf("create resp = %+v", created)
 	}
 
