@@ -2349,11 +2349,13 @@ func runAgent(ctx context.Context, c *cell.Cell, wtRoot, baseSHA string, p runPa
 
 // sparsePathsFor is the on-disk file-set for a -sparse-worktrees worktree: the
 // task's declared lane plus the Go module metadata (go.mod/go.sum) a build
-// reads even when it touches no other file. go.mod/go.sum are matched as
-// literal sparse-checkout patterns, so a repo that lacks them just materializes
-// nothing for them (a non-matching pattern is not an error) — the helper stays
-// correct for a repo with neither. Anything ELSE a build needs must be declared
-// in the task's own files; an undeclared read fails, which is exactly what
+// reads even when it touches no other file. These are literal repo-relative
+// paths; WorktreePopulateSparse anchors each to the repo root, so the ROOT
+// go.mod/go.sum are pulled in (not every nested module's) and a repo that lacks
+// them just materializes nothing for them (an unmatched anchored pattern is not
+// an error) — the helper stays correct for a repo with neither. Anything ELSE a
+// build needs — including a nested module's own go.mod — must be declared in
+// the task's own files; an undeclared read fails, which is exactly what
 // -sparse-worktrees trades for its disk + I/O win (it composes with -lanes
 // strict). files is assumed non-empty — the caller only builds a sparse
 // worktree for a task that declared a lane.

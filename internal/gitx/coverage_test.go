@@ -284,6 +284,118 @@ func TestWorktreePopulateSparse(t *testing.T) {
 	}
 }
 
+// mkfile writes content to dir/rel, creating parent directories (writeFile
+// does not) — needed for the nested-path sparse-pattern fixtures below.
+func mkfile(t *testing.T, dir, rel, content string) {
+	t.Helper()
+	full := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWorktreePopulateSparseAnchorsToRoot is issue #86 review FINDING 1: a
+// --no-cone pattern is an UNANCHORED gitignore glob, so a bare "go.mod"/"main.go"
+// materializes copies at EVERY depth (sub/mod/go.mod, sub/main.go). sparsePattern
+// anchors each path to the repo root, so only the declared root paths land.
+func TestWorktreePopulateSparseAnchorsToRoot(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mkfile(t, dir, "go.mod", "module root\n")
+	mkfile(t, dir, "sub/mod/go.mod", "module nested\n") // a NESTED go.mod
+	mkfile(t, dir, "main.go", "package main\n")
+	mkfile(t, dir, "sub/main.go", "package sub\n") // a deeper main.go
+	base, err := g.CommitAll(ctx, "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wt := filepath.Join(t.TempDir(), "sparse")
+	if err := g.WorktreeAddNoCheckout(ctx, wt, "anchor", base); err != nil {
+		t.Fatal(err)
+	}
+	// Lane = root main.go, plus the go.mod/go.sum the driver always appends.
+	if err := g.At(wt).WorktreePopulateSparse(ctx, []string{"main.go", "go.mod", "go.sum"}); err != nil {
+		t.Fatalf("WorktreePopulateSparse: %v", err)
+	}
+	onDisk := func(rel string) bool {
+		_, err := os.Stat(filepath.Join(wt, rel))
+		return err == nil
+	}
+	if !onDisk("main.go") || !onDisk("go.mod") {
+		t.Fatal("declared root main.go/go.mod not materialized")
+	}
+	if onDisk("sub/main.go") {
+		t.Fatal("over-match: unanchored pattern materialized nested sub/main.go")
+	}
+	if onDisk("sub/mod/go.mod") {
+		t.Fatal("over-match: unanchored pattern materialized nested sub/mod/go.mod")
+	}
+}
+
+// TestWorktreePopulateSparseEscapesGlobChars is issue #86 review FINDING 2: a
+// lane file whose name contains gitignore metacharacters (here "[") is read as a
+// character class and matches NOTHING, so the agent never sees its own declared
+// file. sparsePattern escapes the metacharacters, so the literal file is
+// materialized and editable.
+func TestWorktreePopulateSparseEscapesGlobChars(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	g := New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const lane = "pkg/fixture[1].json"
+	mkfile(t, dir, lane, "orig\n")
+	mkfile(t, dir, "pkg/other.json", "other\n") // a sibling the glob "[1]" must NOT pull in
+	base, err := g.CommitAll(ctx, "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wt := filepath.Join(t.TempDir(), "sparse")
+	if err := g.WorktreeAddNoCheckout(ctx, wt, "escape", base); err != nil {
+		t.Fatal(err)
+	}
+	wg := g.At(wt)
+	if err := wg.WorktreePopulateSparse(ctx, []string{lane}); err != nil {
+		t.Fatalf("WorktreePopulateSparse: %v", err)
+	}
+	// The declared file — glob metachars and all — is on disk and editable.
+	if _, err := os.Stat(filepath.Join(wt, lane)); err != nil {
+		t.Fatalf("under-match: declared lane file %q not materialized: %v", lane, err)
+	}
+	// "[1]" is a literal, not a class: pkg/other.json must NOT come along.
+	if _, err := os.Stat(filepath.Join(wt, "pkg/other.json")); err == nil {
+		t.Fatal("escaped pattern still matched a sibling (pkg/other.json materialized)")
+	}
+	// Edit it and commit: the agent can actually work in its lane.
+	if err := os.WriteFile(filepath.Join(wt, lane), []byte("edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := wg.AddAllSparse(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sha, err := wg.Commit(ctx, "edit fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _, err := g.BlobAt(ctx, sha, lane)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body != "edited\n" {
+		t.Fatalf("declared file not editable in sparse worktree: blob=%q", body)
+	}
+}
+
 // --- WorktreeAddDetached ----------------------------------------------------
 
 func TestWorktreeAddDetached(t *testing.T) {

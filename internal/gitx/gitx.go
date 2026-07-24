@@ -284,16 +284,25 @@ func (g *Git) WorktreePopulate(ctx context.Context) error {
 // O(tree size) checkout for one bounded by len(paths) — the disk + I/O win #86
 // exists for. g must be bound to the worktree dir (use At(dir)).
 //
-// --no-cone matches paths as literal gitignore-style entries (exact files), not
-// cone-mode directory prefixes: a lane of individual files must not drag in each
-// file's whole directory. An empty paths is a caller bug — a no-lane worktree
-// must take the full WorktreePopulate path instead — so it errors rather than
-// silently checking out an empty tree.
+// --no-cone patterns are gitignore GLOBS, not literal paths (cone mode, by
+// contrast, takes literal directory prefixes). A bare path both over-matches —
+// no leading slash means "match at every depth", so "go.mod" also pulls in
+// sub/mod/go.mod — and under-matches — a name with glob metacharacters like
+// "fixture[1].json" is read as a character class and matches nothing on disk, so
+// the agent can't see its own declared file. sparsePattern fixes both: it
+// anchors each path to the repo root with a leading "/" and backslash-escapes
+// the metacharacters, so each pattern matches exactly one path. An empty paths
+// is a caller bug — a no-lane worktree must take the full WorktreePopulate path
+// instead — so it errors rather than silently checking out an empty tree.
 func (g *Git) WorktreePopulateSparse(ctx context.Context, paths []string) error {
 	if len(paths) == 0 {
 		return fmt.Errorf("WorktreePopulateSparse: no paths (a no-lane worktree must use WorktreePopulate)")
 	}
-	if _, err := g.run(ctx, append([]string{"sparse-checkout", "set", "--no-cone"}, paths...)...); err != nil {
+	patterns := make([]string, len(paths))
+	for i, p := range paths {
+		patterns[i] = sparsePattern(p)
+	}
+	if _, err := g.run(ctx, append([]string{"sparse-checkout", "set", "--no-cone"}, patterns...)...); err != nil {
 		return err
 	}
 	// The worktree was added --no-checkout, so nothing is on disk and its index
@@ -303,6 +312,30 @@ func (g *Git) WorktreePopulateSparse(ctx context.Context, paths []string) error 
 		return err
 	}
 	return nil
+}
+
+// sparsePattern turns a literal repo-relative path into a git sparse-checkout
+// (--no-cone) pattern that matches ONLY that exact path. Non-cone patterns are
+// gitignore globs (see WorktreePopulateSparse), so a raw path is wrong two ways:
+// it matches at every depth (unanchored) and interprets *, ?, [, ] as glob
+// operators. The leading "/" anchors to the repo root; the backslash-escapes
+// make the glob metacharacters literal. "!" and "#" need no escaping — they are
+// gitignore-special only at the START of a pattern, and the leading "/" always
+// precedes them here.
+func sparsePattern(path string) string {
+	var b strings.Builder
+	b.Grow(len(path) + 1)
+	b.WriteByte('/')
+	for i := 0; i < len(path); i++ {
+		switch c := path[i]; c {
+		case '\\', '*', '?', '[', ']':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // WorktreeAddSparse creates a worktree WITHOUT checking out the tree, then
