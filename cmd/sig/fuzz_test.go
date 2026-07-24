@@ -201,6 +201,89 @@ func FuzzParseConfigFile(f *testing.F) {
 	})
 }
 
+// FuzzParsePolicy fuzzes the sigbound.policy parser with arbitrary bytes as the
+// file content — a hand-edited, repo-committed file, so it will see malformed
+// values, unknown keys, and stray characters. On the ACCEPT path it re-checks
+// the invariants parsePolicy documents: a present policy always has a hash, its
+// scalars stay in their validated ranges (audit-sample 0..100 or the -1 unset
+// sentinel; non-negative quotas/durations), and lanes/semantic only ever hold a
+// legal value. A crasher (panic) here would let a bad policy file wedge a run.
+func FuzzParsePolicy(f *testing.F) {
+	f.Add([]byte("verify = go build ./...\nverify = go test ./...\n"))
+	f.Add([]byte("lanes = strict\nsemantic = go\nassert = true\n"))
+	f.Add([]byte("ack-paths = auth/**, billing/**\naudit-sample = 25%\nack-timeout = 72h\n"))
+	f.Add([]byte("parallel-agents = 8\nmax-agents = 16\nbudget = 30m\n"))
+	f.Add([]byte(""))
+	f.Add([]byte("# only a comment\n"))
+	f.Add([]byte("lanes = warn\n"))                // invalid value for policy
+	f.Add([]byte("lanez = strict\n"))              // unknown key
+	f.Add([]byte("lanes = strict\nlanes = off\n")) // duplicate scalar
+	f.Add([]byte("verify =\n"))                    // empty verify
+	f.Add([]byte("audit-sample = 250%\n"))         // out of range
+	f.Add([]byte("budget = notaduration\n"))       // bad duration
+	f.Add([]byte("ack-paths =\n"))                 // empty ack-paths
+	f.Add([]byte("=noverb\n"))                     // empty key (lexer error)
+	f.Add([]byte("noequalsline\n"))                // no '=' (lexer error)
+	f.Add([]byte("emoji😀 = 🚀\n"))                  // non-ASCII
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		pol, err := parsePolicy(data)
+		if err != nil {
+			return // rejecting a malformed policy is the point, as long as it did not panic
+		}
+		if !pol.present || pol.hash == "" {
+			t.Fatalf("accepted policy without present/hash: %+v", pol)
+		}
+		if pol.auditSample < -1 || pol.auditSample > 100 {
+			t.Fatalf("accepted out-of-range audit-sample %d", pol.auditSample)
+		}
+		if pol.parallel < 0 || pol.maxAgents < 0 || pol.budget < 0 || pol.ackTimeout < 0 {
+			t.Fatalf("accepted a negative quota/duration: %+v", pol)
+		}
+		if pol.lanes != "" && pol.lanes != laneStrict && pol.lanes != laneOff {
+			t.Fatalf("accepted illegal lanes %q", pol.lanes)
+		}
+		if pol.semantic != "" && pol.semantic != semanticGo && pol.semantic != semanticOff {
+			t.Fatalf("accepted illegal semantic %q", pol.semantic)
+		}
+		for _, v := range pol.verify {
+			if strings.TrimSpace(v) == "" {
+				t.Fatalf("accepted an empty verify battery member")
+			}
+		}
+	})
+}
+
+// FuzzGlobMatch fuzzes the ack-paths matcher over (pattern, path) pairs. The one
+// hard requirement is that it never panics or hangs (the memo keeps '**'
+// backtracking bounded); on top of that it re-checks two documented invariants:
+// '**' matches every path, and a literal pattern (no glob metacharacters)
+// matches iff it equals the path.
+func FuzzGlobMatch(f *testing.F) {
+	f.Add("auth/**", "auth/login.go")
+	f.Add("**/*.go", "cmd/sig/main.go")
+	f.Add("*", "a/b")
+	f.Add("**", "")
+	f.Add("a?c", "abc")
+	f.Add("", "")
+	f.Add("***", "x/y/z")
+	f.Add("a/**/b/**/c", "a/x/y/b/z/c")
+	f.Add("////", "a/b")
+	f.Add("[not-a-class]", "[not-a-class]")
+
+	f.Fuzz(func(t *testing.T, pattern, name string) {
+		got := globMatch(pattern, name)
+		if pattern == "**" && !got {
+			t.Fatalf("** must match %q", name)
+		}
+		if !strings.ContainsAny(pattern, "*?") {
+			if got != (pattern == name) {
+				t.Fatalf("literal pattern %q vs %q: got %v, want %v", pattern, name, got, pattern == name)
+			}
+		}
+	})
+}
+
 // FuzzExtractFileSymbols fuzzes -semantic go's Go source extractor with
 // arbitrary bytes standing in for a git blob's content — exactly what it
 // parses in production, since it is pointed at whatever an agent committed,

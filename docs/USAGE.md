@@ -830,6 +830,113 @@ memory.
 
 ---
 
+## Landing policy
+
+A repo can own its own landing bar. Commit a `sigbound.policy` file at the
+repository root declaring what a landing REQUIRES, and both `sig run` and
+`sig serve` enforce it identically — the repo, not the invoker, sets the bar.
+Policy is enforced by `sig run` and `sig serve` only; [`sig integrate`](#sig-integrate)
+is the raw integration primitive and applies no policy — feed it branches you
+have already gated.
+
+The file is a flat `KEY = VALUE` file, the SAME format as
+[`sig.conf`](#config-file): `#` comments, blank lines, and one `key = value`
+per line (the split is on the first `=`, so a value may itself contain `=`).
+
+```
+# sigbound.policy — this repo's landing bar.
+verify = go build ./...
+verify = go vet ./...
+lanes  = strict
+semantic = go
+ack-paths = auth/**, billing/**
+budget = 30m
+```
+
+### Keys
+
+| Key | Meaning |
+|-----|---------|
+| `verify = <cmd>` | REPEATABLE. Each line adds a member to a verify battery, ANDed and run in file order against the same integrated tree; the first failure fails the gate. |
+| `lanes = strict\|off` | Lane-enforcement floor (see [File lanes](#file-lanes)). `strict` requires strict; `off` imposes nothing. |
+| `semantic = go\|off` | Semantic-analysis floor (see [Semantic conflicts (Go)](#semantic-conflicts-go)). `go` requires it on. |
+| `assert = true\|false` | Integration cross-check floor (see [`-assert`](#flags)). `true` requires it on. |
+| `parallel-agents = N` | Ceiling on fan-out concurrency. Effective value is `min(policy, flag)`. |
+| `max-agents = N` | Ceiling on a run's task count; a run with more tasks is rejected before any agent runs. |
+| `budget = <duration>` | Ceiling on the run's wall-clock budget. Effective value is `min(policy, flag)`. |
+| `ack-paths = <glob>[, <glob>…]` | REPEATABLE and/or comma-separated. A landing that touches a matching path is held for a human (see below). |
+| `audit-sample = N%` | Recorded now (`0..100`); enforced from the v2.0 parking work. |
+| `ack-timeout = <duration>` | Recorded now; enforced from the v2.0 parking work. |
+
+An UNKNOWN key, a malformed value, or a duplicate scalar key (a second
+`lanes =` silently overriding the first) is a hard error naming the file, line,
+and key. The file fails closed: a typo can never silently weaken the bar.
+
+### Loaded from the base SHA
+
+The policy that gates a landing is the one COMMITTED at the base the run lands
+onto — it is read from the base commit's tree (`git show <base>:sigbound.policy`)
+at run start, not from your working directory. It is versioned and lands like
+any other file: to change the bar, commit a change to `sigbound.policy`. A repo
+with no `sigbound.policy` at its base behaves exactly as before — no policy,
+zero migration. The resolved file's sha256 is recorded as `policy.hash` in the
+run report and manifest.
+
+### Flags may only tighten, never loosen
+
+A CLI flag or a `sig serve` request parameter can make a run STRICTER than the
+policy, never laxer:
+
+- `verify`: a flag `-verify` command is APPENDED to the policy battery — both
+  run (the policy's members plus yours). Each member runs in its own shell and
+  they are ANDed, so any member's failure fails the gate. A policy-supplied
+  battery satisfies `-verify-bisect` and `-verify-impact`'s "requires a verify
+  command" precondition on its own: on a repo whose verify comes only from the
+  policy you can pass `-verify-bisect` with no redundant `-verify`. (With
+  neither a policy verify nor a `-verify` flag, both are still rejected.) Note
+  `-verify-impact` runs a scoped command INSTEAD of verify, so it is dropped
+  whenever the policy contributes a battery — the policy's battery always runs
+  in full rather than being replaced by a narrower command.
+- `lanes` / `semantic` / `assert`: a policy `strict` / `go` / `true` cannot be
+  turned off by a flag. An unset flag is raised to the policy floor silently; an
+  EXPLICITLY weaker flag (e.g. `-lanes off` against `lanes = strict`) is a loud
+  error naming both sources, raised before any agent runs.
+- quotas (`parallel-agents`, `budget`): effective value is `min(policy, flag)` —
+  the established clamp semantics, never an error.
+
+### Ack-paths and self-protection (interim behavior)
+
+Two rules keep a change from landing without a human when the repo says one is
+needed. Until the v2.0 parking + acknowledgment flow (issue #109) exists, both
+are enforced through the EXISTING flagged-conflict mechanism: the affected
+branches are KEPT, the base ref is NOT advanced for them, and the reason is
+recorded in the report's `integrate.flagged[].reason`, the `integrate_done`
+event, and the `sig serve` review UI — exactly like a merge conflict today.
+
+- **ack-paths**: a landing whose changes touch a path matching an `ack-paths`
+  glob is held (`policy: ack required for <path>`).
+- **self-protection**: a landing whose changes modify `sigbound.policy` itself
+  is held (`policy: run modifies sigbound.policy`) — a change cannot loosen the
+  bar that gates it. This applies only when a policy already EXISTS at the base:
+  CREATING a `sigbound.policy` where none existed is not held and lands through
+  the normal verify + flag path like any other file. A policy is monotonically
+  at least as strict as no policy, so a first policy can only RAISE the bar for
+  future runs, never loosen the one that gated its own landing — there is
+  nothing to loosen. Only editing (or deleting) an existing policy is held.
+
+Because integration groups are entangled by write-set overlap, the WHOLE group
+containing a held branch is held together; disjoint clean groups still integrate,
+verify, and land as normal (it composes with `-verify-bisect` salvage). A run
+that holds a group exits `4` (flagged), the same as a conflict.
+
+Glob semantics for `ack-paths` (slash-separated, repo-relative paths): `?`
+matches one character except `/`; `*` matches any run of characters except `/`
+(stays within a path segment); `**` matches any run INCLUDING `/` (crosses
+segments), and a `**/` prefix also matches zero leading segments, so
+`**/secrets.yaml` matches both `secrets.yaml` and `deploy/prod/secrets.yaml`.
+
+---
+
 ## `sig integrate`
 
 The integration engine on its own: given a set of existing branches, fold them

@@ -287,6 +287,26 @@ type runReport struct {
 	// manifest's provenance: WHEN this ran, alongside WHAT ran (the commands
 	// above) and WHERE it landed (BaseSHA / Integrate.FinalSHA).
 	StartedAt string `json:"startedAt"`
+	// Policy is the resolved landing policy (sigbound.policy at BaseSHA) — its
+	// sha256 (policyHash) plus the effective battery/ack-paths and the
+	// recorded-but-not-yet-enforced audit-sample/ack-timeout. nil (and omitted
+	// from JSON) when no policy file exists at the base, so a run against a
+	// repo with no policy reports byte-identical to before this feature. See
+	// policy.go and docs/USAGE.md's "Landing policy" section.
+	Policy *policyJSON `json:"policy,omitempty"`
+}
+
+// policyJSON records the resolved landing policy on the report/manifest. Verify
+// is the EFFECTIVE battery (policy lines plus any appended flag/request verify);
+// AuditSample/AckTimeout are parsed, validated, and recorded now but enforced
+// only from the v2.0 parking work (#109) — see the "Landing policy" USAGE
+// section. Every list/scalar is omitempty so a minimal policy records minimally.
+type policyJSON struct {
+	Hash        string   `json:"hash"`
+	Verify      []string `json:"verify,omitempty"`
+	AckPaths    []string `json:"ackPaths,omitempty"`
+	AuditSample *int     `json:"auditSample,omitempty"` // pointer so 0% (never audit) is distinct from unset (nil)
+	AckTimeout  string   `json:"ackTimeout,omitempty"`
 }
 
 // sig run exit codes. An operational error (bad flags, a git/integrate
@@ -442,6 +462,14 @@ type runParams struct {
 	// again.
 	Resume        bool
 	ResumeBaseSHA string
+	// PolicyExplicit names the policy-governed dimensions (lanes/semantic/assert)
+	// the invoker set DELIBERATELY, so resolvePolicy can tell a deliberate
+	// weaker choice (a loud error) from an unset default silently tightened to
+	// the sigbound.policy floor. Set by runRun from its explicit-flags set and by
+	// serve's buildParams from the request's non-empty fields; the zero value
+	// (nothing explicit, e.g. a test building runParams{} directly) lets policy
+	// tighten every dimension silently, the safe direction. See policy.go.
+	PolicyExplicit policyExplicit
 }
 
 // repairFailureMax bounds the captured verify output handed to the fixer agent
@@ -702,12 +730,14 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	if strings.TrimSpace(*agentCmd) == "" {
 		return exitOperationalError, errors.New("-agent is required")
 	}
-	if strings.TrimSpace(*verifyImpactCmd) != "" && strings.TrimSpace(*verifyCmd) == "" {
-		return exitOperationalError, errors.New("-verify-impact requires -verify (or -verify-preset): it composes WITH -verify, which stays required as the fallback")
-	}
-	if *verifyBisect && strings.TrimSpace(*verifyCmd) == "" {
-		return exitOperationalError, errors.New("-verify-bisect requires -verify (or -verify-preset): it bisects over -verify's verdict on the combined tree")
-	}
+	// NOTE: -verify-bisect/-verify-impact's "requires a verify command"
+	// preconditions are NOT checked here. A repo's sigbound.policy can supply the
+	// verify battery, and the policy is only readable from the pinned base SHA
+	// inside driveRun — checking the FLAG here would reject `-verify-bisect` on a
+	// policy-bearing repo whose verify comes solely from the policy, forcing a
+	// redundant -verify. They are validated in driveRun against the EFFECTIVE
+	// verify command instead (see validateVerifyPreconditions), which covers both
+	// this path and serve's from one site.
 	if err := validateStrategy(*strategy); err != nil {
 		return exitOperationalError, err
 	}
@@ -902,6 +932,15 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		EnvVerify:       splitCSV(*envVerify),
 		EnvRepair:       splitCSV(*envRepair),
 		EnvPublish:      splitCSV(*envPublish),
+		// A sig.conf value counts as explicit too (applyConfigFile adds every key
+		// it applies to explicitFlags), same as -config's own precedence — so a
+		// deliberate weaker lanes/semantic/assert from either source is an error
+		// against a stricter policy, not a silent tighten. See resolvePolicy.
+		PolicyExplicit: policyExplicit{
+			Lanes:    explicitFlags["lanes"],
+			Semantic: explicitFlags["semantic"],
+			Assert:   explicitFlags["assert"],
+		},
 	}
 	rep, err := driveRun(context.Background(), p, tasks)
 	if err != nil {
@@ -1222,6 +1261,31 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if p.EnvMode == "" {
 		p.EnvMode = envModeInherit // same in-process default as LaneMode above; slotEnv treats "" as inherit anyway
 	}
+	// Landing policy (issue #108): load sigbound.policy from the PINNED base
+	// SHA's tree (not the working dir — the policy that gates a landing is the
+	// one committed at the base being landed on) and resolve it against these
+	// flags/request. This is the single choke point both `sig run` and `sig
+	// serve` reach — enforcement is identical by construction. A weaker EXPLICIT
+	// flag or an over-count against max-agents is a loud error HERE, before the
+	// disk preflight or any agent runs, so nothing is spent on a run policy
+	// forbids. The tightened p flows into rep below, so the report/manifest shows
+	// the EFFECTIVE lanes/verify/parallel/budget. pol is kept for the ack-path /
+	// self-modification holdback after the agent phase.
+	pol, err := loadPolicy(ctx, g, baseSHA)
+	if err != nil {
+		return runReport{}, err
+	}
+	if err := resolvePolicy(pol, &p, len(tasks)); err != nil {
+		return runReport{}, err
+	}
+	// -verify-bisect/-verify-impact require a verify command to bisect over or
+	// fall back to. Checked HERE, against the EFFECTIVE verify (policy battery
+	// included), not at flag-parse time — a repo whose verify comes solely from
+	// sigbound.policy must be able to use bisect without a redundant -verify.
+	// Still before any agent runs; see validateVerifyPreconditions.
+	if err := validateVerifyPreconditions(p); err != nil {
+		return runReport{}, err
+	}
 	// -parallel-agents: 0 (or unset, e.g. a test building runParams{} directly)
 	// keeps today's behavior -- runtime.GOMAXPROCS(0), a CPU-shaped cap that's
 	// the wrong shape for these I/O-bound model-agent calls. Resolved once
@@ -1243,6 +1307,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		ParallelAgents: p.ParallelAgents,
 		Version:        Version,
 		StartedAt:      runStart.UTC().Format(time.RFC3339),
+		Policy:         policyReport(pol),
 	}
 	emit.emit("run_start", map[string]any{"repo": p.Repo, "base": p.Base, "baseSHA": baseSHA, "tasks": tasks, "parallelAgents": parallelAgents})
 	// Normally wtRoot (and every per-agent worktree under it) is torn down when
@@ -1385,6 +1450,18 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		}
 	}
 
+	// Landing-policy holdback (issue #108, interim): a group whose landed changes
+	// touch an ack-paths glob, or modify sigbound.policy itself, is HELD — routed
+	// through the existing flagged mechanism (branches kept, ref not advanced,
+	// reason recorded), never auto-landed, since a change must not loosen the bar
+	// that gates it and an ack-path needs a human. Only the CLEARED branches go on
+	// to integrate/verify/bisect, so disjoint clean groups still land (composes
+	// with bisect salvage). #109 upgrades this hold to park+ack. policyFlagged is
+	// appended to the integrate report's Flagged below, so it surfaces in the JSON
+	// report, the integrate_done event, and the serve review UI exactly like a
+	// conflict flag.
+	branches, policyFlagged := policyHoldback(pol, branches, writeSets, semanticEdges)
+
 	// ---- integrate via the shared cell path, WITHOUT landing yet ----
 	// The integrated commit is computed detached; the base ref is advanced only
 	// after -verify passes (below), so a failing verify never lands a broken tree.
@@ -1419,6 +1496,10 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	for _, f := range res.Flagged {
 		ir.Flagged = append(ir.Flagged, flaggedJSON{Branch: f.Branch, Paths: f.Conflicts})
 	}
+	// Policy-held groups (ack-paths / self-modification) join the flagged set
+	// with their recorded reason — held branches never entered integrate, so
+	// they are additive to whatever real conflicts it flagged.
+	ir.Flagged = append(ir.Flagged, policyFlagged...)
 	rep.Integrate = ir
 	emit.emit("integrate_done", map[string]any{"landed": ir.Landed, "flagged": ir.Flagged, "resolved": ir.Resolved, "finalSHA": ir.FinalSHA, "wallMs": ir.WallMs})
 

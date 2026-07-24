@@ -1114,12 +1114,14 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 	if err := validateEnvMode(envMode); err != nil {
 		return runParams{}, zeroPlan, err
 	}
-	if strings.TrimSpace(req.VerifyImpact) != "" && strings.TrimSpace(req.Verify) == "" {
-		return runParams{}, zeroPlan, errors.New("verifyImpact requires verify: it composes WITH verify, which stays the fallback")
-	}
-	if req.VerifyBisect && strings.TrimSpace(req.Verify) == "" {
-		return runParams{}, zeroPlan, errors.New("verifyBisect requires verify: it bisects over verify's verdict on the combined tree")
-	}
+	// verifyBisect/verifyImpact's "requires verify" preconditions are NOT checked
+	// here: the cell's sigbound.policy may supply the verify battery, and that is
+	// only readable from the pinned base SHA inside driveRun. Checking the REQUEST
+	// field here would reject verifyBisect on a policy-bearing cell whose verify
+	// comes solely from the policy. driveRun validates the EFFECTIVE verify
+	// command for both this path and `sig run` from one site (see
+	// validateVerifyPreconditions); a genuine no-verify-anywhere request is still
+	// rejected loudly, as the run's recorded error rather than a 400.
 
 	agentTimeout, err := parseDur(req.AgentTimeout, 0)
 	if err != nil {
@@ -1196,6 +1198,17 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 		EnvVerify:       s.envVerify,
 		EnvRepair:       s.envRepair,
 		EnvPublish:      s.envPublish,
+		// A request field a caller actually set counts as an explicit choice, so
+		// a deliberate weaker lanes/semantic/assert is an error against a
+		// stricter policy (see resolvePolicy), not a silent tighten. A JSON bool
+		// can't distinguish an explicit assert=false from an omitted one, so only
+		// assert=true is treated as explicit; policy's assert=true floor still
+		// tightens an omitted/false request silently, the safe direction.
+		PolicyExplicit: policyExplicit{
+			Lanes:    strings.TrimSpace(req.Lanes) != "",
+			Semantic: strings.TrimSpace(req.Semantic) != "",
+			Assert:   req.Assert,
+		},
 	}
 
 	if !haveGoal {

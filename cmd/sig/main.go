@@ -195,10 +195,14 @@ func integrateBranches(ctx context.Context, c *cell.Cell, baseRef, baseSHA strin
 }
 
 // flaggedJSON is one branch the engine set aside for a human, with the paths
-// that conflicted.
+// that conflicted. Reason is set only for a landing-policy hold (an ack-path
+// change or a self-modification of sigbound.policy — see policyHoldback):
+// empty, and so omitted from JSON, for an ordinary merge conflict, keeping a
+// conflict-only run's report byte-identical to before the policy feature.
 type flaggedJSON struct {
 	Branch string   `json:"branch"`
 	Paths  []string `json:"paths"`
+	Reason string   `json:"reason,omitempty"`
 }
 
 // resultJSON is the integrate command's stdout contract.

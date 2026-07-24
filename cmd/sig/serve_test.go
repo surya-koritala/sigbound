@@ -399,7 +399,11 @@ func TestServeBadRequests(t *testing.T) {
 		{"neither tasks nor goal", runRequest{Cell: repo, Agent: "true"}, "one of tasks or goal", codeBadRequest},
 		{"missing agent", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}}, "agent is required", codeBadRequest},
 		{"empty task id", runRequest{Cell: repo, Tasks: []taskSpec{{ID: ""}}, Agent: "true"}, "empty id", codeBadRequest},
-		{"verifyImpact without verify", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Agent: "true", VerifyImpact: "go test ./..."}, "verifyImpact requires verify", codeBadRequest},
+		// NOTE: "verifyImpact/verifyBisect without verify" is no longer a 400 here.
+		// A cell's sigbound.policy can supply the verify battery, which is only
+		// readable from the pinned base SHA inside driveRun, so the precondition
+		// moved there and now fires against the EFFECTIVE verify command as the
+		// run's recorded error. See TestPolicyBisectRejectedWithNoVerifyAnywhere.
 		{"bad duration", runRequest{Cell: repo, Tasks: []taskSpec{{ID: "t1"}}, Agent: "true", Budget: "notaduration"}, "budget", codeBadRequest},
 		{"goal without planner", runRequest{Cell: repo, Goal: "split it", Agent: "true"}, "planner is required", codeBadRequest},
 	}
