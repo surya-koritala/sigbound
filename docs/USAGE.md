@@ -1269,7 +1269,7 @@ All requests and responses are JSON (events are NDJSON).
 | `GET /health` | `{ok, version, cells:[{id, repo}]}` |
 | `POST /runs` | Start a run. Returns **202** `{runId, cell, status}` immediately; the run executes asynchronously. |
 | `GET /runs` | `{runs:[{id, cell, status, startedAt, finalSHA?}]}`, newest first. |
-| `GET /runs/{id}` | `{id, cell, status, startedAt, report?, usage?}` — `status` is `running`, `done`, or `error`; the full run report is present once `done`, and `usage` alongside it (see [Quotas and metering](#quotas-and-metering)). |
+| `GET /runs/{id}` | `{id, cell, status, startedAt, error?, report?, usage?}` — `status` is `queued`, `running`, `done`, `error`, or `interrupted` (see [Crash recovery](#crash-recovery)); the full run report is present once `done`, and `usage` alongside it (see [Quotas and metering](#quotas-and-metering)). |
 | `GET /runs/{id}/events` | The run's `events.ndjson` as written so far (`Content-Type: application/x-ndjson`) — the same lifecycle events `sig run -events` emits. |
 | `GET /runs/{id}/usage` | That run's metering record. `404` until the run has written a report. |
 | `GET /usage` | Usage totals across all run history, plus a per-cell rollup. |
@@ -1316,8 +1316,50 @@ A run moves the base ref, so a cell runs **one at a time**: a second `POST` for 
 cell whose run is still in flight gets **409 Conflict**. Different cells run
 fully in parallel — that repo-level sharding is the whole point of registering
 several. Run history is durable per cell under `.git/sigbound/runs/<runId>/`
-(`report.json`, `events.ndjson`), the same `.git/sigbound` storage `-verify-cache`
-uses; `rm -rf .git/sigbound` resets it and it never shows up in `git status`.
+(`status.json`, `request.json`, `report.json`, `events.ndjson`, `usage.json`),
+the same `.git/sigbound` storage `-verify-cache` uses; `rm -rf .git/sigbound`
+resets it and it never shows up in `git status`.
+
+### Crash recovery
+
+Every run directory carries a tiny `status.json` phase marker —
+`{status, updatedAt, pid}` — written atomically (write-then-rename, same
+pattern `-verify-cache` uses) at each transition: `queued` the instant
+`POST /runs` accepts the request, `running` once its goroutine actually
+starts, and `done`/`error` at the end. Alongside it, `request.json` journals
+the exact POSTed request body (no server-side env values are ever in a
+request — those live only in the daemon's own `-env-*` flags — so there's
+nothing to redact) the moment the run is accepted, before anything runs.
+
+If the daemon is killed mid-run (`kill -9`, an OOM, a host reboot), the run
+directory is left with a `status.json` still saying `queued` or `running` —
+nobody is ever coming back to finish it. On the **next startup**, `sig serve`
+scans every registered cell's runs directory and rewrites any such entry to
+`interrupted` (with a note recording that the owning process is gone) before
+it accepts its first request. `GET /runs/{id}` (and the `/runs` listing) then
+report that run as `{status: "interrupted"}` — plus whatever `events.ndjson`
+it managed to stream before dying — instead of `running` forever, which is
+what happened before this existed. `usage.json` is never fabricated: if the
+run never got far enough to write one, `usage` is simply absent from the
+response. Any run whose recorded pid is still alive is left alone by that
+startup scan entirely — that covers both a run this same process is still
+actively doing and a sibling `sig serve` daemon's live run sharing the same
+runs directory; only a run whose recorded pid no longer belongs to any
+process gets flipped to `interrupted`. (On a system that recycles pids fast
+enough, a dead run's pid could already belong to some unrelated process by
+the time recovery runs, in which case it's left alone rather than recovered
+— a narrow, best-effort window, consistent with this feature's posture
+elsewhere, not a correctness guarantee.)
+
+`sig serve` does **not** auto-resume an interrupted run — that would mean
+guessing what to do with partial work, which cuts against the fail-safe
+posture (flag, never guess) the whole project holds elsewhere. The journal
+exists so a human can: read `request.json` out of the interrupted run's
+directory and `POST` that same body back to `/runs` to start it fresh. Any
+`agent/<id>` branches the dead run's agents already committed are untouched
+on disk (`runAgent` never cleans them up, see [Resume](#resume)) — a re-POST
+runs the same tasks again from scratch, agent included, since `sig serve`
+does not thread `-manifest`/`-resume` through its own runs today.
 
 ### Conflict review UI
 
@@ -1447,7 +1489,7 @@ curl -s localhost:7777/runs -d '{
   "agent": "claude -p \"$SIGBOUND_TASK\"",
   "verify":"go build ./... && go test ./..."
 }'
-# -> {"runId":"20260722T164530Z-a1b2c3d4e5f6","cell":"...","status":"running"}
+# -> {"runId":"20260722T164530Z-a1b2c3d4e5f6","cell":"...","status":"queued"}
 
 # Poll it, then read the landed report:
 curl -s localhost:7777/runs/20260722T164530Z-a1b2c3d4e5f6 | jq '.status, .report.integrate.finalSHA'

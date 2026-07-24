@@ -8,6 +8,14 @@
 // as -verify-cache), so history survives a restart: the GET endpoints read from
 // disk.
 //
+// CRASH SAFETY: alongside report.json/events.ndjson, every run dir carries a
+// status.json phase marker (queued/running/done/error), written atomically at
+// each transition, plus a request.json journal of the POSTed request body
+// written at accept time. On startup, any run a PRIOR process left
+// queued/running (its PID is gone) is rewritten to status "interrupted" — so a
+// daemon killed mid-run is reported honestly instead of looking like it's still
+// running forever. See docs/USAGE.md's "Crash recovery" section.
+//
 //	sig serve -addr 127.0.0.1:7777 -repos /path/a,/path/b [-token-env NAME] [-allow-remote]
 //
 // POSTURE: this is a SINGLE-PROCESS, SINGLE-USER daemon, NOT a multi-tenant
@@ -31,7 +39,7 @@
 //	GET  /health           -> {ok, version, cells:[{id, repo}]}
 //	POST /runs             -> Content-Type: application/json required; 202 {runId,...}; runs ASYNC via driveRun
 //	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}
-//	GET  /runs/{id}        -> {status: running|done|error, report?, usage?}
+//	GET  /runs/{id}        -> {status: queued|running|done|error|interrupted, report?, usage?}
 //	GET  /runs/{id}/events -> the run's events.ndjson (application/x-ndjson)
 //	GET  /runs/{id}/usage  -> that run's metering record (see usage.go)
 //	GET  /usage            -> usage totals across all run history, + a per-cell rollup
@@ -149,14 +157,15 @@ type server struct {
 }
 
 // runRecord is the in-memory truth for a run started by THIS process. Disk
-// (report.json / events.ndjson under the run dir) is the durable record the GET
-// endpoints fall back to for runs from a prior process (restart survival).
+// (status.json / report.json / events.ndjson under the run dir) is the durable
+// record the GET endpoints fall back to for runs from a prior process (restart
+// survival) — see diskRunStatus and recoverStaleRuns.
 type runRecord struct {
 	id        string
 	cellID    string
 	repo      string
 	dir       string
-	status    string // running | done | error
+	status    string // queued | running | done | error
 	startedAt time.Time
 	finalSHA  string
 	errMsg    string
@@ -226,6 +235,13 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		s.cells = append(s.cells, rc)
 		s.byKey[c.ID()] = rc
 		s.byKey[c.Repo()] = rc
+		// Startup recovery (issue #90): a run this cell's dir still shows
+		// queued/running belongs to a process that is, by construction, not
+		// this one (a fresh process never reuses its predecessor's PID) — no
+		// goroutine of ours will ever finish it. Rewrite it to "interrupted"
+		// now, before the server accepts any request, so GET reports it
+		// honestly instead of "running" forever. See recoverStaleRuns.
+		recoverStaleRuns(rc.runsDir, os.Getpid())
 	}
 	return s, nil
 }
@@ -460,9 +476,16 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "create run dir: "+err.Error(), codeInternalError)
 		return
 	}
+	// Journal (issue #90): status.json records "queued" the instant the run
+	// is accepted, and request.json the exact POSTed body — both BEFORE the
+	// goroutine is even started, so a crash in the gap between accept and the
+	// goroutine's first instruction still leaves an accurate, diagnosable
+	// trail on disk (see docs/USAGE.md's "Crash recovery" section).
+	writeRunStatus(dir, "queued", "")
+	writeRunRequest(dir, req)
 	s.busy[rc.cell.ID()] = true
 	s.activeRuns++
-	rec := &runRecord{id: runID, cellID: rc.cell.ID(), repo: rc.cell.Repo(), dir: dir, status: "running", startedAt: time.Now()}
+	rec := &runRecord{id: runID, cellID: rc.cell.ID(), repo: rc.cell.Repo(), dir: dir, status: "queued", startedAt: time.Now()}
 	s.runs[runID] = rec
 	s.wg.Add(1)
 	s.mu.Unlock()
@@ -473,7 +496,7 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"runId":  runID,
 		"cell":   rc.cell.ID(),
-		"status": "running",
+		"status": "queued",
 	})
 }
 
@@ -492,6 +515,12 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 		s.activeRuns--
 		s.mu.Unlock()
 	}()
+
+	// Transition: queued -> running (see handleCreateRun's "queued" write).
+	s.mu.Lock()
+	rec.status = "running"
+	s.mu.Unlock()
+	writeRunStatus(rec.dir, "running", "")
 
 	if haveGoal {
 		planned, err := planTasks(s.baseCtx, p.Repo, plan.goal, plan.plannerCmd, plan.n, plan.plannerTimeout, "", p.EnvMode, s.envPlanner)
@@ -527,6 +556,7 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 	}
 	writeRunReport(rec.dir, rep)
 	writeRunUsage(rec.dir, computeUsage(&rep, time.Since(rec.startedAt).Milliseconds(), reportFileSize(rec.dir)))
+	writeRunStatus(rec.dir, "done", "")
 	s.mu.Lock()
 	rec.status = "done"
 	rec.finalSHA = rep.Integrate.FinalSHA
@@ -535,6 +565,7 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 
 func (s *server) failRun(rec *runRecord, msg string) {
 	writeRunError(rec.dir, msg, rec.startedAt, rec.cellID)
+	writeRunStatus(rec.dir, "error", "")
 	s.mu.Lock()
 	rec.status = "error"
 	rec.errMsg = msg
@@ -582,13 +613,10 @@ func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dir, cellID = fdir, frc.cell.ID()
-		status = diskStatus(fdir)
-		if status == "" {
-			// A dir with neither report.json nor error.json, not tracked in
-			// memory: an interrupted run from a crashed/restarted process.
-			status = "error"
-			errMsg = "run did not complete (no report on disk)"
-		}
+		// Not tracked in this process's memory: a prior process's run.
+		// status.json (see runStatusFile) is the source of truth for it,
+		// including "interrupted" for one that process left mid-flight.
+		status, errMsg = diskRunStatus(fdir)
 	}
 
 	resp := runStatusResponse{ID: id, Cell: cellID, Status: status}
@@ -607,6 +635,9 @@ func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		if errMsg == "" {
 			errMsg = readRunErrorMsg(dir)
 		}
+		resp.Error = errMsg
+	}
+	if status == "interrupted" {
 		resp.Error = errMsg
 	}
 	if u, err := readRunUsage(dir); err == nil {
@@ -651,10 +682,7 @@ func (s *server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 				e.StartedAt = rec.startedAt.UTC().Format(time.RFC3339)
 				e.FinalSHA = rec.finalSHA
 			} else {
-				e.Status = diskStatus(dir)
-				if e.Status == "" {
-					e.Status = "error"
-				}
+				e.Status, _ = diskRunStatus(dir)
 			}
 			if e.Status == "done" && e.FinalSHA == "" {
 				if rep, err := readRunReport(dir); err == nil {
@@ -1278,6 +1306,152 @@ func diskStatus(dir string) string {
 		return "error"
 	}
 	return ""
+}
+
+// ---- crash-safe run journal: status.json / request.json (issue #90) ----
+
+// runStatusFile is status.json's shape: the tiny phase marker written
+// atomically (write-then-rename, same pattern as verifyCacheStore) at every
+// run transition — POST accept ("queued"), the goroutine's first instruction
+// ("running"), and the run's end ("done"/"error"). It is what lets a restart
+// tell "still running" apart from "was running when the process died":
+// recoverStaleRuns rewrites a dead owner's queued/running entry to
+// "interrupted" at startup, and diskRunStatus reads status.json as the source
+// of truth for any run this process didn't itself start.
+type runStatusFile struct {
+	Status    string `json:"status"` // queued | running | done | error | interrupted
+	UpdatedAt string `json:"updatedAt"`
+	PID       int    `json:"pid"`
+	Note      string `json:"note,omitempty"` // set on "interrupted": why (see recoverStaleRuns)
+}
+
+// writeRunStatus atomically records dir's current phase. Best-effort, like
+// every other durable-storage writer in this file: a write failure here (a
+// full disk, a read-only .git) must never turn an otherwise-successful run
+// into a reported failure.
+func writeRunStatus(dir, status, note string) {
+	data, err := json.MarshalIndent(runStatusFile{
+		Status:    status,
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		PID:       os.Getpid(),
+		Note:      note,
+	}, "", "  ")
+	if err != nil {
+		return
+	}
+	// Write-then-rename (same pattern as verifyCacheStore): a concurrent GET
+	// must never observe a torn status.json.
+	tmp := filepath.Join(dir, ".status.json.tmp")
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, "status.json")); err != nil {
+		os.Remove(tmp)
+	}
+}
+
+func readRunStatus(dir string) (*runStatusFile, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "status.json"))
+	if err != nil {
+		return nil, err
+	}
+	var sf runStatusFile
+	if err := json.Unmarshal(data, &sf); err != nil {
+		return nil, err
+	}
+	return &sf, nil
+}
+
+// diskRunStatus reports status (+ an explanatory note, for error/interrupted)
+// for a run dir NOT tracked in this process's memory, i.e. a prior process's
+// run. status.json is the source of truth when present. A dir written before
+// this feature existed (no status.json) falls back to diskStatus's
+// report.json/error.json check, and — with neither — is reported
+// "interrupted": there's no more information on disk than "something ran
+// here and never reached a terminal state".
+func diskRunStatus(dir string) (status, note string) {
+	if sf, err := readRunStatus(dir); err == nil {
+		return sf.Status, sf.Note
+	}
+	if st := diskStatus(dir); st != "" {
+		return st, ""
+	}
+	return "interrupted", "no status recorded for this run"
+}
+
+// writeRunRequest journals the POSTed request body (request.json) at accept
+// time, alongside status.json: the run's inputs, known before the goroutine
+// even starts, so an interrupted run is diagnosable and its body can be
+// re-POSTed by hand as the manual recovery path (see docs/USAGE.md's "Crash
+// recovery" section). req is exactly what the caller sent — serve's
+// environment policy lives on the SERVER (server.envMode etc.), never in a
+// request, so there are no env values in here to sanitize out.
+func writeRunRequest(dir string, req runRequest) {
+	data, err := json.MarshalIndent(req, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, "request.json"), data, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "sig serve: write request journal %s: %v\n", dir, err)
+	}
+}
+
+// recoverStaleRuns is newServer's startup recovery pass over one cell's runs
+// dir: a run whose status.json still says queued/running belongs to a dead
+// owner if its recorded PID no longer resolves to a live process. A dead
+// owner's entry gets rewritten to "interrupted" here, before the server
+// accepts its first request -- that's what keeps GET from reporting
+// "running" forever after a kill -9. A LIVE recorded PID is left alone
+// unconditionally, whether it's our own PID (a run this same process is
+// still doing -- restart recovery doesn't run mid-process, but the test
+// suite plants this case directly) or a sibling daemon's (multiple `sig
+// serve` processes can share a runs dir; recovery must never stomp another
+// daemon's in-flight run just because it isn't ours). ourPID is accepted as
+// a parameter (not read via os.Getpid() inside) purely so a test can name a
+// specific "this process" pid without actually running as it; the recovery
+// decision itself no longer depends on it.
+//
+// Accepted residual: pidAlive only checks that SOME process holds sf.PID
+// right now, not that it's the same process that wrote the status. On a
+// system that recycles PIDs fast enough, a genuinely dead owner's pid could
+// already belong to an unrelated process by the time recovery runs, and that
+// run would be false-positived as still alive and left "running"/"queued"
+// forever (until manually inspected -- see docs/USAGE.md's "Crash recovery"
+// section). This is a narrow window and consistent with the rest of this
+// file's best-effort posture, not a correctness guarantee.
+func recoverStaleRuns(runsDir string, ourPID int) {
+	entries, err := os.ReadDir(runsDir)
+	if err != nil {
+		return // missing dir (no runs yet, or first startup) => nothing to recover
+	}
+	for _, de := range entries {
+		if !de.IsDir() {
+			continue
+		}
+		dir := filepath.Join(runsDir, de.Name())
+		sf, err := readRunStatus(dir)
+		if err != nil || (sf.Status != "queued" && sf.Status != "running") {
+			continue // no status.json, or already terminal -- nothing to do
+		}
+		if pidAlive(sf.PID) {
+			continue // owning process still alive -- ours or a sibling daemon's, never touch it
+		}
+		writeRunStatus(dir, "interrupted", fmt.Sprintf("recovered at startup: owning process (pid %d) is gone", sf.PID))
+	}
+}
+
+// pidAlive reports whether pid names a currently running process. On Unix,
+// os.FindProcess always succeeds without checking anything; sending signal 0
+// is the standard, side-effect-free way to actually probe existence.
+func pidAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 // ---- HTTP write helpers ----
