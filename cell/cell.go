@@ -43,6 +43,14 @@ type Cell struct {
 	// Distinct cells never share it, so N cells on N repos never contend.
 	mu      sync.Mutex
 	created map[string]struct{} // worktree dirs this cell added and hasn't removed
+
+	// blobMu guards the lazy-started, reused cat-file --batch daemon (see
+	// BlobsBatch). It is SEPARATE from mu so blob reads and worktree-admin never
+	// block each other; it also serializes the daemon's strictly-sequential wire
+	// protocol (only one Read may be in flight). blob is nil until first use and
+	// after any error (which resets it so the next call restarts it).
+	blobMu sync.Mutex
+	blob   *gitx.BatchBlobReader
 }
 
 // Option configures a Cell at Open time.
@@ -108,6 +116,59 @@ func (c *Cell) Repo() string { return c.repo }
 // Git returns the cell's main-repo git handle (for diffs, rev-parse, the
 // detached verify/repair worktrees driveRun manages itself, etc.).
 func (c *Cell) Git() *gitx.Git { return c.git }
+
+// BlobsBatch resolves object specs to blob content (the same map contract as
+// gitx.BlobsBatch) through this cell's ONE long-lived `git cat-file --batch`
+// process, lazily started and reused across every call so a busy cell — semantic
+// analysis reading two blobs per branch, the review three-sides endpoint hit
+// repeatedly, a resolver's per-conflict reads — resolves blobs WITHOUT a git
+// process per operation (measured ~15ms of spawn overhead per call on macOS,
+// which the daemon collapses to a sub-millisecond pipe round-trip).
+//
+// It is FAIL-OPEN: any daemon failure — it won't start, or a read desyncs its
+// wire stream — discards the wedged process and satisfies the call with a fresh
+// per-call spawn (gitx.BlobsBatch), then lets the next call restart the daemon.
+// A broken daemon therefore only forfeits the speedup; it can never fail a run.
+// The daemon is closed in Close.
+//
+// blobMu serializes the whole operation, which the strictly-sequential --batch
+// protocol requires anyway; concurrent callers (e.g. parallel integrations on
+// one cell) block here rather than corrupt each other's records.
+func (c *Cell) BlobsBatch(ctx context.Context, specs []string) (map[string]string, error) {
+	if len(specs) == 0 {
+		return map[string]string{}, nil
+	}
+	c.blobMu.Lock()
+	defer c.blobMu.Unlock()
+	if c.blob == nil {
+		br, err := c.git.NewBatchBlobReader()
+		if err != nil {
+			// Couldn't even start it: fall back to a spawn and stay nil so the next
+			// call retries the start.
+			return c.git.BlobsBatch(ctx, specs)
+		}
+		c.blob = br
+	}
+	// Bound the read by ctx. An alive-but-silent daemon (accepts the request, never
+	// answers) would otherwise block here forever WHILE HOLDING blobMu, stalling
+	// Close and every other blob read on the cell. AfterFunc Kills the process on
+	// ctx cancellation, which makes the blocked Read error out so the fallback
+	// below engages (and the spawn fallback then honors the cancelled ctx by
+	// failing fast); stop() disarms it on the happy path so a completed call never
+	// kills a healthy daemon.
+	stop := context.AfterFunc(ctx, c.blob.Cancel)
+	m, err := c.blob.Read(specs)
+	stop()
+	if err == nil {
+		return m, nil
+	}
+	// The daemon desynced or was cancelled mid-stream — its position/health is now
+	// unknown. Discard it (next call restarts a clean one) and satisfy THIS call
+	// with a fresh spawn (which fails fast if ctx is the thing that was cancelled).
+	_ = c.blob.Close()
+	c.blob = nil
+	return c.git.BlobsBatch(ctx, specs)
+}
 
 // AddWorktree creates a worktree at dir on branch off base and returns only once
 // its working tree is fully populated. It runs in two phases so the O(tree size)
@@ -199,6 +260,7 @@ func (c *Cell) Integrate(ctx context.Context, base string, changes []BranchChang
 	for _, o := range opts {
 		o(in)
 	}
+	in.blobs = c // resolver blob reads route through this cell's daemon (fail-open)
 	return in.Integrate(ctx, base, changes, strategy)
 }
 
@@ -208,6 +270,15 @@ func (c *Cell) Integrate(ctx context.Context, base string, changes []BranchChang
 // error, if any, but always finishes forgetting every tracked worktree so a
 // retry never re-touches a half-removed one.
 func (c *Cell) Close(ctx context.Context) error {
+	// Reap the cat-file --batch daemon (if ever started) under its own lock —
+	// distinct from mu, so this never blocks on or behind worktree-admin.
+	c.blobMu.Lock()
+	if c.blob != nil {
+		_ = c.blob.Close()
+		c.blob = nil
+	}
+	c.blobMu.Unlock()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var firstErr error

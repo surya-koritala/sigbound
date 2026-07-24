@@ -33,8 +33,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/surya-koritala/sigbound/internal/gitx"
 )
 
 // -semantic's two accepted values.
@@ -270,14 +268,28 @@ func newRefs(base, branch map[string]bool) map[string]bool {
 	return added
 }
 
+// blobBatcher is the seam semantic analysis reads blobs through: either a raw
+// gitx.Git (a cat-file spawn per call) or a cell (its reused cat-file --batch
+// daemon). Both satisfy gitx.BlobsBatch's signature, so the -semantic phase's
+// per-branch reads route through the cell's daemon in a live run yet still take a
+// plain *gitx.Git in the unit tests.
+type blobBatcher interface {
+	BlobsBatch(ctx context.Context, specs []string) (map[string]string, error)
+}
+
 // readModulePath returns the `module ...` path declared in go.mod at rev, or
 // "" if go.mod is absent/unreadable/has no module line. Callers degrade
 // gracefully on "": cross-package selector references simply never resolve
 // (extractFileSymbols/dirFromImportPath); same-package bare-call references
-// are unaffected.
-func readModulePath(ctx context.Context, g *gitx.Git, rev string) string {
-	content, present, err := g.BlobAt(ctx, rev, "go.mod")
-	if err != nil || !present {
+// are unaffected. The single go.mod read goes through blobs (the daemon in a
+// live run) like every other -semantic blob read.
+func readModulePath(ctx context.Context, blobs blobBatcher, rev string) string {
+	m, err := blobs.BlobsBatch(ctx, []string{rev + ":go.mod"})
+	if err != nil {
+		return ""
+	}
+	content, ok := m[rev+":go.mod"]
+	if !ok {
 		return ""
 	}
 	for _, line := range strings.Split(content, "\n") {
@@ -301,7 +313,7 @@ func readModulePath(ctx context.Context, g *gitx.Git, rev string) string {
 // this branch contributes no semantic edges, exactly as if -semantic were
 // off for it. A successful analysis (possibly of zero .go files) returns
 // non-nil, possibly-empty maps and note "analyzed".
-func branchSemanticWriteSet(ctx context.Context, g *gitx.Git, modulePath, baseSHA, branch string, files []string) (declared, refs map[string]bool, note string) {
+func branchSemanticWriteSet(ctx context.Context, blobs blobBatcher, modulePath, baseSHA, branch string, files []string) (declared, refs map[string]bool, note string) {
 	var goFiles []string
 	for _, f := range files {
 		if !strings.HasSuffix(f, ".go") {
@@ -317,7 +329,7 @@ func branchSemanticWriteSet(ctx context.Context, g *gitx.Git, modulePath, baseSH
 	for _, path := range goFiles {
 		specs = append(specs, baseSHA+":"+path, branch+":"+path)
 	}
-	blobs, err := g.BlobsBatch(ctx, specs)
+	contents, err := blobs.BlobsBatch(ctx, specs)
 	if err != nil {
 		return nil, nil, fmt.Sprintf("skipped: read blobs: %v", err)
 	}
@@ -326,11 +338,11 @@ func branchSemanticWriteSet(ctx context.Context, g *gitx.Git, modulePath, baseSH
 	refs = map[string]bool{}
 	for _, path := range goFiles {
 		dir := filepath.ToSlash(filepath.Dir(path))
-		baseSyms, berr := extractFileSymbols(dir, modulePath, []byte(blobs[baseSHA+":"+path]))
+		baseSyms, berr := extractFileSymbols(dir, modulePath, []byte(contents[baseSHA+":"+path]))
 		if berr != nil {
 			return nil, nil, fmt.Sprintf("skipped: parse error in %s", path)
 		}
-		branchSyms, brerr := extractFileSymbols(dir, modulePath, []byte(blobs[branch+":"+path]))
+		branchSyms, brerr := extractFileSymbols(dir, modulePath, []byte(contents[branch+":"+path]))
 		if brerr != nil {
 			return nil, nil, fmt.Sprintf("skipped: parse error in %s", path)
 		}
@@ -379,8 +391,8 @@ func semanticOverlap(a, b branchSemantics) bool {
 // NEVER fails the run: every analysis error is a per-branch "skipped" note,
 // not an operational error (see branchSemanticWriteSet). baseSHA is the
 // pinned base every branch forked from.
-func computeSemanticEdges(ctx context.Context, g *gitx.Git, baseSHA string, agents []perAgentJSON) (edges [][2]string, notes map[string]string) {
-	modulePath := readModulePath(ctx, g, baseSHA)
+func computeSemanticEdges(ctx context.Context, blobs blobBatcher, baseSHA string, agents []perAgentJSON) (edges [][2]string, notes map[string]string) {
+	modulePath := readModulePath(ctx, blobs, baseSHA)
 	notes = make(map[string]string, len(agents))
 
 	var syms []branchSemantics
@@ -388,7 +400,7 @@ func computeSemanticEdges(ctx context.Context, g *gitx.Git, baseSHA string, agen
 		if !a.OK {
 			continue
 		}
-		declared, refs, note := branchSemanticWriteSet(ctx, g, modulePath, baseSHA, a.Branch, a.Files)
+		declared, refs, note := branchSemanticWriteSet(ctx, blobs, modulePath, baseSHA, a.Branch, a.Files)
 		notes[a.Branch] = note
 		if declared == nil && refs == nil {
 			continue // fail-open: this branch contributes no edges

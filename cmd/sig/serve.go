@@ -946,7 +946,7 @@ func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
 	addSide("ours", rep.Integrate.FinalSHA)
 	addSide("theirs", branchSHA)
 
-	contents, err := rc.cell.Git().BlobsBatch(r.Context(), specs)
+	contents, err := rc.cell.BlobsBatch(r.Context(), specs)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "read blobs: "+err.Error(), codeInternalError)
 		return
