@@ -52,11 +52,12 @@
 // QUOTAS: managed-layer ceilings, all opt-in via server flags (0 = unlimited,
 // today's behavior byte-identical): -max-agents-per-run (400 on POST /runs
 // before any run starts), -max-run-time (a request's -budget, capped via
-// min()), -max-concurrent-runs (429 across ALL cells, on top of the per-cell
-// 409). METERING is always on — a usage.json is written alongside every
-// run's report.json, derived from data driveRun already tracks. Neither is a
-// biller: no price, currency, or external metering call. See docs/USAGE.md's
-// "Quotas and metering" section.
+// min()), -max-parallel-agents (a request's -parallel-agents, capped the
+// same min() way), -max-concurrent-runs (429 across ALL cells, on top of the
+// per-cell 409). METERING is always on — a usage.json is written alongside
+// every run's report.json, derived from data driveRun already tracks.
+// Neither is a biller: no price, currency, or external metering call. See
+// docs/USAGE.md's "Quotas and metering" section.
 package main
 
 import (
@@ -133,10 +134,12 @@ type server struct {
 	// handleCreateRun BEFORE a run starts (no run dir, no cell slot held on
 	// rejection); maxRunTime is folded into a request's -budget via
 	// min() in buildParams — a request can only make its own budget
-	// stricter, never laxer than the server ceiling.
+	// stricter, never laxer than the server ceiling. maxParallelAgents caps
+	// a request's -parallel-agents the same min() way — see issue #84.
 	maxAgentsPerRun   int
 	maxRunTime        time.Duration
 	maxConcurrentRuns int
+	maxParallelAgents int
 
 	mu         sync.Mutex
 	busy       map[string]bool       // cell id -> a run is in flight (per-cell 409)
@@ -177,6 +180,7 @@ type serverConfig struct {
 	maxAgentsPerRun   int
 	maxRunTime        time.Duration
 	maxConcurrentRuns int
+	maxParallelAgents int
 }
 
 // newServer opens every repo as a cell (fail-fast on any bad repo) and resolves
@@ -200,6 +204,7 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		maxAgentsPerRun:   cfg.maxAgentsPerRun,
 		maxRunTime:        cfg.maxRunTime,
 		maxConcurrentRuns: cfg.maxConcurrentRuns,
+		maxParallelAgents: cfg.maxParallelAgents,
 		byKey:             map[string]*registeredCell{},
 		busy:              map[string]bool{},
 		runs:              map[string]*runRecord{},
@@ -338,11 +343,12 @@ type runRequest struct {
 	Repair    string `json:"repair"`
 	RepairMax int    `json:"repairMax"` // default 2
 
-	NoAutocommit bool   `json:"noAutocommit"`
-	Lanes        string `json:"lanes"` // off | warn | strict
-	KeepFailed   bool   `json:"keepFailed"`
-	Budget       string `json:"budget"`
-	Notes        bool   `json:"notes"`
+	NoAutocommit   bool   `json:"noAutocommit"`
+	Lanes          string `json:"lanes"` // off | warn | strict
+	KeepFailed     bool   `json:"keepFailed"`
+	ParallelAgents int    `json:"parallelAgents"` // fan-out concurrency cap; <=0 = server default (see server.maxParallelAgents)
+	Budget         string `json:"budget"`
+	Notes          bool   `json:"notes"`
 
 	Publish        string `json:"publish"`
 	PublishTimeout string `json:"publishTimeout"` // default 120s
@@ -1036,6 +1042,17 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 			budget = s.maxRunTime
 		}
 	}
+	// Quota: -max-parallel-agents caps -parallel-agents at this server's
+	// ceiling, exactly like -max-run-time caps -budget above — a request can
+	// only narrow its own fan-out concurrency, never exceed the server's. An
+	// unset/non-positive request value (today's GOMAXPROCS default) becomes
+	// the ceiling; a request value already under the ceiling is left alone.
+	parallelAgents := req.ParallelAgents
+	if s.maxParallelAgents > 0 {
+		if parallelAgents <= 0 || s.maxParallelAgents < parallelAgents {
+			parallelAgents = s.maxParallelAgents
+		}
+	}
 	publishTimeout, err := parseDur(req.PublishTimeout, 120*time.Second)
 	if err != nil {
 		return runParams{}, zeroPlan, fmt.Errorf("publishTimeout: %w", err)
@@ -1068,6 +1085,7 @@ func (s *server) buildParams(req runRequest, repo string, haveGoal bool) (runPar
 		Autocommit:      !req.NoAutocommit,
 		LaneMode:        lanes,
 		KeepFailed:      req.KeepFailed,
+		ParallelAgents:  parallelAgents,
 		Budget:          budget,
 		Notes:           req.Notes,
 		PublishCmd:      req.Publish,
@@ -1336,6 +1354,7 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	maxAgentsPerRun := fs.Int("max-agents-per-run", 0, "quota: reject (400) a POST /runs whose agent count exceeds N, before any run starts. For a -goal request the target -n is checked (the true count isn't known until planning runs). 0 = unlimited (default)")
 	maxRunTime := fs.Duration("max-run-time", 0, "quota: cap every run's -budget at this duration (e.g. 10m); a request's own shorter -budget always wins (min of the two). 0 = unlimited (default)")
 	maxConcurrentRuns := fs.Int("max-concurrent-runs", 0, "quota: reject (429) a POST /runs once N runs are in flight across ALL cells, on top of the existing per-cell 409. 0 = unlimited (default)")
+	maxParallelAgents := fs.Int("max-parallel-agents", 0, "quota: cap every run's -parallel-agents (fan-out concurrency) at this value; a request's own smaller value always wins (min of the two), and an over-ask is silently capped, not rejected. 0 = unlimited (default)")
 
 	if err := fs.Parse(argv); err != nil {
 		if err == flag.ErrHelp {
@@ -1385,6 +1404,7 @@ func runServe(w io.Writer, argv []string) (int, error) {
 		maxAgentsPerRun:   *maxAgentsPerRun,
 		maxRunTime:        *maxRunTime,
 		maxConcurrentRuns: *maxConcurrentRuns,
+		maxParallelAgents: *maxParallelAgents,
 	})
 	if err != nil {
 		return exitOperationalError, err

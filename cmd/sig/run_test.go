@@ -1027,6 +1027,114 @@ func TestDriveRunVerifyKilledByBudget(t *testing.T) {
 	}
 }
 
+// overlapDetectorAgent returns an -agent command that proves whether two
+// invocations of it ran CONCURRENTLY: each invocation atomically mkdir's a
+// shared "running" marker directory (mkdir is POSIX-atomic -- no flock
+// needed); an invocation that finds the marker already held (another
+// invocation still has it) records an overlap before releasing it. Used to
+// prove -parallel-agents actually gates driveRun's fan-out semaphore
+// (issue #84), not just a value threaded through and ignored: strictly
+// serial execution can never observe the marker held, concurrent execution
+// can. The overlap file exists iff at least one overlap was recorded.
+func overlapDetectorAgent(t *testing.T) (agentCmd, overlapFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	running := filepath.Join(dir, "running")
+	overlapFile = filepath.Join(dir, "overlap")
+	agentCmd = fmt.Sprintf(`if mkdir %q 2>/dev/null; then :; else echo overlap >> %q; fi; sleep 0.2; rmdir %q 2>/dev/null; exit 0`, running, overlapFile, running)
+	return agentCmd, overlapFile
+}
+
+// TestDriveRunParallelAgentsCapsFanOutConcurrency proves -parallel-agents
+// (runParams.ParallelAgents) actually bounds driveRun's fan-out semaphore.
+// At ParallelAgents=1 the fan-out loop itself blocks on the semaphore before
+// a second agent's goroutine can even start (see driveRun), so overlap is
+// IMPOSSIBLE, not just unlikely; at ParallelAgents=4 all four of this test's
+// tasks launch at once, so overlap is expected well within the 200ms sleep
+// window overlapDetectorAgent uses.
+func TestDriveRunParallelAgentsCapsFanOutConcurrency(t *testing.T) {
+	overlapped := func(t *testing.T, parallelAgents int) bool {
+		_, repo := makeGoRepo(t)
+		agentCmd, overlapFile := overlapDetectorAgent(t)
+		tasks := []taskSpec{{ID: "a", Prompt: "x"}, {ID: "b", Prompt: "x"}, {ID: "c", Prompt: "x"}, {ID: "d", Prompt: "x"}}
+		p := runParams{Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agentCmd, ParallelAgents: parallelAgents}
+		if _, err := driveRun(context.Background(), p, tasks); err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		_, err := os.Stat(overlapFile)
+		return err == nil
+	}
+
+	t.Run("parallelAgents=1 runs strictly serially", func(t *testing.T) {
+		if overlapped(t, 1) {
+			t.Fatal("overlap detected at -parallel-agents 1; agents must run strictly one at a time")
+		}
+	})
+	t.Run("parallelAgents=4 allows concurrent agents", func(t *testing.T) {
+		if !overlapped(t, 4) {
+			t.Fatal("no overlap detected at -parallel-agents 4; want concurrent execution")
+		}
+	})
+}
+
+// TestRunRunParallelAgentsRejectsNegative: -parallel-agents must reject a
+// negative value before any agent runs, same fail-safe posture as every
+// other flag validation in runRun (e.g. -semantic, -lanes).
+func TestRunRunParallelAgentsRejectsNegative(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	var buf bytes.Buffer
+	code, err := runRun(&buf, []string{
+		"-repo", repo, "-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+		"-agent", "true", "-parallel-agents", "-1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "-parallel-agents") {
+		t.Fatalf("err=%v, want a -parallel-agents complaint", err)
+	}
+	if code != exitOperationalError {
+		t.Fatalf("code=%d, want exitOperationalError", code)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("report=%q, want no report written (nothing should have run)", buf.String())
+	}
+}
+
+// TestRunRunParallelAgentsThreadsIntoReportAndOmitsAtDefault: -parallel-agents
+// N reaches report.parallelAgents (the CONFIGURED value, not the resolved
+// GOMAXPROCS-derived cap); a run WITHOUT the flag reports byte-identical to
+// before -parallel-agents existed (the field is omitted, not 0).
+func TestRunRunParallelAgentsThreadsIntoReportAndOmitsAtDefault(t *testing.T) {
+	run := func(extraArgs ...string) string {
+		_, repo := makeGoRepo(t)
+		var buf bytes.Buffer
+		args := append([]string{
+			"-repo", repo, "-tasks", tasksFileFor(t, []taskSpec{{ID: "a", Prompt: "x"}}),
+			"-agent", writeFileAgent("a.txt"), "-json",
+		}, extraArgs...)
+		code, err := runRun(&buf, args)
+		if err != nil {
+			t.Fatalf("runRun: %v\n%s", err, buf.String())
+		}
+		if code != exitOK {
+			t.Fatalf("code=%d, want exitOK\n%s", code, buf.String())
+		}
+		return buf.String()
+	}
+
+	withFlag := run("-parallel-agents", "2")
+	var repWith runReport
+	if err := json.Unmarshal([]byte(withFlag), &repWith); err != nil {
+		t.Fatalf("parse report: %v\n%s", err, withFlag)
+	}
+	if repWith.ParallelAgents != 2 {
+		t.Fatalf("parallelAgents=%d, want 2", repWith.ParallelAgents)
+	}
+
+	without := run()
+	if strings.Contains(without, `"parallelAgents"`) {
+		t.Fatalf("report includes parallelAgents at the default, want omitted (byte-identical to before this flag existed): %s", without)
+	}
+}
+
 // TestRunExitCode exercises the outcome->exit-code mapping directly (the
 // seam runRun uses), including the override precedence when a report matches
 // more than one failure class: verify-failed > no-agent-succeeded > flagged.

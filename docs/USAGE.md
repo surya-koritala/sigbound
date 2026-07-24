@@ -38,6 +38,7 @@ sig run [-config PATH]
         [-lanes off|warn|strict]
         [-no-autocommit]
         [-keep-failed]
+        [-parallel-agents N]
         [-budget D]
         [-logdir DIR]
         [-events FILE]
@@ -85,6 +86,7 @@ sig run [-config PATH]
 | `-lanes` | `warn`* | Lane enforcement: `off`, `warn`, or `strict` (see [File lanes](#file-lanes)). *`-goal` runs default to `strict` instead unless `-lanes` is set explicitly. |
 | `-no-autocommit` | `false` | Do **not** commit edits an agent left uncommitted. By default the driver stages and commits them, so edit-only agents still land. |
 | `-keep-failed` | `false` | Keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected. The path is printed and recorded in the report. Successful agents' worktrees are always removed. A kept worktree stays registered with git until you remove it: `git worktree remove <path>` (or `git worktree prune` after deleting the directory yourself). With `-agent-retries`, only the LAST failed attempt's worktree is kept — every earlier attempt is torn down as it fails. |
+| `-parallel-agents` | `0` | Cap how many agents run concurrently — the fan-out semaphore every agent goes through (see [Parallelism](#parallelism)). `0` (default): today's behavior, unchanged — `runtime.GOMAXPROCS(0)`. Must be `>= 0`. |
 | `-budget` | `0` | Wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (`0` = none). On expiry, outstanding agents are cancelled and fail; integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial. |
 | `-logdir` | — | Write each agent/repair/verify/planner command's **full** stdout+stderr to `<logdir>/<name>.log` (`agent-<id>.log`, `repair-<n>.log`, `verify-<n>.log`, `planner.log`), on top of the truncated tails the report keeps in memory. The directory is created if needed and must be writable — checked before any agent runs, so a bad `-logdir` fails the whole run rather than silently dropping logs partway through. Repeated runs against the same `-logdir` **append** to the same files; there is no per-run rotation. A task's `id` is sanitized for use in the filename (non-alphanumeric characters become `-`), so two exotic ids that sanitize to the same string share one log file. |
 | `-events` | — | Stream one JSON object per line to FILE as the run progresses (see [Events](#events)); `-` writes to stderr. The file is truncated fresh each run. Opening it is checked before any agent runs, same fail-fast policy as `-logdir`; a write failure afterward is best-effort and never fails the run. |
@@ -119,6 +121,25 @@ anything), and integrate/verify are attempted against whatever's left of
 that same expired context. If they can't complete, `sig run` reports an
 honest operational error naming the budget instead of ever landing a
 partial tree — the same `-verify` gate applies as on any other run.
+
+### Parallelism
+
+`-parallel-agents` caps the number of agents `driveRun` runs at once — the
+fan-out semaphore every task's agent command queues on. The default (`0`)
+keeps today's behavior: `runtime.GOMAXPROCS(0)`, a cap sized for CPU-bound
+work. Model agents are not CPU-bound — each one spends almost all its wall
+clock waiting on a network call, so `GOMAXPROCS` under-uses a batch far
+larger than your core count (on a 10-core laptop, only 10 of 512 agents run
+at a time no matter how idle the network is).
+
+**Raise it** (well past `GOMAXPROCS` — `-parallel-agents 64` is a legitimate
+ask for I/O-bound calls) to trade more concurrent API usage for a shorter
+wall clock, up to whatever your model provider's rate limits allow.
+**Lower it** — down to `-parallel-agents 1`, fully serial — when a
+rate-limited key can't sustain many concurrent requests: better one agent at
+a time than a batch that trips 429s and burns retries. There's no wrong
+default to override; pick the number your provider's limits and your
+patience for wall clock actually allow.
 
 ### Scoped verification
 
@@ -1093,6 +1114,7 @@ sig serve -repos /path/a,/path/b [-addr HOST:PORT] [-token-env NAME] [-allow-rem
 | `-env-agent` … `-env-publish` | — | Per-slot allowlists for `-env-mode scoped`, exactly as on `sig run`. Operator-set: a request never chooses what env the daemon's commands see. |
 | `-max-agents-per-run` | `0` (unlimited) | Reject (`400`) a `POST /runs` whose agent count exceeds N, before any run starts. See [Quotas and metering](#quotas-and-metering). |
 | `-max-run-time` | `0` (unlimited) | Cap every run's `-budget` at this duration (e.g. `10m`). See [Quotas and metering](#quotas-and-metering). |
+| `-max-parallel-agents` | `0` (unlimited) | Cap every run's `-parallel-agents` (fan-out concurrency) at N. See [Quotas and metering](#quotas-and-metering). |
 | `-max-concurrent-runs` | `0` (unlimited) | Reject (`429`) a `POST /runs` once N runs are in flight across ALL cells. See [Quotas and metering](#quotas-and-metering). |
 
 ### Posture — single-user, single-process
@@ -1205,6 +1227,7 @@ via the same `-budget` machinery that already bounds a run in flight:
 |------|-------------|
 | `-max-agents-per-run` | The request's agent count exceeds N → `400`. For an explicit `tasks` request the count is exact; for a `goal` (planner) request the true count isn't known until planning runs asynchronously, so the only synchronously-available number — `n`, the planner's already-validated/defaulted target — is checked instead. A BYO planner that ignores `n` is outside what serve can check before starting. |
 | `-max-run-time` | Folded into the run's `-budget` via `min(request budget, server ceiling)` — a request can only make its own budget **stricter**, never laxer than the server's ceiling. An unset/zero request budget (unlimited) becomes exactly the ceiling. |
+| `-max-parallel-agents` | Folded into the run's `-parallel-agents` via the same `min(request value, server ceiling)` as `-max-run-time` above — a request can only narrow its own fan-out concurrency, never exceed the server's. An unset/non-positive request value (today's `GOMAXPROCS` default) becomes exactly the ceiling. An over-ask is silently capped, **not** rejected with a `400` — same posture as `-max-run-time`. |
 | `-max-concurrent-runs` | N runs already in flight **across ALL cells** → `429 Too Many Requests`, naming the limit. This is on top of the existing per-cell `409` (one run per cell) — different cells can still each hold a slot up to N total. The counter is released on every run's completion, success or operational error alike (a `defer`, so it can't leak even on a panic). |
 
 A quota rejection composes cleanly with everything else: it happens strictly
@@ -1433,6 +1456,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
 {
   "repo": "…", "base": "main", "baseSHA": "…",
   "laneMode": "warn",
+  "parallelAgents": 4,
   "tasks":    [ { "id": "…", "prompt": "…", "files": ["…"] } ],
   "perAgent": [ {
     "id": "…", "branch": "…", "sha": "…", "files": ["…"],
@@ -1473,6 +1497,12 @@ With `-json`, `sig run` prints a full report. Top-level shape:
 
 - `integrate.landed` / `integrate.flagged` — branches that merged vs. branches
   set aside for a human (real conflicts).
+- `parallelAgents` is the CONFIGURED `-parallel-agents` value (see
+  [Parallelism](#parallelism)), not the resolved `GOMAXPROCS`-derived cap —
+  omitted at the default (`0`), so a run without `-parallel-agents` reports
+  byte-identical to before the flag existed. The resolved numeric cap that
+  was actually applied is in the `run_start` event instead (see
+  [Events](#events)).
 - `perAgent[].resumed` is `true` iff `-resume` reused that task's `agent/<id>`
   branch outright instead of running its agent again (see
   [Resume](#resume)); always `false` on a run without `-resume`, and false
@@ -1546,7 +1576,7 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 
 | Event | Fields | When |
 |-------|--------|------|
-| `run_start` | `repo`, `base`, `baseSHA`, `tasks` | Once, right after the base ref resolves. |
+| `run_start` | `repo`, `base`, `baseSHA`, `tasks`, `parallelAgents` | Once, right after the base ref resolves. `parallelAgents` is the RESOLVED fan-out cap actually applied (see [Parallelism](#parallelism)) — `-parallel-agents`'s own value when set, else the `GOMAXPROCS`-derived default; always a concrete number here even when `-parallel-agents` wasn't passed. |
 | `agent_start` | `id`, `branch` | Once per task, right before that agent's worktree/command starts. |
 | `agent_done` | `id`, `ok`, `exit`, `attempts`, `files`, `inLane`, `wallMs`, `resumed`* | Once per task, after all of that task's attempts (including `-agent-retries`) finish. *`resumed` is present (`true`) only for a task `-resume` reused outright — see [Resume](#resume) — with `wallMs=0` since no agent command ran; absent for every ordinary task. |
 | `semantic_done` | `edges`, `notes` | Once, only when `-semantic go` is set (see [Semantic conflicts (Go)](#semantic-conflicts-go)) — after every agent finishes, before integration starts. |

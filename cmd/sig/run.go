@@ -219,12 +219,19 @@ type publishJSON struct {
 // simply this same report persisted, so a `sig replay` fed a -manifest file or
 // a `-json` report has identical fields to work from.
 type runReport struct {
-	Repo     string         `json:"repo"`
-	Base     string         `json:"base"`
-	BaseSHA  string         `json:"baseSHA"`
-	LaneMode string         `json:"laneMode"` // lane enforcement mode: off|warn|strict
-	Tasks    []taskSpec     `json:"tasks"`
-	PerAgent []perAgentJSON `json:"perAgent"`
+	Repo     string `json:"repo"`
+	Base     string `json:"base"`
+	BaseSHA  string `json:"baseSHA"`
+	LaneMode string `json:"laneMode"` // lane enforcement mode: off|warn|strict
+	// ParallelAgents is the CONFIGURED -parallel-agents value, not the
+	// resolved cap actually applied -- omitted from JSON at the default (0),
+	// so a run without -parallel-agents reports byte-identical to before
+	// this flag existed. The resolved numeric cap (GOMAXPROCS-derived when
+	// this is 0) is only in the run_start event; see docs/USAGE.md's Events
+	// section.
+	ParallelAgents int            `json:"parallelAgents,omitempty"`
+	Tasks          []taskSpec     `json:"tasks"`
+	PerAgent       []perAgentJSON `json:"perAgent"`
 	// Strategy is the integration strategy this run was configured with (see
 	// -strategy). Duplicated at the top level even though Integrate.Strategy
 	// already carries the strategy actually applied, so a manifest/replay can
@@ -365,8 +372,17 @@ type runParams struct {
 	EventsPath      string        // when set, one JSON event per line is streamed here as the run progresses ("-" = stderr); see eventEmitter
 	AgentTimeout    time.Duration // per-agent command timeout (0 = none); see runAgent
 	AgentRetries    int           // retry a FAILED agent (bad exit or -agent-timeout, never a lane-strict stray) up to this many more times; see runAgentWithRetries
-	Budget          time.Duration // wall-clock ceiling for the agent phase + integrate + verify (0 = none); see driveRun
-	Notes           bool          // when the run LANDS, attach the report as a git note under refs/notes/sigbound on the landed commit; see -notes and attachNote
+	// ParallelAgents caps how many agents run concurrently -- the fan-out
+	// semaphore in driveRun. 0 (default, including a test's zero-value
+	// runParams{}) keeps today's behavior: the cap is runtime.GOMAXPROCS(0),
+	// a CPU-shaped default that's the wrong shape for these I/O-bound model
+	// agents. Raise it past GOMAXPROCS for more wall-clock throughput
+	// (bounded by your model provider's rate limits); lower it -- down to 1,
+	// fully serial -- to stay under a rate-limited key's concurrent-request
+	// ceiling. See -parallel-agents.
+	ParallelAgents int
+	Budget         time.Duration // wall-clock ceiling for the agent phase + integrate + verify (0 = none); see driveRun
+	Notes          bool          // when the run LANDS, attach the report as a git note under refs/notes/sigbound on the landed commit; see -notes and attachNote
 	// PublishCmd, when non-empty, is run ONCE via runPublish after the run
 	// LANDS (base ref advanced; -verify green or unset) — never on a run
 	// that didn't land. cwd = Repo itself (unlike -agent/-verify/-repair,
@@ -433,7 +449,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-semantic go|off] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-semantic go|off] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-parallel-agents N] [-budget D] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset); -publish succeeded or was unset")
@@ -515,6 +531,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	lanes := fs.String("lanes", laneWarn, "lane enforcement for declared file-sets: off (ignore) | warn (record out-of-lane writes, still land) | strict (out-of-lane => failed agent, not landed). warn is best-effort; strict is the real disjointness guarantee. "+
 		"Default is warn, EXCEPT a planned run (-goal) with -lanes not set explicitly defaults to strict, since the planner already promised a disjoint split")
 	keepFailed := fs.Bool("keep-failed", false, "keep a FAILED agent's worktree on disk instead of removing it, so it can be inspected; the path is printed and recorded in the report. Successful agents' worktrees are always removed")
+	parallelAgents := fs.Int("parallel-agents", 0, "cap how many agents run concurrently (the fan-out semaphore driveRun gates every agent through). 0 (default): today's behavior, unchanged -- runtime.GOMAXPROCS(0), "+
+		"a CPU-shaped cap that under-uses these I/O-bound model-agent calls (only GOMAXPROCS of a much larger task count ever run at once). Raise it past GOMAXPROCS for more wall-clock throughput, as high as your model "+
+		"provider's rate limits allow (64 concurrent agent calls is a legitimate ask); lower it -- down to 1, fully serial -- to stay under a rate-limited key's concurrent-request ceiling. Must be >= 0")
 	budget := fs.Duration("budget", 0, "wall-clock ceiling for the whole run: the agent phase, integrate, and verify combined (0 = none). On expiry, outstanding agents are cancelled and fail; "+
 		"integrate/verify then run against whatever's left of that same deadline, and if they can't complete, the run reports an operational error naming the budget instead of landing anything partial")
 	logDir := fs.String("logdir", "", "when set, write each agent/repair/verify/planner command's FULL stdout+stderr to <logdir>/<name>.log "+
@@ -651,6 +670,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	}
 	if err := validateEnvMode(*envMode); err != nil {
 		return exitOperationalError, err
+	}
+	if *parallelAgents < 0 {
+		return exitOperationalError, fmt.Errorf("-parallel-agents must be >= 0 (0 = default: today's GOMAXPROCS-shaped cap), got %d", *parallelAgents)
 	}
 	// A bare "*" in any slot's -env-* allowlist is rejected here, before
 	// anything runs, regardless of -env-mode -- see validateEnvAllow. This
@@ -812,6 +834,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Autocommit:      !*noAutocommit,
 		LaneMode:        laneMode,
 		KeepFailed:      *keepFailed,
+		ParallelAgents:  *parallelAgents,
 		Budget:          *budget,
 		LogDir:          logDirAbs,
 		EventsPath:      *events,
@@ -1134,19 +1157,29 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if p.EnvMode == "" {
 		p.EnvMode = envModeInherit // same in-process default as LaneMode above; slotEnv treats "" as inherit anyway
 	}
+	// -parallel-agents: 0 (or unset, e.g. a test building runParams{} directly)
+	// keeps today's behavior -- runtime.GOMAXPROCS(0), a CPU-shaped cap that's
+	// the wrong shape for these I/O-bound model-agent calls. Resolved once
+	// here so the fan-out semaphore below and the run_start event
+	// (observability) agree on the exact same number.
+	parallelAgents := p.ParallelAgents
+	if parallelAgents <= 0 {
+		parallelAgents = max(1, runtime.GOMAXPROCS(0))
+	}
 	rep = runReport{
 		Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks, LogDir: p.LogDir,
-		Strategy:    p.Strategy,
-		AgentCmd:    p.AgentCmd,
-		ResolverCmd: p.ResolverCmd,
-		VerifyCmd:   p.VerifyCmd,
-		RepairCmd:   p.RepairCmd,
-		PlannerCmd:  p.PlannerCmd,
-		EnvMode:     p.EnvMode,
-		Version:     Version,
-		StartedAt:   runStart.UTC().Format(time.RFC3339),
+		Strategy:       p.Strategy,
+		AgentCmd:       p.AgentCmd,
+		ResolverCmd:    p.ResolverCmd,
+		VerifyCmd:      p.VerifyCmd,
+		RepairCmd:      p.RepairCmd,
+		PlannerCmd:     p.PlannerCmd,
+		EnvMode:        p.EnvMode,
+		ParallelAgents: p.ParallelAgents,
+		Version:        Version,
+		StartedAt:      runStart.UTC().Format(time.RFC3339),
 	}
-	emit.emit("run_start", map[string]any{"repo": p.Repo, "base": p.Base, "baseSHA": baseSHA, "tasks": tasks})
+	emit.emit("run_start", map[string]any{"repo": p.Repo, "base": p.Base, "baseSHA": baseSHA, "tasks": tasks, "parallelAgents": parallelAgents})
 	// Normally wtRoot (and every per-agent worktree under it) is torn down when
 	// the run ends. -keep-failed retains individual failed agents' worktrees
 	// (see runAgent); when any survive, leave wtRoot itself in place too, or
@@ -1176,7 +1209,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	// ---- fan out: one agent per task, each in its own isolated worktree ----
 	agents := make([]perAgentJSON, len(tasks))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, max(1, runtime.GOMAXPROCS(0)))
+	sem := make(chan struct{}, parallelAgents)
 	for i := range tasks {
 		wg.Add(1)
 		sem <- struct{}{}
