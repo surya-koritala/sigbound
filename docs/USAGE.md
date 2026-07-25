@@ -2486,19 +2486,19 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 | `parked` | `reason`, `verifiedSHA`, `baseSHA`, `forkSHA`, `branches`, `matchedPaths` | Once, when a policy-held group's own tree verified green and was parked for an ack (see [Run parking](#run-parking)). |
 | `park_failed` | `branches`, `flagged`, `error`, `output` | Once, when a held group could NOT be offered as a landing (a conflict among the held branches, or a red verify). Nothing is parked; the branches stay flagged. |
 | `audit_selected` | `runId`, `sample`, `sha` | Once, when a clean landing was drawn into the `audit-sample` (see [Spot-audit sampling](#spot-audit-sampling)). |
-| `repark` | `attempt`, `verdict`, `baseSHA`, `finalSHA` | Once per re-verify cycle an ack ran because the base had moved. `verdict` is `green` or `red`; a red one leaves the run parked. |
-| `ack` | `actor`, `sha`, `reverified`, `attempt`* | Once, when an ack landed. `actor` is `cli` or `http`; `reverified` says whether the base had moved. *`attempt` only on a re-verified landing. |
-| `ack_refused` | `actor`, `attempt`, `verifiedSHA`, `baseSHA`, `movedTo` | An ack re-verified green but the base moved again while it ran, so nothing landed. The green result is re-parked against `baseSHA` — the head it was verified on — and the run stays `awaiting-ack`; ack again to land it against current state. |
-| `reject` | `actor`, `reason` | Once, when a park was rejected. `actor` is `cli`, `http`, or `timeout` for an expired `ack-timeout`. |
+| `repark` † | `attempt`, `verdict`, `baseSHA`, `finalSHA` | Once per re-verify cycle an ack ran because the base had moved. `verdict` is `green` or `red`; a red one leaves the run parked. |
+| `ack` † | `actor`, `sha`, `reverified`, `attempt`* | Once, when an ack landed. `actor` is `cli` or `http`; `reverified` says whether the base had moved. *`attempt` only on a re-verified landing. |
+| `ack_refused` † | `actor`, `attempt`, `verifiedSHA`, `baseSHA`, `movedTo` | An ack re-verified green but the base moved again while it ran, so nothing landed. The green result is re-parked against `baseSHA` — the head it was verified on — and the run stays `awaiting-ack`; ack again to land it against current state. |
+| `reject` † | `actor`, `reason` | Once, when a park was rejected. `actor` is `cli`, `http`, or `timeout` for an expired `ack-timeout`. |
 | `publish_start` | — | Once, right before the `-publish` command runs. Only emitted when `-publish` is set AND the run landed. |
 | `publish_done` | `ok`, `exit`, `wallMs` | Once, right after the `-publish` command finishes. |
 | `run_done` | `ok`, `exitCode`, `wallMs` | Once, always last — even on a mid-run operational error. |
 
 `-events` off (the default, empty `-events`) emits nothing at all.
 
-The last five are appended to a `sig serve` run's `events.ndjson` **after** the
-run itself finished — an ack can arrive days later — so `run_done` is the last
-event of the RUN, not necessarily the last line in the file.
+Events marked † are appended to a `sig serve` run's `events.ndjson` **after**
+the run itself finished — an ack can arrive days later — so `run_done` is the
+last event of the RUN, not necessarily the last line in the file.
 
 ---
 
