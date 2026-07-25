@@ -1572,8 +1572,11 @@ func parseDur(s string, def time.Duration) (time.Duration, error) {
 //
 // The startup crash-recovery sweep runs here too. It is `sig serve`'s at
 // newServer, but a repo that never runs a daemon has no other moment to heal a
-// dir a Ctrl-C left saying "running"; a live daemon's runs are untouched either
-// way, since recovery only ever rewrites a DEAD pid's (see recoverStaleRuns).
+// dir a Ctrl-C left saying "running". Recovery only rewrites a run whose pid
+// the liveness probe reports gone (see recoverStaleRuns) -- which on unix
+// leaves a live daemon's runs alone, and on Windows leaves nothing alone,
+// because pidAlive has no implementation there and calls every pid dead (see
+// issue #94, and the recovery section in docs/USAGE.md for what that costs).
 func startRunDir(ctx context.Context, g *gitx.Git) (dir, runID string, err error) {
 	common, err := g.GitCommonDir(ctx)
 	if err != nil {

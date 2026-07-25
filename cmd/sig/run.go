@@ -1108,14 +1108,26 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	// is still emitted (and the manifest still written) first — a failure here
 	// means the operator needs both, not neither.
 	_, parkErr := finishRunDir(runDir, rep)
-	if err := emitReport(w, rep, *asJSON); err != nil {
-		return exitOperationalError, err
-	}
+	// The report and the manifest are written whatever happened, and parkErr
+	// outranks a stdout failure when both go wrong: a broken pipe costs the
+	// operator a printout they can regenerate from the manifest, while a lost
+	// parking record is the one write here that strands a verified landing.
+	// Returning on the emit error first would discard parkErr and skip the
+	// manifest, hiding the worse failure behind the lesser one.
+	emitErr := emitReport(w, rep, *asJSON)
 	if manifestPath != "" {
 		writeManifest(manifestPath, rep)
 	}
 	if parkErr != nil {
+		// Mark the dir too. Every other failure in this function records a
+		// phase, and this process is about to exit -- left saying "running" the
+		// run reads as live forever, until some later invocation's recovery
+		// sweep heals it to the vaguer "interrupted".
+		writeRunStatus(runDir, "error", parkErr.Error())
 		return exitOperationalError, fmt.Errorf("write the parking record for run %s (the landing verified, but nothing can release it until this record exists; the branches are kept): %w", runID, parkErr)
+	}
+	if emitErr != nil {
+		return exitOperationalError, emitErr
 	}
 	return code, nil
 }

@@ -624,7 +624,9 @@ func TestAuditSelectedIsDeterministic(t *testing.T) {
 			}
 		}
 	}
-	// A run with no id (i.e. `sig run`) is never sampled.
+	// A run with no id -- an in-process driveRun caller that made no run dir;
+	// every `sig run` and `sig serve` invocation has one since issue #137 -- is
+	// never sampled.
 	if auditSelected("", 100) {
 		t.Fatal("an empty run id was sampled")
 	}
