@@ -30,10 +30,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/surya-koritala/sigbound/cell"
@@ -337,25 +339,127 @@ func lockParkFile(dir string) (unlock func(), ok bool) {
 	return nil, false
 }
 
-// writePark records pk atomically (write-then-rename, the same pattern
-// writeRunStatus and verifyCacheStore use): a concurrent GET /inbox must never
-// observe a torn park.json. Unlike the other durable writers in this codebase
-// this one RETURNS its error — park.json is not a log, it is the only record of
-// a verified landing that has not landed yet, so losing it must be loud.
+// atomicWriteFile publishes data as dir/name in one step: write a temp file in
+// the same directory, then rename it over the target. Rename is atomic within a
+// filesystem, so a reader sees either the whole old file or the whole new one.
+//
+// THE TEMP NAME MUST BE UNIQUE PER WRITER, and that is the entire reason this
+// helper exists rather than three near-identical copies of the pattern. Every
+// durable writer here used to build a FIXED temp path (".park.json.tmp",
+// ".status.json.tmp", "."+key+".tmp"), so two concurrent writers opened the SAME
+// temp file, interleaved their bytes in it, and the rename then published the
+// mixture. That is worse than the torn read the pattern exists to prevent: the
+// published file is CORRUPT and stays corrupt. Measured at roughly 1 in 400
+// concurrent writer pairs on a loaded machine — rare enough to survive review,
+// common enough to happen in a fleet. With os.CreateTemp the only thing two
+// writers share is the rename, which is atomic and last-writer-wins: the loser's
+// bytes are discarded whole, which is the correct outcome for every caller here.
+//
+// perm is applied explicitly because os.CreateTemp makes 0600 and these are
+// world-readable artifacts like every other file in a run dir.
+func atomicWriteFile(dir, name string, data []byte, perm os.FileMode) error {
+	f, err := os.CreateTemp(dir, "."+name+".*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	// Every exit that is not the rename removes the temp: a leaked dot-file in a
+	// run dir is one more thing readers, `sig gc` and the next operator have to
+	// know to ignore.
+	defer func() {
+		if tmp != "" {
+			os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, perm); err != nil {
+		return err
+	}
+	if err := renameOver(tmp, filepath.Join(dir, name)); err != nil {
+		return err
+	}
+	tmp = "" // renamed away: there is no temp left to clean up
+	return nil
+}
+
+// Windows error numbers, spelled numerically because syscall's names for them
+// exist only in the windows build while this file compiles everywhere: 5 is
+// ERROR_ACCESS_DENIED, 32 is ERROR_SHARING_VIOLATION.
+const (
+	winErrorAccessDenied     = syscall.Errno(5)
+	winErrorSharingViolation = syscall.Errno(32)
+)
+
+// The Windows rename retry budget: ten attempts backing off 10ms, 20ms ... 90ms,
+// so a contended rename gets about half a second before it gives up. Long enough
+// to outlast a reader or a virus scanner holding a handle, short enough that a
+// genuinely stuck destination still fails while somebody is watching.
+const (
+	atomicRenameAttempts = 10
+	atomicRenameBackoff  = 10 * time.Millisecond
+)
+
+// renameOver publishes tmp as dst, retrying briefly when Windows says the
+// destination is busy.
+//
+// On POSIX this is one os.Rename and nothing else: rename(2) replaces the
+// destination atomically no matter who has it open, so there is nothing to
+// retry. WINDOWS IS DIFFERENT, and it failed CI exactly this way. os.Rename
+// there is MoveFileEx with MOVEFILE_REPLACE_EXISTING, which needs delete access
+// to the destination — and Go opens files with FILE_SHARE_READ|FILE_SHARE_WRITE
+// and no FILE_SHARE_DELETE, so ANY concurrent reader of the destination,
+// including our own readPark, makes the rename fail with ERROR_ACCESS_DENIED.
+// It is not confined to our own concurrency either: virus scanners and search
+// indexers routinely take brief handles on a freshly written file, which makes a
+// single-shot rename fragile on Windows even in a single-threaded program.
+//
+// The failure was always SAFE — a rename that fails publishes nothing, the old
+// record stays intact and the caller gets an error — so this is about not
+// failing a write that would have succeeded a moment later, never about
+// correctness.
+func renameOver(tmp, dst string) error {
+	for attempt := 1; ; attempt++ {
+		err := os.Rename(tmp, dst)
+		if err == nil || attempt == atomicRenameAttempts || !renameContended(err) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt) * atomicRenameBackoff)
+	}
+}
+
+// renameContended reports whether err is Windows saying somebody else holds the
+// destination open. The GOOS test is what keeps POSIX behaviour byte-identical:
+// runtime.GOOS is a compile-time constant, so the loop above collapses to a
+// single os.Rename off Windows and a genuine EACCES on Unix is still returned
+// immediately rather than retried for half a second.
+func renameContended(err error) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	var errno syscall.Errno
+	return errors.As(err, &errno) && (errno == winErrorAccessDenied || errno == winErrorSharingViolation)
+}
+
+// writePark records pk atomically (see atomicWriteFile): a concurrent GET /inbox
+// must never observe a torn park.json, and two concurrent writers must never
+// publish a mixture of both records. Unlike the other durable writers in this
+// codebase this one RETURNS its error — park.json is not a log, it is the only
+// record of a verified landing that has not landed yet, so losing it must be
+// loud. A record that cannot be read back is permanent damage: ack, reject and
+// the timeout sweep all refuse to act on it, and loadParkedBranches fails
+// closed, so one wedged park disables `sig gc` for the whole repository.
 func writePark(dir string, pk *parkJSON) error {
 	data, err := json.MarshalIndent(pk, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(dir, ".park.json.tmp")
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, parkFileName)); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
+	return atomicWriteFile(dir, parkFileName, data, 0o644)
 }
 
 // readPark reads and VALIDATES dir's park.json. Every failure — missing,
@@ -433,12 +537,34 @@ func writeParkCAS(dir string, want []byte, pk *parkJSON) error {
 //   - the park is UNRESOLVED: the holder is live (refuse) or crashed
 //     mid-resolution (steal, once the claim is older than parkClaimStale).
 //
-// ponytail: two resolvers arriving within microseconds of EACH OTHER, minutes
-// after a crash, can both judge the same claim stale and both steal it — the
-// post-create ownership re-read below closes the common ordering of that, and
-// the residual needs a doubly-nested interleaving on a path that only runs after
-// a crash. Upgrade to a rename-based steal with a content token if a real
-// deployment ever shows it.
+// THE STEAL PATH DOES NOT GUARANTEE EXCLUSION, and nothing downstream may be
+// written as though it does. Two resolvers arriving within microseconds of each
+// other, minutes after a crash, can both judge the same stale claim dead: the
+// post-create ownership re-read below closes only the ordering where the second
+// stealer's remove lands between the first's create and its re-read, and the
+// complementary ordering — first stealer re-reads its own token before the
+// second removes it — is open. Measured under CPU oversubscription (20 hogs on
+// 10 cores, 64 processes x 40 rounds) at about 5% of rounds with two concurrent
+// holders. The clean create path is unaffected: O_EXCL alone decides it.
+//
+// WHAT ACTUALLY SERIALIZES A RESOLUTION IS THE RECORD WRITE, not this claim. Two
+// holders both proceed to writeParkCAS, which compares the bytes it is replacing
+// against the ones the caller read, so the second one is refused and lands
+// nothing. In the narrower case where both compares pass — each read landing
+// before either write — what gets published is still one WHOLE record rather
+// than a mixture of two, because writePark goes through a UNIQUE temp file (see
+// atomicWriteFile) and the losing rename is simply overwritten. Under the old
+// shared temp that case published a corrupt park.json instead, which no ack,
+// reject, sweep or gc could ever act on again.
+//
+// The front doors additionally do not reach this path at all in practice, by an
+// ordering that is documented and tested at both call sites: ackRun and
+// rejectRun each run enforceParkTimeout first, whose own claim+release reaps a
+// crashed resolver's stale claim, so their claimPark sees either no claim (clean
+// O_EXCL create) or a young one (refused). See ackRun.
+//
+// ponytail: rename-based steal with a content token is the real fix; it is not
+// worth it while the record write is the serialization point anyway.
 func claimPark(dir string) (release func(), err error) {
 	path := filepath.Join(dir, parkClaimName)
 	token := fmt.Sprintf("%d %d %s", os.Getpid(), parkClaimSeq.Add(1), time.Now().UTC().Format(time.RFC3339Nano))
@@ -470,12 +596,31 @@ func claimPark(dir string) (release func(), err error) {
 		if serr != nil {
 			continue // vanished between the create and the stat: retry the create
 		}
-		if time.Since(fi.ModTime()) < parkClaimStale {
-			return nil, errParkBusy
+		if held := time.Since(fi.ModTime()); held < parkClaimStale {
+			return nil, parkBusyErr(path, held)
 		}
 		os.Remove(path) // holder crashed mid-resolution: steal once, then retry
 	}
 	return nil, errParkBusy
+}
+
+// parkBusyErr explains a claim that is present and not yet stale. Plain
+// errParkBusy says "another ack or reject is in progress", which is only ONE of
+// the two things this state means and, for the ten minutes after a crash, the
+// wrong one: a resolver that died holding the claim leaves a file indistinguish-
+// able from a live holder's, and an operator told a resolution is in progress
+// goes looking for a process that does not exist. Name both cases and say when a
+// retry can win. It wraps the sentinel, so both front doors still map it to the
+// same 409 without knowing any of this.
+func parkBusyErr(path string, held time.Duration) error {
+	who := ""
+	if data, rerr := os.ReadFile(path); rerr == nil {
+		if fields := strings.Fields(string(data)); len(fields) > 0 {
+			who = fmt.Sprintf(" (claimed by pid %s)", fields[0])
+		}
+	}
+	return fmt.Errorf("%w%s — or that resolver crashed, in which case the claim is reclaimable in %s",
+		errParkBusy, who, (parkClaimStale - held).Round(time.Second))
 }
 
 // parsePark decodes and validates park.json's bytes — split from readPark so the
@@ -725,7 +870,10 @@ func auditSelected(runID string, pct int) bool {
 var errNotAwaitingAck = errors.New("run is not awaiting ack")
 
 // errParkBusy is returned when another ack, reject, or timeout sweep holds this
-// run's lock. Also a 409: the caller should look again, not retry blindly.
+// run's lock or its resolution claim. Also a 409: the caller should look again,
+// not retry blindly. claimPark wraps it with parkBusyErr, which says how long
+// the claim has left before a crashed holder's is reclaimable — the bare text
+// here is a live-holder claim this code cannot actually make.
 var errParkBusy = errors.New("another ack or reject is in progress for this run")
 
 // errParkChanged is writeParkCAS's refusal: the record changed under a writer
@@ -785,6 +933,16 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 	// the timeout here too, not just on the read paths, so the answer never
 	// depends on whether anyone happened to look at the inbox first. Runs BEFORE
 	// the lock below, since it takes the same lock itself.
+	//
+	// LOAD-BEARING ORDERING, do not move this below the claim. enforceParkTimeout
+	// takes and releases the resolution claim in its own right, which REAPS a
+	// stale claim left by a crashed resolver. That is what keeps the front doors
+	// off claimPark's steal path — the one path where exclusion is not guaranteed
+	// (see claimPark) — because by the time the claim below is taken, the claim
+	// file is either absent or young, and a young claim is refused rather than
+	// stolen. The property was incidental and undocumented until it was measured;
+	// TestFrontDoorsEnforceTimeoutBeforeClaiming pins it so a reorder cannot
+	// silently reopen the hole.
 	enforceParkTimeout(ctx, c.Git(), dir)
 
 	unlock, ok := lockPark(dir)
@@ -818,18 +976,28 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 		// base-moved path below discards it entirely and rebuilds from the fork
 		// point, and refusing that because a commit it never reads looks wrong
 		// would strand a perfectly recoverable park.
-		// THE SERIALIZATION POINT: an atomic one-shot claim on this run's single
-		// terminal transition, taken before anything is decided and released only
-		// once it is committed. This — not the advisory lock, and not the CAS — is
-		// what makes `rejected` terminal, and it holds on every platform because
-		// O_EXCL create is atomic in the filesystem. See claimPark.
+		// An atomic one-shot claim on this run's single terminal transition. It is
+		// a NARROWING, not the serialization point: it holds on every platform
+		// because O_EXCL create is atomic in the filesystem, but two resolvers can
+		// still both hold it on the post-crash steal path (see claimPark). What
+		// makes `rejected` terminal is the RECORD — resolvedAt, written under
+		// writeParkCAS's compare — and these are two overlapping guards, either of
+		// which alone closes the ack-vs-reject race. Mutating one at a time
+		// therefore changes no outcome, which is a property of the design and not
+		// a gap in the tests; what each one uniquely covers is pinned separately
+		// (TestClaimParkIsAtomicAndRecovers, TestWriteParkCASRefusesAStaleWrite,
+		// TestAckRefusesAResolvedRecordUnderTheClaim).
 		unclaim, cerr := claimPark(dir)
 		if cerr != nil {
 			return ackOutcome{}, cerr
 		}
 		defer unclaim()
-		// Revalidate UNDER the claim: the previous holder may have resolved this
-		// run and released between our status read above and the claim.
+		// Revalidate UNDER the claim. This is the ONE check the CAS below cannot
+		// stand in for: a resolver that crashed between its record write and its
+		// status write leaves a park whose record says resolved while status.json
+		// still says awaiting-ack, so the bytes read above already match disk and
+		// the compare would pass. Without this the ack would land a REJECTED park.
+		// Pinned by TestAckRefusesAResolvedRecordUnderTheClaim.
 		if err := recheckResolvable(dir, &raw, &pk); err != nil {
 			return ackOutcome{}, err
 		}
@@ -838,10 +1006,14 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 		}
 		pk.LandedSHA = pk.VerifiedSHA
 		pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
-		// Record before the ref moves, so a crash leaves a park claiming a landing
-		// that did not happen (idempotently re-landed by the next ack) rather than
-		// losing the record of one that did. Kept structurally identical to
-		// ackReverify's commit phase so nobody has to work out which is safe.
+		// Record before the ref moves. A crash between the two then leaves a park
+		// claiming a landing that did not happen, which is the survivable side: the
+		// record is terminal, so the run stops dead and an operator has to look at
+		// it, rather than a landing that really happened losing its record and
+		// being offered for ack all over again. The next ack does NOT re-land it —
+		// recheckResolvable refuses a record with a resolvedAt — which is the
+		// fail-closed direction. Kept structurally identical to ackReverify's
+		// commit phase so nobody has to work out which is safe.
 		if err := writeParkCAS(dir, raw, pk); err != nil {
 			return ackOutcome{}, fmt.Errorf("claim the parking record (nothing was landed): %w", err)
 		}
@@ -929,10 +1101,12 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 	// ---- commit phase: everything below decides state ----
 	// The verify above may have taken minutes. In that window a human may have
 	// rejected this run, or its ack-timeout may have expired and auto-rejected
-	// it. Both must WIN. THE SERIALIZATION POINT is the same atomic one-shot
-	// claim ackRun's direct-land branch takes (see claimPark) — it covers the RED
-	// path too, so an attempt record can never interleave with somebody else's
-	// resolution either.
+	// it. Both must WIN, and here the RECORD is what guarantees it: raw is by
+	// construction minutes stale, so writeParkCAS's compare fails against
+	// anything that changed while the verify ran. The claim taken below is the
+	// same narrowing ackRun's direct-land branch takes (see claimPark), covering
+	// the RED path too so an attempt record cannot interleave with somebody
+	// else's resolution either.
 	unclaim, cerr := claimPark(dir)
 	if cerr != nil {
 		return ackOutcome{}, cerr
@@ -972,11 +1146,11 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 		return ackOutcome{}, fmt.Errorf("tree of re-verified %s: %w", short(finalSHA), terr)
 	}
 	// Record before the ref moves, exactly as in ackRun's direct-land branch —
-	// under the resolution claim taken above. That ordering also puts the crash
-	// window on the survivable side: a crash between the two leaves a park that
-	// says it landed when it did not, which the next ack resolves idempotently
-	// (the base is unchanged, so it re-lands the same commit), whereas the
-	// reverse order would lose the record of a landing that really happened.
+	// under the resolution claim taken above. That ordering puts the crash window
+	// on the survivable side: a crash between the two leaves a park that says it
+	// landed when it did not, which is terminal and visible, whereas the reverse
+	// order would lose the record of a landing that really happened and offer it
+	// for ack a second time.
 	pk.VerifiedSHA, pk.VerifiedTree, pk.BaseSHA = finalSHA, tree, current
 	pk.LandedSHA = finalSHA
 	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
@@ -996,10 +1170,17 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 }
 
 // recheckResolvable re-reads a run's status and parking record while the caller
-// holds the resolution claim, refreshing both in place. It is what turns the
-// claim into a real gate: the claim can be won moments after a PREVIOUS holder
-// resolved the run and released, so holding it proves only that nobody else is
-// resolving right now — not that the run still needs resolving.
+// holds the resolution claim, refreshing both in place. Holding the claim proves
+// only that nobody else is resolving RIGHT NOW — the claim can be won moments
+// after a previous holder resolved the run and released — so this is what turns
+// it into a gate on the run still needing resolution at all.
+//
+// Its unique contribution, the one writeParkCAS cannot make: a caller whose
+// bytes still match disk passes the CAS, and a resolver that crashed between its
+// record write and its status write leaves exactly that state (record resolved,
+// status.json still awaiting-ack). Only re-reading the record catches it. On
+// rejectRun and enforceParkTimeout it is load-bearing more bluntly still — they
+// have no earlier read, so this call is where raw and pk come from at all.
 func recheckResolvable(dir string, raw *[]byte, pk **parkJSON) error {
 	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
 		return fmt.Errorf("%w (status %s)", errNotAwaitingAck, st)
@@ -1063,7 +1244,13 @@ func validateParkedLanding(ctx context.Context, g *gitx.Git, pk *parkJSON) error
 // never a decision to destroy the work. reason is optional and recorded verbatim.
 func rejectRun(ctx context.Context, g *gitx.Git, dir, actor, reason string) (ackOutcome, error) {
 	runID := filepath.Base(dir)
-	enforceParkTimeout(ctx, g, dir) // claims in its own right; must run before we hold one
+	// LOAD-BEARING ORDERING, identical to ackRun's and for the same reason: this
+	// claims in its own right, so it must run before we hold one — and its
+	// claim+release is what reaps a crashed resolver's stale claim, keeping the
+	// claimPark below on the clean O_EXCL create path instead of the steal path,
+	// where exclusion is not guaranteed (see claimPark). Pinned by
+	// TestFrontDoorsEnforceTimeoutBeforeClaiming.
+	enforceParkTimeout(ctx, g, dir)
 	// THE SERIALIZATION POINT, the same atomic one-shot claim both ack paths
 	// take: a rejection is a terminal resolution, and a run resolves exactly
 	// once. See claimPark.

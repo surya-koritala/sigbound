@@ -138,13 +138,9 @@ func verifyCacheStore(ctx context.Context, g *gitx.Git, treeOID, resolvedCmd str
 		return
 	}
 	key := verifyCacheKey(treeOID, cmdHash)
-	// Write-then-rename: a concurrent `sig run` verifying the same tree at
-	// the same time must never observe a torn/partial entry.
-	tmp := filepath.Join(dir, "."+key+".tmp")
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, key)); err != nil {
-		os.Remove(tmp)
-	}
+	// Write-then-rename through the shared helper: two `sig run`s verifying the
+	// same tree at the same time write the SAME key, so the temp file this goes
+	// through must be unique per writer or they interleave their bytes in it and
+	// the rename publishes the mixture. See atomicWriteFile.
+	_ = atomicWriteFile(dir, key, data, 0o644)
 }

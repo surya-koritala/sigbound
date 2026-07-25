@@ -1572,15 +1572,12 @@ func writeRunStatus(dir, status, note string) {
 	if err != nil {
 		return
 	}
-	// Write-then-rename (same pattern as verifyCacheStore): a concurrent GET
-	// must never observe a torn status.json.
-	tmp := filepath.Join(dir, ".status.json.tmp")
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, "status.json")); err != nil {
-		os.Remove(tmp)
-	}
+	// Write-then-rename through the shared helper: a concurrent GET must never
+	// observe a torn status.json, and the run dir has genuinely concurrent
+	// writers — an ack, a reject and the lazy timeout sweep can all be resolving
+	// the same run from different processes — so the temp file this goes through
+	// must be unique per writer. See atomicWriteFile.
+	_ = atomicWriteFile(dir, "status.json", data, 0o644)
 }
 
 func readRunStatus(dir string) (*runStatusFile, error) {
