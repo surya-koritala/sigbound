@@ -200,6 +200,26 @@ func (g *Git) TreeOID(ctx context.Context, rev string) (string, error) {
 	return g.run(ctx, "rev-parse", "--verify", rev+"^{tree}")
 }
 
+// IsAncestor reports whether ancestor is reachable from descendant
+// (`git merge-base --is-ancestor`), git's own exit-code predicate: 0 yes, 1 no,
+// anything else a real failure. A commit is its own ancestor, matching git. Used
+// to check that a recorded landing still descends from the base it was computed
+// against before that landing is allowed to move a ref.
+func (g *Git) IsAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	_, stderr, code, err := g.runRaw(ctx, "merge-base", "--is-ancestor", ancestor, descendant)
+	if err != nil {
+		return false, err
+	}
+	switch code {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		return false, fmt.Errorf("merge-base --is-ancestor %s %s: exit %d: %s", ancestor, descendant, code, strings.TrimSpace(stderr))
+	}
+}
+
 // GitCommonDir returns the absolute path of the repo's SHARED git directory
 // (`git rev-parse --path-format=absolute --git-common-dir`) — the main
 // repo's .git, even when g points at a linked worktree (a worktree's own

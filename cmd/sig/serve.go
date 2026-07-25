@@ -243,6 +243,12 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		// now, before the server accepts any request, so GET reports it
 		// honestly instead of "running" forever. See recoverStaleRuns.
 		recoverStaleRuns(rc.runsDir, os.Getpid())
+		// Parking (issue #109) deliberately survives that sweep — awaiting-ack is
+		// durable, and recoverStaleRuns only ever rewrites queued/running. What a
+		// restart DOES owe a parked run is the lazy ack-timeout: a daemon that was
+		// down past a park's deadline must report it expired from its first
+		// request onward, not from whenever someone next opens the inbox.
+		expireParks(ctx, c.Git(), rc.runsDir)
 	}
 	return s, nil
 }
@@ -271,6 +277,13 @@ func (s *server) handler() http.Handler {
 	// field, so serving the shell unauthenticated leaks nothing.
 	mux.HandleFunc("GET /runs/{id}/flagged", s.handleFlagged)
 	mux.HandleFunc("GET /runs/{id}/flagged/{rest...}", s.handleFlaggedDetail)
+	// Run parking (issue #109). These two POSTs are the ONLY mutating endpoints
+	// besides POST /runs, and the only ones the review UI can reach — an ack does
+	// not integrate anything new by itself, it releases a landing this daemon
+	// already computed and verified. GET /inbox is the read side.
+	mux.HandleFunc("POST /runs/{id}/ack", s.handleAck)
+	mux.HandleFunc("POST /runs/{id}/reject", s.handleReject)
+	mux.HandleFunc("GET /inbox", s.handleInbox)
 	mux.HandleFunc("GET /ui", s.handleUI)
 	mux.HandleFunc("GET /ui/", s.handleUI)
 	mux.HandleFunc("GET /usage", s.handleUsageAggregate)
@@ -498,6 +511,9 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	p.EventsPath = filepath.Join(dir, "events.ndjson")
+	// The run id is the key the spot-audit sample is drawn on (see
+	// auditSelected): a recorded, replayable id, never a fresh random draw.
+	p.RunID = runID
 	go s.execRun(rec, p, req.Tasks, plan, haveGoal)
 
 	writeJSON(w, http.StatusAccepted, map[string]string{
@@ -563,9 +579,23 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 	}
 	writeRunReport(rec.dir, rep)
 	writeRunUsage(rec.dir, computeUsage(&rep, time.Since(rec.startedAt).Milliseconds(), reportFileSize(rec.dir)))
-	writeRunStatus(rec.dir, "done", "")
+	// Parking (issue #109): a run that verified a landing but deliberately did
+	// not advance the ref is NOT done — it is awaiting a human. park.json is
+	// written BEFORE the status flips, so a crash in between leaves a parked run
+	// looking merely interrupted rather than an awaiting-ack run with no record
+	// of what it would land. A park.json that cannot be written is therefore a
+	// hard failure for the run, not a best-effort miss like the report.
+	status := "done"
+	if rep.Park != nil {
+		if err := writePark(rec.dir, rep.Park); err != nil {
+			s.failRun(rec, "write parking record: "+err.Error())
+			return
+		}
+		status = statusAwaitingAck
+	}
+	writeRunStatus(rec.dir, status, "")
 	s.mu.Lock()
-	rec.status = "done"
+	rec.status = status
 	rec.finalSHA = rep.Integrate.FinalSHA
 	s.mu.Unlock()
 }
@@ -593,6 +623,10 @@ type runStatusResponse struct {
 	Error     string     `json:"error,omitempty"`
 	Report    *runReport `json:"report,omitempty"`
 	Usage     *UsageJSON `json:"usage,omitempty"`
+	// Park is the run's parking record (issue #109), present whenever park.json
+	// exists and reads back — on an awaiting-ack run it is what an ack would
+	// land; on a done/rejected one it is the record of what happened to it.
+	Park *parkJSON `json:"park,omitempty"`
 }
 
 func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
@@ -625,12 +659,30 @@ func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		// including "interrupted" for one that process left mid-flight.
 		status, errMsg = diskRunStatus(fdir)
 	}
+	// Lazy ack-timeout (issue #109): reading a run is one of the moments an
+	// expired park becomes rejected, so a caller never sees awaiting-ack for a
+	// park already past its deadline. A run this process owns gets its in-memory
+	// status refreshed from disk to match.
+	if rc := s.byKey[cellID]; rc != nil && enforceParkTimeout(r.Context(), rc.cell.Git(), dir) {
+		status, errMsg = diskRunStatus(dir)
+		if rec != nil {
+			s.mu.Lock()
+			rec.status = status
+			s.mu.Unlock()
+		}
+	}
 
 	resp := runStatusResponse{ID: id, Cell: cellID, Status: status}
 	if !startedAt.IsZero() {
 		resp.StartedAt = startedAt.UTC().Format(time.RFC3339)
 	}
-	if status == "done" {
+	if pk, err := readPark(dir); err == nil {
+		resp.Park = pk
+	}
+	// The report is the run's own record and exists from the moment driveRun
+	// returns, which is also when a park is created — so a parked (or since
+	// rejected) run serves it exactly like a done one.
+	if status == "done" || status == statusAwaitingAck || status == statusRejected {
 		if rep, err := readRunReport(dir); err == nil {
 			resp.Report = rep
 			if resp.StartedAt == "" {
@@ -1029,6 +1081,114 @@ func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
 		Theirs:  side("theirs"),
 		BaseSHA: rep.BaseSHA,
 	})
+}
+
+// ---- run parking surface (issue #109) ----
+
+// ackRequest is the optional POST /runs/{id}/ack|reject body. Only `reason` is
+// accepted, and only by reject — an ack carries no data because it decides
+// nothing about WHAT lands: that was fixed when the run parked. Unknown fields
+// are rejected like every other body on this daemon.
+type ackRequest struct {
+	Reason string `json:"reason"`
+}
+
+func (s *server) handleAck(w http.ResponseWriter, r *http.Request) { s.handleAckReject(w, r, true) }
+
+func (s *server) handleReject(w http.ResponseWriter, r *http.Request) {
+	s.handleAckReject(w, r, false)
+}
+
+// handleAckReject is the HTTP front door onto ackRun/rejectRun — it validates
+// and locks, then delegates every decision about what lands to that shared
+// function, which `sig ack`/`sig reject` call identically.
+//
+// It holds the cell's run slot for the duration, the same slot POST /runs
+// takes: an ack whose base moved runs a real integrate + verify against the cell
+// and then moves the base ref, so it must serialize with runs and with other
+// acks exactly as a run does. That is also what makes a second ack arriving
+// while a re-verify is in flight a 409 rather than two concurrent landings. The
+// global -max-concurrent-runs counter is deliberately NOT taken: refusing to
+// release an already-verified landing because the daemon is busy would be a
+// quota applied to the wrong thing.
+func (s *server) handleAckReject(w http.ResponseWriter, r *http.Request, ack bool) {
+	id := r.PathValue("id")
+	if !validRunID(id) {
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
+		return
+	}
+	rc, dir, ok := s.locateRun(id)
+	if !ok || rc == nil {
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
+		return
+	}
+	var body ackRequest
+	r.Body = http.MaxBytesReader(w, r.Body, serveMaxBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), codeBadRequest)
+		return
+	}
+	if ack && strings.TrimSpace(body.Reason) != "" {
+		writeErr(w, http.StatusBadRequest, "reason applies to reject, not ack", codeBadRequest)
+		return
+	}
+
+	cellID := rc.cell.ID()
+	s.mu.Lock()
+	if s.busy[cellID] {
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, fmt.Sprintf("cell %s (%s) is busy with a run or another ack; one at a time", cellID, rc.cell.Repo()), codeCellBusy)
+		return
+	}
+	s.busy[cellID] = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.busy[cellID] = false
+		s.mu.Unlock()
+	}()
+
+	var out ackOutcome
+	var err error
+	if ack {
+		// s.baseCtx, NOT the request's: an ack is a durable state transition, and
+		// its re-verify can run as long as the repo's verify command does. On the
+		// request context, a client timeout or a closed browser tab would abort a
+		// real integrate+verify partway and record it as a RED attempt — a park
+		// claiming "verify failed" when nobody actually asked verify. Only a daemon
+		// shutdown cancels it, exactly as for a run.
+		//
+		// Environment policy for a re-verify is the OPERATOR's, exactly as it is
+		// for a run — a request never chooses what env the daemon's commands see.
+		out, err = ackRun(s.baseCtx, rc.cell, dir, "http", ackEnv{Mode: s.envMode, Verify: s.envVerify, Resolver: s.envResolver})
+	} else {
+		out, err = rejectRun(r.Context(), rc.cell.Git(), dir, "http", body.Reason)
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, errNotAwaitingAck):
+			// Covers an already-resolved run too: errParkResolved wraps this.
+			writeErr(w, http.StatusConflict, err.Error(), codeNotParked)
+		case errors.Is(err, errParkBusy):
+			writeErr(w, http.StatusConflict, err.Error(), codeCellBusy)
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error(), codeInternalError)
+		}
+		return
+	}
+	// Keep this process's in-memory view honest for a run it started itself;
+	// the disk journal was already updated by ackRun/rejectRun.
+	s.mu.Lock()
+	if rec := s.runs[id]; rec != nil {
+		rec.status = out.Status
+		if out.LandedSHA != "" {
+			rec.finalSHA = out.LandedSHA
+		}
+	}
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleUI serves the single self-contained conflict-review page (uiHTML). A
@@ -1443,6 +1603,28 @@ func readRunStatus(dir string) (*runStatusFile, error) {
 // "interrupted": there's no more information on disk than "something ran
 // here and never reached a terminal state".
 func diskRunStatus(dir string) (status, note string) {
+	status, note = markerRunStatus(dir)
+	// An UNRESOLVED parking record outranks the phase marker (issue #109). The
+	// two are written in sequence — park.json first, deliberately — so a crash in
+	// that gap leaves a genuinely parked run marked "running", which startup
+	// recovery would then rewrite to "interrupted": a verified landing that no
+	// ack or reject could ever reach again, whose branches `sig gc` would pin
+	// forever with nothing able to release them. park.json is the authority on
+	// whether a park exists; status.json only records the phase.
+	switch status {
+	case statusAwaitingAck, statusRejected, "done":
+		return status, note
+	}
+	if pk, err := readPark(dir); err == nil && pk.ResolvedAt == "" {
+		return statusAwaitingAck, "an unresolved parking record outranks the recorded phase " + strconv.Quote(status)
+	}
+	return status, note
+}
+
+// markerRunStatus reports what status.json alone says, falling back to the
+// report.json/error.json probe for a dir written before that file existed. See
+// diskRunStatus, which layers the parking record's authority on top.
+func markerRunStatus(dir string) (status, note string) {
 	if sf, err := readRunStatus(dir); err == nil {
 		return sf.Status, sf.Note
 	}
@@ -1509,6 +1691,15 @@ func recoverStaleRuns(runsDir string, ourPID int) {
 		if pidAlive(sf.PID) {
 			continue // owning process still alive -- ours or a sibling daemon's, never touch it
 		}
+		// A dead owner that had already written an unresolved park.json got as far
+		// as producing a VERIFIED landing; it just never flipped the marker. That
+		// run is parked, not interrupted -- calling it interrupted would make the
+		// landing permanently unreachable (see diskRunStatus). Heal the marker
+		// instead.
+		if pk, perr := readPark(dir); perr == nil && pk.ResolvedAt == "" {
+			writeRunStatus(dir, statusAwaitingAck, fmt.Sprintf("recovered at startup: owning process (pid %d) is gone, but this run had already parked a verified landing", sf.PID))
+			continue
+		}
 		writeRunStatus(dir, "interrupted", fmt.Sprintf("recovered at startup: owning process (pid %d) is gone", sf.PID))
 	}
 }
@@ -1549,7 +1740,8 @@ const (
 	codeNotFound             = "not_found"              // 404: generic, not run- or cell-specific
 	codeRunNotFound          = "run_not_found"          // 404: run id doesn't resolve
 	codeCellNotFound         = "cell_not_found"         // 400: POST /runs named an unregistered cell
-	codeCellBusy             = "cell_busy"              // 409: that cell already has a run in flight
+	codeCellBusy             = "cell_busy"              // 409: that cell already has a run (or an ack's re-verify) in flight
+	codeNotParked            = "not_parked"             // 409: ack/reject on a run that isn't awaiting-ack
 	codeQuotaConcurrency     = "quota_concurrency"      // 429: -max-concurrent-runs exceeded
 	codeQuotaAgents          = "quota_agents"           // 400: -max-agents-per-run exceeded
 	codeEnvWidenRefused      = "env_widen_refused"      // 400: request tried to widen scoped envMode

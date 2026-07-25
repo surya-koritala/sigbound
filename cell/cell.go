@@ -264,6 +264,19 @@ func (c *Cell) Integrate(ctx context.Context, base string, changes []BranchChang
 	return in.Integrate(ctx, base, changes, strategy)
 }
 
+// IntegrateOnto is Integrate's counterpart for branches whose fork point is no
+// longer where the result must land — see Integrator.IntegrateOnto. Same engine,
+// same resolver/flag semantics, routed through this cell's git handle and blob
+// daemon; it never moves a ref.
+func (c *Cell) IntegrateOnto(ctx context.Context, mergeBase, onto string, changes []BranchChange, opts ...func(*Integrator)) (IntegrationResult, error) {
+	in := NewIntegrator(c.git)
+	for _, o := range opts {
+		o(in)
+	}
+	in.blobs = c
+	return in.IntegrateOnto(ctx, mergeBase, onto, changes)
+}
+
 // Close tears down every worktree this cell created and has not yet removed,
 // leaving branches intact. Idempotent: a second call (or one after the caller
 // already removed everything) finds nothing to do. It returns the first removal

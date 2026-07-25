@@ -11,9 +11,15 @@
 // resumeAgent), so sweeping one out from under a resumable run would
 // silently break resume.
 //
+// A branch named by an OPEN park.json (a landing that passed verify and is
+// waiting on a human ack -- see park.go) is kept UNCONDITIONALLY: no age
+// cutoff, and -force does not reach it either. gc exists to sweep debris, and
+// a parked branch is the opposite of debris.
+//
 //	sig gc -repo PATH [-older-than 72h] [-delete] [-force] [-json]
 //
-// gc NEVER touches: the base branch or any branch outside agent/ and
+// gc NEVER touches: refs/sigbound/park/* (a parked landing's keep-alive ref,
+// see park.go), the base branch or any branch outside agent/ and
 // imported/<worker>/, refs/notes/sigbound, or the run history itself under
 // .git/sigbound/runs (deliberately out of scope -- see docs/USAGE.md).
 package main
@@ -52,7 +58,7 @@ const gcDefaultOlderThan = 72 * time.Hour
 // else on the machine legitimately created.
 var gcTempPatterns = []string{
 	"sig-run-*", "sig-verify-*", "sig-bisect-*", "sig-repair-*", "sig-replay-verify-*",
-	"sig-int-*", "sig-resolve-*", "sig-doctor-*",
+	"sig-park-*", "sig-int-*", "sig-resolve-*", "sig-doctor-*",
 }
 
 // gcBranchPrefixes are the ONLY ref prefixes gc will ever consider removing.
@@ -69,6 +75,10 @@ type gcReport struct {
 	Tempdirs        []string `json:"tempdirs"`
 	BranchesDeleted []string `json:"branchesDeleted"`
 	BranchesKept    []string `json:"branchesKept"`
+	// ParkRefsDeleted names the stranded keep-alive refs swept (see
+	// strandedParkRefs). omitempty, so a repo that has never parked reports
+	// byte-identical to before parking existed.
+	ParkRefsDeleted []string `json:"parkRefsDeleted,omitempty"`
 }
 
 // gcPlan is everything gcPlanFor computed, before anything is (maybe)
@@ -83,6 +93,15 @@ type gcPlan struct {
 	ToDelete       []string
 	ToKeep         []string
 	Forced         map[string]bool // subset of ToDelete that was manifest-protected but -force overrode
+	// Parked is the subset of ToKeep held by an OPEN parking record (issue
+	// #109) rather than by an ordinary run manifest. Unlike manifest
+	// protection, this one is absolute: -force does not reach it and neither
+	// does -older-than.
+	Parked map[string]bool
+	// ParkRefs are keep-alive refs whose park has resolved (or whose run dir is
+	// gone), left behind by a crash between recording a resolution and
+	// releasing the ref. Nothing else sweeps refs/sigbound/**.
+	ParkRefs []string
 }
 
 func (p gcPlan) report() gcReport {
@@ -91,6 +110,7 @@ func (p gcPlan) report() gcReport {
 		Tempdirs:        p.Tempdirs,
 		BranchesDeleted: p.ToDelete,
 		BranchesKept:    p.ToKeep,
+		ParkRefsDeleted: p.ParkRefs,
 	}
 	if rep.Tempdirs == nil {
 		rep.Tempdirs = []string{}
@@ -191,9 +211,33 @@ func gcPlanFor(ctx context.Context, g *gitx.Git, olderThan time.Duration, force 
 	if err != nil {
 		return gcPlan{}, fmt.Errorf("load protected branches from .git/sigbound/runs: %w", err)
 	}
+	// Parked runs (issue #109) are protected UNCONDITIONALLY -- see the
+	// plan.Parked check below.
+	parked, err := loadParkedBranches(ctx, g)
+	if err != nil {
+		return gcPlan{}, fmt.Errorf("load parked branches from .git/sigbound/runs: %w", err)
+	}
 
-	plan := gcPlan{StaleWorktrees: stale, Tempdirs: tempdirs, Forced: map[string]bool{}}
+	// Keep-alive refs a crash stranded: inert, but nothing else sweeps them and
+	// each pins a commit (see strandedParkRefs). Fails closed on an unreadable
+	// parking record, same as the manifest scan above.
+	strandedRefs, err := strandedParkRefs(ctx, g, cutoff)
+	if err != nil {
+		return gcPlan{}, err
+	}
+
+	plan := gcPlan{StaleWorktrees: stale, Tempdirs: tempdirs, Forced: map[string]bool{}, Parked: map[string]bool{}, ParkRefs: strandedRefs}
 	for _, b := range branches {
+		// A branch an OPEN park still names is never a candidate, at any age and
+		// regardless of -force: it is the only copy of a landing that already
+		// passed verify and is waiting on a human, so deleting it would destroy
+		// work the daemon has promised is still ackable. Checked BEFORE the age
+		// cutoff so the reason it survives is recorded rather than incidental.
+		if parked[b.Name] {
+			plan.Parked[b.Name] = true
+			plan.ToKeep = append(plan.ToKeep, b.Name)
+			continue
+		}
 		if !b.CommitTime.Before(cutoff) {
 			continue // not old enough: not a candidate at all, regardless of -force
 		}
@@ -316,6 +360,11 @@ func applyGC(ctx context.Context, c *cell.Cell, plan gcPlan) error {
 			return fmt.Errorf("delete branch %s: %w", b, err)
 		}
 	}
+	for _, ref := range plan.ParkRefs {
+		if err := c.Git().DeleteRef(ctx, ref); err != nil {
+			return fmt.Errorf("delete stranded parking ref %s: %w", ref, err)
+		}
+	}
 	return nil
 }
 
@@ -344,8 +393,18 @@ func printGCTable(w io.Writer, plan gcPlan, applied bool) {
 		}
 		fmt.Fprintf(w, "  %s: %s%s\n", action, b, note)
 	}
+	if len(plan.ParkRefs) > 0 {
+		fmt.Fprintf(w, "stranded parking refs: %d %s\n", len(plan.ParkRefs), action)
+		for _, ref := range plan.ParkRefs {
+			fmt.Fprintf(w, "  %s: %s (its park is already resolved)\n", action, ref)
+		}
+	}
 	for _, b := range plan.ToKeep {
-		fmt.Fprintf(w, "  kept (manifest-referenced): %s\n", b)
+		why := "manifest-referenced"
+		if plan.Parked[b] {
+			why = "PARKED -- awaiting ack; -force and -older-than do not apply"
+		}
+		fmt.Fprintf(w, "  kept (%s): %s\n", why, b)
 	}
 	if !applied {
 		fmt.Fprintln(w, "dry-run: nothing was removed; run with -delete to actually remove it")

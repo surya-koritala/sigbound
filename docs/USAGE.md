@@ -864,9 +864,10 @@ budget = 30m
 | `parallel-agents = N` | Ceiling on fan-out concurrency. Effective value is `min(policy, flag)`. |
 | `max-agents = N` | Ceiling on a run's task count; a run with more tasks is rejected before any agent runs. |
 | `budget = <duration>` | Ceiling on the run's wall-clock budget. Effective value is `min(policy, flag)`. |
-| `ack-paths = <glob>[, <glob>…]` | REPEATABLE and/or comma-separated. A landing that touches a matching path is held for a human (see below). |
-| `audit-sample = N%` | Recorded now (`0..100`); enforced from the v2.0 parking work. |
-| `ack-timeout = <duration>` | Recorded now; enforced from the v2.0 parking work. |
+| `ack-paths = <glob>[, <glob>…]` | REPEATABLE and/or comma-separated. A landing that touches a matching path is PARKED for a human ack (see [Run parking](#run-parking)). |
+| `audit-sample = N%` | `0..100`. Percentage of CLEAN landings sampled into non-blocking `audit` inbox entries (see [Spot-audit sampling](#spot-audit-sampling)). |
+| `ack-timeout = <duration>` | How long a parked landing waits before it auto-resolves. Absent (the default) parks forever. |
+| `ack-timeout-action = reject` | What an EXPIRED park becomes. `reject` is the only value; it is also the default whenever `ack-timeout` is set. |
 
 An UNKNOWN key, a malformed value, or a duplicate scalar key (a second
 `lanes =` silently overriding the first) is a hard error naming the file, line,
@@ -904,14 +905,10 @@ policy, never laxer:
 - quotas (`parallel-agents`, `budget`): effective value is `min(policy, flag)` —
   the established clamp semantics, never an error.
 
-### Ack-paths and self-protection (interim behavior)
+### Ack-paths and self-protection
 
 Two rules keep a change from landing without a human when the repo says one is
-needed. Until the v2.0 parking + acknowledgment flow (issue #109) exists, both
-are enforced through the EXISTING flagged-conflict mechanism: the affected
-branches are KEPT, the base ref is NOT advanced for them, and the reason is
-recorded in the report's `integrate.flagged[].reason`, the `integrate_done`
-event, and the `sig serve` review UI — exactly like a merge conflict today.
+needed:
 
 - **ack-paths**: a landing whose changes touch a path matching an `ack-paths`
   glob is held (`policy: ack required for <path>`).
@@ -926,14 +923,177 @@ event, and the `sig serve` review UI — exactly like a merge conflict today.
 
 Because integration groups are entangled by write-set overlap, the WHOLE group
 containing a held branch is held together; disjoint clean groups still integrate,
-verify, and land as normal (it composes with `-verify-bisect` salvage). A run
-that holds a group exits `4` (flagged), the same as a conflict.
+verify, and land as normal (it composes with `-verify-bisect` salvage). The held
+group's own tree is then verified and PARKED for an ack — see
+[Run parking](#run-parking). The run exits `4` (flagged), the same as a conflict:
+its held branches are in `integrate.flagged[]` with a `reason`, which is what the
+three-pane diff viewer reads.
 
 Glob semantics for `ack-paths` (slash-separated, repo-relative paths): `?`
 matches one character except `/`; `*` matches any run of characters except `/`
 (stays within a path segment); `**` matches any run INCLUDING `/` (crosses
 segments), and a `**/` prefix also matches zero leading segments, so
 `**/secrets.yaml` matches both `secrets.yaml` and `deploy/prod/secrets.yaml`.
+
+---
+
+## Run parking
+
+A held group does not just stop. It is **integrated and verified like any other
+landing, and then parked**: the exact commit that passed verify is recorded, the
+base ref is left alone, the branches are kept, and the run sits in a new durable
+status, `awaiting-ack`, until a human acks or rejects it.
+
+That ordering is the point. A park is always an **already-verified landing**,
+which is what lets an ack simply advance the ref:
+
+> **What lands on an ack is byte-for-byte the tree that passed verify.** The ack
+> is an INPUT to the existing landing gate, not a second landing path — it
+> advances the ref through the same code `sig run` lands through.
+
+Parking is `sig serve`'s flow: the record lives in the run's durable directory as
+`park.json`, alongside `status.json` and `report.json`. `sig run` has no run
+directory (and no run id), so it reports the park in its JSON report's `park`
+field and leaves the branches for you to land with `sig integrate` yourself.
+
+### park.json
+
+```json
+{
+  "verifiedSHA":  "…",         // what an ack lands
+  "verifiedTree": "…",         // its tree OID, re-checked at ack time
+  "baseSHA":      "…",         // the base this was verified against
+  "forkSHA":      "…",         // where the parked branches were created
+  "keepRef":      "refs/sigbound/park/<runId>",
+  "reason":       "ack-paths", // or "policy-modified"
+  "createdAt":    "…",
+  "groups":       [{"branches": ["agent/t1"], "matchedPaths": {"auth/x.go": "auth/**"}}],
+  "attempts":     [{"n": 1, "baseSHA": "…", "finalSHA": "…", "verifyOk": true}]
+}
+```
+
+`attempts[0]` is the park's own verify; each later entry is one re-verify cycle
+(below). `matchedPaths` maps each triggering path to the glob that matched it.
+
+**`keepRef` is load-bearing.** The verified commit is built with `commit-tree`
+and is reachable from no branch — its *parents* are the base and the agent
+branches, so keeping those alive protects its ancestors, not it. Left
+unreferenced it is ordinary garbage that `git gc`, `git maintenance`, a repack,
+or simply crossing `gc.auto`'s loose-object threshold would delete, and the
+landing would become unackable forever. So a park holds a keep-alive ref on it
+under `refs/sigbound/park/`, re-pointed on every green re-verify and released
+when the park resolves. That namespace is outside everything
+[`sig gc`](#sig-gc) sweeps, so the two never fight.
+
+### Ack and reject
+
+```
+sig ack    RUN_ID -repo PATH [-json]
+sig reject RUN_ID -repo PATH [-reason TEXT] [-json]
+
+POST /runs/{id}/ack
+POST /runs/{id}/reject      {"reason": "…"}    (reason optional)
+```
+
+The CLI and the HTTP endpoints call the **same internal function** — there is no
+second implementation to drift. Both are valid only while the run is
+`awaiting-ack`; anything else is a `409` (`not_parked`). An ack that arrives
+while a re-verify is already in flight is a `409` (`cell_busy`), the same slot a
+run holds.
+
+**Ack, base unchanged.** The recorded commit is re-checked against the live
+object store — it must still exist, still carry the recorded tree OID, and still
+descend from the recorded base — and then landed as-is. Nothing is recomputed. If
+any of those checks fails the ack is refused and the ref does not move: landing
+anything other than the exact verified tree is the outcome this whole feature
+exists to prevent. Those are **consistency** checks against corruption,
+truncation and staleness, not an authenticity guarantee — anyone who can rewrite
+`park.json` can also move the base ref directly, which needs no ack at all. What
+they buy is that an ack cannot land the wrong thing by *accident*.
+
+**Ack, base moved.** The stale tree is **not** landed. The parked branches are
+re-integrated onto the base's current head — merged against their own fork point,
+so each contributes its own changes and never reverts what landed meanwhile — and
+re-verified under the policy loaded **at that new head**, so a policy that
+tightened while the run sat parked gates the landing it releases. A green result
+lands the NEW commit and records it as the park's verified landing; a red one
+leaves the run parked with the failed attempt attached, which the inbox then
+shows. Either way the attempt is recorded in `attempts[]`.
+
+**Reject** is terminal (`rejected`), lands nothing, records the optional reason,
+and **keeps every branch** — a rejection is a decision not to land, never a
+decision to destroy the work.
+
+**A reject always beats an in-flight ack.** An ack and a reject can genuinely
+race — a base-moved ack sits in a re-verify for as long as the repo's verify
+command takes, and a human may well reject it in that window. Two things keep
+the outcome coherent, and it is worth being precise about which does the work:
+
+- **An atomic one-shot claim decides who resolves.** A run resolves exactly once
+  in its life, so every path that resolves one — ack, reject, timeout — first
+  claims that single transition by creating a file in the run directory with
+  `O_CREATE|O_EXCL`. That is an atomic test-and-set in the filesystem itself on
+  every platform Sigbound runs on: of any number of concurrent claimants exactly
+  one succeeds and the rest are told the run is busy or already resolved. It
+  consults no process ids, so it does not degrade anywhere. **This is what makes
+  `rejected` terminal.**
+- **Everything else only narrows the race.** Both landing paths also write the
+  record before the ref moves, compare-and-swap it against the bytes they read,
+  and re-read the run's status under the claim — each a useful guard, none of
+  them sufficient alone, because read-then-write is not atomic across processes.
+  A separate advisory lock stops two acks from both starting an expensive
+  re-verify; it is released for the slow verify (holding it would make
+  `sig reject` hang for exactly as long) and provides no mutual exclusion on
+  Windows, which is now merely wasteful rather than dangerous.
+
+A resolver killed mid-resolution does not wedge the run: its claim is stolen
+once it is older than a generous threshold, and a claim left over a run that was
+already resolved is recognised as vestigial and reported as such.
+
+The ack also re-reads the run's status immediately before landing, so a run that
+became `rejected` — by a person or by an expired `ack-timeout` — is refused with
+a conflict rather than landed.
+
+### Ack timeout
+
+With `ack-timeout` set, a park that is never acked auto-resolves per
+`ack-timeout-action` (`reject`, the only v2.0 value). Enforcement is **lazy**:
+the transition happens the next time anyone looks — serve startup, `GET /inbox`,
+`GET /runs/{id}`, or an ack/reject itself. There is no timer goroutine; nothing
+depends on the transition firing at the instant it comes due, only on it being
+true by the time anyone can observe otherwise. With no `ack-timeout`, a park
+waits indefinitely.
+
+### Durability
+
+`awaiting-ack` survives a `kill -9` and a restart. Startup crash recovery only
+ever rewrites `queued`/`running` runs to `interrupted` (see
+[Crash recovery](#crash-recovery)); a parked run is deliberately outside that
+sweep, because the human it is waiting for may not be back for days.
+
+`park.json` is written **before** the status marker flips, and an unresolved
+`park.json` **outranks** that marker. A daemon killed in the gap between the two
+would otherwise leave a genuinely parked run marked `running`, which recovery
+would then call `interrupted` — a verified landing no ack or reject could reach
+again, with its branches pinned by `sig gc` and nothing able to release them.
+The record is the authority on whether a park exists; the marker only records
+the phase, and is healed to match on the next read or restart.
+
+`sig gc` will **never** delete a branch an open park names — no age cutoff
+reaches it and neither does `-force` (see [`sig gc`](#sig-gc)). A `park.json` that
+cannot be read fails closed in every direction: the ack refuses, and gc aborts
+rather than assume it protects nothing.
+
+### Spot-audit sampling
+
+`audit-sample = N%` selects a share of **clean** landings — nothing parked,
+nothing flagged, nothing bisect-dropped — for a non-blocking look. Selection is
+`sha256(runId) mod 100 < N`: deterministic and replayable, with no RNG anywhere,
+so the same run always samples the same way in every process and every version.
+A selected run gets `"audit": true` in its manifest and an `audit` inbox entry.
+
+It is **purely informational**: no state machine, no gate, nothing to close. An
+entry ages out of the inbox via `?limit`.
 
 ---
 
@@ -1279,10 +1439,32 @@ branch younger than the cutoff is never a candidate at all, `-force` or not
 — and it has no effect on worktree pruning or tempdirs, which have no
 manifest-protection concept to override.
 
+**Parked runs are protected absolutely.** A branch named by an open `park.json`
+(see [Run parking](#run-parking)) is never a sweep candidate: no age cutoff
+reaches it and `-force` does not either. The park's own keep-alive ref lives
+under `refs/sigbound/park/`, outside the `refs/heads/agent/` and
+`refs/heads/imported/` prefixes this command sweeps, so an open park's ref is
+never deleted — and because it is a real ref, plain `git gc` in your repo will
+not reclaim the verified commit behind it.
+
+gc does reclaim **stranded** ones: a keep-alive ref is released only after its
+resolution is durably recorded (the safe order), so a crash in that gap leaves a
+ref behind, and nothing else sweeps `refs/sigbound/**`. A ref whose park is
+already resolved, or whose run directory is gone, is deleted once it is past
+`-older-than`; they appear as `stranded parking refs` in the output and
+`parkRefsDeleted` in `-json`. A `park.json` that exists but cannot be read
+aborts gc, same as an unreadable manifest. It is the only copy of a landing that
+already passed verify and is waiting on a person, which is the opposite of
+debris. The dry-run and `-delete` output both name it as `kept (PARKED …)`. Once
+that park is acked or rejected it stops being parked, and ordinary manifest rules
+resume. A `park.json` that exists but cannot be read **aborts gc entirely** with a
+loud error rather than assuming it protects nothing — the same fail-closed posture
+an unreadable manifest already gets.
+
 ### Tempdir liveness caveat
 
 A sigbound tempdir (`sig-run-*`, `sig-verify-*`, `sig-bisect-*`,
-`sig-repair-*`, `sig-replay-verify-*`, `sig-int-*`, `sig-resolve-*`,
+`sig-repair-*`, `sig-replay-verify-*`, `sig-park-*`, `sig-int-*`, `sig-resolve-*`,
 `sig-doctor-*` under `os.TempDir()`) is normally removed by its own creator
 (`defer os.RemoveAll`) when the command that made it finishes. What
 `sig gc` finds is what's left after a hard kill (SIGKILL, an OOM kill, a
@@ -1528,13 +1710,16 @@ All requests and responses are JSON (events are NDJSON).
 | `GET /health` | `{ok, version, cells:[{id, repo}]}` |
 | `POST /runs` | Start a run. Returns **202** `{runId, cell, status}` immediately; the run executes asynchronously. |
 | `GET /runs` | `{runs:[{id, cell, status, startedAt, finalSHA?}]}`, newest first. |
-| `GET /runs/{id}` | `{id, cell, status, startedAt, error?, report?, usage?}` — `status` is `queued`, `running`, `done`, `error`, or `interrupted` (see [Crash recovery](#crash-recovery)); the full run report is present once `done`, and `usage` alongside it (see [Quotas and metering](#quotas-and-metering)). |
+| `GET /runs/{id}` | `{id, cell, status, startedAt, error?, report?, usage?, park?}` — `status` is `queued`, `running`, `done`, `error`, `interrupted` (see [Crash recovery](#crash-recovery)), `awaiting-ack`, or `rejected` (see [Run parking](#run-parking)); the full run report is present once the run has one, `usage` alongside it (see [Quotas and metering](#quotas-and-metering)), and `park` whenever the run has a parking record. |
 | `GET /runs/{id}/events` | The run's `events.ndjson` as written so far (`Content-Type: application/x-ndjson`) — the same lifecycle events `sig run -events` emits. |
 | `GET /runs/{id}/usage` | That run's metering record. `404` until the run has written a report. |
 | `GET /usage` | Usage totals across all run history, plus a per-cell rollup. |
-| `GET /runs/{id}/flagged` | `{runId, cell, flagged:[{branch, paths}]}` — the branches this run flagged and each one's conflicted paths (see [Conflict review UI](#conflict-review-ui)). `404` until the run has a report. |
+| `GET /runs/{id}/flagged` | `{runId, cell, flagged:[{branch, paths}]}` — the branches this run flagged and each one's conflicted paths (see [Review UI](#review-ui)). `404` until the run has a report. |
 | `GET /runs/{id}/flagged/{branch}/{path...}` | `{path, base, ours, theirs, baseSHA}` — the three sides of one conflicted path. A side is `null` when the path is absent there (an add/delete conflict). `{branch}/{path...}` must **exactly** match a flagged pair from the listing above; anything else is `404` and reads nothing. |
-| `GET /ui` (and `/ui/`) | The read-only conflict-review HTML page (see [Conflict review UI](#conflict-review-ui)). |
+| `POST /runs/{id}/ack` | Release a parked landing (see [Run parking](#run-parking)). No body. `409` (`not_parked`) unless the run is `awaiting-ack`; `409` (`cell_busy`) if a run or another ack holds the cell. |
+| `POST /runs/{id}/reject` | Reject a parked landing; optional body `{"reason": "…"}`. Terminal, lands nothing, keeps the branches. |
+| `GET /inbox` | `{entries:[…]}` — everything across all cells waiting on a human, newest first. `?type=parked\|flagged\|dropped\|repair-failed\|audit`, `?limit=N` (default 100). See [The inbox](#the-inbox). |
+| `GET /ui` (and `/ui/`) | The review HTML page: conflict panes plus the Inbox tab (see [Review UI](#review-ui)). |
 | `GET /log` | `{cells:[{cell, repo, runs:[…]}]}` — the newest-first run history per cell, `?limit=N` (default 50). The HTTP mirror of [`sig log`](#sig-log). |
 | `GET /log/sha/{sha}` | `{cell, provenance:{…}}` — which run/task/agent landed `{sha}` (see [`sig log`](#sig-log)). `404` (`not_found`) for a commit no cell landed. |
 
@@ -1565,7 +1750,8 @@ The vocabulary:
 | `env_widen_refused` | 400 | The request's `envMode` tried to widen the server's `scoped` default to `inherit`. |
 | `quota_agents` | 400 | `-max-agents-per-run` exceeded. |
 | `unsupported_media_type` | 415 | `Content-Type` isn't `application/json`. |
-| `cell_busy` | 409 | That cell already has a run in flight (one run per cell at a time). |
+| `cell_busy` | 409 | That cell already has a run — or an ack's re-verify — in flight (one at a time). |
+| `not_parked` | 409 | `ack`/`reject` on a run that is not `awaiting-ack` — including a run that was rejected, or whose `ack-timeout` expired, WHILE an ack was re-verifying. |
 | `quota_concurrency` | 429 | `-max-concurrent-runs` exceeded. |
 | `run_not_found` | 404 | The run id in the path doesn't resolve to any run. |
 | `not_found` | 404 | A known run has no report/usage yet, or a `flagged` path/branch isn't in that run's allowlist — not a run- or cell-lookup failure. |
@@ -1576,8 +1762,11 @@ The vocabulary:
 A run moves the base ref, so a cell runs **one at a time**: a second `POST` for a
 cell whose run is still in flight gets **409 Conflict**. Different cells run
 fully in parallel — that repo-level sharding is the whole point of registering
-several. Run history is durable per cell under `.git/sigbound/runs/<runId>/`
-(`status.json`, `request.json`, `report.json`, `events.ndjson`, `usage.json`),
+several. An ack whose base has moved runs a real integrate + verify and then
+moves the base ref, so it takes that same per-cell slot for its duration. Run
+history is durable per cell under `.git/sigbound/runs/<runId>/`
+(`status.json`, `request.json`, `report.json`, `events.ndjson`, `usage.json`,
+and `park.json` for a parked run),
 the same `.git/sigbound` storage `-verify-cache` uses; `rm -rf .git/sigbound`
 resets it and it never shows up in `git status`.
 
@@ -1622,26 +1811,64 @@ on disk (`runAgent` never cleans them up, see [Resume](#resume)) — a re-POST
 runs the same tasks again from scratch, agent included, since `sig serve`
 does not thread `-manifest`/`-resume` through its own runs today.
 
-### Conflict review UI
+A run in `awaiting-ack` is deliberately **outside** that sweep: it is not a run
+that died mid-flight, it is a verified landing waiting on a person, and it stays
+`awaiting-ack` across any number of restarts until acked, rejected, or expired by
+its `ack-timeout`. See [Run parking](#run-parking).
+
+### The inbox
+
+`GET /inbox` is the single list of everything, across every registered cell, that
+is waiting on a human. It is a READ over what the runs already wrote — it
+computes no verdicts and holds no state of its own, so an inbox entry can never
+disagree with the run behind it.
+
+| `type` | Raised by | Actionable |
+|--------|-----------|------------|
+| `parked` | A landing held by `ack-paths` or policy self-protection. | **Yes** — ack or reject. |
+| `flagged` | Branches set aside as real conflicts. | No — resolve on the CLI. |
+| `dropped` | Groups `-verify-bisect` dropped to salvage a green subset. | No. |
+| `repair-failed` | Verify still red after the `-repair` loop exhausted. | No. |
+| `audit` | A clean landing the `audit-sample` rate selected. | No — informational. |
+
+Every entry carries `{type, cellId, runId, age, summary, links}`; a `parked` one
+adds `reason`, `matchedPaths`, `branches`, the re-verify `attempts` count, and
+`expiresAt` when an `ack-timeout` applies. `links.flagged` points at the existing
+three-pane diff for the triggering paths — a parked branch is in the run's flagged
+set, so there is no second viewer to drift from it.
+
+Entries are newest-run-first, filterable with `?type=`, capped with `?limit=`
+(default 100). A parked branch is listed once, as `parked`, never additionally as
+`flagged`.
+
+### Review UI
 
 When a run flags branches — a real conflict a `-resolver` declined, or none was
 set — Sigbound's fail-safe **flags, never guesses**: those branches don't land,
 and a human decides. `sig serve` surfaces exactly that, so you can **see** what
 was flagged without leaving the daemon or digging blobs out of git by hand.
 
-Open **`GET /ui`** (e.g. `http://127.0.0.1:7777/ui`) in a browser. The page lists
-runs; pick one to see its flagged branches, then a branch's path to see the
-**three sides side by side — `base` | `ours` (the landed tree) | `theirs` (the
-flagged branch)**. It's a single self-contained HTML page: vanilla HTML/CSS/JS,
-**no framework, no CDN, no external asset of any kind**, so it works offline on an
-air-gapped daemon. File contents are rendered with `textContent` only (never
-`innerHTML`), so agent-generated code in a conflicted file can't inject anything.
+Open **`GET /ui`** (e.g. `http://127.0.0.1:7777/ui`) in a browser. It has two
+tabs. **Conflicts** lists runs; pick one to see its flagged branches, then a
+branch's path to see the **three sides side by side — `base` | `ours` (the landed
+tree) | `theirs` (the flagged branch)**. **Inbox** renders
+[`GET /inbox`](#the-inbox). It's a single self-contained HTML page: vanilla
+HTML/CSS/JS, **no framework, no CDN, no external asset of any kind**, so it works
+offline on an air-gapped daemon. Everything from the server — file contents,
+branch names, paths, summaries — is rendered with `textContent` only (never
+`innerHTML`), so agent-generated content can't inject anything.
 
-This surface is **strictly read-only.** It does not resolve, merge, or land
-anything from the browser — that would be a new landing path, which Sigbound
-deliberately does not have. Resolving a flagged branch stays a CLI act: re-run
-with a `-resolver`, or land it yourself with `sig run` / `sig integrate`. The UI
-just shows you the data so you can make that call.
+**The only two things this page can change** are **Ack** and **Reject**, and they
+appear **only on a parked entry** in the Inbox tab. Both go through the same
+`POST` endpoints and the same bearer token as everything else, and the daemon
+re-checks the run's state either way — the button's presence is convenience, never
+the authorization. Reject takes an optional reason inline.
+
+Nothing else is mutable from the browser. The UI does not resolve, merge, or land
+anything on its own: an ack releases a landing this daemon **already computed and
+verified**, which is why it is not a new landing path. Resolving a flagged branch
+stays a CLI act: re-run with a `-resolver`, or land it yourself with `sig run` /
+`sig integrate`.
 
 The same data is available as JSON — `GET /runs/{id}/flagged` for the listing and
 `GET /runs/{id}/flagged/{branch}/{path...}` for one path's three sides (see
@@ -2062,6 +2289,17 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   `envMode` is `-env-mode`'s value (`inherit` or `scoped`) — the `-env-*`
   allowlists and the actual resolved environment are deliberately NOT part
   of this report (see [Scoped environments](#scoped-environments)).
+- `policy` is present iff the base commit carried a `sigbound.policy` (see
+  [Landing policy](#landing-policy)): its `hash`, the policy's own `verify`
+  battery and `ackPaths`, plus `auditSample`/`ackTimeout`/`ackTimeoutAction`
+  when set. Absent — not `null` — on a repo with no policy.
+- `park` is present iff a policy-held group's own tree passed verify and was
+  parked for an ack (see [Run parking](#run-parking)). It is the same record
+  `sig serve` persists as the run's `park.json`. Absent on every other run.
+- `audit` is `true` iff this CLEAN landing was drawn into the policy's
+  `audit-sample` (see [Spot-audit sampling](#spot-audit-sampling)); absent
+  otherwise. It gates nothing. Sampling keys on `sig serve`'s run id, so a
+  `sig run` invocation — which has none — is never sampled.
 
 Without `-json`, the same run prints a short human summary.
 
@@ -2097,11 +2335,21 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 | `bisect_attempt` | `groups`, `ok` | After each candidate-subset verify. `groups` is the branch names per group in that candidate; `ok` is its verdict. |
 | `bisect_done` | `landed`, `dropped` | Once, when bisect finishes. `landed`/`dropped` are the branch names per group that landed vs. were dropped (`landed` empty when nothing was salvaged). |
 | `land` | `sha` | Once, right after the base ref advances (never emitted when nothing lands). |
+| `parked` | `reason`, `verifiedSHA`, `baseSHA`, `forkSHA`, `branches`, `matchedPaths` | Once, when a policy-held group's own tree verified green and was parked for an ack (see [Run parking](#run-parking)). |
+| `park_failed` | `branches`, `flagged`, `error`, `output` | Once, when a held group could NOT be offered as a landing (a conflict among the held branches, or a red verify). Nothing is parked; the branches stay flagged. |
+| `audit_selected` | `runId`, `sample`, `sha` | Once, when a clean landing was drawn into the `audit-sample` (see [Spot-audit sampling](#spot-audit-sampling)). |
+| `repark` | `attempt`, `verdict`, `baseSHA`, `finalSHA` | Once per re-verify cycle an ack ran because the base had moved. `verdict` is `green` or `red`; a red one leaves the run parked. |
+| `ack` | `actor`, `sha`, `reverified`, `attempt`* | Once, when an ack landed. `actor` is `cli` or `http`; `reverified` says whether the base had moved. *`attempt` only on a re-verified landing. |
+| `reject` | `actor`, `reason` | Once, when a park was rejected. `actor` is `cli`, `http`, or `timeout` for an expired `ack-timeout`. |
 | `publish_start` | — | Once, right before the `-publish` command runs. Only emitted when `-publish` is set AND the run landed. |
 | `publish_done` | `ok`, `exit`, `wallMs` | Once, right after the `-publish` command finishes. |
 | `run_done` | `ok`, `exitCode`, `wallMs` | Once, always last — even on a mid-run operational error. |
 
 `-events` off (the default, empty `-events`) emits nothing at all.
+
+The last four are appended to a `sig serve` run's `events.ndjson` **after** the
+run itself finished — an ack can arrive days later — so `run_done` is the last
+event of the RUN, not necessarily the last line in the file.
 
 ---
 

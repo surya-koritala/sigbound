@@ -317,6 +317,40 @@ func (in *Integrator) IntegrateOCC(ctx context.Context, base string, changes []B
 	return res, nil
 }
 
+// IntegrateOnto folds changes onto a base they did NOT fork from: mergeBase is
+// their common ancestor — the commit the branches were created off — and onto is
+// where the result must land, a commit that has since moved past it. Every
+// branch is merged with a real 3-way merge against mergeBase, so what each one
+// contributes is ITS OWN changes and nothing else. Integrating the same branches
+// with onto as the merge base instead would compute "everything that happened on
+// the base since they forked" as their change-set and silently revert it, which
+// is the failure this method exists to make impossible.
+//
+// Exactly one commit is created, with onto as its FIRST parent, so the result is
+// always a descendant of onto and landing it is a fast-forward. It never moves a
+// ref itself, even with WithLandRef: this seam exists for run parking (see
+// cmd/sig/park.go), where landing is a separate, human-gated act.
+//
+// A serial fold, not the OCC partition: the branches handed here are entangled
+// by construction (that is why they were held as one group), so there is nothing
+// to parallelize. Conflicts are flagged and skipped exactly as anywhere else —
+// flag, never guess.
+func (in *Integrator) IntegrateOnto(ctx context.Context, mergeBase, onto string, changes []BranchChange) (IntegrationResult, error) {
+	start := time.Now()
+	res := IntegrationResult{Strategy: "onto", FinalSHA: onto, Groups: 1, MaxBatch: 1, LargestGroup: len(changes)}
+	head, landed, flagged, auto, err := in.fold(ctx, mergeBase, onto, changes, "sigbound: onto")
+	if err != nil {
+		return res, err
+	}
+	res.FinalSHA, res.Landed, res.Flagged, res.AutoMerged = head, landed, flagged, auto
+	if len(landed) > 0 {
+		res.GroupHeads = []string{head}
+		res.GroupBranches = [][]string{landed}
+	}
+	res.Duration = time.Since(start)
+	return res, nil
+}
+
 // fold sequentially merges changes onto acc (starting from acc, with mergeBase
 // as the common ancestor) using in-memory merge-tree. The accumulator is kept
 // as a bare TREE OID for the whole loop — merge-tree accepts tree-ish for both

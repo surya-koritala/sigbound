@@ -426,6 +426,26 @@ func (g *Git) UpdateRef(ctx context.Context, ref, oid string) error {
 	return g.UpdateRefs(ctx, map[string]string{ref: oid})
 }
 
+// DeleteRef removes ref (`git update-ref -d`). Deleting a ref that is already
+// gone is NOT an error: callers use this to release a keep-alive ref on a path
+// that may run twice (a retried resolve, a crash between the record write and
+// the release), and an idempotent delete is what makes that safe.
+func (g *Git) DeleteRef(ctx context.Context, ref string) error {
+	if strings.ContainsAny(ref, " \t\n") {
+		return fmt.Errorf("update-ref -d: illegal whitespace in ref %q", ref)
+	}
+	_, se, code, err := g.runRaw(ctx, "update-ref", "-d", ref)
+	if err != nil {
+		return err
+	}
+	// git exits non-zero when the ref does not exist; that is the desired
+	// end state, so only a real failure is reported.
+	if code != 0 && !strings.Contains(se, "unable to resolve") && !strings.Contains(se, "does not exist") {
+		return fmt.Errorf("update-ref -d %s: exit %d: %s", ref, code, strings.TrimSpace(se))
+	}
+	return nil
+}
+
 // HashObject writes body to the object store as a blob and returns its OID
 // (`git hash-object -w --stdin`). Used to materialize a conflict resolver's
 // output before splicing it into a tree — no worktree involved.
