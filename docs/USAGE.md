@@ -1274,6 +1274,15 @@ Imported branches are just branch names, so they feed straight into the ordinary
 sig integrate -repo COORD -base main -branches imported/w1/agent/t1,imported/w1/agent/t2
 ```
 
+**Every branch fed to `sig integrate` must contain the base it lands onto.**
+Imported branches fork from whatever base the *worker* had, which is routinely
+older than the coordinator's `main` by the time the bundle arrives — and a
+branch that does not contain the base is refused outright (the error names the
+branch; nothing lands, exit non-zero), because its overlay contribution would
+otherwise be the *deletion* of everything the base gained since that fork
+point. Rebase refused branches onto the coordinator's current base — or
+re-export from a worker synced to it — and integrate again.
+
 ### End-to-end example
 
 `sig integrate` on its own has no verify gate — unlike `sig run -verify`, it

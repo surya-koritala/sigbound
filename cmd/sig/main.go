@@ -162,7 +162,39 @@ func usage(w *os.File) {
 // computeSemanticEdges), fed straight into cell.WithSemanticEdges so
 // PartitionSemantic unions them on top of path overlap. `sig integrate` and
 // `sig replay` always pass nil — -semantic is a `sig run`-only flag.
+//
+// Contract: every branch must contain baseSHA (or BE it). A branch that
+// doesn't refuses the whole batch before anything integrates — see the
+// ancestry guard below for WHY that branch would silently delete landed work.
 func integrateBranches(ctx context.Context, c *cell.Cell, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool, resolverEnv []string, semanticEdges [][2]string) (cell.IntegrationResult, error) {
+	// Ancestry guard (issue #130): the overlay strategy takes a branch's
+	// contribution to be the TWO-tree diff baseSHA→tip, so a branch that does
+	// not contain baseSHA carries, as its "contribution", the REMOVAL of
+	// everything the base gained since that branch forked — and the OCC
+	// partitioner cannot catch it, because such a branch's base...tip write-set
+	// is empty. Every branch must therefore contain the base before anything
+	// reaches the integrator; the invariant is adoptableAgainst's (the same one
+	// `sig serve -watch` adoption enforces — see adoptBranch), fails CLOSED on
+	// any error, and one refused branch refuses the whole batch: nothing lands.
+	g := c.Git()
+	for _, b := range branches {
+		head, err := g.RevParse(ctx, b)
+		if err != nil {
+			return cell.IntegrationResult{}, fmt.Errorf("resolve branch %q: %w", b, err)
+		}
+		if head == baseSHA {
+			continue // IS the base: contains it trivially, empty contribution
+		}
+		switch verdict, err := adoptableAgainst(ctx, g, baseSHA, head); {
+		case err != nil:
+			return cell.IntegrationResult{}, fmt.Errorf("branch %q: cannot determine whether it contains base %s; refusing to integrate: %w", b, short(baseSHA), err)
+		case verdict != adoptOK:
+			return cell.IntegrationResult{}, fmt.Errorf("branch %q does not contain base %s: integrating it would delete everything the base gained since the branch forked. "+
+				"Rebase the branch onto %s (or re-fork it from the current base) and retry. "+
+				"Branches from `sig import` (imported/<worker>/*) routinely predate the coordinator's base and need the same rebase. Nothing was landed", b, short(baseSHA), short(baseSHA))
+		}
+	}
+
 	var need []string
 	for _, b := range branches {
 		// Contract: omit the key (or map it to nil) to request recompute; an
