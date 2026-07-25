@@ -703,11 +703,13 @@ keeps exit `3`. See [Verify bisect](#verify-bisect).
 
 ### Provenance
 
-`sig run` prints a report and advances a branch, but by default nothing else
-survives the process exiting — the exact inputs (which commit SHAs landed,
-what `-agent`/`-verify`/`-resolver` actually ran) live only in that one
-stdout capture. `-manifest` and `-notes` persist that same report as durable
-provenance, in two complementary places:
+Every run — `sig run` and `sig serve` alike — records itself under the target
+repo's `.git/sigbound/runs/<runId>/`: a `status.json` phase marker, the full
+`report.json`, and `park.json` when the run parked. That directory is what
+[`sig log`](#sig-log) reads, what `sig gc` consults before sweeping a branch, and
+what `sig ack`/`sig reject` resolve a `RUN_ID` to. `-manifest` and `-notes`
+persist the SAME report somewhere you choose instead, in two complementary
+places:
 
 - **`-manifest FILE`** writes the full JSON report (identical shape to
   `-json`) to `FILE` at the end of the run — independent of `-json`, which
@@ -734,9 +736,11 @@ commit, nothing more). An explicit `-notes` or `-notes=false` always wins over
 that default. Read the recorded history back with [`sig log`](#sig-log), whose
 `-sha` resolves a commit to the run, task, and agent that landed it.
 
-The report's new top-level fields carry that provenance: `strategy` (the
-integration strategy, duplicated here even though `integrate.strategy`
-already has it, so it's readable without integrate having run at all),
+The report's new top-level fields carry that provenance: `runId` (the run
+directory this report was written from, and the `RUN_ID` an ack takes),
+`strategy` (the integration strategy, duplicated here even though
+`integrate.strategy` already has it, so it's readable without integrate having
+run at all),
 `agentCmd`/`resolverCmd`/`verifyCmd`/`repairCmd`/`plannerCmd` (the exact,
 RESOLVED command strings this run executed — after `-*-preset` expansion and
 `-config` merging), `envMode` (`-env-mode`'s value, `inherit` or `scoped` —
@@ -1209,10 +1213,24 @@ which is what lets an ack simply advance the ref:
 > is an INPUT to the existing landing gate, not a second landing path — it
 > advances the ref through the same code `sig run` lands through.
 
-Parking is `sig serve`'s flow: the record lives in the run's durable directory as
-`park.json`, alongside `status.json` and `report.json`. `sig run` has no run
-directory (and no run id), so it reports the park in its JSON report's `park`
-field and leaves the branches for you to land with `sig integrate` yourself.
+### Which entry points park, and how each is released
+
+**Both of them, identically.** `sig run` and `sig serve` drive the same
+orchestration, so either can park — and either park is released the same way,
+because a park lives in a run directory and both entry points create one:
+`.git/sigbound/runs/<runId>/park.json`, alongside that run's `status.json` and
+`report.json`.
+
+| Entry point | Parks | Released by |
+|-------------|-------|-------------|
+| `sig run` | Yes. The run exits `4`, its report carries `runId` and `park`, and the terse summary prints the `sig ack` line. | `sig ack RUN_ID -repo PATH` / `sig reject RUN_ID -repo PATH` — or `POST /runs/{id}/ack` on any daemon later pointed at that repo. |
+| `POST /runs` (`sig serve`) | Yes. The run goes to `awaiting-ack` and raises a `parked` [inbox](#the-inbox) entry. | `POST /runs/{id}/ack` / `/reject`, the review UI, or the same `sig ack`/`sig reject` on the CLI. |
+| `sig serve -watch` | Yes — a cycle is an ordinary run. | As above. |
+| `sig integrate` / `sig replay` | No — neither runs the policy holdback. | — |
+
+The run id is the handle: it names the run directory, so `sig ack` and the HTTP
+endpoint resolve the same park from the same record. A `sig run` prints it in the
+summary and in `-json`'s `runId`; there is no second flow to learn.
 
 ### park.json
 
@@ -1788,8 +1806,8 @@ metadata.
 ### Run history and notes are out of scope
 
 `sig gc` never removes anything under `.git/sigbound/runs` (the durable
-`report.json`/`events.ndjson` history `sig serve` and `-manifest` write —
-see [`sig serve`](#sig-serve) and [Provenance](#provenance)) or the
+`report.json`/`park.json` history every run writes, whichever entry point drove
+it — see [`sig serve`](#sig-serve) and [Provenance](#provenance)) or the
 `refs/notes/sigbound` namespace `-notes` writes to. Both are the durable
 record of what actually happened; a sweep tool guessing which of those
 records are "old enough to matter" is exactly the kind of judgment call this
@@ -1805,8 +1823,8 @@ manual act, not something `sig gc` decides on your behalf.
 ## `sig log`
 
 A **read-only** query layer over what runs already record — the `report.json`
-manifests under `.git/sigbound/runs` (`sig serve` writes them; a `sig run`
-`-manifest` file has the identical shape) and the landing notes under
+manifests under `.git/sigbound/runs` (both entry points write one per run; a
+`sig run` `-manifest` file has the identical shape) and the landing notes under
 `refs/notes/sigbound` (see [Provenance](#provenance)). It adds no storage and
 changes nothing a run writes; it only reads the history back.
 
@@ -2104,6 +2122,15 @@ A run in `awaiting-ack` is deliberately **outside** that sweep: it is not a run
 that died mid-flight, it is a verified landing waiting on a person, and it stays
 `awaiting-ack` across any number of restarts until acked, rejected, or expired by
 its `ack-timeout`. See [Run parking](#run-parking).
+
+`sig run` journals the same way — its own `status.json`, `report.json` and (when
+it parks) `park.json` under the same `.git/sigbound/runs/<runId>/`, which is what
+makes a CLI park ackable at all. It also runs that recovery sweep itself, at the
+start of every run: a repo that never runs a daemon has no other moment to heal a
+directory a `Ctrl-C` left saying `running`. A live daemon's runs are untouched
+either way — recovery only ever rewrites a dead pid's. `sig run` writes no
+`request.json` (there is no request body behind it) and no `usage.json`, and it
+streams events only where `-events` points.
 
 ### The inbox
 
@@ -2600,6 +2627,7 @@ With `-json`, `sig run` prints a full report. Top-level shape:
 
 ```jsonc
 {
+  "runId": "20250101T000000Z-1a2b3c4d5e6f",
   "repo": "…", "base": "main", "baseSHA": "…",
   "laneMode": "warn",
   "parallelAgents": 4,
@@ -2711,13 +2739,17 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   [Landing policy](#landing-policy)): its `hash`, the policy's own `verify`
   battery and `ackPaths`, plus `auditSample`/`ackTimeout`/`ackTimeoutAction`
   when set. Absent — not `null` — on a repo with no policy.
+- `runId` names this run's durable directory under `.git/sigbound/runs/`, and is
+  therefore the `RUN_ID` `sig ack`/`sig reject` take. Both entry points set it.
 - `park` is present iff a policy-held group's own tree passed verify and was
   parked for an ack (see [Run parking](#run-parking)). It is the same record
-  `sig serve` persists as the run's `park.json`. Absent on every other run.
+  persisted as the run's `park.json`, and `runId` above is how you release it.
+  Absent on every other run.
 - `audit` is `true` iff this CLEAN landing was drawn into the policy's
   `audit-sample` (see [Spot-audit sampling](#spot-audit-sampling)); absent
-  otherwise. It gates nothing. Sampling keys on `sig serve`'s run id, so a
-  `sig run` invocation — which has none — is never sampled.
+  otherwise. It gates nothing. Sampling keys on the run id, so it applies to
+  `sig run` and `sig serve` alike — the sample is a property of the landing and
+  its policy, not of which entry point produced it.
 - `landRefused` is present only when the landing was REFUSED: the base moved
   off `baseSHA` while this run was computing against it, so the ref advance
   would have reset somebody else's landing away. It names the commit the base
