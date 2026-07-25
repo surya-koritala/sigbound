@@ -146,9 +146,48 @@ func TestIntegrateLandsBranchContainingBase(t *testing.T) {
 // resolves the conflict, so integration proceeds all the way to a landing whose
 // expected old value is gone. The swap must be refused, the winner must survive
 // intact, and the command must exit non-zero.
+// resolverSeamRepo is gitRepoWithGoFile with a removal that tolerates a
+// Windows failure. The tests below hand `sig integrate` a -resolver that shells
+// out to git, and a shell's grandchild is not ours to reap portably: on unix an
+// unreaped one cannot stop the directory going away, and on Windows an open
+// handle blocks the unlink and fails t.TempDir()'s cleanup AFTER the test has
+// already made its assertions. Reaping arbitrary grandchildren of a
+// user-supplied resolver would be a product change, not a test fix. What is
+// deliberately NOT tolerated here is a failure in the test body: these tests
+// cover a guard against silently resetting away someone else's landing, so they
+// run on every platform rather than skipping Windows, and only the rmdir is
+// best-effort.
+func resolverSeamRepo(t *testing.T, files map[string]string) (*gitx.Git, string) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "sig-resolver-seam-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	ctx := context.Background()
+	g := gitx.New(dir)
+	if err := g.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for rel, content := range files {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base, err := g.CommitAll(ctx, "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g, base
+}
+
 func TestIntegrateRefusesWhenTheBaseMovedUnderTheResolver(t *testing.T) {
 	ctx := context.Background()
-	g, base := gitRepoWithGoFile(t, "", map[string]string{"shared.txt": "l1\nl2\nl3\nl4\nl5\n"})
+	g, base := resolverSeamRepo(t, map[string]string{"shared.txt": "l1\nl2\nl3\nl4\nl5\n"})
 	// Same line, two different bodies: a real conflict merge-tree cannot
 	// auto-resolve, so the resolver is guaranteed to run.
 	mkBranchFrom(t, g, "agent/a", base, map[string]string{"shared.txt": "l1\nl2\na\nl4\nl5\n"})
@@ -195,7 +234,7 @@ func TestIntegrateRefusesWhenTheBaseMovedUnderTheResolver(t *testing.T) {
 // refused every resolver-using integration would pass the test above.
 func TestIntegrateLandsThroughAResolverWhenTheBaseHeldStill(t *testing.T) {
 	ctx := context.Background()
-	g, base := gitRepoWithGoFile(t, "", map[string]string{"shared.txt": "l1\nl2\nl3\nl4\nl5\n"})
+	g, base := resolverSeamRepo(t, map[string]string{"shared.txt": "l1\nl2\nl3\nl4\nl5\n"})
 	mkBranchFrom(t, g, "agent/a", base, map[string]string{"shared.txt": "l1\nl2\na\nl4\nl5\n"})
 	mkBranchFrom(t, g, "agent/b", base, map[string]string{"shared.txt": "l1\nl2\nb\nl4\nl5\n"})
 
