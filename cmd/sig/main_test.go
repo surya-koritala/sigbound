@@ -1,0 +1,133 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/surya-koritala/sigbound/internal/gitx"
+)
+
+// treeFiles returns rev's tree as a set, for asserting the base tree itself —
+// the issue-#130 failure mode is a WRONG tree behind an advanced ref, so these
+// tests assert file presence, never just the exit path.
+func treeFiles(t *testing.T, g *gitx.Git, rev string) map[string]bool {
+	t.Helper()
+	files, err := g.LsTree(context.Background(), rev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	have := make(map[string]bool, len(files))
+	for _, f := range files {
+		have[f] = true
+	}
+	return have
+}
+
+// TestIntegrateRefusesStaleBranchesAfterBaseMoved is issue #130's exact
+// scenario: land two branches (moving the base), then feed those same
+// now-stale branches back to `sig integrate`. Their overlay contribution
+// versus the MOVED base is the deletion of everything it gained, so the
+// ancestry guard must refuse the batch, land nothing, and leave the base ref
+// and tree untouched.
+func TestIntegrateRefusesStaleBranchesAfterBaseMoved(t *testing.T) {
+	ctx := context.Background()
+	g, base := gitRepoWithGoFile(t, "", map[string]string{"base.txt": "base\n"})
+	mkBranchFrom(t, g, "agent/a", base, map[string]string{"a.txt": "a\n"})
+	mkBranchFrom(t, g, "agent/b", base, map[string]string{"b.txt": "b\n"})
+
+	// First integrate lands both and advances main past the branches' tips.
+	captureStdout(t, func() {
+		if err := runIntegrate([]string{"-repo", g.Dir(), "-base", "main", "-branches", "agent/a,agent/b"}); err != nil {
+			t.Fatalf("first integrate: %v", err)
+		}
+	})
+	moved, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved == base {
+		t.Fatal("first integrate did not move the base; scenario not established")
+	}
+
+	// Re-integrating the SAME branches must refuse — with an error naming an
+	// offending branch and the base — and change nothing.
+	err = runIntegrate([]string{"-repo", g.Dir(), "-base", "main", "-branches", "agent/a,agent/b"})
+	if err == nil {
+		t.Fatal("re-integrating stale branches succeeded; want refusal")
+	}
+	if !strings.Contains(err.Error(), "agent/a") || !strings.Contains(err.Error(), short(moved)) {
+		t.Fatalf("refusal must name the offending branch and the base, got: %v", err)
+	}
+	after, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != moved {
+		t.Fatalf("base ref moved on a refused integrate: %s -> %s", moved, after)
+	}
+	have := treeFiles(t, g, "main")
+	if !have["a.txt"] || !have["b.txt"] || !have["base.txt"] {
+		t.Fatalf("base tree lost landed files on a refused integrate: %v", have)
+	}
+}
+
+// TestIntegrateRefusesImportedBranchPredatingBase is the bundle workflow's
+// version of the same hazard: `sig import` creates imported/<worker>/* branches
+// forked from whatever base the WORKER had, which routinely predates the
+// coordinator's. Such a branch must be refused, deleting nothing.
+func TestIntegrateRefusesImportedBranchPredatingBase(t *testing.T) {
+	ctx := context.Background()
+	g, fork := gitRepoWithGoFile(t, "", map[string]string{"base.txt": "base\n"})
+	mkBranchFrom(t, g, "imported/w1/agent/t1", fork, map[string]string{"t1.txt": "t1\n"})
+
+	// The coordinator's main moves on past the worker's fork point.
+	if err := os.WriteFile(filepath.Join(g.Dir(), "landed.txt"), []byte("landed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := g.CommitAll(ctx, "landed on coordinator")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runIntegrate([]string{"-repo", g.Dir(), "-base", "main", "-branches", "imported/w1/agent/t1"}); err == nil {
+		t.Fatal("integrating an imported branch that predates the base succeeded; want refusal")
+	}
+	after, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != moved {
+		t.Fatalf("base ref moved on a refused integrate: %s -> %s", moved, after)
+	}
+	if have := treeFiles(t, g, "main"); !have["landed.txt"] {
+		t.Fatalf("refused integrate deleted landed.txt from the base tree: %v", have)
+	}
+}
+
+// TestIntegrateLandsBranchContainingBase pins the no-regression side of the
+// guard: a branch forked from the CURRENT base descends from it and must
+// integrate and land exactly as before.
+func TestIntegrateLandsBranchContainingBase(t *testing.T) {
+	g, base := gitRepoWithGoFile(t, "", map[string]string{"base.txt": "base\n"})
+	mkBranchFrom(t, g, "agent/ok", base, map[string]string{"ok.txt": "ok\n"})
+
+	out := captureStdout(t, func() {
+		if err := runIntegrate([]string{"-repo", g.Dir(), "-base", "main", "-branches", "agent/ok"}); err != nil {
+			t.Fatalf("runIntegrate: %v", err)
+		}
+	})
+	var res resultJSON
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("parse integrate json: %v\n%s", err, out)
+	}
+	if len(res.Landed) != 1 || res.Landed[0] != "agent/ok" {
+		t.Fatalf("landed = %v, want [agent/ok]", res.Landed)
+	}
+	if have := treeFiles(t, g, "main"); !have["ok.txt"] || !have["base.txt"] {
+		t.Fatalf("base tree missing files after a legitimate integrate: %v", have)
+	}
+}
