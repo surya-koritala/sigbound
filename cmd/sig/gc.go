@@ -61,6 +61,14 @@ var gcTempPatterns = []string{
 	"sig-park-*", "sig-int-*", "sig-resolve-*", "sig-doctor-*",
 }
 
+// gcTempRoot is where the sweep looks for those tempdirs. It is a var purely
+// so tests can point it at their own directory: a test that swept the real
+// os.TempDir() with a short -older-than would delete the live worktrees of any
+// other sigbound test binary running at the same time, which is a genuinely
+// confusing failure to debug (it looks like a regression in whatever that
+// other binary was proving). Production never reassigns it.
+var gcTempRoot = os.TempDir
+
 // gcBranchPrefixes are the ONLY ref prefixes gc will ever consider removing.
 // Nothing outside these -- most importantly the base branch itself -- is a
 // gc candidate at all.
@@ -198,7 +206,7 @@ func gcPlanFor(ctx context.Context, g *gitx.Git, olderThan time.Duration, force 
 	sort.Slice(stale, func(i, j int) bool { return stale[i].Path < stale[j].Path })
 
 	cutoff := time.Now().Add(-olderThan)
-	tempdirs, err := scanTempdirs(os.TempDir(), cutoff)
+	tempdirs, err := scanTempdirs(gcTempRoot(), cutoff)
 	if err != nil {
 		return gcPlan{}, fmt.Errorf("scan tempdirs: %w", err)
 	}

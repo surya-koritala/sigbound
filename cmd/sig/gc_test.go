@@ -520,6 +520,14 @@ func TestGCNoRepoFlag(t *testing.T) {
 // private-tempRoot test seam, so at least one test proves the wiring
 // between runGC and gcPlanFor/applyGC actually works end to end.
 func TestRunGCEndToEnd(t *testing.T) {
+	// Point the sweep at a private root: this test deletes with a short
+	// -older-than, and against the real os.TempDir() that would take out the
+	// live worktrees of any other sigbound test binary running beside it.
+	orig := gcTempRoot
+	root := t.TempDir()
+	gcTempRoot = func() string { return root }
+	t.Cleanup(func() { gcTempRoot = orig })
+
 	g, repoDir, base := newGCRepo(t)
 	old := time.Now().Add(-30 * 24 * time.Hour)
 	makeBranchAt(t, g, repoDir, "agent/old", base, old)
