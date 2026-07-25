@@ -415,6 +415,8 @@ func FuzzParsePark(f *testing.F) {
 	f.Add([]byte(`{`))
 	f.Add([]byte("{\"base\":\"ma\x00in\"}"))
 	f.Add([]byte(`{"base":"ref with spaces"}`))
+	f.Add([]byte(strings.Replace(valid, `"base":"main"`, `"base":"main","keepRef":"refs/heads/main"`, 1)))
+	f.Add([]byte(strings.Replace(valid, `"base":"main"`, `"base":"main","keepRef":"refs/sigbound/park/../../heads/main"`, 1)))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		pk, err := parsePark(data)
@@ -447,6 +449,14 @@ func FuzzParsePark(f *testing.F) {
 		}
 		if _, err := time.Parse(time.RFC3339, pk.CreatedAt); err != nil {
 			t.Fatalf("accepted unparseable createdAt %q", pk.CreatedAt)
+		}
+		// A keep-alive ref is handed straight to update-ref, so an accepted one
+		// must live in our own namespace and be free of traversal.
+		if pk.KeepRef != "" {
+			if !strings.HasPrefix(pk.KeepRef, parkRefPrefix) || !relSafe(pk.KeepRef) ||
+				strings.ContainsAny(pk.KeepRef, " \t\n:?*[\\\x00") {
+				t.Fatalf("accepted unusable keepRef %q", pk.KeepRef)
+			}
 		}
 		// The accessors an inbox read and a timeout sweep call must be total on
 		// anything that got this far.

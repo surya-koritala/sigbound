@@ -1712,12 +1712,17 @@ func attachNote(ctx context.Context, g *gitx.Git, commit string, rep runReport) 
 	}
 }
 
-// landRef advances a base BRANCH to sha — the one and only place a verified
-// tree becomes the thing the base points at. Both landings in this binary go
-// through it: driveRun's own land, and an ack releasing an already-verified
-// parked landing (see ackRun). The ack is deliberately an INPUT to this gate,
-// not a second landing path — the invariant "what lands is exactly the tree that
-// passed verify" is only checkable because there is one line that moves a ref.
+// landRef advances a base BRANCH to sha — the single place a RUN's verified tree
+// becomes the thing the base points at. Both run-shaped landings go through it:
+// driveRun's own land, and an ack releasing an already-verified parked landing
+// (see ackRun). The ack is deliberately an INPUT to this gate, not a second
+// landing path — "what lands is exactly the tree that passed verify" is only
+// checkable because one line moves the ref for both.
+//
+// `sig integrate` (without -no-land) advances the ref through the cell's own
+// WithLandRef instead. That is the raw integration primitive with no verify gate
+// of its own and no policy — feed it branches you have already gated — so it is
+// outside this statement, not an exception to it.
 //
 // ponytail: a plain update-ref, not a compare-and-swap against the base's
 // expected old value, so a base that moves between the caller's read and this

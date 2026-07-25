@@ -248,7 +248,7 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		// restart DOES owe a parked run is the lazy ack-timeout: a daemon that was
 		// down past a park's deadline must report it expired from its first
 		// request onward, not from whenever someone next opens the inbox.
-		expireParks(rc.runsDir)
+		expireParks(ctx, c.Git(), rc.runsDir)
 	}
 	return s, nil
 }
@@ -663,7 +663,7 @@ func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// expired park becomes rejected, so a caller never sees awaiting-ack for a
 	// park already past its deadline. A run this process owns gets its in-memory
 	// status refreshed from disk to match.
-	if enforceParkTimeout(dir) {
+	if rc := s.byKey[cellID]; rc != nil && enforceParkTimeout(r.Context(), rc.cell.Git(), dir) {
 		status, errMsg = diskRunStatus(dir)
 		if rec != nil {
 			s.mu.Lock()
@@ -1164,7 +1164,7 @@ func (s *server) handleAckReject(w http.ResponseWriter, r *http.Request, ack boo
 		// for a run — a request never chooses what env the daemon's commands see.
 		out, err = ackRun(s.baseCtx, rc.cell, dir, "http", ackEnv{Mode: s.envMode, Verify: s.envVerify, Resolver: s.envResolver})
 	} else {
-		out, err = rejectRun(dir, "http", body.Reason)
+		out, err = rejectRun(r.Context(), rc.cell.Git(), dir, "http", body.Reason)
 	}
 	if err != nil {
 		if errors.Is(err, errNotAwaitingAck) {
@@ -1599,6 +1599,28 @@ func readRunStatus(dir string) (*runStatusFile, error) {
 // "interrupted": there's no more information on disk than "something ran
 // here and never reached a terminal state".
 func diskRunStatus(dir string) (status, note string) {
+	status, note = markerRunStatus(dir)
+	// An UNRESOLVED parking record outranks the phase marker (issue #109). The
+	// two are written in sequence — park.json first, deliberately — so a crash in
+	// that gap leaves a genuinely parked run marked "running", which startup
+	// recovery would then rewrite to "interrupted": a verified landing that no
+	// ack or reject could ever reach again, whose branches `sig gc` would pin
+	// forever with nothing able to release them. park.json is the authority on
+	// whether a park exists; status.json only records the phase.
+	switch status {
+	case statusAwaitingAck, statusRejected, "done":
+		return status, note
+	}
+	if pk, err := readPark(dir); err == nil && pk.ResolvedAt == "" {
+		return statusAwaitingAck, "an unresolved parking record outranks the recorded phase " + strconv.Quote(status)
+	}
+	return status, note
+}
+
+// markerRunStatus reports what status.json alone says, falling back to the
+// report.json/error.json probe for a dir written before that file existed. See
+// diskRunStatus, which layers the parking record's authority on top.
+func markerRunStatus(dir string) (status, note string) {
 	if sf, err := readRunStatus(dir); err == nil {
 		return sf.Status, sf.Note
 	}
@@ -1664,6 +1686,15 @@ func recoverStaleRuns(runsDir string, ourPID int) {
 		}
 		if pidAlive(sf.PID) {
 			continue // owning process still alive -- ours or a sibling daemon's, never touch it
+		}
+		// A dead owner that had already written an unresolved park.json got as far
+		// as producing a VERIFIED landing; it just never flipped the marker. That
+		// run is parked, not interrupted -- calling it interrupted would make the
+		// landing permanently unreachable (see diskRunStatus). Heal the marker
+		// instead.
+		if pk, perr := readPark(dir); perr == nil && pk.ResolvedAt == "" {
+			writeRunStatus(dir, statusAwaitingAck, fmt.Sprintf("recovered at startup: owning process (pid %d) is gone, but this run had already parked a verified landing", sf.PID))
+			continue
 		}
 		writeRunStatus(dir, "interrupted", fmt.Sprintf("recovered at startup: owning process (pid %d) is gone", sf.PID))
 	}

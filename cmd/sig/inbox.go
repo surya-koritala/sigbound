@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/surya-koritala/sigbound/internal/gitx"
 )
 
 // Inbox entry types. Everything an operator might need to act on has exactly one
@@ -92,11 +95,14 @@ func (s *server) handleInbox(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		sort.Sort(sort.Reverse(sort.StringSlice(ids)))
+		// ponytail: every cell is scanned in full and the merged list is truncated
+		// AFTER sorting. Truncating per cell (on a counter shared across cells, as
+		// this once did) makes "newest first" a lie the moment there is more than
+		// one cell — the first cell fills the quota with its oldest runs and every
+		// later cell starves, however recent its parked landings are. Same full
+		// scan GET /runs already does; add a per-cell index if it ever matters.
 		for _, id := range ids {
-			if limit > 0 && len(entries) >= limit {
-				break
-			}
-			entries = append(entries, inboxEntriesFor(rc.cell.ID(), filepath.Join(rc.runsDir, id), id, want, now)...)
+			entries = append(entries, inboxEntriesFor(r.Context(), rc.cell.Git(), rc.cell.ID(), filepath.Join(rc.runsDir, id), id, want, now)...)
 		}
 	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].RunID > entries[j].RunID })
@@ -113,8 +119,8 @@ func (s *server) handleInbox(w http.ResponseWriter, r *http.Request) {
 // ("" = all). It enforces the park ack-timeout on the way past (the lazy sweep —
 // see enforceParkTimeout), so simply reading the inbox is enough to make an
 // expired park's auto-rejection true.
-func inboxEntriesFor(cellID, dir, runID, want string, now time.Time) []inboxEntry {
-	enforceParkTimeout(dir)
+func inboxEntriesFor(ctx context.Context, g *gitx.Git, cellID, dir, runID, want string, now time.Time) []inboxEntry {
+	enforceParkTimeout(ctx, g, dir)
 	status, _ := diskRunStatus(dir)
 	rep, _ := readRunReport(dir)
 	started := runStartedAt(runID, rep)

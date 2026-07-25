@@ -19,6 +19,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -30,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +43,23 @@ import (
 // report.json / events.ndjson. Its presence is also what makes `sig gc` protect
 // the run's branches unconditionally (see loadParkedBranches).
 const parkFileName = "park.json"
+
+// parkLockName is the run dir's advisory cross-process lock (see lockPark).
+const parkLockName = ".park.lock"
+
+// parkRefPrefix namespaces the KEEP-ALIVE ref every park holds on its verified
+// commit. That commit is created by commit-tree and is reachable from NOTHING
+// otherwise — its parents are the base and the agent branches, so protecting
+// those protects the commit's ancestors, not the commit. Unreferenced, it is
+// ordinary garbage: `git gc`, `git maintenance`, a repack, or simply crossing
+// gc.auto's loose-object threshold in the USER's repo (sigbound only sets
+// gc.auto=0 on repos it creates itself) deletes it, and since the default park
+// is forever, an ack would then fail permanently with nothing left to land.
+//
+// The ref lives outside gcBranchPrefixes, so `sig gc` never considers it either.
+// It is created when the park is (and re-pointed on every green re-verify) and
+// released when the park resolves.
+const parkRefPrefix = "refs/sigbound/park/"
 
 // Park reasons — the machine-readable discriminant on a park record and on each
 // parked group. policy-modified outranks ack-paths when a group triggers both.
@@ -137,6 +156,12 @@ type parkJSON struct {
 	AckTimeoutAction string            `json:"ackTimeoutAction,omitempty"`
 	Attempts         []parkAttemptJSON `json:"attempts,omitempty"`
 
+	// KeepRef is the keep-alive ref pinning VerifiedSHA against garbage
+	// collection (see parkRefPrefix). Recorded rather than recomputed so the
+	// release is exact even if the naming scheme ever changes. Empty only for a
+	// record written before this field existed.
+	KeepRef string `json:"keepRef,omitempty"`
+
 	// Re-verify inputs (see the type comment).
 	Base          string `json:"base"`
 	Verify        string `json:"verify,omitempty"`
@@ -230,7 +255,55 @@ func (pk *parkJSON) validate() error {
 	if _, err := time.Parse(time.RFC3339, pk.CreatedAt); err != nil {
 		return fmt.Errorf("%s: createdAt %q is not RFC3339", parkFileName, pk.CreatedAt)
 	}
+	// A keep-alive ref is handed straight to update-ref, so it must be a ref this
+	// binary could have written: our own namespace, no traversal, no whitespace.
+	if pk.KeepRef != "" {
+		if !strings.HasPrefix(pk.KeepRef, parkRefPrefix) || !relSafe(pk.KeepRef) ||
+			strings.ContainsAny(pk.KeepRef, " \t\n:?*[\\") {
+			return fmt.Errorf("%s: keepRef %q is not a %s ref", parkFileName, pk.KeepRef, parkRefPrefix)
+		}
+	}
 	return nil
+}
+
+// lockPark takes a best-effort cross-process lock on ONE run's parking record.
+// It is a TRY-lock: it never blocks, because every caller has a correct answer
+// for "someone else is mid-ack" — the lazy timeout sweep skips (it will fire
+// next time anyone looks) and ack/reject report a conflict.
+//
+// The lock spans processes, which the daemon's in-memory busy map cannot: `sig
+// ack` on the CLI and a POST to a running daemon are different processes acting
+// on the same run dir. A crashed holder is detected and its lock stolen via
+// pidAlive, so a kill -9 mid-ack cannot wedge a park forever.
+//
+// Windows note: pidAlive reports every pid as dead there (see its doc), so the
+// lock is stolen immediately and provides no mutual exclusion on that platform —
+// the same documented degradation `sig serve`'s crash recovery already has
+// (issue #94). The status re-check immediately before landRef is what makes a
+// rejected park un-landable, and that check is platform-independent.
+func lockPark(dir string) (unlock func(), ok bool) {
+	path := filepath.Join(dir, parkLockName)
+	for attempt := 0; attempt < 2; attempt++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			fmt.Fprintf(f, "%d\n", os.Getpid())
+			f.Close()
+			return func() { os.Remove(path) }, true
+		}
+		if !os.IsExist(err) {
+			return nil, false // cannot create the lock at all: refuse rather than proceed unlocked
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil, false
+		}
+		pid, perr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if perr != nil || pidAlive(pid) {
+			return nil, false // genuinely held
+		}
+		os.Remove(path) // holder is gone: steal it once, then retry
+	}
+	return nil, false
 }
 
 // writePark records pk atomically (write-then-rename, the same pattern
@@ -260,15 +333,43 @@ func writePark(dir string, pk *parkJSON) error {
 // sweep leaves it alone, and gc protects its branches by refusing to run. Fail
 // closed, in the one direction that cannot lose work.
 func readPark(dir string) (*parkJSON, error) {
-	data, err := os.ReadFile(filepath.Join(dir, parkFileName))
+	_, pk, err := readParkAt(dir)
+	return pk, err
+}
+
+// readParkAt is readPark plus the EXACT bytes it parsed. Those bytes are the
+// compare-and-swap token: a writer that read the record, spent minutes
+// re-verifying, and then wants to update it must first prove the record on disk
+// is still the one it read. Without that, an ack's read-modify-write silently
+// erases a reject that landed in between (which is exactly how a rejectReason
+// used to disappear).
+func readParkAt(dir string) ([]byte, *parkJSON, error) {
+	path := filepath.Join(dir, parkFileName)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	pk, err := parsePark(data)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", filepath.Join(dir, parkFileName), err)
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return pk, nil
+	return data, pk, nil
+}
+
+// writeParkCAS writes pk only if dir's park.json still holds exactly want — the
+// bytes the caller originally read. A mismatch means someone else changed the
+// record (a reject, a competing ack) and this write would clobber it, so it
+// fails instead. Callers hold the park lock across the read/compare/write, which
+// is what makes this a genuine compare-and-swap rather than a narrower race.
+func writeParkCAS(dir string, want []byte, pk *parkJSON) error {
+	got, err := os.ReadFile(filepath.Join(dir, parkFileName))
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(got, want) {
+		return errParkChanged
+	}
+	return writePark(dir, pk)
 }
 
 // parsePark decodes and validates park.json's bytes — split from readPark so the
@@ -332,12 +433,23 @@ func parkHeldGroups(ctx context.Context, c *cell.Cell, p runParams, pol policy, 
 			break
 		}
 	}
+	// Pin the verified commit BEFORE recording it: until this ref exists the
+	// commit is reachable from nothing and a concurrent `git gc` in the user's
+	// repo can delete it. A park whose record names a pruned commit can never be
+	// acked, so a failure here means no park at all — the branches stay flagged,
+	// which is recoverable, unlike a landing that quietly evaporates.
+	keepRef := parkRefPrefix + parkRefKey(p.RunID, finalSHA)
+	if err := c.Git().UpdateRef(ctx, keepRef, finalSHA); err != nil {
+		emit.emit("park_failed", map[string]any{"branches": branches, "error": errText(err)})
+		return nil
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	pk := &parkJSON{
 		VerifiedSHA:  finalSHA,
 		VerifiedTree: tree,
 		BaseSHA:      landSHA,
 		ForkSHA:      forkSHA,
+		KeepRef:      keepRef,
 		Groups:       groups,
 		Reason:       reason,
 		CreatedAt:    now,
@@ -370,6 +482,32 @@ func parkHeldGroups(ctx context.Context, c *cell.Cell, p runParams, pol policy, 
 		"matchedPaths": pk.matchedPaths(),
 	})
 	return pk
+}
+
+// parkRefKey names a park's keep-alive ref. `sig serve`'s run id is the natural
+// key — one park per run, and the release is unambiguous. `sig run` has no run
+// id, so its park keys on the verified commit itself, which is equally unique
+// and equally releasable (the chosen name is recorded in the record either way,
+// so nothing downstream depends on which branch was taken).
+func parkRefKey(runID, sha string) string {
+	if runID != "" {
+		return runID
+	}
+	return sha
+}
+
+// releaseParkRef drops a resolved park's keep-alive ref. Best-effort and
+// idempotent by construction (gitx.DeleteRef treats an absent ref as success):
+// it runs only AFTER the resolution is durably recorded, so a crash in between
+// strands a ref that pins one commit and blocks nothing — strictly better than
+// the reverse order, which could unpin a park that is still open.
+func releaseParkRef(ctx context.Context, g *gitx.Git, pk *parkJSON) {
+	if pk.KeepRef == "" {
+		return
+	}
+	if err := g.DeleteRef(ctx, pk.KeepRef); err != nil {
+		fmt.Fprintf(os.Stderr, "sig: could not release parking ref %s: %v\n", pk.KeepRef, err)
+	}
 }
 
 // integrateVerifyPark folds branches (created off forkSHA) onto onto — the base
@@ -417,6 +555,14 @@ func integrateVerifyPark(ctx context.Context, c *cell.Cell, p runParams, forkSHA
 	for _, f := range res.Flagged {
 		flagged = append(flagged, flaggedJSON{Branch: f.Branch, Paths: f.Conflicts})
 	}
+	// A parked group is entangled by write-set overlap: it lands whole or not at
+	// all, so a partial fold is never a landing candidate. Return with NO commit
+	// rather than verifying a subset — and, just as importantly, rather than
+	// handing back `onto` (what IntegrateOnto yields when nothing folded), which
+	// an attempt record would show as though the base itself were the result.
+	if len(flagged) > 0 {
+		return "", verifyJSON{}, flagged, nil
+	}
 	if strings.TrimSpace(p.VerifyCmd) == "" {
 		return res.FinalSHA, verifyJSON{}, flagged, nil
 	}
@@ -461,6 +607,15 @@ func auditSelected(runID string, pct int) bool {
 // stay independent (issue #93).
 var errNotAwaitingAck = errors.New("run is not awaiting ack")
 
+// errParkBusy is returned when another ack, reject, or timeout sweep holds this
+// run's lock. Also a 409: the caller should look again, not retry blindly.
+var errParkBusy = errors.New("another ack or reject is in progress for this run")
+
+// errParkChanged is writeParkCAS's refusal: the record changed under a writer
+// that had already read it. Reported as a conflict rather than resolved by
+// overwriting, because the other writer's decision is the newer one.
+var errParkChanged = errors.New("the parking record changed while this ack was running")
+
 // ackEnv is the environment policy an ack's re-verify runs the recorded
 // verify/resolver commands under. It is NOT recorded in the park (a run's
 // environment can carry secrets its command text never mentions — see
@@ -504,12 +659,27 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 	runID := filepath.Base(dir)
 	// An expired park is already rejected by the time an ack arrives — enforce
 	// the timeout here too, not just on the read paths, so the answer never
-	// depends on whether anyone happened to look at the inbox first.
-	enforceParkTimeout(dir)
+	// depends on whether anyone happened to look at the inbox first. Runs BEFORE
+	// the lock below, since it takes the same lock itself.
+	enforceParkTimeout(ctx, c.Git(), dir)
+
+	unlock, ok := lockPark(dir)
+	if !ok {
+		return ackOutcome{}, errParkBusy
+	}
+	locked := true
+	release := func() {
+		if locked {
+			unlock()
+			locked = false
+		}
+	}
+	defer release()
+
 	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
 		return ackOutcome{}, fmt.Errorf("%w (status %s)", errNotAwaitingAck, st)
 	}
-	pk, err := readPark(dir)
+	raw, pk, err := readParkAt(dir)
 	if err != nil {
 		return ackOutcome{}, fmt.Errorf("read parking record: %w", err)
 	}
@@ -518,27 +688,41 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 	if err != nil {
 		return ackOutcome{}, fmt.Errorf("resolve base %q: %w", pk.Base, err)
 	}
-	if err := validateParkedLanding(ctx, g, pk); err != nil {
-		return ackOutcome{}, err
-	}
 	if current == pk.BaseSHA {
+		// Direct release of the recorded landing. The recorded commit is only
+		// consulted on THIS path, so it is only validated on this path: the
+		// base-moved path below discards it entirely and rebuilds from the fork
+		// point, and refusing that because a commit it never reads looks wrong
+		// would strand a perfectly recoverable park.
+		if err := validateParkedLanding(ctx, g, pk); err != nil {
+			return ackOutcome{}, err
+		}
 		if err := landRef(ctx, g, pk.Base, pk.VerifiedSHA); err != nil {
 			return ackOutcome{}, fmt.Errorf("land %s: %w", short(pk.VerifiedSHA), err)
 		}
 		pk.LandedSHA = pk.VerifiedSHA
 		pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
-		if err := writePark(dir, pk); err != nil {
+		if err := writeParkCAS(dir, raw, pk); err != nil {
 			// The ref has moved; the record of why must not be silently lost.
 			fmt.Fprintf(os.Stderr, "sig: ack %s landed %s but could not update %s: %v\n", runID, short(pk.LandedSHA), parkFileName, err)
 		}
 		writeRunStatus(dir, "done", "")
+		// The landed commit is now reachable from the base branch, so the
+		// keep-alive ref has nothing left to protect.
+		releaseParkRef(ctx, g, pk)
 		appendRunEvent(dir, "ack", map[string]any{"actor": actor, "sha": pk.LandedSHA, "reverified": false})
 		return ackOutcome{
 			RunID: runID, Status: "done", LandedSHA: pk.LandedSHA,
 			Message: fmt.Sprintf("landed the verified commit %s on %s", short(pk.LandedSHA), pk.Base),
 		}, nil
 	}
-	return ackReverify(ctx, c, dir, actor, env, pk, current)
+	// The base moved: the re-integrate + re-verify below can run as long as the
+	// repo's verify command does, and holding the lock across it would make a
+	// human's `sig reject` hang for exactly as long. Release it — a reject that
+	// wins the race is the CORRECT outcome, and ackReverify re-takes the lock and
+	// re-reads the status before it lands anything.
+	release()
+	return ackReverify(ctx, c, dir, actor, env, pk, raw, current)
 }
 
 // ackReverify is ackRun's base-moved half: the recorded tree was verified
@@ -546,7 +730,7 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 // candidate and the parked branches are integrated + verified afresh against
 // what IS there. The attempt is recorded either way, so a park that has been
 // acked into three successive red re-verifies says so.
-func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv, pk *parkJSON, current string) (ackOutcome, error) {
+func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv, pk *parkJSON, raw []byte, current string) (ackOutcome, error) {
 	runID := filepath.Base(dir)
 	branches := pk.branches()
 	p := runParams{
@@ -586,12 +770,50 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 		att.Error = errText(err)
 		att.VerifyOK = err == nil && len(flagged) == 0 && (!v.Ran || v.OK)
 	}
+	// A failed attempt with nothing to read is useless to the human it is being
+	// shown to: a verify command can fail silently (a bare `exit 1`, or a policy
+	// battery member that prints nothing), which would otherwise record a red
+	// attempt with empty output AND empty error. Say what happened.
+	if !att.VerifyOK && att.Output == "" && att.Error == "" {
+		switch {
+		case len(flagged) > 0:
+			att.Error = fmt.Sprintf("%s conflicted when re-integrated onto %s", plural(len(flagged), "branch", "branches"), short(current))
+		case v.Ran:
+			att.Error = fmt.Sprintf("verify failed with no output (command: %s)", p.VerifyCmd)
+		default:
+			att.Error = "re-verify produced no result"
+		}
+	}
+	// ---- commit phase: everything below decides state, so re-take the lock ----
+	// The verify above may have taken minutes. In that window a human may have
+	// rejected this run, or its ack-timeout may have expired and auto-rejected
+	// it. Both must WIN: re-read the status under the lock and refuse to land
+	// against it, and compare-and-swap the record so a stale write cannot erase
+	// the reason someone else recorded.
+	unlock, ok := lockPark(dir)
+	if !ok {
+		return ackOutcome{}, errParkBusy
+	}
+	defer unlock()
+	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
+		return ackOutcome{}, fmt.Errorf("%w (status %s changed while the re-verify was running; nothing was landed)", errNotAwaitingAck, st)
+	}
+
+	// The keep-alive ref must cover the NEW commit before anything else: from
+	// here on it is the landing candidate, and until it is pinned a concurrent
+	// `git gc` can delete it.
+	if att.VerifyOK && pk.KeepRef != "" {
+		if err := c.Git().UpdateRef(ctx, pk.KeepRef, finalSHA); err != nil {
+			return ackOutcome{}, fmt.Errorf("pin re-verified %s: %w", short(finalSHA), err)
+		}
+	}
+
 	pk.Attempts = append(pk.Attempts, att)
 	appendRunEvent(dir, "repark", map[string]any{
 		"attempt": att.N, "verdict": verdictOf(att.VerifyOK), "baseSHA": current, "finalSHA": att.FinalSHA,
 	})
 	if !att.VerifyOK {
-		if err := writePark(dir, pk); err != nil {
+		if err := writeParkCAS(dir, raw, pk); err != nil {
 			return ackOutcome{}, fmt.Errorf("record re-verify attempt: %w", err)
 		}
 		// Re-assert awaiting-ack: the park stays open, now with a failure the
@@ -606,16 +828,21 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 	if terr != nil {
 		return ackOutcome{}, fmt.Errorf("tree of re-verified %s: %w", short(finalSHA), terr)
 	}
-	if err := landRef(ctx, c.Git(), pk.Base, finalSHA); err != nil {
-		return ackOutcome{}, fmt.Errorf("land %s: %w", short(finalSHA), err)
-	}
+	// Record the outcome BEFORE moving the ref: a crash between the two leaves a
+	// park that says it landed when it did not, which the next ack resolves
+	// (the base is unchanged, so it re-lands the same commit idempotently). The
+	// reverse order loses the record of a landing that really happened.
 	pk.VerifiedSHA, pk.VerifiedTree, pk.BaseSHA = finalSHA, tree, current
 	pk.LandedSHA = finalSHA
 	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := writePark(dir, pk); err != nil {
-		fmt.Fprintf(os.Stderr, "sig: ack %s landed %s but could not update %s: %v\n", runID, short(finalSHA), parkFileName, err)
+	if err := writeParkCAS(dir, raw, pk); err != nil {
+		return ackOutcome{}, fmt.Errorf("record the re-verified landing (nothing was landed): %w", err)
+	}
+	if err := landRef(ctx, c.Git(), pk.Base, finalSHA); err != nil {
+		return ackOutcome{}, fmt.Errorf("land %s: %w", short(finalSHA), err)
 	}
 	writeRunStatus(dir, "done", "")
+	releaseParkRef(ctx, c.Git(), pk)
 	appendRunEvent(dir, "ack", map[string]any{"actor": actor, "sha": finalSHA, "reverified": true, "attempt": att.N})
 	return ackOutcome{
 		RunID: runID, Status: "done", LandedSHA: finalSHA, Reverified: true, Attempts: att.N,
@@ -624,20 +851,26 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 }
 
 // validateParkedLanding re-checks a recorded landing against the LIVE object
-// store, immediately before it is allowed to move a ref. Three independent
-// checks, each of which alone would let a mutated record through:
+// store, immediately before it is allowed to move a ref:
 //
 //   - the commit still resolves (it was not garbage collected, and the record
 //     names a real object rather than plausible-looking hex);
-//   - its tree OID still equals the recorded one, so a verifiedSHA edited to
-//     point at some OTHER commit is refused — the only way past this is a commit
-//     with a byte-identical tree, which is the same landing;
+//   - its tree OID still equals the recorded one, so a verifiedSHA that no
+//     longer agrees with the tree the record was written for is refused;
 //   - the recorded base is still an ancestor of it, so the landing is genuinely
 //     a descendant of what it was verified against rather than an unrelated
 //     history.
 //
-// Any failure refuses the ack outright. Landing something other than the exact
-// verified tree is the one outcome this whole feature exists to prevent.
+// These are CONSISTENCY checks against corruption, truncation, staleness, and
+// partial edits — NOT an authenticity guarantee. They are emphatically not a
+// trust boundary: anyone able to rewrite park.json can rewrite verifiedSHA,
+// verifiedTree and baseSHA together to describe a commit of their choosing and
+// this will accept it. That is not an escalation, because the same write access
+// already permits moving the base ref directly, which needs no ack at all. What
+// these checks do buy is that an ack cannot land the WRONG thing by accident:
+// a half-written record, a garbage-collected commit, or a record left over from
+// a base that has since been rewritten all fail loudly instead of advancing a
+// ref to something nobody verified.
 func validateParkedLanding(ctx context.Context, g *gitx.Git, pk *parkJSON) error {
 	if _, err := g.RevParse(ctx, pk.VerifiedSHA); err != nil {
 		return fmt.Errorf("refusing to ack: recorded verifiedSHA %s no longer resolves to a commit: %w", short(pk.VerifiedSHA), err)
@@ -663,22 +896,31 @@ func validateParkedLanding(ctx context.Context, g *gitx.Git, pk *parkJSON) error
 // rejectRun marks a parked run rejected: terminal, nothing lands, and the
 // branches are KEPT exactly as they are — a rejection is a decision not to land,
 // never a decision to destroy the work. reason is optional and recorded verbatim.
-func rejectRun(dir, actor, reason string) (ackOutcome, error) {
+func rejectRun(ctx context.Context, g *gitx.Git, dir, actor, reason string) (ackOutcome, error) {
 	runID := filepath.Base(dir)
-	enforceParkTimeout(dir)
+	enforceParkTimeout(ctx, g, dir) // takes the same lock; must run before we hold it
+	unlock, ok := lockPark(dir)
+	if !ok {
+		return ackOutcome{}, errParkBusy
+	}
+	defer unlock()
 	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
 		return ackOutcome{}, fmt.Errorf("%w (status %s)", errNotAwaitingAck, st)
 	}
-	pk, err := readPark(dir)
+	raw, pk, err := readParkAt(dir)
 	if err != nil {
 		return ackOutcome{}, fmt.Errorf("read parking record: %w", err)
 	}
 	pk.RejectReason = strings.TrimSpace(reason)
 	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := writePark(dir, pk); err != nil {
+	if err := writeParkCAS(dir, raw, pk); err != nil {
 		return ackOutcome{}, fmt.Errorf("record rejection: %w", err)
 	}
 	writeRunStatus(dir, statusRejected, pk.RejectReason)
+	// Nothing landed, so the verified commit has no other reference: releasing
+	// the keep-alive ref lets git reclaim it. Done only AFTER the rejection is
+	// durably recorded (see releaseParkRef).
+	releaseParkRef(ctx, g, pk)
 	appendRunEvent(dir, "reject", map[string]any{"actor": actor, "reason": pk.RejectReason})
 	msg := "rejected; branches kept, nothing landed"
 	if pk.RejectReason != "" {
@@ -695,11 +937,25 @@ func rejectRun(dir, actor, reason string) (ackOutcome, error) {
 //
 // A park with no timeout, or one whose record no longer reads back cleanly, is
 // left alone — an unreadable park is not evidence that it expired.
-func enforceParkTimeout(dir string) bool {
+// It takes the same per-run lock ack and reject do, so an expiry can never race
+// an in-flight ack — a sweep that cannot get the lock simply skips, which is
+// exactly right for a check whose whole contract is "true before anyone can
+// observe otherwise". g releases the keep-alive ref on an expiry; it may be nil
+// where no git handle is available, in which case the ref is left in place
+// (harmless — it pins one commit — but a leak, so callers pass one where they can).
+func enforceParkTimeout(ctx context.Context, g *gitx.Git, dir string) bool {
+	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
+		return false // cheap pre-check: skip the lock entirely for the common case
+	}
+	unlock, ok := lockPark(dir)
+	if !ok {
+		return false
+	}
+	defer unlock()
 	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
 		return false
 	}
-	pk, err := readPark(dir)
+	raw, pk, err := readParkAt(dir)
 	if err != nil {
 		return false
 	}
@@ -709,10 +965,13 @@ func enforceParkTimeout(dir string) bool {
 	}
 	pk.RejectReason = fmt.Sprintf("ack-timeout %s expired without an ack", pk.AckTimeout)
 	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
-	if err := writePark(dir, pk); err != nil {
+	if err := writeParkCAS(dir, raw, pk); err != nil {
 		return false
 	}
 	writeRunStatus(dir, statusRejected, pk.RejectReason)
+	if g != nil {
+		releaseParkRef(ctx, g, pk)
+	}
 	appendRunEvent(dir, "reject", map[string]any{"actor": "timeout", "reason": pk.RejectReason})
 	return true
 }
@@ -721,14 +980,14 @@ func enforceParkTimeout(dir string) bool {
 // startup half of the lazy sweep, run alongside recoverStaleRuns so a daemon
 // that was down past a park's deadline reports it correctly from its first
 // request onward.
-func expireParks(runsDir string) {
+func expireParks(ctx context.Context, g *gitx.Git, runsDir string) {
 	entries, err := os.ReadDir(runsDir)
 	if err != nil {
 		return
 	}
 	for _, de := range entries {
 		if de.IsDir() {
-			enforceParkTimeout(filepath.Join(runsDir, de.Name()))
+			enforceParkTimeout(ctx, g, filepath.Join(runsDir, de.Name()))
 		}
 	}
 }
@@ -840,7 +1099,7 @@ func runAckReject(w io.Writer, argv []string, ack bool) (int, error) {
 		// flags instead. Never the park's — a run's environment is not recorded.
 		out, err = ackRun(ctx, c, dir, "cli", ackEnv{Mode: envModeInherit})
 	} else {
-		out, err = rejectRun(dir, "cli", *reason)
+		out, err = rejectRun(ctx, c.Git(), dir, "cli", *reason)
 	}
 	if err != nil {
 		return exitOperationalError, err

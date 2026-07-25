@@ -11,6 +11,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,8 +24,15 @@ import (
 // seedRun writes a synthetic completed run directory into runsDir and returns
 // its id.
 func seedRun(t *testing.T, runsDir string, rep runReport) string {
+	return seedRunID(t, runsDir, newRunID(), rep)
+}
+
+// seedRunID is seedRun with an explicit id, for tests that depend on the
+// newest-first ORDER. newRunID's timestamp is second-precision, so several runs
+// seeded in one test all share it and sort by their random suffix instead —
+// useless for asserting anything about chronology.
+func seedRunID(t *testing.T, runsDir, id string, rep runReport) string {
 	t.Helper()
-	id := newRunID()
 	dir := filepath.Join(runsDir, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -332,5 +340,55 @@ func TestInboxEmptyWhenNothingWaits(t *testing.T) {
 	}
 	if body.Entries == nil || len(body.Entries) != 0 {
 		t.Fatalf("empty inbox = %+v, want []", body.Entries)
+	}
+}
+
+// TestInboxLimitIsGlobalNotPerCell is the M-c regression: ?limit=N used to break
+// the per-cell scan on a counter shared across cells, so the FIRST cell filled
+// the quota with its own oldest runs and every later cell starved — however
+// recent its parked landings were. "Newest first" was a lie with more than one
+// cell registered, which is the only configuration where an aggregated inbox
+// exists to be wrong about.
+func TestInboxLimitIsGlobalNotPerCell(t *testing.T) {
+	requirePOSIXShell(t)
+	_, repoA := makeGoRepo(t)
+	_, repoB := makeGoRepo(t)
+	srv, tsrv := newTestServer(t, "", repoA, repoB)
+	runsA, runsB := srv.cells[0].runsDir, srv.cells[1].runsDir
+
+	// Cell A gets the OLDER runs, cell B the newer ones. Run ids are
+	// timestamp-prefixed, so seeding A first makes its ids sort lower.
+	flagged := func() runReport {
+		return runReport{Integrate: integrateJSON{Flagged: []flaggedJSON{{Branch: "agent/x", Paths: []string{"f.txt"}}}}}
+	}
+	var older, newer []string
+	for i := 0; i < 4; i++ {
+		older = append(older, seedRunID(t, runsA, fmt.Sprintf("20240101T00000%dZ-aaaaaaaaaaaa", i), flagged()))
+		newer = append(newer, seedRunID(t, runsB, fmt.Sprintf("20240202T00000%dZ-bbbbbbbbbbbb", i), flagged()))
+	}
+
+	got := getInbox(t, tsrv.URL, "?limit=4")
+	if len(got) != 4 {
+		t.Fatalf("?limit=4 returned %d entries", len(got))
+	}
+	// The four NEWEST are cell B's, whichever cell happens to be scanned first.
+	inNewer := map[string]bool{}
+	for _, id := range newer {
+		inNewer[id] = true
+	}
+	for _, e := range got {
+		if !inNewer[e.RunID] {
+			t.Fatalf("?limit=4 returned %s from the older cell; the newest four are all in the other cell (older=%v newer=%v)",
+				e.RunID, older, newer)
+		}
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1].RunID < got[i].RunID {
+			t.Fatalf("entries are not newest-first across cells: %s before %s", got[i-1].RunID, got[i].RunID)
+		}
+	}
+	// Unlimited still sees everything from both cells.
+	if all := getInbox(t, tsrv.URL, ""); len(all) != 8 {
+		t.Fatalf("unfiltered inbox returned %d entries, want 8", len(all))
 	}
 }

@@ -18,7 +18,8 @@
 //
 //	sig gc -repo PATH [-older-than 72h] [-delete] [-force] [-json]
 //
-// gc NEVER touches: the base branch or any branch outside agent/ and
+// gc NEVER touches: refs/sigbound/park/* (a parked landing's keep-alive ref,
+// see park.go), the base branch or any branch outside agent/ and
 // imported/<worker>/, refs/notes/sigbound, or the run history itself under
 // .git/sigbound/runs (deliberately out of scope -- see docs/USAGE.md).
 package main

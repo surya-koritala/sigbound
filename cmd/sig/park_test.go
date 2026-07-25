@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -262,9 +264,6 @@ func TestParkAckRefusesMutatedRecord(t *testing.T) {
 			}
 			pk.VerifiedTree = tree
 		}},
-		{"baseSHA rewritten to an unrelated ancestor-less commit", func(f *parkFixture, pk *parkJSON) {
-			pk.BaseSHA = strings.Repeat("b", len(pk.BaseSHA))
-		}},
 		{"verifiedSHA is not hex at all", func(f *parkFixture, pk *parkJSON) {
 			pk.VerifiedSHA = "../../etc/passwd"
 		}},
@@ -305,7 +304,7 @@ func TestParkReadFailsClosedOnCorruption(t *testing.T) {
 	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err == nil {
 		t.Fatal("ack accepted a corrupt parking record")
 	}
-	if _, err := rejectRun(f.dir, "test", ""); err == nil {
+	if _, err := rejectRun(ctx, f.g, f.dir, "test", ""); err == nil {
 		t.Fatal("reject accepted a corrupt parking record")
 	}
 	if got := f.head(); got != before {
@@ -405,7 +404,7 @@ func TestParkAckBaseMovedReverifiesRedRePark(t *testing.T) {
 		t.Fatalf("a red re-verify rewrote the recorded landing: %+v", pk)
 	}
 	// The inbox surfaces the red attempt.
-	entries := inboxEntriesFor("c", f.dir, f.runID, inboxParked, time.Now())
+	entries := inboxEntriesFor(context.Background(), f.g, "c", f.dir, f.runID, inboxParked, time.Now())
 	if len(entries) != 1 || !strings.Contains(entries[0].Summary, "red") {
 		t.Fatalf("inbox entry does not surface the red attempt: %+v", entries)
 	}
@@ -420,7 +419,7 @@ func TestParkRejectIsTerminalAndKeepsBranches(t *testing.T) {
 	ctx := context.Background()
 	before := f.head()
 
-	out, err := rejectRun(f.dir, "test", "not shipping auth changes this week")
+	out, err := rejectRun(context.Background(), f.g, f.dir, "test", "not shipping auth changes this week")
 	if err != nil {
 		t.Fatalf("rejectRun: %v", err)
 	}
@@ -447,7 +446,7 @@ func TestParkRejectIsTerminalAndKeepsBranches(t *testing.T) {
 	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err == nil {
 		t.Fatal("ack succeeded on a rejected run")
 	}
-	if _, err := rejectRun(f.dir, "test", "again"); err == nil {
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "again"); err == nil {
 		t.Fatal("reject succeeded twice on the same run")
 	}
 	if f.status() != statusRejected {
@@ -752,7 +751,7 @@ func TestParkWithoutTimeoutNeverExpires(t *testing.T) {
 	}
 	pk.CreatedAt = time.Now().Add(-100000 * time.Hour).UTC().Format(time.RFC3339)
 	f.writeParkRaw(pk)
-	if enforceParkTimeout(f.dir) {
+	if enforceParkTimeout(context.Background(), f.g, f.dir) {
 		t.Fatal("a park with no ack-timeout expired")
 	}
 	if f.status() != statusAwaitingAck {
@@ -825,6 +824,7 @@ func normalizedPark(pk *parkJSON) string {
 	c := *pk
 	c.VerifiedSHA, c.VerifiedTree, c.BaseSHA, c.ForkSHA, c.LandedSHA = "", "", "", "", ""
 	c.CreatedAt, c.ResolvedAt = "", ""
+	c.KeepRef = "" // names the run, so it differs between two runs by construction
 	c.Attempts = append([]parkAttemptJSON(nil), pk.Attempts...)
 	for i := range c.Attempts {
 		c.Attempts[i].At, c.Attempts[i].BaseSHA, c.Attempts[i].FinalSHA = "", "", ""
@@ -992,4 +992,459 @@ func assertEvent(t *testing.T, dir, name string) {
 		}
 	}
 	t.Fatalf("no %q event in %s/events.ndjson:\n%s", name, dir, data)
+}
+
+// ---- regressions from the adversarial review of cf3d491 ----
+
+// keepRefSHA returns what the park's keep-alive ref points at, or "" if the ref
+// is gone.
+func (f *parkFixture) keepRefSHA(ref string) string {
+	f.t.Helper()
+	sha, err := f.g.RevParse(context.Background(), ref)
+	if err != nil {
+		return ""
+	}
+	return sha
+}
+
+// pruneUnreachable is the reviewer's exact garbage-collection sequence: drop
+// every reflog entry (so nothing is reachable via reflog) and collect
+// aggressively. Anything not reachable from a real ref is deleted.
+func (f *parkFixture) pruneUnreachable() {
+	f.t.Helper()
+	for _, args := range [][]string{
+		{"reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all"},
+		{"gc", "--prune=now"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = f.repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			f.t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
+// TestParkSurvivesGitGarbageCollection is the BLOCK-1 regression. The parked
+// commit is built by commit-tree and is reachable from no branch — its parents
+// are the base and the agent branches, so protecting those protects its
+// ancestors, not it. Without a keep-alive ref, an ordinary `git gc` in the
+// user's own repo deletes the verified landing and the park can never be acked
+// again. sigbound only disables gc.auto on repos it creates itself, and a park
+// waits indefinitely by default, so this is not a hypothetical.
+func TestParkSurvivesGitGarbageCollection(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	pk := f.reread()
+
+	if pk.KeepRef == "" {
+		t.Fatal("the park recorded no keep-alive ref")
+	}
+	if got := f.keepRefSHA(pk.KeepRef); got != pk.VerifiedSHA {
+		t.Fatalf("keep-alive ref points at %s, want the verified commit %s", short(got), short(pk.VerifiedSHA))
+	}
+	// It must live outside every prefix `sig gc` sweeps, or the protection is
+	// circular.
+	for _, prefix := range gcBranchPrefixes {
+		if strings.HasPrefix(pk.KeepRef, prefix) {
+			t.Fatalf("keep-alive ref %s is inside sig gc's sweep prefix %s", pk.KeepRef, prefix)
+		}
+	}
+
+	f.pruneUnreachable()
+
+	if _, err := f.g.RevParse(ctx, pk.VerifiedSHA); err != nil {
+		t.Fatalf("git gc pruned the parked commit %s: %v", short(pk.VerifiedSHA), err)
+	}
+	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err != nil {
+		t.Fatalf("ack after git gc: %v", err)
+	}
+	if out.LandedSHA != pk.VerifiedSHA {
+		t.Fatalf("ack landed %s, want %s", short(out.LandedSHA), short(pk.VerifiedSHA))
+	}
+	// Once landed, the base branch reaches the commit, so the keep-alive ref has
+	// nothing left to protect and is released.
+	if got := f.keepRefSHA(pk.KeepRef); got != "" {
+		t.Fatalf("keep-alive ref survived the ack (still at %s)", short(got))
+	}
+}
+
+// TestParkRejectReleasesKeepAliveRef: a rejection lands nothing, so the verified
+// commit becomes garbage on purpose — the ref must not pin it forever.
+func TestParkRejectReleasesKeepAliveRef(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	pk := f.reread()
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "no"); err != nil {
+		t.Fatalf("rejectRun: %v", err)
+	}
+	if got := f.keepRefSHA(pk.KeepRef); got != "" {
+		t.Fatalf("keep-alive ref survived a reject (still at %s)", short(got))
+	}
+	// The branches are still kept — a reject declines a landing, it does not
+	// destroy work.
+	for _, b := range pk.branches() {
+		if _, err := f.g.RevParse(context.Background(), b); err != nil {
+			t.Fatalf("reject lost branch %s: %v", b, err)
+		}
+	}
+}
+
+// TestParkAckBaseMovedDoesNotNeedTheRecordedCommit is the amplifier regression:
+// validateParkedLanding used to run unconditionally, so a park whose recorded
+// commit was unusable was refused even on the base-MOVED path — which never
+// reads that commit at all, rebuilding instead from the fork point and the
+// branches (both of which gc protects). A recoverable park was permanently
+// stranded by a check on something it did not need.
+func TestParkAckBaseMovedDoesNotNeedTheRecordedCommit(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	pk := f.reread()
+
+	// Take the keep-alive ref away and collect, so the recorded commit is really
+	// gone — the exact state a pre-keep-ref park would be in.
+	if err := f.g.DeleteRef(ctx, pk.KeepRef); err != nil {
+		t.Fatal(err)
+	}
+	f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
+	f.pruneUnreachable()
+	if _, err := f.g.RevParse(ctx, pk.VerifiedSHA); err == nil {
+		t.Skip("the recorded commit is still reachable; this platform's gc did not prune it")
+	}
+
+	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err != nil {
+		t.Fatalf("base-moved ack refused over an unusable recorded commit it never needed: %v", err)
+	}
+	if !out.Reverified || out.Status != "done" {
+		t.Fatalf("ack outcome %+v, want a re-verified landing", out)
+	}
+	if _, present, err := f.g.BlobAt(ctx, f.head(), "auth/token.go"); err != nil || !present {
+		t.Fatalf("the rebuilt landing is missing the parked change (err=%v)", err)
+	}
+}
+
+// slowVerify rewrites the park's recorded verify command so a re-verify takes
+// long enough for a second actor to race it, and returns the deadline by which
+// that ack will have finished.
+func (f *parkFixture) slowVerify(cmd string) {
+	f.t.Helper()
+	pk := f.reread()
+	pk.Verify = cmd
+	f.writeParkRaw(pk)
+}
+
+// TestRejectDuringInFlightAckWins is BLOCK-2 proof (1): status was checked once
+// at ack entry and landRef fired minutes later, so a human who rejected a run
+// mid-ack was told "nothing landed" and then watched the ref advance anyway,
+// with the ack's stale read-modify-write erasing the rejection reason.
+func TestRejectDuringInFlightAckWins(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	f.moveBase("package main\n\nfunc extra() int { return 7 }\n") // force the slow re-verify path
+	f.slowVerify("sleep 3")
+	before := f.head()
+
+	ackErr := make(chan error, 1)
+	go func() {
+		_, err := ackRun(ctx, f.cell, f.dir, "http", ackEnv{Mode: envModeInherit})
+		ackErr <- err
+	}()
+	time.Sleep(750 * time.Millisecond) // the ack is now inside its re-verify
+
+	out, err := rejectRun(ctx, f.g, f.dir, "cli", "changed my mind")
+	if err != nil {
+		t.Fatalf("reject during an in-flight ack: %v", err)
+	}
+	if out.Status != statusRejected {
+		t.Fatalf("reject outcome %+v", out)
+	}
+	if err := <-ackErr; err == nil {
+		t.Fatal("the in-flight ack succeeded after the run was rejected")
+	}
+
+	if got := f.head(); got != before {
+		t.Fatalf("the ref advanced to %s after a reject won (was %s)", short(got), short(before))
+	}
+	if f.status() != statusRejected {
+		t.Fatalf("final status %q, want %s — a reject is terminal", f.status(), statusRejected)
+	}
+	pk := f.reread()
+	if pk.RejectReason != "changed my mind" {
+		t.Fatalf("rejectReason = %q; the in-flight ack clobbered it", pk.RejectReason)
+	}
+	if pk.LandedSHA != "" {
+		t.Fatalf("a rejected park recorded a landing: %s", pk.LandedSHA)
+	}
+}
+
+// TestExpiryDuringInFlightAckWins is BLOCK-2 proof (2): the lazy ack-timeout
+// sweep runs from an ordinary GET /inbox, with none of the daemon's per-cell
+// locking, so a plain read could auto-reject a park while an ack was mid-verify
+// — and the ack landed it anyway and overwrote the status back to done.
+func TestExpiryDuringInFlightAckWins(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths+"ack-timeout = 1h\n")
+	ctx := context.Background()
+	f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
+	before := f.head()
+
+	// Expire one second from now: not yet expired when the ack starts, expired
+	// while it is inside its verify.
+	pk := f.reread()
+	pk.Verify = "sleep 3"
+	pk.CreatedAt = time.Now().Add(-1 * time.Hour).Add(time.Second).UTC().Format(time.RFC3339)
+	f.writeParkRaw(pk)
+
+	ackErr := make(chan error, 1)
+	go func() {
+		_, err := ackRun(ctx, f.cell, f.dir, "http", ackEnv{Mode: envModeInherit})
+		ackErr <- err
+	}()
+	time.Sleep(1500 * time.Millisecond)
+	getInbox(t, f.ts.URL, "") // the lazy sweep fires here
+	if f.status() != statusRejected {
+		t.Fatalf("status %q after the deadline passed and the inbox was read, want %s", f.status(), statusRejected)
+	}
+
+	if err := <-ackErr; err == nil {
+		t.Fatal("the in-flight ack succeeded after its park expired")
+	}
+	if got := f.head(); got != before {
+		t.Fatalf("the ref advanced to %s after an expiry (was %s)", short(got), short(before))
+	}
+	if f.status() != statusRejected {
+		t.Fatalf("final status %q, want %s", f.status(), statusRejected)
+	}
+}
+
+// TestConcurrentAcksLandExactlyOnce: two acks racing the same park must produce
+// exactly one landing and one coherent record — the loser must not overwrite the
+// winner's attempt history.
+func TestConcurrentAcksLandExactlyOnce(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
+	f.slowVerify("sleep 1")
+
+	type res struct {
+		out ackOutcome
+		err error
+	}
+	results := make(chan res, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+			results <- res{out, err}
+		}()
+	}
+	landed := 0
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err == nil && r.out.LandedSHA != "" {
+			landed++
+		}
+	}
+	if landed != 1 {
+		t.Fatalf("%d of 2 concurrent acks landed; exactly one must", landed)
+	}
+	pk := f.reread()
+	if pk.LandedSHA == "" || f.status() != "done" {
+		t.Fatalf("after two concurrent acks: landedSHA=%q status=%q", pk.LandedSHA, f.status())
+	}
+	// The winner's attempt history survives: attempt 1 (the park's own verify)
+	// plus exactly one re-verify. A last-writer-wins clobber loses one.
+	if len(pk.Attempts) != 2 {
+		t.Fatalf("attempts = %d, want 2 — a concurrent writer clobbered the record: %+v", len(pk.Attempts), pk.Attempts)
+	}
+	if f.head() != pk.LandedSHA {
+		t.Fatalf("main at %s, record says %s", short(f.head()), short(pk.LandedSHA))
+	}
+}
+
+// TestParkSurvivesCrashBetweenRecordAndStatus is the M-a regression: execRun
+// writes park.json and THEN status.json, so a crash in that gap left a genuinely
+// parked run marked "running". Startup recovery rewrote it to "interrupted" and
+// the verified landing became permanently unreachable — ack and reject both
+// refused it, while sig gc pinned its branches forever with nothing able to
+// release them. An unresolved parking record now outranks the phase marker.
+func TestParkSurvivesCrashBetweenRecordAndStatus(t *testing.T) {
+	requireUnixProcessSemantics(t)
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+
+	// The crash: park.json is on disk, the marker never advanced past "running",
+	// and the owning process is gone.
+	writeRunStatusAsPID(t, f.dir, "running", deadPID(t))
+
+	if st, _ := diskRunStatus(f.dir); st != statusAwaitingAck {
+		t.Fatalf("diskRunStatus = %q for a run with an unresolved parking record, want %s", st, statusAwaitingAck)
+	}
+	recoverStaleRuns(filepath.Dir(f.dir), os.Getpid())
+	if got := f.status(); got != statusAwaitingAck {
+		t.Fatalf("startup recovery marked a parked run %q, want %s", got, statusAwaitingAck)
+	}
+	// And it is genuinely actionable again.
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err != nil {
+		t.Fatalf("the recovered park was not ackable: %v", err)
+	}
+}
+
+// TestParkLockIsCrossProcessAndStealsFromDeadHolders: the lock has to span
+// processes, since `sig ack` and the daemon are different ones acting on the
+// same run dir, and it must never wedge a park when a holder is killed.
+func TestParkLockIsCrossProcessAndStealsFromDeadHolders(t *testing.T) {
+	requireUnixProcessSemantics(t)
+	dir := t.TempDir()
+
+	unlock, ok := lockPark(dir)
+	if !ok {
+		t.Fatal("could not take a fresh park lock")
+	}
+	if _, ok := lockPark(dir); ok {
+		t.Fatal("the park lock was granted twice at once")
+	}
+	unlock()
+	unlock2, ok := lockPark(dir)
+	if !ok {
+		t.Fatal("the park lock was not released")
+	}
+	unlock2()
+
+	// A holder that died without releasing must not wedge the run forever.
+	if err := os.WriteFile(filepath.Join(dir, parkLockName), []byte(strconv.Itoa(deadPID(t))+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unlock3, ok := lockPark(dir)
+	if !ok {
+		t.Fatal("a lock held by a dead process was not stolen")
+	}
+	unlock3()
+}
+
+// TestRedAttemptAlwaysExplainsItself is the M-d regression: a verify that fails
+// SILENTLY (a bare `exit 1`, or a policy battery member that prints nothing)
+// recorded verifyOk=false with empty output AND empty error, so the inbox said
+// "attempt 2 failed" with nothing whatsoever to inspect.
+func TestRedAttemptAlwaysExplainsItself(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
+	f.slowVerify("exit 1") // fails, prints nothing at all
+
+	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err != nil {
+		t.Fatalf("ackRun: %v", err)
+	}
+	if out.Status != statusAwaitingAck {
+		t.Fatalf("outcome %+v, want the run left parked", out)
+	}
+	att := f.reread().Attempts
+	if len(att) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(att))
+	}
+	last := att[1]
+	if last.VerifyOK {
+		t.Fatal("a failing verify recorded a green attempt")
+	}
+	if strings.TrimSpace(last.Output) == "" && strings.TrimSpace(last.Error) == "" {
+		t.Fatalf("a red attempt recorded neither output nor error: %+v", last)
+	}
+}
+
+// TestConflictAttemptRecordsNoFinalSHA: when every parked branch conflicts on
+// re-integration nothing is produced, so the attempt must not report the BASE
+// commit as though it were the result.
+func TestConflictAttemptRecordsNoFinalSHA(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	// Land a conflicting edit to the very file the parked branch adds.
+	if err := f.g.ResetHard(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(f.repo, "auth"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.repo, "auth/token.go"), []byte("package auth\n\nfunc Token() string { return \"other\" }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := f.g.CommitAll(ctx, "conflicting edit on the base")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err != nil {
+		t.Fatalf("ackRun: %v", err)
+	}
+	if out.Status != statusAwaitingAck {
+		t.Fatalf("outcome %+v, want the run left parked on a conflict", out)
+	}
+	if got := f.head(); got != moved {
+		t.Fatalf("the ref moved to %s on a conflicting re-integration", short(got))
+	}
+	last := f.reread().Attempts[1]
+	if last.FinalSHA != "" {
+		t.Fatalf("a conflict-only attempt recorded finalSHA %s — that is the base, not a result", short(last.FinalSHA))
+	}
+	if len(last.Flagged) == 0 {
+		t.Fatal("a conflict-only attempt recorded no flagged branches")
+	}
+}
+
+// TestParkMutatedBaseSHAReverifiesRatherThanLandingStale pins the semantics of
+// the ONE record field an ack cannot simply refuse over. A rewritten baseSHA is
+// indistinguishable from a base that legitimately moved — that is precisely what
+// "the base moved" means — so it routes to the re-verify path, which is a
+// STRICTER gate than the direct release, not a weaker one: the recorded tree is
+// discarded, the branches are re-integrated from the fork point, and only a
+// freshly green result lands.
+//
+// The property that matters is not "every mutation is refused" (see
+// validateParkedLanding's note on what these checks are and are not). It is that
+// no mutation can make an UNVERIFIED tree land.
+func TestParkMutatedBaseSHAReverifiesRatherThanLandingStale(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	pk := f.reread()
+	stale := pk.VerifiedSHA
+	before := f.head()
+
+	pk.BaseSHA = strings.Repeat("b", len(pk.BaseSHA))
+	f.writeParkRaw(pk)
+
+	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err != nil {
+		// Refusing is also acceptable; what must never happen is landing stale.
+		if f.head() != before {
+			t.Fatalf("ack failed but the ref still moved to %s", short(f.head()))
+		}
+		return
+	}
+	if !out.Reverified {
+		t.Fatalf("outcome %+v: a record whose baseSHA does not match the base must re-verify, never release the recorded commit", out)
+	}
+	// NOTE: the re-verified commit may legitimately EQUAL the recorded one.
+	// Integration is deterministic, so re-folding the same branches onto the same
+	// base with the same merge base reproduces the same tree and parents — and
+	// within the same second, commit-tree's timestamp matches too, yielding the
+	// identical SHA. That is deterministic integration agreeing with itself, not
+	// a stale release; what proves the difference is that it went through a real
+	// re-verify (asserted above and via attempt 2 below), so the SHA is not
+	// compared here.
+	_ = stale
+	head := f.head()
+	if head != out.LandedSHA {
+		t.Fatalf("main at %s, outcome says %s", short(head), short(out.LandedSHA))
+	}
+	// Whatever landed is a fresh descendant of what was there, carrying the
+	// parked change — i.e. it went through a real verify just now.
+	if anc, aerr := f.g.IsAncestor(ctx, before, head); aerr != nil || !anc {
+		t.Fatalf("the landing is not a fast-forward from %s (err=%v)", short(before), aerr)
+	}
+	if _, present, berr := f.g.BlobAt(ctx, head, "auth/token.go"); berr != nil || !present {
+		t.Fatalf("the landing is missing the parked change (err=%v)", berr)
+	}
+	att := f.reread().Attempts
+	if len(att) != 2 || !att[1].VerifyOK {
+		t.Fatalf("no green re-verify attempt was recorded: %+v", att)
+	}
 }

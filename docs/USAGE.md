@@ -964,6 +964,7 @@ field and leaves the branches for you to land with `sig integrate` yourself.
   "verifiedTree": "…",         // its tree OID, re-checked at ack time
   "baseSHA":      "…",         // the base this was verified against
   "forkSHA":      "…",         // where the parked branches were created
+  "keepRef":      "refs/sigbound/park/<runId>",
   "reason":       "ack-paths", // or "policy-modified"
   "createdAt":    "…",
   "groups":       [{"branches": ["agent/t1"], "matchedPaths": {"auth/x.go": "auth/**"}}],
@@ -973,6 +974,16 @@ field and leaves the branches for you to land with `sig integrate` yourself.
 
 `attempts[0]` is the park's own verify; each later entry is one re-verify cycle
 (below). `matchedPaths` maps each triggering path to the glob that matched it.
+
+**`keepRef` is load-bearing.** The verified commit is built with `commit-tree`
+and is reachable from no branch — its *parents* are the base and the agent
+branches, so keeping those alive protects its ancestors, not it. Left
+unreferenced it is ordinary garbage that `git gc`, `git maintenance`, a repack,
+or simply crossing `gc.auto`'s loose-object threshold would delete, and the
+landing would become unackable forever. So a park holds a keep-alive ref on it
+under `refs/sigbound/park/`, re-pointed on every green re-verify and released
+when the park resolves. That namespace is outside everything
+[`sig gc`](#sig-gc) sweeps, so the two never fight.
 
 ### Ack and reject
 
@@ -995,7 +1006,10 @@ object store — it must still exist, still carry the recorded tree OID, and sti
 descend from the recorded base — and then landed as-is. Nothing is recomputed. If
 any of those checks fails the ack is refused and the ref does not move: landing
 anything other than the exact verified tree is the outcome this whole feature
-exists to prevent.
+exists to prevent. Those are **consistency** checks against corruption,
+truncation and staleness, not an authenticity guarantee — anyone who can rewrite
+`park.json` can also move the base ref directly, which needs no ack at all. What
+they buy is that an ack cannot land the wrong thing by *accident*.
 
 **Ack, base moved.** The stale tree is **not** landed. The parked branches are
 re-integrated onto the base's current head — merged against their own fork point,
@@ -1009,6 +1023,23 @@ shows. Either way the attempt is recorded in `attempts[]`.
 **Reject** is terminal (`rejected`), lands nothing, records the optional reason,
 and **keeps every branch** — a rejection is a decision not to land, never a
 decision to destroy the work.
+
+**A reject always beats an in-flight ack.** A base-moved ack can sit in a
+re-verify for as long as the repo's verify command takes, and a human may well
+reject it in that window. Each run's record is guarded by a lock in its own run
+directory — held across processes, so `sig ack` on the CLI and a `POST` to a
+running daemon serialize against each other, and stolen automatically if its
+holder was killed. The ack releases that lock for the slow re-verify (holding it
+would make `sig reject` hang for exactly as long), then re-takes it and
+**re-reads the run's status immediately before landing**: a run that became
+`rejected` — by a person or by an expired `ack-timeout` — is never landed, and
+the ack reports a conflict instead. Record updates are compare-and-swap, so a
+losing ack cannot overwrite the rejection reason with a stale copy of the record
+it read minutes earlier.
+
+On Windows the lock provides no mutual exclusion (it depends on the same pid
+liveness probe [crash recovery](#crash-recovery) does); the status re-check
+before landing is platform-independent and is what makes `rejected` terminal.
 
 ### Ack timeout
 
@@ -1026,6 +1057,14 @@ waits indefinitely.
 ever rewrites `queued`/`running` runs to `interrupted` (see
 [Crash recovery](#crash-recovery)); a parked run is deliberately outside that
 sweep, because the human it is waiting for may not be back for days.
+
+`park.json` is written **before** the status marker flips, and an unresolved
+`park.json` **outranks** that marker. A daemon killed in the gap between the two
+would otherwise leave a genuinely parked run marked `running`, which recovery
+would then call `interrupted` — a verified landing no ack or reject could reach
+again, with its branches pinned by `sig gc` and nothing able to release them.
+The record is the authority on whether a park exists; the marker only records
+the phase, and is healed to match on the next read or restart.
 
 `sig gc` will **never** delete a branch an open park names — no age cutoff
 reaches it and neither does `-force` (see [`sig gc`](#sig-gc)). A `park.json` that
@@ -1389,7 +1428,11 @@ manifest-protection concept to override.
 
 **Parked runs are protected absolutely.** A branch named by an open `park.json`
 (see [Run parking](#run-parking)) is never a sweep candidate: no age cutoff
-reaches it and `-force` does not either. It is the only copy of a landing that
+reaches it and `-force` does not either. The park's own keep-alive ref lives
+under `refs/sigbound/park/`, outside the `refs/heads/agent/` and
+`refs/heads/imported/` prefixes this command considers at all, so it is never
+touched here either — and because it is a real ref, plain `git gc` in your repo
+will not reclaim the verified commit behind it. It is the only copy of a landing that
 already passed verify and is waiting on a person, which is the opposite of
 debris. The dry-run and `-delete` output both name it as `kept (PARKED …)`. Once
 that park is acked or rejected it stops being parked, and ordinary manifest rules
@@ -1687,7 +1730,7 @@ The vocabulary:
 | `quota_agents` | 400 | `-max-agents-per-run` exceeded. |
 | `unsupported_media_type` | 415 | `Content-Type` isn't `application/json`. |
 | `cell_busy` | 409 | That cell already has a run — or an ack's re-verify — in flight (one at a time). |
-| `not_parked` | 409 | `ack`/`reject` on a run that is not `awaiting-ack`. |
+| `not_parked` | 409 | `ack`/`reject` on a run that is not `awaiting-ack` — including a run that was rejected, or whose `ack-timeout` expired, WHILE an ack was re-verifying. |
 | `quota_concurrency` | 429 | `-max-concurrent-runs` exceeded. |
 | `run_not_found` | 404 | The run id in the path doesn't resolve to any run. |
 | `not_found` | 404 | A known run has no report/usage yet, or a `flagged` path/branch isn't in that run's allowlist — not a run- or cell-lookup failure. |
