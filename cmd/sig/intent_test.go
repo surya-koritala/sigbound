@@ -485,3 +485,39 @@ func TestResumeCarriesIntentForward(t *testing.T) {
 		t.Errorf("resumed intent = %q, want the manifest's recorded intent", intentID)
 	}
 }
+
+// TestImportRejectsAnIntentItCannotReadBack pins the pre-write validation in
+// writeImportedIntents. Review found it was the one guard in this file with no
+// test: deleting it broke nothing, while its failure mode is real -- an
+// unparseable file on disk makes `sig intent list` fail for the whole
+// directory until someone finds and removes it by hand.
+func TestImportRejectsAnIntentItCannotReadBack(t *testing.T) {
+	repo := t.TempDir()
+	// An issue whose title and body are both empty renders an intent with no
+	// goal, which parseIntent refuses -- the shape the guard exists to catch.
+	_, err := writeImportedIntents(repo, []ghIssue{{Number: 1, Title: "", Body: ""}})
+	if err == nil {
+		t.Fatal("import accepted an issue that renders an unparseable intent; the guard is gone")
+	}
+	if _, statErr := os.Stat(intentPath(repo, importedIntentID(1))); !os.IsNotExist(statErr) {
+		t.Fatalf("the unreadable intent was left on disk (stat err %v); `sig intent list` would now fail for every intent", statErr)
+	}
+}
+
+// TestLoadIntentRefusesAnUnsafeIDBeforeReading pins the ORDER, not just the
+// refusal: parseIntent rejects an unsafe id too, so asserting only that the
+// call fails would pass with the pre-read check deleted. What distinguishes
+// them is which error comes back -- reaching the read means a parse/read error
+// instead, and means an arbitrary file was opened and slurped on the way.
+func TestLoadIntentRefusesAnUnsafeIDBeforeReading(t *testing.T) {
+	repo := t.TempDir()
+	for _, id := range []string{"../../etc/passwd", "a/b", "", ".", "..", "a b"} {
+		_, err := loadIntent(repo, id)
+		if err == nil {
+			t.Fatalf("loadIntent(%q) succeeded; an unsafe id must be refused", id)
+		}
+		if !strings.Contains(err.Error(), "is not a safe name") {
+			t.Fatalf("loadIntent(%q) failed with %q, want the pre-read id check -- this error means the file was opened first", id, err)
+		}
+	}
+}

@@ -93,6 +93,14 @@ func intentPath(repo, id string) string { return filepath.Join(intentDir(repo), 
 // without knowing where it was expected); a malformed one fails loudly naming
 // file, line and key — never a partial intent, and never a silently skipped key.
 func loadIntent(repo, id string) (intent, error) {
+	// Validate the id before touching the filesystem. parseIntent checks it too,
+	// but only after the bytes are read, so an unsafe id would open and slurp a
+	// file before being refused. intentPath already confines the result under
+	// the repo's intents/ dir, so this is depth rather than a hole -- but there
+	// is no reason to read a file this function is going to reject.
+	if !slugSafe(id) {
+		return intent{}, fmt.Errorf("intent id %q is not a safe name: it becomes a task id and a branch component", id)
+	}
 	path := intentPath(repo, id)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -452,6 +460,15 @@ func runIntentImportGitHub(w io.Writer, argv []string) (int, error) {
 	}
 	results, err := writeImportedIntents(*repo, issues)
 	if err != nil {
+		// One file per issue, so a failure part-way leaves the earlier ones on
+		// disk. Name them: an operator who is not told cannot tell a partial
+		// import from one that did nothing, and the next run silently skips
+		// whatever landed.
+		for _, r := range results {
+			if r.Written {
+				fmt.Fprintf(w, "wrote %s before the import failed\n", r.Path)
+			}
+		}
 		return exitOperationalError, err
 	}
 	if *asJSON {
@@ -522,12 +539,12 @@ func writeImportedIntents(repo string, issues []ghIssue) ([]importResult, error)
 	results := make([]importResult, 0, len(issues))
 	for _, iss := range issues {
 		if iss.Number <= 0 {
-			return nil, fmt.Errorf("gh returned an issue with number %d", iss.Number)
+			return results, fmt.Errorf("gh returned an issue with number %d", iss.Number)
 		}
 		id := importedIntentID(iss.Number)
 		body := renderImportedIntent(iss)
 		if _, err := parseIntent(body, id); err != nil {
-			return nil, fmt.Errorf("issue #%d would not render a valid intent: %w", iss.Number, err)
+			return results, fmt.Errorf("issue #%d would not render a valid intent: %w", iss.Number, err)
 		}
 		path := intentPath(repo, id)
 		res := importResult{Issue: iss.Number, ID: id, Path: path}
