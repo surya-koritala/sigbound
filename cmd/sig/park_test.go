@@ -49,6 +49,16 @@ type parkFixture struct {
 func newParkFixture(t *testing.T, policyBody string) *parkFixture {
 	t.Helper()
 	requirePOSIXShell(t)
+	// Several park tests call gcPlanFor with a negative -older-than, which puts
+	// the cutoff in the future so every candidate is past the age gate -- the
+	// attack the protection has to withstand. Against the real os.TempDir()
+	// that also sweeps up the live worktrees of any other sigbound test binary
+	// running beside this one, which surfaces as a mystifying failure over
+	// there rather than here. Give every fixture its own root.
+	origTempRoot := gcTempRoot
+	gcRoot := t.TempDir()
+	gcTempRoot = func() string { return gcRoot }
+	t.Cleanup(func() { gcTempRoot = origTempRoot })
 	ctx := context.Background()
 	g, repo := makeGoRepo(t)
 	agent := buildTestAgent(t)
