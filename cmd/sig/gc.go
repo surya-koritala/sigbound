@@ -11,6 +11,11 @@
 // resumeAgent), so sweeping one out from under a resumable run would
 // silently break resume.
 //
+// A branch named by an OPEN park.json (a landing that passed verify and is
+// waiting on a human ack -- see park.go) is kept UNCONDITIONALLY: no age
+// cutoff, and -force does not reach it either. gc exists to sweep debris, and
+// a parked branch is the opposite of debris.
+//
 //	sig gc -repo PATH [-older-than 72h] [-delete] [-force] [-json]
 //
 // gc NEVER touches: the base branch or any branch outside agent/ and
@@ -52,7 +57,7 @@ const gcDefaultOlderThan = 72 * time.Hour
 // else on the machine legitimately created.
 var gcTempPatterns = []string{
 	"sig-run-*", "sig-verify-*", "sig-bisect-*", "sig-repair-*", "sig-replay-verify-*",
-	"sig-int-*", "sig-resolve-*", "sig-doctor-*",
+	"sig-park-*", "sig-int-*", "sig-resolve-*", "sig-doctor-*",
 }
 
 // gcBranchPrefixes are the ONLY ref prefixes gc will ever consider removing.
@@ -83,6 +88,11 @@ type gcPlan struct {
 	ToDelete       []string
 	ToKeep         []string
 	Forced         map[string]bool // subset of ToDelete that was manifest-protected but -force overrode
+	// Parked is the subset of ToKeep held by an OPEN parking record (issue
+	// #109) rather than by an ordinary run manifest. Unlike manifest
+	// protection, this one is absolute: -force does not reach it and neither
+	// does -older-than.
+	Parked map[string]bool
 }
 
 func (p gcPlan) report() gcReport {
@@ -191,9 +201,25 @@ func gcPlanFor(ctx context.Context, g *gitx.Git, olderThan time.Duration, force 
 	if err != nil {
 		return gcPlan{}, fmt.Errorf("load protected branches from .git/sigbound/runs: %w", err)
 	}
+	// Parked runs (issue #109) are protected UNCONDITIONALLY -- see the
+	// plan.Parked check below.
+	parked, err := loadParkedBranches(ctx, g)
+	if err != nil {
+		return gcPlan{}, fmt.Errorf("load parked branches from .git/sigbound/runs: %w", err)
+	}
 
-	plan := gcPlan{StaleWorktrees: stale, Tempdirs: tempdirs, Forced: map[string]bool{}}
+	plan := gcPlan{StaleWorktrees: stale, Tempdirs: tempdirs, Forced: map[string]bool{}, Parked: map[string]bool{}}
 	for _, b := range branches {
+		// A branch an OPEN park still names is never a candidate, at any age and
+		// regardless of -force: it is the only copy of a landing that already
+		// passed verify and is waiting on a human, so deleting it would destroy
+		// work the daemon has promised is still ackable. Checked BEFORE the age
+		// cutoff so the reason it survives is recorded rather than incidental.
+		if parked[b.Name] {
+			plan.Parked[b.Name] = true
+			plan.ToKeep = append(plan.ToKeep, b.Name)
+			continue
+		}
 		if !b.CommitTime.Before(cutoff) {
 			continue // not old enough: not a candidate at all, regardless of -force
 		}
@@ -345,7 +371,11 @@ func printGCTable(w io.Writer, plan gcPlan, applied bool) {
 		fmt.Fprintf(w, "  %s: %s%s\n", action, b, note)
 	}
 	for _, b := range plan.ToKeep {
-		fmt.Fprintf(w, "  kept (manifest-referenced): %s\n", b)
+		why := "manifest-referenced"
+		if plan.Parked[b] {
+			why = "PARKED -- awaiting ack; -force and -older-than do not apply"
+		}
+		fmt.Fprintf(w, "  kept (%s): %s\n", why, b)
 	}
 	if !applied {
 		fmt.Fprintln(w, "dry-run: nothing was removed; run with -delete to actually remove it")

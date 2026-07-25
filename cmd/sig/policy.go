@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -40,12 +41,18 @@ type policy struct {
 	semantic    string   // "" | semanticOff | semanticGo — only semanticGo is a floor
 	assertSet   bool     // whether an assert= line was present
 	assert      bool     // policy's assert value (a floor only when true)
-	ackPaths    []string // globs; a landed change touching one is HELD for a human (interim #108)
-	auditSample int      // 0..100, or -1 when unset. Recorded now; enforced from v2.0 parking
+	ackPaths    []string // globs; a landed change touching one PARKS the landing for a human ack (#109)
+	auditSample int      // 0..100, or -1 when unset: the spot-audit sampling rate (see auditSelected)
 	ackTimeout  time.Duration
-	parallel    int           // parallel-agents ceiling (0 = unset)
-	maxAgents   int           // task-count ceiling (0 = unset)
-	budget      time.Duration // budget ceiling (0 = unset)
+	// ackTimeoutAction is what an EXPIRED park auto-transitions to (see
+	// enforceParkTimeout). parkActionReject is the only value v2.0 accepts; the
+	// key is parsed now so a future action name is a forward-compatible addition
+	// rather than a new key. Defaults to parkActionReject whenever ackTimeout is
+	// set, so `ack-timeout = 72h` alone is complete.
+	ackTimeoutAction string
+	parallel         int           // parallel-agents ceiling (0 = unset)
+	maxAgents        int           // task-count ceiling (0 = unset)
+	budget           time.Duration // budget ceiling (0 = unset)
 }
 
 // policyExplicit names the policy-governed dimensions the invoker chose
@@ -162,6 +169,17 @@ func parsePolicy(data []byte) (policy, error) {
 				return policy{}, fmt.Errorf("line %d: ack-timeout must be a non-negative duration (e.g. 72h), got %q", e.Line, e.Value)
 			}
 			pol.ackTimeout = d
+		case "ack-timeout-action":
+			if err := scalar(e); err != nil {
+				return policy{}, err
+			}
+			// reject is the only action v2.0 implements. Anything else is a hard
+			// error rather than a silent no-op: a policy asking for an action this
+			// binary cannot perform must not quietly leave an expired park open.
+			if e.Value != parkActionReject {
+				return policy{}, fmt.Errorf("line %d: ack-timeout-action must be %s, got %q", e.Line, parkActionReject, e.Value)
+			}
+			pol.ackTimeoutAction = e.Value
 		case "parallel-agents":
 			if err := scalar(e); err != nil {
 				return policy{}, err
@@ -192,6 +210,12 @@ func parsePolicy(data []byte) (policy, error) {
 		default:
 			return policy{}, fmt.Errorf("line %d: unknown policy key %q", e.Line, e.Key)
 		}
+	}
+	// A bare `ack-timeout = 72h` is complete on its own: reject is the only
+	// action v2.0 has, so defaulting here keeps the second key optional without
+	// making an expired park's fate implicit anywhere downstream.
+	if pol.ackTimeout > 0 && pol.ackTimeoutAction == "" {
+		pol.ackTimeoutAction = parkActionReject
 	}
 	return pol, nil
 }
@@ -310,6 +334,7 @@ func policyReport(pol policy) *policyJSON {
 	}
 	if pol.ackTimeout > 0 {
 		out.AckTimeout = pol.ackTimeout.String()
+		out.AckTimeoutAction = pol.ackTimeoutAction
 	}
 	return out
 }
@@ -388,9 +413,12 @@ func clampCeiling[T int | time.Duration](val, ceiling T) T {
 }
 
 // policyHoldback splits ok agent branches into those cleared to integrate and
-// those HELD by policy — routed through the existing flagged mechanism (branches
-// kept, ref not advanced, reason recorded) rather than auto-landed. This is
-// #108's interim behavior; #109 upgrades the hold to park+ack.
+// those HELD by policy — never auto-landed. Held branches are recorded twice, for
+// two different consumers: as flaggedJSON entries (branches kept, ref not
+// advanced, reason recorded — the #108 report/UI surface, unchanged) and as
+// parkGroupJSON groups, which is what driveRun's park pass turns into a
+// park.json awaiting a human ack (#109). A caller that only wants the interim
+// flagging can ignore groups; the two always describe the same branch set.
 //
 // A branch is a trigger when it modifies policyFileName itself (self-protection:
 // a change cannot loosen the bar that gates it) or touches a path matching an
@@ -401,23 +429,36 @@ func clampCeiling[T int | time.Duration](val, ceiling T) T {
 //
 // Held groups compose with bisect salvage untouched: only the CLEARED branches
 // reach integrate/verify/bisect, so disjoint clean groups still land.
-func policyHoldback(pol policy, okBranches []string, writeSets map[string][]string, semanticEdges [][2]string) (clear []string, held []flaggedJSON) {
+func policyHoldback(pol policy, okBranches []string, writeSets map[string][]string, semanticEdges [][2]string) (clear []string, held []flaggedJSON, groups []parkGroupJSON) {
 	if !pol.present || len(okBranches) == 0 {
-		return okBranches, nil
+		return okBranches, nil, nil
 	}
 	changes := make([]cell.BranchChange, 0, len(okBranches))
 	for _, b := range okBranches {
 		changes = append(changes, cell.BranchChange{Branch: b, WriteSet: cell.NewWriteSet(writeSets[b]...)})
 	}
 	for _, g := range cell.PartitionSemantic(changes, semanticEdges) {
-		groupReason := ""
+		groupReason, groupKind := "", ""
 		entries := make([]flaggedJSON, 0, len(g))
+		pg := parkGroupJSON{MatchedPaths: map[string]string{}}
 		for _, bc := range g {
-			reason, paths := branchHoldReason(writeSets[bc.Branch], pol)
+			kind, reason, matched := branchHoldReason(writeSets[bc.Branch], pol)
 			if reason != "" && groupReason == "" {
 				groupReason = reason
 			}
+			// policy-modified outranks ack-paths for the GROUP's reason, the same
+			// precedence branchHoldReason applies within one branch.
+			if kind == parkReasonPolicyModified || (kind != "" && groupKind == "") {
+				groupKind = kind
+			}
+			paths := make([]string, 0, len(matched))
+			for p, glob := range matched {
+				paths = append(paths, p)
+				pg.MatchedPaths[p] = glob
+			}
+			sort.Strings(paths)
 			entries = append(entries, flaggedJSON{Branch: bc.Branch, Paths: paths, Reason: reason})
+			pg.Branches = append(pg.Branches, bc.Branch)
 		}
 		if groupReason == "" {
 			for _, bc := range g {
@@ -432,33 +473,42 @@ func policyHoldback(pol policy, okBranches []string, writeSets map[string][]stri
 				entries[i].Reason = groupReason
 			}
 		}
+		pg.Reason = groupKind
 		held = append(held, entries...)
+		groups = append(groups, pg)
 	}
-	return clear, held
+	return clear, held, groups
 }
 
-// branchHoldReason reports why one branch's own write-set holds it (empty when
-// it triggers nothing): self-modification of the policy file takes precedence
-// over an ack-path match. matched is the branch's paths that caused the hold.
-func branchHoldReason(paths []string, pol policy) (reason string, matched []string) {
+// branchHoldReason reports why one branch's own write-set holds it (kind empty
+// when it triggers nothing): self-modification of the policy file takes
+// precedence over an ack-path match. kind is the machine-readable park reason
+// (parkReason*), reason its human wording, and matched maps each triggering path
+// to the ack-paths GLOB that matched it (policyFileName maps to itself, since
+// self-protection is not glob-driven).
+func branchHoldReason(paths []string, pol policy) (kind, reason string, matched map[string]string) {
 	for _, p := range paths {
 		if p == policyFileName {
-			return "policy: run modifies " + policyFileName, []string{policyFileName}
+			return parkReasonPolicyModified, "policy: run modifies " + policyFileName, map[string]string{policyFileName: policyFileName}
 		}
 	}
-	var acked []string
+	acked := map[string]string{}
+	first := ""
 	for _, p := range paths {
 		for _, glob := range pol.ackPaths {
 			if globMatch(glob, p) {
-				acked = append(acked, p)
+				acked[p] = glob
+				if first == "" || p < first {
+					first = p
+				}
 				break
 			}
 		}
 	}
 	if len(acked) > 0 {
-		return "policy: ack required for " + acked[0], acked
+		return parkReasonAckPaths, "policy: ack required for " + first, acked
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // globMatch reports whether pattern matches name, both slash-separated

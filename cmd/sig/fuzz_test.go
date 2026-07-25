@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // FuzzParsePlan fuzzes the strict plan validator with arbitrary bytes as the
@@ -379,6 +380,79 @@ func FuzzValidRunID(f *testing.F) {
 		}
 		if !strings.HasPrefix(joined, base+string(filepath.Separator)) {
 			t.Fatalf("validRunID accepted %q that escapes the runs dir: %q", id, joined)
+		}
+	})
+}
+
+// FuzzParsePark fuzzes the parking record reader with arbitrary bytes as a run
+// dir's park.json. This is the highest-consequence parser added by run parking:
+// the record it produces decides which commit an ack advances a base ref to, it
+// lives on disk indefinitely, and it outlives the process that wrote it — so a
+// truncated, hand-edited, or hostile file must be REFUSED rather than acted on,
+// and must never panic on the way to refusing. On the ACCEPT path every
+// invariant an ack then relies on is re-checked here: real hex object names, a
+// usable base branch, at least one usable branch to re-integrate, a known
+// reason, a parseable creation stamp, and accessors that stay total.
+func FuzzParsePark(f *testing.F) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	valid := `{"verifiedSHA":"` + sha + `","verifiedTree":"` + sha + `","baseSHA":"` + sha +
+		`","forkSHA":"` + sha + `","reason":"ack-paths","createdAt":"2026-01-02T15:04:05Z","base":"main",` +
+		`"groups":[{"branches":["agent/t1"],"matchedPaths":{"auth/x.go":"auth/**"}}]}`
+	f.Add([]byte(valid))
+	f.Add([]byte(strings.Replace(valid, `"ack-paths"`, `"policy-modified"`, 1)))
+	f.Add([]byte(strings.Replace(valid, `"main"`, `"../../../etc/passwd"`, 1)))
+	f.Add([]byte(strings.Replace(valid, `"agent/t1"`, `"../../evil"`, 1)))
+	f.Add([]byte(strings.Replace(valid, `"reason":"ack-paths"`, `"reason":"whatever"`, 1)))
+	f.Add([]byte(strings.Replace(valid, sha, "not-hex-at-all", 1)))
+	f.Add([]byte(strings.Replace(valid, `"2026-01-02T15:04:05Z"`, `"yesterday"`, 1)))
+	f.Add([]byte(valid[:len(valid)/2])) // truncated mid-record
+	f.Add([]byte(`{"groups":[]}`))
+	f.Add([]byte(`{"groups":[{"branches":[]}]}`))
+	f.Add([]byte(`{"ackTimeout":"not a duration","ackTimeoutAction":"reject"}`))
+	f.Add([]byte(`null`))
+	f.Add([]byte(`[]`))
+	f.Add([]byte(``))
+	f.Add([]byte(`{`))
+	f.Add([]byte("{\"base\":\"ma\x00in\"}"))
+	f.Add([]byte(`{"base":"ref with spaces"}`))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		pk, err := parsePark(data)
+		if err != nil {
+			return // failing closed on a bad record is the whole point; must not panic
+		}
+		// ACCEPT path: every invariant an ack is then allowed to trust.
+		for name, val := range map[string]string{
+			"verifiedSHA": pk.VerifiedSHA, "verifiedTree": pk.VerifiedTree,
+			"baseSHA": pk.BaseSHA, "forkSHA": pk.ForkSHA,
+		} {
+			if !validCommitArg(val) {
+				t.Fatalf("accepted %s %q that is not a hex object name", name, val)
+			}
+		}
+		if pk.Reason != parkReasonAckPaths && pk.Reason != parkReasonPolicyModified {
+			t.Fatalf("accepted unknown reason %q", pk.Reason)
+		}
+		if !relSafe(pk.Base) || strings.ContainsAny(pk.Base, " \t\n:?*[\\\x00") {
+			t.Fatalf("accepted unusable base branch %q", pk.Base)
+		}
+		branches := pk.branches()
+		if len(branches) == 0 {
+			t.Fatal("accepted a record naming no branches to re-integrate")
+		}
+		for _, b := range branches {
+			if !relSafe(b) || strings.ContainsAny(b, " \t\n:?*[\\\x00") {
+				t.Fatalf("accepted unusable branch %q", b)
+			}
+		}
+		if _, err := time.Parse(time.RFC3339, pk.CreatedAt); err != nil {
+			t.Fatalf("accepted unparseable createdAt %q", pk.CreatedAt)
+		}
+		// The accessors an inbox read and a timeout sweep call must be total on
+		// anything that got this far.
+		_ = pk.matchedPaths()
+		if deadline, ok := pk.deadline(); ok && deadline.IsZero() {
+			t.Fatal("deadline reported a zero time as a real deadline")
 		}
 	})
 }

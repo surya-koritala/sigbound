@@ -105,11 +105,11 @@ That invocation is long and doesn't change much run to run — put your standing
 
 ### `sig serve`: an HTTP run API
 
-`sig serve -repos /path/a,/path/b` runs the same engine behind a small local daemon: `POST /runs` starts a run, `GET /runs/{id}` polls it, and a read-only `/ui` page lets you inspect any branch a run flagged for human review. It binds loopback by default, ships no TLS or user model, and adds no new landing path — it drives the exact same `-verify`-gated engine `sig run` does. See [`sig serve`](docs/USAGE.md#sig-serve).
+`sig serve -repos /path/a,/path/b` runs the same engine behind a small local daemon: `POST /runs` starts a run, `GET /runs/{id}` polls it, `GET /inbox` lists everything waiting on a human, and a `/ui` page lets you inspect any branch a run flagged and ack or reject a parked landing. It binds loopback by default, ships no TLS or user model, and adds no new landing path — it drives the exact same `-verify`-gated engine `sig run` does. See [`sig serve`](docs/USAGE.md#sig-serve).
 
 ### `sigbound.policy`: a repo-owned landing bar
 
-Commit a `sigbound.policy` file at the repo root and both `sig run` and `sig serve` enforce it identically: a required `verify` battery, lane/semantic/assert floors, and agent/budget ceilings the invoker cannot loosen (a flag may only tighten). It is read from the base commit's tree, so the bar is versioned with the code. Paths listed under `ack-paths`, and any change that modifies `sigbound.policy` itself, are held for a human instead of auto-landing. See [Landing policy](docs/USAGE.md#landing-policy).
+Commit a `sigbound.policy` file at the repo root and both `sig run` and `sig serve` enforce it identically: a required `verify` battery, lane/semantic/assert floors, and agent/budget ceilings the invoker cannot loosen (a flag may only tighten). It is read from the base commit's tree, so the bar is versioned with the code. Paths listed under `ack-paths`, and any change that modifies `sigbound.policy` itself, are verified and then PARKED instead of auto-landing: `sig ack RUN_ID` lands byte-for-byte the tree that passed verify (re-integrating and re-verifying first if the base moved), `sig reject RUN_ID` lands nothing and keeps the branches. See [Landing policy](docs/USAGE.md#landing-policy) and [Run parking](docs/USAGE.md#run-parking).
 
 ### `sig export` / `sig import`: multi-machine runs
 

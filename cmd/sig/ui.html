@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sigbound — Conflict Review</title>
+<title>Sigbound — Review</title>
 <style>
   :root {
     --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --line: #ddd;
@@ -37,7 +37,7 @@
     background: var(--panel); color: var(--fg); cursor: pointer;
   }
   button:hover { border-color: var(--accent); }
-  main { display: grid; grid-template-columns: 260px 300px 1fr; gap: 0; height: calc(100vh - 54px); }
+  main { display: grid; grid-template-columns: 260px 300px 1fr; gap: 0; height: calc(100vh - 92px); }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; } }
   .col { overflow: auto; padding: 10px 12px; border-right: 1px solid var(--line); }
   .col h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
@@ -69,18 +69,56 @@
   .note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
   .err { color: var(--flag); padding: 10px 12px; white-space: pre-wrap; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  /* Tabs: the conflict panes and the inbox are two views of one page. */
+  nav.tabs { display: flex; gap: 4px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+  nav.tabs button {
+    border: none; border-bottom: 2px solid transparent; border-radius: 0;
+    background: none; padding: 8px 12px; font-weight: 600; color: var(--muted);
+  }
+  nav.tabs button.on { color: var(--fg); border-bottom-color: var(--accent); }
+  [hidden] { display: none !important; }
+  #inboxView { padding: 12px 16px; overflow: auto; }
+  .entry { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; margin-bottom: 8px; }
+  .entry.parked { border-color: var(--flag); }
+  .entry .top { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+  .badge {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .04em; font-weight: 700;
+    padding: 1px 6px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line);
+  }
+  .badge.parked { color: var(--flag); border-color: var(--flag); }
+  .entry .summary { margin: 6px 0; }
+  .entry .paths { margin: 4px 0; }
+  .entry .paths div { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; word-break: break-all; }
+  .actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 8px; }
+  .actions input[type=text] {
+    padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px;
+    background: var(--bg); color: var(--fg); min-width: 200px; flex: 1;
+  }
+  .actions button.ack { border-color: var(--accent); }
+  .actions button.rej { border-color: var(--flag); }
+  .result { margin-top: 6px; font-size: 12px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Sigbound — Conflict Review</h1>
+  <h1>Sigbound — Review</h1>
   <div class="tokrow">
     <input id="token" type="password" placeholder="bearer token (if the daemon sets one)" autocomplete="off">
     <button id="saveTok">Save</button>
-    <button id="reload">Reload runs</button>
+    <button id="reload">Reload</button>
   </div>
 </header>
-<main>
+<nav class="tabs">
+  <button id="tabConflicts" class="on">Conflicts</button>
+  <button id="tabInbox">Inbox</button>
+</nav>
+<section id="inboxView" hidden>
+  <div class="note">Everything across every cell waiting on a human. Only <strong>parked</strong> entries are
+  actionable: <strong>Ack</strong> releases a landing that already passed verify, <strong>Reject</strong> keeps the
+  branches and lands nothing. Everything else here is read-only.</div>
+  <div id="inbox"></div>
+</section>
+<main id="conflictsView">
   <div class="col" id="runsCol">
     <h2>Runs</h2>
     <div id="runs"></div>
@@ -112,6 +150,21 @@ async function api(path) {
   const resp = await fetch(path, { headers });
   if (!resp.ok) throw new Error("HTTP " + resp.status + " — " + path);
   return resp.json();
+}
+
+// apiPost is the ONLY mutating call this page can make, and it is reachable from
+// exactly two buttons, both of which only exist on a parked inbox entry (see
+// renderEntry). Same bearer-token posture as every read above; the daemon
+// re-checks the run's state either way, so the button's presence is convenience,
+// never the authorization.
+async function apiPost(path, body) {
+  const headers = { "Content-Type": "application/json" };
+  const tok = getToken();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  const resp = await fetch(path, { method: "POST", headers, body: JSON.stringify(body || {}) });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status + " — " + path));
+  return data;
 }
 
 // flaggedURL encodes each segment but keeps the slashes that separate the
@@ -233,12 +286,119 @@ async function selectPath(runId, branch, path, item) {
   }
 }
 
+// ---- Inbox ----
+
+let tab = "conflicts";
+
+function showTab(which) {
+  tab = which;
+  $("conflictsView").hidden = which !== "conflicts";
+  $("inboxView").hidden = which !== "inbox";
+  $("tabConflicts").classList.toggle("on", which === "conflicts");
+  $("tabInbox").classList.toggle("on", which === "inbox");
+  reloadCurrent();
+}
+
+function reloadCurrent() { return tab === "inbox" ? loadInbox() : loadRuns(); }
+
+// renderEntry builds one inbox row. Every string that reaches the DOM here —
+// summaries, run ids, branch names, repo paths, glob patterns — goes through
+// el()'s textContent, so agent-authored content renders as inert text.
+function renderEntry(e) {
+  const box = el("div", "entry" + (e.type === "parked" ? " parked" : ""));
+  const top = el("div", "top");
+  top.appendChild(el("span", "badge" + (e.type === "parked" ? " parked" : ""), e.type));
+  top.appendChild(el("span", "mono", e.runId));
+  top.appendChild(el("span", "meta", "cell " + e.cellId + "  ·  " + e.age + " old"));
+  box.appendChild(top);
+  box.appendChild(el("div", "summary", e.summary));
+  if (e.matchedPaths) {
+    const paths = el("div", "paths");
+    for (const p of Object.keys(e.matchedPaths).sort()) {
+      paths.appendChild(el("div", null, p + "   ← " + e.matchedPaths[p]));
+    }
+    box.appendChild(paths);
+  }
+  if (e.expiresAt) box.appendChild(el("div", "meta", "expires " + e.expiresAt));
+  if (e.branches && e.branches.length) box.appendChild(el("div", "meta", "branches: " + e.branches.join(", ")));
+
+  const actions = el("div", "actions");
+  if (e.links && e.links.flagged) {
+    const diff = el("button", null, "Diff");
+    diff.addEventListener("click", () => { showTab("conflicts"); selectRunById(e.runId); });
+    actions.appendChild(diff);
+  }
+  // Ack/Reject exist ONLY on a parked entry — no other entry type has anything
+  // to release, and this page has no other mutating control at all.
+  if (e.type === "parked" && e.links && e.links.ack) {
+    const out = el("div", "result");
+    const reason = el("input");
+    reason.type = "text";
+    reason.placeholder = "reason (optional, reject only)";
+    const run = async (path, body, label) => {
+      out.textContent = label + "…";
+      try {
+        const r = await apiPost(path, body);
+        out.textContent = r.message || r.status;
+        loadInbox();
+      } catch (err) { out.textContent = String(err.message || err); out.className = "result err"; }
+    };
+    const ackBtn = el("button", "ack", "Ack");
+    ackBtn.addEventListener("click", () => {
+      if (!confirm("Ack " + e.runId + "? This lands the verified tree on " + (e.branches || []).join(", ") + "'s base.")) return;
+      run(e.links.ack, {}, "acking");
+    });
+    const rejBtn = el("button", "rej", "Reject");
+    rejBtn.addEventListener("click", () => run(e.links.reject, { reason: reason.value }, "rejecting"));
+    actions.appendChild(ackBtn);
+    actions.appendChild(rejBtn);
+    actions.appendChild(reason);
+    box.appendChild(actions);
+    box.appendChild(out);
+    return box;
+  }
+  if (actions.children.length) box.appendChild(actions);
+  return box;
+}
+
+async function loadInbox() {
+  const box = $("inbox");
+  clear(box);
+  box.appendChild(el("div", "empty", "Loading…"));
+  try {
+    const data = await api("/inbox");
+    clear(box);
+    if (!data.entries || data.entries.length === 0) {
+      box.appendChild(el("div", "empty", "Inbox empty — nothing is waiting on you."));
+      return;
+    }
+    for (const e of data.entries) box.appendChild(renderEntry(e));
+  } catch (e) {
+    clear(box);
+    box.appendChild(el("div", "err", String(e.message || e)));
+  }
+}
+
+// selectRunById drives the Conflicts pane from an inbox row: reload the run
+// list, then open the named run so its flagged/parked paths are one click away.
+async function selectRunById(runId) {
+  await loadRuns();
+  for (const row of $("runs").children) {
+    if (row.firstChild && row.firstChild.textContent === runId) {
+      selectRun(runId, row);
+      return;
+    }
+  }
+}
+
 $("saveTok").addEventListener("click", () => {
   const v = $("token").value.trim();
   if (v) sessionStorage.setItem(TOKKEY, v); else sessionStorage.removeItem(TOKKEY);
-  loadRuns();
+  reloadCurrent();
 });
-$("reload").addEventListener("click", loadRuns);
+$("reload").addEventListener("click", reloadCurrent);
+$("tabConflicts").addEventListener("click", () => showTab("conflicts"));
+$("tabInbox").addEventListener("click", () => showTab("inbox"));
 $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") $("saveTok").click(); });
 
 $("token").value = getToken();

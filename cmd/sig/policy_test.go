@@ -331,7 +331,7 @@ func TestPolicyHoldbackAckPath(t *testing.T) {
 		"agent/a": {"auth/login.go"},
 		"agent/b": {"docs/readme.md"},
 	}
-	clear, held := policyHoldback(pol, []string{"agent/a", "agent/b"}, ws, nil)
+	clear, held, _ := policyHoldback(pol, []string{"agent/a", "agent/b"}, ws, nil)
 	if !reflect.DeepEqual(clear, []string{"agent/b"}) {
 		t.Fatalf("clear=%v, want [agent/b]", clear)
 	}
@@ -346,7 +346,7 @@ func TestPolicyHoldbackAckPath(t *testing.T) {
 func TestPolicyHoldbackSelfModification(t *testing.T) {
 	pol := policy{present: true} // no ack-paths
 	ws := map[string][]string{"agent/a": {policyFileName, "x.go"}}
-	clear, held := policyHoldback(pol, []string{"agent/a"}, ws, nil)
+	clear, held, _ := policyHoldback(pol, []string{"agent/a"}, ws, nil)
 	if len(clear) != 0 || len(held) != 1 || !strings.Contains(held[0].Reason, "modifies "+policyFileName) {
 		t.Fatalf("clear=%v held=%+v, want agent/a held for self-modification", clear, held)
 	}
@@ -362,7 +362,7 @@ func TestPolicyHoldbackGroupEntanglement(t *testing.T) {
 		"agent/b": {"shared.go"},                  // overlaps a on shared.go => same group
 		"agent/c": {"lonely.go"},                  // disjoint => cleared
 	}
-	clear, held := policyHoldback(pol, []string{"agent/a", "agent/b", "agent/c"}, ws, nil)
+	clear, held, _ := policyHoldback(pol, []string{"agent/a", "agent/b", "agent/c"}, ws, nil)
 	if !reflect.DeepEqual(clear, []string{"agent/c"}) {
 		t.Fatalf("clear=%v, want [agent/c]", clear)
 	}
@@ -379,7 +379,7 @@ func TestPolicyHoldbackGroupEntanglement(t *testing.T) {
 // every ok branch is cleared, so a no-policy run integrates byte-identically.
 func TestPolicyHoldbackAbsentClearsAll(t *testing.T) {
 	ws := map[string][]string{"agent/a": {policyFileName}, "agent/b": {"auth/x"}}
-	clear, held := policyHoldback(policy{}, []string{"agent/a", "agent/b"}, ws, nil)
+	clear, held, _ := policyHoldback(policy{}, []string{"agent/a", "agent/b"}, ws, nil)
 	if len(held) != 0 || len(clear) != 2 {
 		t.Fatalf("absent policy: clear=%v held=%v, want all cleared, none held", clear, held)
 	}

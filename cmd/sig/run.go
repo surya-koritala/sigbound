@@ -289,11 +289,25 @@ type runReport struct {
 	StartedAt string `json:"startedAt"`
 	// Policy is the resolved landing policy (sigbound.policy at BaseSHA) — its
 	// sha256 (policyHash) plus the effective battery/ack-paths and the
-	// recorded-but-not-yet-enforced audit-sample/ack-timeout. nil (and omitted
-	// from JSON) when no policy file exists at the base, so a run against a
-	// repo with no policy reports byte-identical to before this feature. See
-	// policy.go and docs/USAGE.md's "Landing policy" section.
+	// audit-sample/ack-timeout parking knobs. nil (and omitted from JSON) when
+	// no policy file exists at the base, so a run against a repo with no policy
+	// reports byte-identical to before this feature. See policy.go and
+	// docs/USAGE.md's "Landing policy" section.
 	Policy *policyJSON `json:"policy,omitempty"`
+	// Park is the run parking record (issue #109), set only when a landed
+	// candidate group triggered the policy's ack-paths / self-protection rule
+	// AND that group's own integrated tree passed verify: the landing is
+	// complete and VERIFIED but the ref was deliberately not advanced, pending a
+	// human ack. nil (and omitted from JSON) on every other run. `sig serve`
+	// persists it as the run dir's park.json and flips the run to
+	// awaiting-ack; see park.go.
+	Park *parkJSON `json:"park,omitempty"`
+	// Audit marks a CLEAN landing (nothing parked, nothing flagged, nothing
+	// bisect-dropped) that the policy's audit-sample rate selected for a
+	// non-blocking spot audit — see auditSelected. Never a gate: it changes
+	// nothing about the landing, it only raises an `audit` inbox entry. Always
+	// false (and omitted) without a run id to sample on, i.e. outside `sig serve`.
+	Audit bool `json:"audit,omitempty"`
 }
 
 // policyJSON records the resolved landing policy on the report/manifest. Verify
@@ -307,6 +321,9 @@ type policyJSON struct {
 	AckPaths    []string `json:"ackPaths,omitempty"`
 	AuditSample *int     `json:"auditSample,omitempty"` // pointer so 0% (never audit) is distinct from unset (nil)
 	AckTimeout  string   `json:"ackTimeout,omitempty"`
+	// AckTimeoutAction is what an expired park auto-transitions to; recorded
+	// only alongside a non-zero AckTimeout, since it is meaningless without one.
+	AckTimeoutAction string `json:"ackTimeoutAction,omitempty"`
 }
 
 // sig run exit codes. An operational error (bad flags, a git/integrate
@@ -462,6 +479,12 @@ type runParams struct {
 	// again.
 	Resume        bool
 	ResumeBaseSHA string
+	// RunID is `sig serve`'s durable run id for this run (see newRunID), the
+	// key the spot-audit sample is drawn on (auditSelected) — deterministic and
+	// replayable precisely because it is that recorded id, not a fresh random
+	// draw. Empty for `sig run`, which has no run id at all: such a run is never
+	// audit-sampled. Never affects what lands.
+	RunID string
 	// PolicyExplicit names the policy-governed dimensions (lanes/semantic/assert)
 	// the invoker set DELIBERATELY, so resolvePolicy can tell a deliberate
 	// weaker choice (a loud error) from an unset default silently tightened to
@@ -1275,6 +1298,11 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	if err != nil {
 		return runReport{}, err
 	}
+	// The RAW, pre-policy verify command, captured before resolvePolicy composes
+	// the battery into it: a park records THIS, so an ack re-composes against the
+	// policy at whatever base it finds instead of re-running an already-composed
+	// battery's members twice. See parkHeldGroups.
+	rawVerifyCmd := p.VerifyCmd
 	if err := resolvePolicy(pol, &p, len(tasks)); err != nil {
 		return runReport{}, err
 	}
@@ -1450,17 +1478,16 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		}
 	}
 
-	// Landing-policy holdback (issue #108, interim): a group whose landed changes
-	// touch an ack-paths glob, or modify sigbound.policy itself, is HELD — routed
-	// through the existing flagged mechanism (branches kept, ref not advanced,
-	// reason recorded), never auto-landed, since a change must not loosen the bar
-	// that gates it and an ack-path needs a human. Only the CLEARED branches go on
-	// to integrate/verify/bisect, so disjoint clean groups still land (composes
-	// with bisect salvage). #109 upgrades this hold to park+ack. policyFlagged is
-	// appended to the integrate report's Flagged below, so it surfaces in the JSON
-	// report, the integrate_done event, and the serve review UI exactly like a
-	// conflict flag.
-	branches, policyFlagged := policyHoldback(pol, branches, writeSets, semanticEdges)
+	// Landing-policy holdback (issues #108/#109): a group whose landed changes
+	// touch an ack-paths glob, or modify sigbound.policy itself, is HELD — never
+	// auto-landed, since a change must not loosen the bar that gates it and an
+	// ack-path needs a human. Only the CLEARED branches go on to
+	// integrate/verify/bisect, so disjoint clean groups still land (composes with
+	// bisect salvage). policyFlagged is appended to the integrate report's Flagged
+	// below, so the hold surfaces in the JSON report, the integrate_done event,
+	// and the serve review UI exactly like a conflict flag; policyGroups is what
+	// the park pass at the end of this function verifies and parks for an ack.
+	branches, policyFlagged, policyGroups := policyHoldback(pol, branches, writeSets, semanticEdges)
 
 	// ---- integrate via the shared cell path, WITHOUT landing yet ----
 	// The integrated commit is computed detached; the base ref is advanced only
@@ -1554,11 +1581,31 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			}
 		}
 	}
-	if err := g.UpdateRef(ctx, "refs/heads/"+p.Base, landSHA); err != nil {
+	if err := landRef(ctx, g, p.Base, landSHA); err != nil {
 		return rep, budgetAwareErr(p, ctx, "land "+short(landSHA), err)
 	}
 	rep.Integrate.FinalSHA = landSHA
 	emit.emit("land", map[string]any{"sha": landSHA})
+	// ---- park the policy-held groups (issue #109) ----
+	// The clean groups have now landed, so the held groups integrate onto the
+	// base AS IT STANDS and get their OWN verify: a park is always an
+	// ALREADY-VERIFIED landing, which is the whole reason an ack can later just
+	// advance the ref. Runs before -publish/-notes so both see the park in the
+	// report they are handed. A run whose own -verify FAILED returned above and
+	// never reaches here: it landed nothing, so it has no landing to park — its
+	// held groups stay flagged, exactly as they were before this feature.
+	if len(policyGroups) > 0 {
+		rep.Park = parkHeldGroups(ctx, c, p, pol, baseSHA, landSHA, rawVerifyCmd, policyGroups, emit)
+	}
+	// Spot-audit sampling (issue #109): a CLEAN landing — nothing parked,
+	// nothing flagged, nothing bisect-dropped — is deterministically sampled at
+	// the policy's audit-sample rate into a non-blocking `audit` inbox entry. It
+	// gates nothing and has already landed by the time this runs.
+	if rep.Park == nil && len(rep.Integrate.Flagged) == 0 && len(rep.Integrate.DroppedByBisect) == 0 &&
+		landSHA != baseSHA && pol.auditSample > 0 && auditSelected(p.RunID, pol.auditSample) {
+		rep.Audit = true
+		emit.emit("audit_selected", map[string]any{"runId": p.RunID, "sample": pol.auditSample, "sha": landSHA})
+	}
 	// -publish: the run has now LANDED (base ref advanced past baseSHA;
 	// -verify green or unset — a verify failure already returned above,
 	// before ever reaching UpdateRef). landSHA == baseSHA here means nothing
@@ -1663,6 +1710,23 @@ func attachNote(ctx context.Context, g *gitx.Git, commit string, rep runReport) 
 	if err := g.NoteAdd(ctx, "sigbound", commit, data); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: -notes: attach note to %s: %v\n", short(commit), err)
 	}
+}
+
+// landRef advances a base BRANCH to sha — the one and only place a verified
+// tree becomes the thing the base points at. Both landings in this binary go
+// through it: driveRun's own land, and an ack releasing an already-verified
+// parked landing (see ackRun). The ack is deliberately an INPUT to this gate,
+// not a second landing path — the invariant "what lands is exactly the tree that
+// passed verify" is only checkable because there is one line that moves a ref.
+//
+// ponytail: a plain update-ref, not a compare-and-swap against the base's
+// expected old value, so a base that moves between the caller's read and this
+// write is clobbered — today's behavior for `sig run`, unchanged. ackRun narrows
+// that window by re-reading the base immediately before calling here. Upgrade to
+// `update-ref <ref> <new> <old>` if concurrent writers to one base ever become a
+// real workflow, and give both callers the same failure semantics at once.
+func landRef(ctx context.Context, g *gitx.Git, baseBranch, sha string) error {
+	return g.UpdateRef(ctx, "refs/heads/"+baseBranch, sha)
 }
 
 // budgetAwareErr wraps err from a driveRun phase (integrate, land), naming
