@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1446,5 +1447,206 @@ func TestParkMutatedBaseSHAReverifiesRatherThanLandingStale(t *testing.T) {
 	att := f.reread().Attempts
 	if len(att) != 2 || !att[1].VerifyOK {
 		t.Fatalf("no green re-verify attempt was recorded: %+v", att)
+	}
+}
+
+// TestParkAckRefusesLandingThatLeftItsBase pins the ancestry check in
+// validateParkedLanding — the sole guard on the ONE path that releases a
+// recorded commit without re-verifying it. The mutation table cannot reach it:
+// rewriting baseSHA to anything that differs from the live base routes to the
+// re-verify path instead. It is reachable only when the recorded base MATCHES
+// the current head (so the direct-land branch is taken) while the recorded
+// landing does not descend from it — a record left over from a base that has
+// since been rewritten.
+func TestParkAckRefusesLandingThatLeftItsBase(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+
+	// Move the base somewhere the parked commit does NOT descend from, and point
+	// the record's baseSHA at it so the direct-land branch is what runs.
+	moved := f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
+	pk := f.reread()
+	if anc, err := f.g.IsAncestor(ctx, moved, pk.VerifiedSHA); err != nil || anc {
+		t.Fatalf("fixture is wrong: the parked commit already descends from %s (err=%v)", short(moved), err)
+	}
+	pk.BaseSHA = moved
+	f.writeParkRaw(pk)
+
+	_, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err == nil {
+		t.Fatal("ack released a recorded landing that does not descend from its recorded base")
+	}
+	if !strings.Contains(err.Error(), "descend") {
+		t.Fatalf("refused for the wrong reason (%v); the ancestry check is what must fire here", err)
+	}
+	if got := f.head(); got != moved {
+		t.Fatalf("the ref moved to %s despite a refused ack", short(got))
+	}
+	if f.status() != statusAwaitingAck {
+		t.Fatalf("status %q, want the park left open at %s", f.status(), statusAwaitingAck)
+	}
+}
+
+// TestWriteParkCASRefusesAStaleWrite pins the compare-and-swap itself: a writer
+// that read the record, then found it changed underneath, must FAIL rather than
+// overwrite. This is the primitive both land paths stake their ordering on.
+func TestWriteParkCASRefusesAStaleWrite(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	raw, pk, err := readParkAt(f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Someone else resolves the park in the meantime.
+	other := *pk
+	other.RejectReason = "someone else got here first"
+	other.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
+	if err := writePark(f.dir, &other); err != nil {
+		t.Fatal(err)
+	}
+	// Our stale write must be refused, and must not have touched the record.
+	mine := *pk
+	mine.LandedSHA = pk.VerifiedSHA
+	if err := writeParkCAS(f.dir, raw, &mine); !errors.Is(err, errParkChanged) {
+		t.Fatalf("writeParkCAS returned %v, want errParkChanged", err)
+	}
+	if got := f.reread(); got.RejectReason != "someone else got here first" || got.LandedSHA != "" {
+		t.Fatalf("a stale CAS clobbered the record: %+v", got)
+	}
+	// An up-to-date CAS still succeeds.
+	raw2, cur, err := readParkAt(f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.RejectReason = "updated"
+	if err := writeParkCAS(f.dir, raw2, cur); err != nil {
+		t.Fatalf("a current CAS was refused: %v", err)
+	}
+}
+
+// TestRejectBeatsAckWithNoLockAtAll is the platform-independent proof for the
+// direct-land (base-UNCHANGED) path — the ORDINARY ack, and the one that used to
+// land first and only warn when its record write lost.
+//
+// lockPark is stubbed to a no-op, which is exactly how Windows degrades: pidAlive
+// reports every pid dead there, so every caller steals the lock and there is no
+// mutual exclusion whatsoever. The guarantee under test does not depend on the
+// lock — it is the ordering, "claim the record before moving the ref, and fail if
+// the claim is lost". So this asserts the operator-facing invariant directly:
+//
+//	if reject returned success, the ref did not move.
+//
+// It says nothing about WHICH racer wins (that is genuinely a race); it asserts
+// that whatever the outcome, the two never both succeed.
+func TestRejectBeatsAckWithNoLockAtAll(t *testing.T) {
+	restore := lockPark
+	lockPark = func(string) (func(), bool) { return func() {}, true }
+	t.Cleanup(func() { lockPark = restore })
+
+	for i := 0; i < 12; i++ {
+		f := newParkFixture(t, parkPolicyAckPaths)
+		ctx := context.Background()
+		before := f.head()
+
+		var ackOut ackOutcome
+		var ackErr error
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ackOut, ackErr = ackRun(ctx, f.cell, f.dir, "http", ackEnv{Mode: envModeInherit})
+		}()
+		rejOut, rejErr := rejectRun(ctx, f.g, f.dir, "cli", "no thanks")
+		<-done
+
+		head := f.head()
+		moved := head != before
+		switch {
+		case rejErr == nil && ackErr == nil:
+			t.Fatalf("iteration %d: reject AND ack both succeeded (reject=%+v ack=%+v)", i, rejOut, ackOut)
+		case rejErr == nil:
+			// The operator was told the run was rejected and nothing landed.
+			// That must be true.
+			if moved {
+				t.Fatalf("iteration %d: reject succeeded but the ref advanced to %s", i, short(head))
+			}
+			if f.status() != statusRejected {
+				t.Fatalf("iteration %d: reject succeeded but final status is %q", i, f.status())
+			}
+			if pk := f.reread(); pk.RejectReason != "no thanks" || pk.LandedSHA != "" {
+				t.Fatalf("iteration %d: the losing ack corrupted the rejection: %+v", i, pk)
+			}
+		case ackErr == nil:
+			// The ack won; then it really landed and the run is done.
+			if !moved || head != ackOut.LandedSHA {
+				t.Fatalf("iteration %d: ack reported landing %s but main is at %s", i, short(ackOut.LandedSHA), short(head))
+			}
+			if f.status() != "done" {
+				t.Fatalf("iteration %d: ack succeeded but final status is %q", i, f.status())
+			}
+		default:
+			// Both refused (each lost the record claim to the other's write).
+			// Nothing may have landed.
+			if moved {
+				t.Fatalf("iteration %d: both ack and reject failed but the ref advanced to %s", i, short(head))
+			}
+		}
+	}
+}
+
+// TestGCSweepsStrandedParkRefsOnly covers the keep-alive ref's other end. The
+// ref is released only AFTER a resolution is durably recorded — the correct
+// order — so a crash in that gap strands one. Nothing else sweeps
+// refs/sigbound/**, so without this they accumulate without bound, each pinning
+// a commit. An OPEN park's ref must survive the most aggressive sweep gc offers.
+func TestGCSweepsStrandedParkRefsOnly(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	pk := f.reread()
+	openRef := pk.KeepRef
+
+	// An open park's ref is never a candidate, even with -force and everything
+	// past the age gate.
+	plan, err := gcPlanFor(ctx, f.g, -time.Hour, true)
+	if err != nil {
+		t.Fatalf("gcPlanFor: %v", err)
+	}
+	if slicesContains(plan.ParkRefs, openRef) {
+		t.Fatalf("gc planned to delete an OPEN park's keep-alive ref %s", openRef)
+	}
+
+	// Resolve the park, then strand the ref exactly as a crash between recording
+	// the resolution and releasing it would.
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err != nil {
+		t.Fatalf("ackRun: %v", err)
+	}
+	if err := f.g.UpdateRef(ctx, openRef, pk.VerifiedSHA); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err = gcPlanFor(ctx, f.g, -time.Hour, false)
+	if err != nil {
+		t.Fatalf("gcPlanFor: %v", err)
+	}
+	if !slicesContains(plan.ParkRefs, openRef) {
+		t.Fatalf("gc did not spot the stranded ref %s (plan: %v)", openRef, plan.ParkRefs)
+	}
+	if err := applyGC(ctx, f.cell, plan); err != nil {
+		t.Fatalf("applyGC: %v", err)
+	}
+	if got := f.keepRefSHA(openRef); got != "" {
+		t.Fatalf("stranded ref survived gc (still at %s)", short(got))
+	}
+	// It is reported, so a -json consumer sees what happened.
+	if !slicesContains(plan.report().ParkRefsDeleted, openRef) {
+		t.Fatalf("the swept ref is missing from the gc report: %+v", plan.report())
+	}
+
+	// Fail closed: a park.json that exists but cannot be read aborts gc rather
+	// than licensing a delete.
+	f2 := newParkFixture(t, parkPolicyAckPaths)
+	if err := os.WriteFile(filepath.Join(f2.dir, parkFileName), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gcPlanFor(ctx, f2.g, -time.Hour, true); err == nil {
+		t.Fatal("gc planned a sweep despite an unreadable parking record")
 	}
 }

@@ -75,6 +75,10 @@ type gcReport struct {
 	Tempdirs        []string `json:"tempdirs"`
 	BranchesDeleted []string `json:"branchesDeleted"`
 	BranchesKept    []string `json:"branchesKept"`
+	// ParkRefsDeleted names the stranded keep-alive refs swept (see
+	// strandedParkRefs). omitempty, so a repo that has never parked reports
+	// byte-identical to before parking existed.
+	ParkRefsDeleted []string `json:"parkRefsDeleted,omitempty"`
 }
 
 // gcPlan is everything gcPlanFor computed, before anything is (maybe)
@@ -94,6 +98,10 @@ type gcPlan struct {
 	// protection, this one is absolute: -force does not reach it and neither
 	// does -older-than.
 	Parked map[string]bool
+	// ParkRefs are keep-alive refs whose park has resolved (or whose run dir is
+	// gone), left behind by a crash between recording a resolution and
+	// releasing the ref. Nothing else sweeps refs/sigbound/**.
+	ParkRefs []string
 }
 
 func (p gcPlan) report() gcReport {
@@ -102,6 +110,7 @@ func (p gcPlan) report() gcReport {
 		Tempdirs:        p.Tempdirs,
 		BranchesDeleted: p.ToDelete,
 		BranchesKept:    p.ToKeep,
+		ParkRefsDeleted: p.ParkRefs,
 	}
 	if rep.Tempdirs == nil {
 		rep.Tempdirs = []string{}
@@ -209,7 +218,15 @@ func gcPlanFor(ctx context.Context, g *gitx.Git, olderThan time.Duration, force 
 		return gcPlan{}, fmt.Errorf("load parked branches from .git/sigbound/runs: %w", err)
 	}
 
-	plan := gcPlan{StaleWorktrees: stale, Tempdirs: tempdirs, Forced: map[string]bool{}, Parked: map[string]bool{}}
+	// Keep-alive refs a crash stranded: inert, but nothing else sweeps them and
+	// each pins a commit (see strandedParkRefs). Fails closed on an unreadable
+	// parking record, same as the manifest scan above.
+	strandedRefs, err := strandedParkRefs(ctx, g, cutoff)
+	if err != nil {
+		return gcPlan{}, err
+	}
+
+	plan := gcPlan{StaleWorktrees: stale, Tempdirs: tempdirs, Forced: map[string]bool{}, Parked: map[string]bool{}, ParkRefs: strandedRefs}
 	for _, b := range branches {
 		// A branch an OPEN park still names is never a candidate, at any age and
 		// regardless of -force: it is the only copy of a landing that already
@@ -343,6 +360,11 @@ func applyGC(ctx context.Context, c *cell.Cell, plan gcPlan) error {
 			return fmt.Errorf("delete branch %s: %w", b, err)
 		}
 	}
+	for _, ref := range plan.ParkRefs {
+		if err := c.Git().DeleteRef(ctx, ref); err != nil {
+			return fmt.Errorf("delete stranded parking ref %s: %w", ref, err)
+		}
+	}
 	return nil
 }
 
@@ -370,6 +392,12 @@ func printGCTable(w io.Writer, plan gcPlan, applied bool) {
 			note = " (FORCED -- manifest-referenced; -resume for that run can no longer reuse it)"
 		}
 		fmt.Fprintf(w, "  %s: %s%s\n", action, b, note)
+	}
+	if len(plan.ParkRefs) > 0 {
+		fmt.Fprintf(w, "stranded parking refs: %d %s\n", len(plan.ParkRefs), action)
+		for _, ref := range plan.ParkRefs {
+			fmt.Fprintf(w, "  %s: %s (its park is already resolved)\n", action, ref)
+		}
 	}
 	for _, b := range plan.ToKeep {
 		why := "manifest-referenced"

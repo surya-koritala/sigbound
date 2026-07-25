@@ -281,7 +281,13 @@ func (pk *parkJSON) validate() error {
 // the same documented degradation `sig serve`'s crash recovery already has
 // (issue #94). The status re-check immediately before landRef is what makes a
 // rejected park un-landable, and that check is platform-independent.
-func lockPark(dir string) (unlock func(), ok bool) {
+// lockPark is a variable ONLY so a test can substitute a no-op and exercise the
+// platform-independent ordering guarantees on their own — the record-claim
+// ordering has to hold with no mutual exclusion at all, which is precisely the
+// Windows case. Production code never reassigns it.
+var lockPark = lockParkFile
+
+func lockParkFile(dir string) (unlock func(), ok bool) {
 	path := filepath.Join(dir, parkLockName)
 	for attempt := 0; attempt < 2; attempt++ {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
@@ -566,6 +572,17 @@ func integrateVerifyPark(ctx context.Context, c *cell.Cell, p runParams, forkSHA
 	if strings.TrimSpace(p.VerifyCmd) == "" {
 		return res.FinalSHA, verifyJSON{}, flagged, nil
 	}
+	// LOAD-BEARING SIDE EFFECT, do not remove without replacing it: between
+	// commit-tree creating res.FinalSHA and the caller pinning it with a
+	// keep-alive ref, that commit is reachable from NOTHING and an aggressive
+	// concurrent `git gc` could delete it. What covers the gap is this detached
+	// worktree — a linked worktree's HEAD is a gc reachability root for as long
+	// as the worktree exists, which spans the whole verify. The no-verify-command
+	// path above skips this and is instead covered by being sub-millisecond
+	// (commit-tree straight into the caller's UpdateRef), so both paths fail
+	// closed today. A refactor that verifies WITHOUT materializing a worktree
+	// must pin the commit here itself, or it silently reopens the whole
+	// garbage-collected-landing class of bug.
 	dir, derr := os.MkdirTemp("", "sig-park-*")
 	if derr != nil {
 		return "", verifyJSON{}, flagged, fmt.Errorf("verify worktree: %w", derr)
@@ -697,14 +714,23 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 		if err := validateParkedLanding(ctx, g, pk); err != nil {
 			return ackOutcome{}, err
 		}
-		if err := landRef(ctx, g, pk.Base, pk.VerifiedSHA); err != nil {
-			return ackOutcome{}, fmt.Errorf("land %s: %w", short(pk.VerifiedSHA), err)
-		}
 		pk.LandedSHA = pk.VerifiedSHA
 		pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
+		// THE SERIALIZATION POINT: claim the record BEFORE the ref moves, and
+		// treat losing the claim as fatal. The lock above only NARROWS the race —
+		// it is advisory and, on Windows, absent entirely — so the ordering here
+		// is what actually makes `rejected` terminal: whoever writes park.json
+		// first wins, and a loser's CAS fails against the bytes it read at entry.
+		// Landing first and merely warning on a failed CAS (what this used to do)
+		// meant a reject could complete, tell the operator nothing landed, and
+		// then watch this path advance the ref and overwrite `rejected` with
+		// `done`. Kept structurally identical to ackReverify's commit phase so
+		// nobody has to work out which of the two is the safe one.
 		if err := writeParkCAS(dir, raw, pk); err != nil {
-			// The ref has moved; the record of why must not be silently lost.
-			fmt.Fprintf(os.Stderr, "sig: ack %s landed %s but could not update %s: %v\n", runID, short(pk.LandedSHA), parkFileName, err)
+			return ackOutcome{}, fmt.Errorf("claim the parking record (nothing was landed): %w", err)
+		}
+		if err := landRef(ctx, g, pk.Base, pk.VerifiedSHA); err != nil {
+			return ackOutcome{}, fmt.Errorf("land %s: %w", short(pk.VerifiedSHA), err)
 		}
 		writeRunStatus(dir, "done", "")
 		// The landed commit is now reachable from the base branch, so the
@@ -828,10 +854,14 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 	if terr != nil {
 		return ackOutcome{}, fmt.Errorf("tree of re-verified %s: %w", short(finalSHA), terr)
 	}
-	// Record the outcome BEFORE moving the ref: a crash between the two leaves a
-	// park that says it landed when it did not, which the next ack resolves
-	// (the base is unchanged, so it re-lands the same commit idempotently). The
-	// reverse order loses the record of a landing that really happened.
+	// THE SERIALIZATION POINT, exactly as in ackRun's direct-land branch: claim
+	// the record BEFORE moving the ref, and treat losing the claim as fatal. The
+	// lock only narrows the race (advisory, and absent on Windows); this ordering
+	// is what makes `rejected` terminal. It also orders the crash window the
+	// survivable way — a crash between the two leaves a park that says it landed
+	// when it did not, which the next ack resolves idempotently (the base is
+	// unchanged, so it re-lands the same commit), whereas the reverse order
+	// would lose the record of a landing that really happened.
 	pk.VerifiedSHA, pk.VerifiedTree, pk.BaseSHA = finalSHA, tree, current
 	pk.LandedSHA = finalSHA
 	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
@@ -1149,4 +1179,52 @@ func loadParkedBranches(ctx context.Context, g *gitx.Git) (map[string]bool, erro
 		}
 	}
 	return parked, nil
+}
+
+// strandedParkRefs names the keep-alive refs (see parkRefPrefix) that no longer
+// pin anything anyone can act on, so `sig gc` can reclaim them.
+//
+// Release runs AFTER a resolution is durably recorded, which is the right order
+// (see releaseParkRef) but means a crash in that gap strands a ref. Each one is
+// inert, but nothing else sweeps refs/sigbound/** — gc's branch prefixes are
+// refs/heads/agent/ and refs/heads/imported/ — so across repeated crashes they
+// accumulate without bound, each pinning a commit forever.
+//
+// A ref is stranded when its run's park.json says RESOLVED, or when there is no
+// park.json for it at all. It is kept when the park is still open, and — failing
+// closed exactly as loadProtectedBranches does — an unreadable park.json is a
+// hard error that aborts gc rather than a licence to delete. The same
+// -older-than cutoff the branch sweep uses applies, so a fresh park's ref is
+// never swept out from under a resolution that is still in flight.
+func strandedParkRefs(ctx context.Context, g *gitx.Git, cutoff time.Time) ([]string, error) {
+	refs, err := g.ForEachRefCommit(ctx, parkRefPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("list parking refs: %w", err)
+	}
+	common, err := g.GitCommonDir(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, r := range refs {
+		if !r.CommitTime.Before(cutoff) {
+			continue // too fresh to be debris
+		}
+		// ForEachRefCommit yields short names; parkRefKey is the last component.
+		key := r.Name[strings.LastIndexByte(r.Name, '/')+1:]
+		if key == "" || !slugSafe(key) {
+			continue // not a name this binary writes; leave it alone
+		}
+		pk, rerr := readPark(filepath.Join(common, "sigbound", "runs", key))
+		switch {
+		case rerr == nil && pk.ResolvedAt == "":
+			continue // an OPEN park: this ref is doing its job
+		case rerr != nil && !errors.Is(rerr, os.ErrNotExist):
+			return nil, fmt.Errorf("read the parking record behind %s: %w", r.Name, rerr)
+		}
+		// ForEachRefCommit yields SHORT names; deletion needs the full path.
+		out = append(out, parkRefPrefix+key)
+	}
+	sort.Strings(out)
+	return out, nil
 }

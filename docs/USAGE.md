@@ -1024,22 +1024,28 @@ shows. Either way the attempt is recorded in `attempts[]`.
 and **keeps every branch** — a rejection is a decision not to land, never a
 decision to destroy the work.
 
-**A reject always beats an in-flight ack.** A base-moved ack can sit in a
-re-verify for as long as the repo's verify command takes, and a human may well
-reject it in that window. Each run's record is guarded by a lock in its own run
-directory — held across processes, so `sig ack` on the CLI and a `POST` to a
-running daemon serialize against each other, and stolen automatically if its
-holder was killed. The ack releases that lock for the slow re-verify (holding it
-would make `sig reject` hang for exactly as long), then re-takes it and
-**re-reads the run's status immediately before landing**: a run that became
-`rejected` — by a person or by an expired `ack-timeout` — is never landed, and
-the ack reports a conflict instead. Record updates are compare-and-swap, so a
-losing ack cannot overwrite the rejection reason with a stale copy of the record
-it read minutes earlier.
+**A reject always beats an in-flight ack.** An ack and a reject can genuinely
+race — a base-moved ack sits in a re-verify for as long as the repo's verify
+command takes, and a human may well reject it in that window. Two things keep
+the outcome coherent, and it is worth being precise about which does the work:
 
-On Windows the lock provides no mutual exclusion (it depends on the same pid
-liveness probe [crash recovery](#crash-recovery) does); the status re-check
-before landing is platform-independent and is what makes `rejected` terminal.
+- **The record write is the serialization point.** Both landing paths claim
+  `park.json` with a compare-and-swap against the bytes they read, *before* the
+  base ref moves, and treat losing that claim as fatal — nothing lands. So
+  whoever writes the record first wins, and the loser fails cleanly instead of
+  overwriting the winner's decision. That is what makes `rejected` terminal, and
+  it holds on every platform.
+- **The lock only narrows the race.** Each run has a lock file in its own run
+  directory, held across processes so `sig ack` on the CLI and a `POST` to a
+  daemon serialize, and stolen automatically if its holder was killed. The ack
+  deliberately releases it for the slow re-verify (holding it would make
+  `sig reject` hang for exactly as long) and re-takes it to commit. On Windows
+  it provides no mutual exclusion at all, since it rests on the same pid
+  liveness probe [crash recovery](#crash-recovery) does.
+
+The ack also re-reads the run's status immediately before landing, so a run that
+became `rejected` — by a person or by an expired `ack-timeout` — is refused with
+a conflict rather than landed.
 
 ### Ack timeout
 
@@ -1430,9 +1436,17 @@ manifest-protection concept to override.
 (see [Run parking](#run-parking)) is never a sweep candidate: no age cutoff
 reaches it and `-force` does not either. The park's own keep-alive ref lives
 under `refs/sigbound/park/`, outside the `refs/heads/agent/` and
-`refs/heads/imported/` prefixes this command considers at all, so it is never
-touched here either — and because it is a real ref, plain `git gc` in your repo
-will not reclaim the verified commit behind it. It is the only copy of a landing that
+`refs/heads/imported/` prefixes this command sweeps, so an open park's ref is
+never deleted — and because it is a real ref, plain `git gc` in your repo will
+not reclaim the verified commit behind it.
+
+gc does reclaim **stranded** ones: a keep-alive ref is released only after its
+resolution is durably recorded (the safe order), so a crash in that gap leaves a
+ref behind, and nothing else sweeps `refs/sigbound/**`. A ref whose park is
+already resolved, or whose run directory is gone, is deleted once it is past
+`-older-than`; they appear as `stranded parking refs` in the output and
+`parkRefsDeleted` in `-json`. A `park.json` that exists but cannot be read
+aborts gc, same as an unreadable manifest. It is the only copy of a landing that
 already passed verify and is waiting on a person, which is the opposite of
 debris. The dry-run and `-delete` output both name it as `kept (PARKED …)`. Once
 that park is acked or rejected it stops being parked, and ordinary manifest rules
