@@ -1704,7 +1704,7 @@ sig gc -repo PATH [-older-than 72h] [-delete] [-force] [-json]
 | `-repo` | *(required)* | Path to the target git repository. |
 | `-older-than` | `72h` | Age cutoff for tempdirs (mtime) and `agent`/`imported` branches (commit date). Ignored by worktree-registration pruning, which is always safe regardless of age. |
 | `-delete` | `false` | Actually remove debris. Without it, `sig gc` only prints what it would remove and changes nothing. |
-| `-force` | `false` | Also delete `agent`/`imported` branches a run manifest under `.git/sigbound/runs` still references (printed as a loud per-branch warning — that run's `-resume` can no longer reuse it). Never bypasses `-older-than`, and has no effect on worktree pruning or tempdirs. |
+| `-force` | `false` | Also delete `agent`/`imported` branches an **unresolved** run's manifest under `.git/sigbound/runs` still references (printed as a loud per-branch warning — that run's `-resume` can no longer reuse it). A finished run's branches need no `-force`; a parked run's are not reachable by it. Never bypasses `-older-than`, and has no effect on worktree pruning or tempdirs. |
 | `-json` | `false` | Emit the result as JSON: `{worktreesPruned, tempdirs, branchesDeleted, branchesKept}`. |
 
 **Dry-run by default.** Nothing is ever deleted without `-delete` — a bare
@@ -1722,8 +1722,8 @@ debris:
    `-older-than` cutoff — see [Tempdir liveness](#tempdir-liveness-caveat)
    below for exactly what "old enough" means here.
 3. **`agent/*` and `imported/*` branches** whose commit date is at or before
-   the `-older-than` cutoff **and** aren't referenced by a run manifest under
-   `.git/sigbound/runs` (see below).
+   the `-older-than` cutoff **and** aren't referenced by an *unresolved* run's
+   manifest under `.git/sigbound/runs` (see below).
 
 Nothing else is ever a candidate. In particular, `sig gc` **never touches**
 the base branch or any branch outside `agent/` and `imported/<worker>/`,
@@ -1735,14 +1735,34 @@ below.
 **Manifest protection and `-force`.** Every `.git/sigbound/runs/*/report.json`
 names the branches `sig run -resume` might still reuse (see
 [Resume](#resume)): each agent's branch, plus any branch a `-verify-bisect`
-run dropped. An old, otherwise-sweepable branch that a manifest still names
-is **kept**, not deleted — deleting it would silently break that run's
-`-resume`. `-force` overrides this protection and deletes it anyway, printed
-with a loud per-branch `FORCED` warning so it's never a silent loss. `-force`
-is **manifest-only**: it does not, and cannot, bypass `-older-than` — a
+run dropped. An old, otherwise-sweepable branch that an **unresolved** run's
+manifest still names is **kept**, not deleted — deleting it would silently break
+that run's `-resume`. `-force` overrides this protection and deletes it anyway,
+printed with a loud per-branch `FORCED` warning so it's never a silent loss.
+`-force` is **manifest-only**: it does not, and cannot, bypass `-older-than` — a
 branch younger than the cutoff is never a candidate at all, `-force` or not
 — and it has no effect on worktree pruning or tempdirs, which have no
 manifest-protection concept to override.
+
+**Protection follows the run's phase, not its existence.** A manifest protects
+only while its run could still be acted on. Concretely, from the run's
+`status.json`:
+
+| Run phase | Its manifest's branches |
+|-----------|-------------------------|
+| `done` (landed) | **Not protected.** Old ones go with a plain `sig gc -delete`. |
+| `rejected` (park refused, or `ack-timeout` expired) | **Not protected.** Same — the decision is already made. |
+| `awaiting-ack` (parked) | Protected, and *absolutely* — see below. |
+| `error`, `interrupted` | Protected. These are exactly the runs `-resume` exists for. |
+| `queued`, `running` | Protected. The run is live. |
+| no readable `status.json` | Protected. An unreadable phase is never read as "finished". |
+
+This is what keeps `sig gc` useful: every run writes a `report.json`, so if a
+finished run's manifest protected its branches, `sig gc -delete` would keep
+every branch of every run you had ever completed and `-force` would become
+mandatory — the opposite of a tool whose job is cleaning up after completed and
+crashed runs. It applies identically to `sig run` and `sig serve`; neither entry
+point pins its history.
 
 **Parked runs are protected absolutely.** A branch named by an open `park.json`
 (see [Run parking](#run-parking)) is never a sweep candidate: no age cutoff
@@ -1757,14 +1777,14 @@ resolution is durably recorded (the safe order), so a crash in that gap leaves a
 ref behind, and nothing else sweeps `refs/sigbound/**`. A ref whose park is
 already resolved, or whose run directory is gone, is deleted once it is past
 `-older-than`; they appear as `stranded parking refs` in the output and
-`parkRefsDeleted` in `-json`. A `park.json` that exists but cannot be read
-aborts gc, same as an unreadable manifest. It is the only copy of a landing that
+`parkRefsDeleted` in `-json`. An open park is the only copy of a landing that
 already passed verify and is waiting on a person, which is the opposite of
-debris. The dry-run and `-delete` output both name it as `kept (PARKED …)`. Once
-that park is acked or rejected it stops being parked, and ordinary manifest rules
-resume. A `park.json` that exists but cannot be read **aborts gc entirely** with a
-loud error rather than assuming it protects nothing — the same fail-closed posture
-an unreadable manifest already gets.
+debris; the dry-run and `-delete` output both name it as `kept (PARKED …)`. Once
+that park is acked or rejected it stops being parked, and the phase table above
+takes over — which for a resolved run means its old branches become ordinary
+sweep candidates. A `park.json` that exists but cannot be read **aborts gc
+entirely** with a loud error rather than assuming it protects nothing — the same
+fail-closed posture an unreadable manifest already gets.
 
 ### Tempdir liveness caveat
 
@@ -2127,10 +2147,28 @@ its `ack-timeout`. See [Run parking](#run-parking).
 it parks) `park.json` under the same `.git/sigbound/runs/<runId>/`, which is what
 makes a CLI park ackable at all. It also runs that recovery sweep itself, at the
 start of every run: a repo that never runs a daemon has no other moment to heal a
-directory a `Ctrl-C` left saying `running`. A live daemon's runs are untouched
-either way — recovery only ever rewrites a dead pid's. `sig run` writes no
-`request.json` (there is no request body behind it) and no `usage.json`, and it
-streams events only where `-events` points.
+directory a `Ctrl-C` left saying `running`. `sig run` writes no `request.json`
+(there is no request body behind it) and no `usage.json`, and it streams events
+only where `-events` points.
+
+**The live-run exclusion is a unix guarantee, and it degrades on Windows.** On
+Linux and macOS, recovery — from either entry point — only ever rewrites a run
+whose recorded pid belongs to no process, so a live daemon's runs and a
+concurrent `sig run`'s are untouched. That exclusion is a `kill(pid, 0)` probe,
+and Windows rejects signal 0, so the probe reports **every** pid as gone there,
+live or dead (there is no Windows implementation; see issue #94). On the
+`windows_amd64` binary we ship, recovery therefore has no liveness test at all:
+a `sig run` (or a `sig serve` startup) can rewrite a genuinely live run's marker
+to `interrupted` while that run is still going.
+
+What that costs is an inaccurate phase, not the run. The live run overwrites its
+own marker at its terminal transition, so the misreport lasts only as long as the
+run does; an unresolved `park.json` outranks the marker anyway, so a park stays
+ackable; and nothing that deletes anything widens its reach on a marker reading
+`interrupted` — `sig gc` treats that phase as protected, so a wrong
+`interrupted` only ever keeps more than it should, never sweeps more. The
+observable effect on Windows is `sig log` and `GET /runs/{id}` reporting
+`interrupted` for a run that is fine.
 
 ### The inbox
 

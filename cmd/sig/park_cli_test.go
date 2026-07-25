@@ -399,11 +399,73 @@ func TestCLIParkSurvivesGCEvenForced(t *testing.T) {
 	if contains(plan.ParkRefs, f.park.KeepRef) {
 		t.Fatalf("gc would sweep the open park's keep-alive ref %s: %+v", f.park.KeepRef, plan.ParkRefs)
 	}
-	// Contrast, and the proof the run dir carries a report: the LANDED branch is
-	// manifest-protected from that report, and -force is what reaches it —
+	// Contrast, and the proof the run dir carries a report: this run is
+	// UNRESOLVED (it is parked), so its report.json still manifest-protects the
+	// branch its clean group landed, and -force is what reaches that one —
 	// exactly the protection a parked branch does not get and does not need.
 	if !plan.Forced["agent/clean"] {
 		t.Fatalf("agent/clean was not manifest-protected by the run dir's report.json: %+v", plan)
+	}
+}
+
+// TestCompletedCLIRunDoesNotPinItsBranches: giving `sig run` a run directory
+// made it journal report.json into the ledger the way `sig serve` always has,
+// and manifest protection keys on that file. It must not follow that every CLI
+// run anyone has ever completed pins its agent branches forever — that would
+// leave `sig gc -delete` with nothing to sweep and make -force mandatory, which
+// is the opposite of a tool for cleaning up after completed and crashed runs.
+// A run that FINISHED protects nothing; the negative control is the same repo
+// with nothing changed but the recorded phase.
+func TestCompletedCLIRunDoesNotPinItsBranches(t *testing.T) {
+	requirePOSIXShell(t)
+	// Negative -older-than puts the cutoff in the future so the just-created
+	// branch is past the age gate; that also means never scanning the real
+	// os.TempDir() (see newCLIParkFixture).
+	origTempRoot := gcTempRoot
+	gcRoot := t.TempDir()
+	gcTempRoot = func() string { return gcRoot }
+	t.Cleanup(func() { gcTempRoot = origTempRoot })
+
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	rep, code, out := runRunJSON(t, repo, buildTestAgent(t), []taskSpec{
+		taskWrite(t, "clean", map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"}),
+	})
+	if code != exitOK {
+		t.Fatalf("exit code %d, want exitOK (%d)\n%s", code, exitOK, out)
+	}
+	if len(rep.PerAgent) != 1 || rep.PerAgent[0].Branch == "" {
+		t.Fatalf("report names no agent branch to sweep: %+v", rep.PerAgent)
+	}
+	branch := rep.PerAgent[0].Branch
+	if _, err := g.RevParse(ctx, branch); err != nil {
+		t.Fatalf("%s does not exist, so this test would pass vacuously: %v", branch, err)
+	}
+	if st, _ := diskRunStatus(runDirOf(t, g, rep.RunID)); st != "done" {
+		t.Fatalf("a clean `sig run` recorded phase %q, want done", st)
+	}
+
+	plan, err := gcPlanFor(ctx, g, -time.Hour, false)
+	if err != nil {
+		t.Fatalf("gcPlanFor: %v", err)
+	}
+	if !contains(plan.ToDelete, branch) {
+		t.Fatalf("`sig gc -delete` (no -force) would keep %s from a completed run: ToDelete=%v ToKeep=%v", branch, plan.ToDelete, plan.ToKeep)
+	}
+
+	// Negative control: nothing about the repo changes except the recorded
+	// phase. An unresolved run is exactly what -resume reads, so the same
+	// branch must flip back to kept, and back to reachable only with -force.
+	writeRunStatus(runDirOf(t, g, rep.RunID), "interrupted", "")
+	plan, err = gcPlanFor(ctx, g, -time.Hour, false)
+	if err != nil {
+		t.Fatalf("gcPlanFor: %v", err)
+	}
+	if !contains(plan.ToKeep, branch) || contains(plan.ToDelete, branch) {
+		t.Fatalf("an interrupted run stopped protecting %s: ToDelete=%v ToKeep=%v", branch, plan.ToDelete, plan.ToKeep)
+	}
+	if plan, err = gcPlanFor(ctx, g, -time.Hour, true); err != nil || !plan.Forced[branch] {
+		t.Fatalf("-force must still reach %s (err=%v): %+v", branch, err, plan)
 	}
 }
 

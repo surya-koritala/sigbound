@@ -1843,12 +1843,18 @@ func recoverStaleRuns(runsDir string, ourPID int) {
 // is the standard, side-effect-free way to actually probe existence.
 //
 // Windows note: Process.Signal rejects signal 0 ("not supported by windows"),
-// so this returns false for every pid there, live or dead. `sig serve`'s
-// startup recovery consequently over-reaches on Windows (it would mark even a
-// live sibling run "interrupted") and is not validated on that platform — the
-// primary Windows path is the `sig run` CLI, not the serve daemon. See issue
-// #94; a correct Windows probe (OpenProcess + GetExitCodeProcess) is left as a
-// follow-up rather than pulled into the CI-enablement change.
+// so this returns false for every pid there, live or dead. recoverStaleRuns
+// consequently over-reaches on Windows — with no liveness test it would mark
+// even a live sibling run "interrupted" — and since issue #137 that is NOT
+// confined to the serve daemon: startRunDir runs the same sweep, so the `sig
+// run` CLI, the primary Windows path, has it too. Neither is validated on that
+// platform. What the over-reach does and does not cost is stated in
+// docs/USAGE.md's "Crash recovery" section; the short version is a misreported
+// phase, never lost work, because a live run rewrites its own marker and an
+// unresolved park.json outranks the marker regardless. Issue #94 settled the
+// Windows posture (ship the binary, state the limits) and is closed; a correct
+// probe (OpenProcess + GetExitCodeProcess) was left out of it and remains
+// follow-up work.
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false

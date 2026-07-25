@@ -4,12 +4,14 @@
 // agent/*/imported/*/* branches that outlived their run.
 //
 // Default is DRY-RUN: sig gc only prints what it would remove and exits 0.
-// Nothing is ever deleted without -delete. A branch a run manifest under
-// .git/sigbound/runs still references is kept unless -force is also given
-// (loudly, per branch) -- that manifest is exactly what `sig run -resume`
-// reads to decide which agent/<id> branches it can reuse (see run.go's
-// resumeAgent), so sweeping one out from under a resumable run would
-// silently break resume.
+// Nothing is ever deleted without -delete. A branch an UNRESOLVED run's
+// manifest under .git/sigbound/runs still references is kept unless -force is
+// also given (loudly, per branch) -- that manifest is exactly what `sig run
+// -resume` reads to decide which agent/<id> branches it can reuse (see run.go's
+// resumeAgent), so sweeping one out from under a resumable run would silently
+// break resume. A run that has RESOLVED -- landed, or had its park rejected --
+// protects nothing: nobody resumes a finished run, and its old branches are
+// precisely the debris gc exists to sweep. See loadProtectedBranches.
 //
 // A branch named by an OPEN park.json (a landing that passed verify and is
 // waiting on a human ack -- see park.go) is kept UNCONDITIONALLY: no age
@@ -145,9 +147,10 @@ func runGC(w io.Writer, argv []string) (int, error) {
 	olderThan := fs.Duration("older-than", gcDefaultOlderThan, "age cutoff for tempdirs (mtime) and agent/imported branches (commit date); "+
 		"ignored by worktree-registration pruning, which is always safe regardless of age")
 	doDelete := fs.Bool("delete", false, "actually remove debris; without this, sig gc only prints what it would remove and changes nothing")
-	force := fs.Bool("force", false, "also delete agent/imported branches a run manifest under .git/sigbound/runs still references "+
-		"(printed as a loud per-branch warning -- that run's -resume can no longer reuse it); never bypasses -older-than, "+
-		"and has no effect on worktree pruning or tempdirs")
+	force := fs.Bool("force", false, "also delete agent/imported branches an UNRESOLVED run's manifest under .git/sigbound/runs "+
+		"still references (printed as a loud per-branch warning -- that run's -resume can no longer reuse it); a finished run's "+
+		"branches need no -force, a parked run's are never reachable by it, and it never bypasses -older-than or affects "+
+		"worktree pruning or tempdirs")
 	asJSON := fs.Bool("json", false, "emit the result as JSON: {worktreesPruned, tempdirs, branchesDeleted, branchesKept}")
 	if err := fs.Parse(argv); err != nil {
 		if err == flag.ErrHelp {
@@ -298,8 +301,8 @@ func scanTempdirs(root string, cutoff time.Time) ([]string, error) {
 }
 
 // loadProtectedBranches scans every .git/sigbound/runs/*/report.json (the
-// durable run storage `sig serve` writes, see serve.go's writeRunReport)
-// and returns the set of branch names those manifests reference: every
+// durable run storage BOTH entry points write, see serve.go's writeRunReport)
+// and returns the set of branch names the UNRESOLVED ones reference: every
 // agent's branch (runReport.PerAgent[].Branch, ok or not) plus every branch
 // -verify-bisect dropped (runReport.Integrate.DroppedByBisect). This is
 // exactly the set `sig run -resume` might still read a branch out of --
@@ -308,14 +311,36 @@ func scanTempdirs(root string, cutoff time.Time) ([]string, error) {
 // so sweeping one of these out from under a resumable run would silently
 // break resume.
 //
+// WHY ONLY UNRESOLVED RUNS. Protection exists so a run that might still be
+// acted on does not have its branches swept out from under it, not so that
+// every run ever completed pins its branches forever -- that would defeat gc,
+// whose whole job is cleaning up after completed and crashed runs. A run whose
+// status.json says "done" (it landed) or "rejected" (its park was refused, or
+// timed out) is finished: nothing will resume it, its branches are ordinary
+// history, and after -older-than they are exactly what a plain `sig gc -delete`
+// is supposed to remove. Every other phase still protects: queued/running
+// (live), error and interrupted (the two -resume cases), awaiting-ack, and any
+// run whose phase cannot be read at all. Note what awaiting-ack gets here is
+// ordinary, -force-overridable protection over the whole manifest; the branches
+// the park record ITSELF names get the unconditional kind, from
+// loadParkedBranches, which -force cannot reach.
+//
+// This rule applies to both entry points, and the problem it fixes was never
+// specific to one: `sig serve` has written a report.json per completed run
+// since the journal existed, so a served run's branches were already pinned
+// forever. Issue #137 giving `sig run` a run dir only made the same latent bug
+// visible at the entry point most people use.
+//
 // A run directory with no report.json (crashed before finishing, or only
 // ever wrote error.json) contributes nothing -- there's no manifest to
-// protect anything for. But a report.json that EXISTS and fails to read or
-// parse is a loud error that aborts gc entirely: guessing "protects
-// nothing" for a manifest gc can't actually read is exactly the wrong
+// protect anything for. But a report.json that EXISTS in an unresolved run and
+// fails to read or parse is a loud error that aborts gc entirely: guessing
+// "protects nothing" for a manifest gc can't actually read is exactly the wrong
 // direction to fail open in (it would let real debris — a branch a corrupt
 // manifest still names — get swept), so this refuses to run rather than
-// risk it, matching the project's "bad plan => no run" fail-safe posture.
+// risk it, matching the project's "bad plan => no run" fail-safe posture. A
+// corrupt report in a run that RESOLVED is not read at all and so cannot wedge
+// gc: its branches would not have been protected either way.
 func loadProtectedBranches(ctx context.Context, g *gitx.Git) (map[string]bool, error) {
 	common, err := g.GitCommonDir(ctx)
 	if err != nil {
@@ -327,6 +352,17 @@ func loadProtectedBranches(ctx context.Context, g *gitx.Git) (map[string]bool, e
 	}
 	protected := map[string]bool{}
 	for _, m := range matches {
+		// Dropping protection requires an EXPLICIT resolved phase: status.json
+		// must exist, parse, and say the run finished. A status.json that is
+		// absent (a dir written before the journal existed, or a best-effort
+		// status write that failed) or unreadable keeps protecting -- the same
+		// fail-safe direction the corrupt-manifest error below takes. Note this
+		// deliberately does NOT use diskStatus's "report.json exists => done"
+		// inference: that would read every legacy dir as finished on evidence
+		// that is merely the manifest we are standing in.
+		if sf, serr := readRunStatus(filepath.Dir(m)); serr == nil && (sf.Status == "done" || sf.Status == statusRejected) {
+			continue // resolved: ordinary sweep rules apply to its branches
+		}
 		data, rerr := os.ReadFile(m)
 		if rerr != nil {
 			return nil, fmt.Errorf("read %s: %w", m, rerr)
@@ -408,7 +444,7 @@ func printGCTable(w io.Writer, plan gcPlan, applied bool) {
 		}
 	}
 	for _, b := range plan.ToKeep {
-		why := "manifest-referenced"
+		why := "manifest-referenced by an unresolved run"
 		if plan.Parked[b] {
 			why = "PARKED -- awaiting ack; -force and -older-than do not apply"
 		}

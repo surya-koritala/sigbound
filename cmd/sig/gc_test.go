@@ -107,17 +107,26 @@ func makeTempdir(t *testing.T, tempRoot, pattern string, old bool) string {
 	return dir
 }
 
-// writeRunManifest writes a report.json under .git/sigbound/runs/<id>/,
-// protecting the given branches (as perAgent entries, mixing ok=true/false
-// -- resumeAgent doesn't care) and droppedByBisect names.
-func writeRunManifest(t *testing.T, g *gitx.Git, id string, okBranches, droppedByBisect []string) {
+// runDirOf is <git-common-dir>/sigbound/runs/<id> -- the directory both entry
+// points journal a run into, and the one gc reads status.json and report.json
+// back out of.
+func runDirOf(t *testing.T, g *gitx.Git, id string) string {
 	t.Helper()
-	ctx := context.Background()
-	common, err := g.GitCommonDir(ctx)
+	common, err := g.GitCommonDir(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(common, "sigbound", "runs", id)
+	return filepath.Join(common, "sigbound", "runs", id)
+}
+
+// writeRunManifest writes a report.json under .git/sigbound/runs/<id>/,
+// protecting the given branches (as perAgent entries, mixing ok=true/false
+// -- resumeAgent doesn't care) and droppedByBisect names. It deliberately
+// writes NO status.json: a run whose phase gc cannot read is protected, so
+// this is the fixture for "protected" without having to name a phase.
+func writeRunManifest(t *testing.T, g *gitx.Git, id string, okBranches, droppedByBisect []string) {
+	t.Helper()
+	dir := runDirOf(t, g, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -499,6 +508,79 @@ func TestGCRunDirWithoutReportJSONIsIgnored(t *testing.T) {
 	}
 	if len(protected) != 0 {
 		t.Fatalf("protected=%v, want empty (no report.json to read)", protected)
+	}
+}
+
+// TestGCProtectionFollowsRunPhase pins the SCOPE of manifest protection. It
+// exists so a run that can still be acted on does not have its branches swept
+// out from under it -- not so that every run ever completed pins its branches
+// forever, which would defeat the tool. A run whose status.json says it landed
+// ("done") or that its park was refused ("rejected") protects nothing; every
+// other phase -- including one gc cannot read at all -- still protects. Both
+// entry points write a report.json (issue #137 gave `sig run` a run dir too),
+// so without this a plain `sig gc -delete` would keep every branch of every
+// completed run and -force would become mandatory.
+func TestGCProtectionFollowsRunPhase(t *testing.T) {
+	for _, tc := range []struct {
+		phase     string // "" writes no status.json at all
+		protected bool
+	}{
+		{"done", false},
+		{statusRejected, false},
+		{statusAwaitingAck, true},
+		{"error", true},
+		{"interrupted", true},
+		{"running", true},
+		{"queued", true},
+		{"", true},
+	} {
+		name := tc.phase
+		if name == "" {
+			name = "unreadable-phase"
+		}
+		t.Run(name, func(t *testing.T) {
+			g, _, _ := newGCRepo(t)
+			writeRunManifest(t, g, "run1", []string{"agent/a"}, []string{"agent/dropped"})
+			if tc.phase != "" {
+				writeRunStatus(runDirOf(t, g, "run1"), tc.phase, "")
+			}
+			protected, err := loadProtectedBranches(context.Background(), g)
+			if err != nil {
+				t.Fatalf("loadProtectedBranches: %v", err)
+			}
+			// Both halves of the manifest -- an agent's branch and one
+			// -verify-bisect dropped -- follow the same rule.
+			for _, b := range []string{"agent/a", "agent/dropped"} {
+				if protected[b] != tc.protected {
+					t.Fatalf("phase %q: protected[%s]=%v, want %v (protected=%v)", tc.phase, b, protected[b], tc.protected, protected)
+				}
+			}
+		})
+	}
+}
+
+// TestGCDeleteSweepsAFinishedRunsBranchesWithoutForce is the plan-level half of
+// the rule above, and the regression it guards: a finished run's old branch
+// must land in ToDelete for a plain `sig gc -delete`, with no -force. The
+// negative control is the identical repo with only the phase changed back to
+// an unresolved one, which must move the same branch to ToKeep.
+func TestGCDeleteSweepsAFinishedRunsBranchesWithoutForce(t *testing.T) {
+	f := newGCFixture(t) // run1's manifest names agent/protected, an old branch
+	dir := runDirOf(t, f.g, "run1")
+
+	writeRunStatus(dir, "done", "")
+	plan := planWithTempRoot(t, f, 24*time.Hour, false)
+	if !containsStr(plan.ToDelete, "agent/protected") {
+		t.Fatalf("a landed run still pins its branch: ToDelete=%v ToKeep=%v", plan.ToDelete, plan.ToKeep)
+	}
+
+	writeRunStatus(dir, "interrupted", "")
+	plan = planWithTempRoot(t, f, 24*time.Hour, false)
+	if !containsStr(plan.ToKeep, "agent/protected") || containsStr(plan.ToDelete, "agent/protected") {
+		t.Fatalf("an interrupted run must still protect its branch (that is what -resume reads): ToDelete=%v ToKeep=%v", plan.ToDelete, plan.ToKeep)
+	}
+	if plan := planWithTempRoot(t, f, 24*time.Hour, true); !plan.Forced["agent/protected"] {
+		t.Fatalf("-force must still reach an unresolved run's branch: %+v", plan)
 	}
 }
 
