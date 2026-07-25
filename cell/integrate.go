@@ -119,6 +119,9 @@ func NewIntegrator(g *gitx.Git) *Integrator {
 // serialized write in an otherwise lock-free, object-only pipeline. Empty ref
 // (the default) integrates without moving any ref, leaving FinalSHA a detached
 // commit the caller can inspect.
+//
+// The write is a COMPARE-AND-SWAP against the base handed to Integrate, so the
+// base MUST be the commit OID the caller read — not a branch name. See land.
 func (in *Integrator) WithLandRef(ref string) *Integrator {
 	in.landRef = ref
 	return in
@@ -186,11 +189,24 @@ func (in *Integrator) Integrate(ctx context.Context, base string, changes []Bran
 // land publishes commit to the configured ref (no-op when unset/empty). This is
 // the single serialized step: merges/overlays only write objects, so everything
 // upstream of here is parallel and lock-free.
-func (in *Integrator) land(ctx context.Context, commit string) error {
-	if in.landRef == "" || commit == "" {
+//
+// THE SWAP IS CONDITIONAL (issue #138). base is the commit every strategy above
+// computed against, and git applies the move only while the ref still holds it,
+// so a landing that arrived during the integration — another run, an ack, a
+// second `sig integrate` — is REFUSED here rather than reset away. Integration
+// takes as long as a fold plus a resolver takes, which is exactly the window;
+// without the compare, whoever lost it was discarded silently, and the caller
+// still reported success. A refusal is gitx.ErrRefMoved, which callers can tell
+// from a broken repository because the two demand opposite reactions: re-read
+// the base and integrate again, versus stop.
+//
+// commit == base is nothing to land (a serial strategy that flagged everything),
+// so there is no move to make and no race to lose: skipped, not swapped.
+func (in *Integrator) land(ctx context.Context, base, commit string) error {
+	if in.landRef == "" || commit == "" || commit == base {
 		return nil
 	}
-	return in.g.UpdateRef(ctx, in.landRef, commit)
+	return in.g.UpdateRefCAS(ctx, in.landRef, commit, base)
 }
 
 // IntegrateNaive is the obvious approach with no OCC: fold every branch onto the
@@ -208,7 +224,7 @@ func (in *Integrator) IntegrateNaive(ctx context.Context, base string, changes [
 	res.Landed = landed
 	res.Flagged = flagged
 	res.AutoMerged = auto
-	if err := in.land(ctx, res.FinalSHA); err != nil {
+	if err := in.land(ctx, base, res.FinalSHA); err != nil {
 		return res, err
 	}
 	res.Duration = time.Since(start)
@@ -310,7 +326,7 @@ func (in *Integrator) IntegrateOCC(ctx context.Context, base string, changes []B
 		return res, err
 	}
 	res.FinalSHA = final
-	if err := in.land(ctx, res.FinalSHA); err != nil {
+	if err := in.land(ctx, base, res.FinalSHA); err != nil {
 		return res, err
 	}
 	res.Duration = time.Since(start)
@@ -667,7 +683,7 @@ func (in *Integrator) IntegrateOverlay(ctx context.Context, base string, changes
 		return res, err
 	}
 	res.FinalSHA = final
-	if err := in.land(ctx, res.FinalSHA); err != nil {
+	if err := in.land(ctx, base, res.FinalSHA); err != nil {
 		return res, err
 	}
 	res.Duration = time.Since(start)
@@ -749,7 +765,7 @@ func (in *Integrator) IntegratePorcelain(ctx context.Context, base string, chang
 		return res, err
 	}
 	res.FinalSHA = head
-	if err := in.land(ctx, res.FinalSHA); err != nil {
+	if err := in.land(ctx, base, res.FinalSHA); err != nil {
 		return res, err
 	}
 	res.Duration = time.Since(start)

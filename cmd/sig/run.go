@@ -315,6 +315,15 @@ type runReport struct {
 	// nothing about the landing, it only raises an `audit` inbox entry. Always
 	// false (and omitted) without a run id to sample on, i.e. outside `sig serve`.
 	Audit bool `json:"audit,omitempty"`
+	// LandRefused names the commit the base was actually at when the landing
+	// swap was refused: somebody else advanced it while this run was computing
+	// against BaseSHA (see landRef). Set only on that refusal — empty and
+	// omitted on every other run — and it is what separates "your change is
+	// broken" from "someone else landed first" in a report where -verify had
+	// already passed (or was unset) and yet nothing landed. The run also returns
+	// an operational error, so this rides the partial report `sig run` and
+	// `sig serve` persist on that path.
+	LandRefused string `json:"landRefused,omitempty"`
 }
 
 // policyJSON records the resolved landing policy on the report/manifest. Verify
@@ -1625,8 +1634,26 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			}
 		}
 	}
-	if err := landRef(ctx, g, p.Base, landSHA); err != nil {
-		return rep, budgetAwareErr(p, ctx, "land "+short(landSHA), err)
+	// landSHA == baseSHA means nothing actually landed (no agent succeeded, or
+	// every branch got flagged), so there is no ref move to make: the swap would
+	// be a no-op that can only FAIL, refusing a run that had nothing to land
+	// because somebody else landed something. The event still fires, unchanged —
+	// "the run reached landing" is what it reports, and it always did.
+	if landSHA != baseSHA {
+		if err := landRef(ctx, g, p.Base, baseSHA, landSHA); err != nil {
+			// A refused swap is not a broken run: the tree verified green, somebody
+			// else simply reached the base first, and re-running against the new head
+			// is the recovery. Say so in the report and the events rather than letting
+			// it read as an ordinary land failure — nothing landed either way, but the
+			// operator's next move is entirely different.
+			if errors.Is(err, gitx.ErrRefMoved) {
+				rep.LandRefused, _ = g.RevParse(ctx, p.Base) // best-effort: names the landing that won
+				emit.emit("land_refused", map[string]any{"sha": landSHA, "baseSHA": baseSHA, "movedTo": rep.LandRefused})
+				return rep, fmt.Errorf("land %s: the base %q moved to %s while this run was computing against %s; nothing landed — re-run against the new head: %w",
+					short(landSHA), p.Base, shortMoved(rep.LandRefused), short(baseSHA), err)
+			}
+			return rep, budgetAwareErr(p, ctx, "land "+short(landSHA), err)
+		}
 	}
 	rep.Integrate.FinalSHA = landSHA
 	emit.emit("land", map[string]any{"sha": landSHA})
@@ -1651,8 +1678,8 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		emit.emit("audit_selected", map[string]any{"runId": p.RunID, "sample": pol.auditSample, "sha": landSHA})
 	}
 	// -publish: the run has now LANDED (base ref advanced past baseSHA;
-	// -verify green or unset — a verify failure already returned above,
-	// before ever reaching UpdateRef). landSHA == baseSHA here means nothing
+	// -verify green or unset — a verify failure already returned above, before
+	// ever reaching the landing swap). landSHA == baseSHA here means nothing
 	// actually landed (no agent succeeded, or every branch got flagged), so
 	// the guard below skips -publish for that case too — "landed" is exactly
 	// "the ref moved", nothing more to check. A publish FAILURE never
@@ -1768,14 +1795,15 @@ func attachNote(ctx context.Context, g *gitx.Git, commit string, rep runReport) 
 // of its own and no policy — feed it branches you have already gated — so it is
 // outside this statement, not an exception to it.
 //
-// ponytail: a plain update-ref, not a compare-and-swap against the base's
-// expected old value, so a base that moves between the caller's read and this
-// write is clobbered — today's behavior for `sig run`, unchanged. ackRun narrows
-// that window by re-reading the base immediately before calling here. Upgrade to
-// `update-ref <ref> <new> <old>` if concurrent writers to one base ever become a
-// real workflow, and give both callers the same failure semantics at once.
-func landRef(ctx context.Context, g *gitx.Git, baseBranch, sha string) error {
-	return g.UpdateRef(ctx, "refs/heads/"+baseBranch, sha)
+// THE SWAP IS CONDITIONAL (issue #138). fromSHA is the head the caller computed
+// sha against, and git applies the move only while the base still holds it, so a
+// landing that arrived from anywhere else in between is REFUSED rather than reset
+// away. Every caller reads the base, spends real time computing against it, and
+// only then lands; without the compare that gap silently discards whoever won it.
+// A refusal is gitx.ErrRefMoved, distinguishable from a broken repository because
+// the two demand opposite reactions — retry against the new head, versus stop.
+func landRef(ctx context.Context, g *gitx.Git, baseBranch, fromSHA, sha string) error {
+	return g.UpdateRefCAS(ctx, "refs/heads/"+baseBranch, sha, fromSHA)
 }
 
 // budgetAwareErr wraps err from a driveRun phase (integrate, land), naming
@@ -3223,4 +3251,16 @@ func short(sha string) string {
 		return sha[:12]
 	}
 	return sha
+}
+
+// shortMoved names the head that won a refused landing swap. Every caller reads
+// it best-effort — the swap already failed, and on a cancelled or expired
+// context the re-read fails too — but this is the ONE field that makes a
+// refusal actionable ("re-run against the new head" needs a head), so an unread
+// one says so instead of trailing the sentence off into "moved to ".
+func shortMoved(sha string) string {
+	if strings.TrimSpace(sha) == "" {
+		return "a commit this run could not read back"
+	}
+	return short(sha)
 }

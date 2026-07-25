@@ -16,6 +16,9 @@ package gitx
 //                    per branch.
 //   - UpdateRefs   : one `git update-ref --stdin` applying every ref move
 //                    atomically in a single process (the final landing).
+//   - UpdateRefCAS : the same command's compare-and-swap form, which refuses the
+//                    write unless the ref still holds the value the caller
+//                    computed against (every landing path in the product).
 //   - BlobsBatch   : every conflict's base/ours/theirs blob CONTENT in ONE `git
 //                    cat-file --batch` process instead of a `cat-file blob` fork
 //                    per side per path (the resolver seam's blob reads).
@@ -424,6 +427,56 @@ func (g *Git) UpdateRefs(ctx context.Context, updates map[string]string) error {
 // UpdateRef is the single-ref convenience over UpdateRefs.
 func (g *Git) UpdateRef(ctx context.Context, ref, oid string) error {
 	return g.UpdateRefs(ctx, map[string]string{ref: oid})
+}
+
+// ErrRefMoved is UpdateRefCAS's refusal: the ref no longer held the expected old
+// value, so git rejected the swap and NOTHING was written. It is a sentinel
+// because the two answers demand opposite reactions from a caller — "somebody
+// else advanced this ref while you were computing" is a retry against the new
+// head, while any other update-ref failure is a broken repository — and a caller
+// that cannot tell them apart has to treat both as fatal.
+var ErrRefMoved = errors.New("ref moved since it was read")
+
+// UpdateRefCAS advances ref from oldOID to newOID as a COMPARE-AND-SWAP: git's
+// stdin format takes the expected old value as an optional third field
+// (`update SP <ref> SP <newvalue> [SP <oldvalue>]`) and applies the update only
+// while the ref still holds it, inside the same lock it takes to write. That is
+// what makes a read-then-write over a ref atomic — a landing that arrives between
+// a caller's read and this write is REFUSED here rather than silently reset away.
+//
+// A lost swap comes back as ErrRefMoved, wrapping git's own message (which names
+// both the value found and the value expected). The discriminant is that message,
+// so LC_ALL=C pins its language: on a localized git the wording would otherwise
+// change under us and a lost race would read as a broken repository. That is the
+// fail-closed direction — nothing lands either way — but it turns a retryable
+// answer into a fatal one, so the mapping is pinned by a test rather than
+// trusted.
+func (g *Git) UpdateRefCAS(ctx context.Context, ref, newOID, oldOID string) error {
+	for _, f := range []string{ref, newOID, oldOID} {
+		if strings.ContainsAny(f, " \t\n") || f == "" {
+			return fmt.Errorf("update-ref: illegal ref/oid field %q", f)
+		}
+	}
+	// oldOID must be an OID, never a name. git resolves a NAME in this field at
+	// compare time, so passing the very ref being updated (or anything else that
+	// tracks it) would compare it against its own current value and pass always —
+	// a compare-and-swap that silently degrades into the plain write it exists to
+	// replace. The caller has to name the value it actually read.
+	if !isHexOID(oldOID) {
+		return fmt.Errorf("update-ref: expected-old value %q is not an object id: a compare-and-swap must name the value the caller read, not a ref that resolves to whatever is there now", oldOID)
+	}
+	stdin := []byte(fmt.Sprintf("update %s %s %s\n", ref, newOID, oldOID))
+	_, se, code, err := g.runWith(ctx, []string{"LC_ALL=C"}, stdin, "update-ref", "--stdin")
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		if strings.Contains(se, "but expected") {
+			return fmt.Errorf("%w: %s: %s", ErrRefMoved, ref, strings.TrimSpace(se))
+		}
+		return fmt.Errorf("update-ref --stdin: exit %d: %s", code, strings.TrimSpace(se))
+	}
+	return nil
 }
 
 // DeleteRef removes ref (`git update-ref -d`). Deleting a ref that is already
