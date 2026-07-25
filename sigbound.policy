@@ -3,12 +3,18 @@
 # This file is read from the base commit's tree, so changing the bar is
 # itself a change that must land through the bar.
 
-# Every landing builds, vets, and passes the race suite for the packages
-# that carry the engine. Members run in order; the first failure fails the
-# gate and is named in the report.
+# Every landing builds, vets, and passes the race suite for EVERY package in
+# the module. Members run in order and are ANDed, so build and vet still fail
+# fast and the suite only runs on a tree that already compiles. The test member
+# is ./... rather than a list of packages: an enumerated list silently stops
+# covering each package added after it was written, which is how ./cmd/sig/ —
+# where most changes land — stayed outside this gate (#139). -timeout is
+# explicit because ./cmd/sig/ alone is minutes of race-instrumented subprocess
+# work, and go test's 10m per-package default is near enough to that to turn a
+# loaded machine into a red gate on green code.
 verify = go build ./...
 verify = go vet ./...
-verify = go test -race ./cell/ ./internal/gitx/
+verify = go test -race -timeout 20m ./...
 
 # An agent that writes outside its declared files is rejected, and Go
 # symbol-level conflicts are detected rather than merged textually.

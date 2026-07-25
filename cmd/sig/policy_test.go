@@ -1,11 +1,40 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+// ---- this repo's OWN sigbound.policy ----
+
+// TestRepoPolicyTestsEveryPackage pins the one property this repo's committed
+// battery has to keep: its test member covers EVERY package in the module. An
+// enumerated package list stops covering each package added after it was
+// written, and the gap is silent — a change lands green with its own tests
+// never executed, which is exactly what happened to ./cmd/sig/ (#139). The
+// assertion is on the COMMITTED file, not on CI, because that file is what
+// gates a landing here; narrowing it back to a list must be a deliberate edit
+// that also changes this test.
+func TestRepoPolicyTestsEveryPackage(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", policyFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol, err := parsePolicy(data)
+	if err != nil {
+		t.Fatalf("parsePolicy(%s): %v", policyFileName, err)
+	}
+	for _, m := range pol.verify {
+		if strings.HasPrefix(m, "go test") && strings.Contains(m, "./...") {
+			return
+		}
+	}
+	t.Fatalf("%s verify battery = %q: no member runs the tests over ./..., so a package can be added and never gated", policyFileName, pol.verify)
+}
 
 // ---- parsePolicy ----
 
