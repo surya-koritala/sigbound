@@ -150,11 +150,19 @@ type server struct {
 	maxConcurrentRuns int
 	maxParallelAgents int
 
+	// Watch mode (issue #111), all zero/nil unless -watch is set. watchEvents is
+	// the daemon-level event stream (the cell-scoped watch_* lines that belong to
+	// no single run); watchOn gates POST /queue; queued holds each cell's
+	// explicitly enqueued branches. See watch.go.
+	watchOn     bool
+	watchEvents *eventEmitter
+
 	mu         sync.Mutex
 	busy       map[string]bool       // cell id -> a run is in flight (per-cell 409)
 	activeRuns int                   // runs in flight across ALL cells (maxConcurrentRuns' 429 counter)
 	runs       map[string]*runRecord // runId -> live record for THIS process
-	wg         sync.WaitGroup        // in-flight run goroutines, waited on shutdown
+	queued     map[string][]string   // cell id -> branches enqueued via POST /queue
+	wg         sync.WaitGroup        // in-flight run goroutines AND watch loops, waited on shutdown
 }
 
 // runRecord is the in-memory truth for a run started by THIS process. Disk
@@ -218,6 +226,7 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		byKey:             map[string]*registeredCell{},
 		busy:              map[string]bool{},
 		runs:              map[string]*runRecord{},
+		queued:            map[string][]string{},
 	}
 	ctx := context.Background()
 	for _, repo := range cfg.repos {
@@ -284,6 +293,10 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /runs/{id}/ack", s.handleAck)
 	mux.HandleFunc("POST /runs/{id}/reject", s.handleReject)
 	mux.HandleFunc("GET /inbox", s.handleInbox)
+	// Watch mode's one enqueue endpoint (issue #111). It starts nothing by
+	// itself: it names existing branches for the next cycle, which drives the
+	// same run POST /runs would. Only meaningful with -watch (400 otherwise).
+	mux.HandleFunc("POST /queue", s.handleQueue)
 	mux.HandleFunc("GET /ui", s.handleUI)
 	mux.HandleFunc("GET /ui/", s.handleUI)
 	mux.HandleFunc("GET /usage", s.handleUsageAggregate)
@@ -472,40 +485,84 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Acquire the cell's run slot and create the run's durable directory before
-	// returning 202, so the events endpoint can be polled the instant the
-	// caller has the runId. A cell already running rejects with 409. Quota:
-	// -max-concurrent-runs, a global ceiling across ALL cells on top of that
-	// per-cell 409 — checked under the same lock, before the run dir is
-	// created, so a 429 here starts no run either.
-	s.mu.Lock()
-	if s.busy[rc.cell.ID()] {
-		s.mu.Unlock()
-		writeErr(w, http.StatusConflict, fmt.Sprintf("a run is already in progress for cell %s (%s); one run per cell at a time", rc.cell.ID(), rc.cell.Repo()), codeCellBusy)
+	rec, err := s.acquireRun(rc, req, &p)
+	switch {
+	case errors.Is(err, errCellBusy):
+		writeErr(w, http.StatusConflict, err.Error(), codeCellBusy)
+		return
+	case errors.Is(err, errQuotaConcurrency):
+		writeErr(w, http.StatusTooManyRequests, err.Error(), codeQuotaConcurrency)
+		return
+	case err != nil:
+		writeErr(w, http.StatusInternalServerError, err.Error(), codeInternalError)
 		return
 	}
+	go s.execRun(rec, p, req.Tasks, plan, haveGoal)
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"runId":  rec.id,
+		"cell":   rc.cell.ID(),
+		"status": "queued",
+	})
+}
+
+// errCellBusy / errQuotaConcurrency are acquireRun's two REFUSALS, as sentinels
+// rather than response codes: the HTTP path turns them into 409/429, and a watch
+// cycle turns the first into a skipped tick (see watchCycle). Same condition,
+// two callers, one place that decides it.
+//
+// Each one's text is the TRAILING CLAUSE of the message it is wrapped into, so
+// the composed error reproduces byte-for-byte the wording POST /runs has always
+// returned — a sentinel is an implementation detail and must not show up in a
+// response body.
+var (
+	errCellBusy         = errors.New("one run per cell at a time")
+	errQuotaConcurrency = errors.New("try again once a run finishes")
+)
+
+// acquireRun takes the cell's run slot and creates the run's durable directory
+// and journal — everything that must be true BEFORE a run starts, and the one
+// place it happens. POST /runs calls it and then starts execRun in a goroutine
+// (so it can return 202 immediately); a watch cycle calls it and then runs
+// execRun synchronously (so its loop stays serial). Both therefore hold the same
+// per-cell lock, count against the same concurrency quota, and leave the same
+// crash trail — a cycle run is not a second kind of run.
+//
+// The caller MUST call execRun on the returned record on some path: acquireRun
+// has already taken the slot, the counter, and s.wg on its behalf, and execRun's
+// defers are what release all three.
+func (s *server) acquireRun(rc *registeredCell, req runRequest, p *runParams) (*runRecord, error) {
+	cellID := rc.cell.ID()
+	s.mu.Lock()
+	if s.busy[cellID] {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("a run is already in progress for cell %s (%s); %w", cellID, rc.cell.Repo(), errCellBusy)
+	}
+	// Quota: -max-concurrent-runs, a global ceiling across ALL cells on top of
+	// the per-cell busy check — taken under the same lock, before the run dir is
+	// created, so a refusal here starts no run and leaves no dir.
 	if s.maxConcurrentRuns > 0 && s.activeRuns >= s.maxConcurrentRuns {
 		s.mu.Unlock()
-		writeErr(w, http.StatusTooManyRequests, fmt.Sprintf("this server's max-concurrent-runs %d is already in flight; try again once a run finishes", s.maxConcurrentRuns), codeQuotaConcurrency)
-		return
+		return nil, fmt.Errorf("this server's max-concurrent-runs %d is already in flight; %w", s.maxConcurrentRuns, errQuotaConcurrency)
 	}
 	runID := newRunID()
 	dir := filepath.Join(rc.runsDir, runID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		s.mu.Unlock()
-		writeErr(w, http.StatusInternalServerError, "create run dir: "+err.Error(), codeInternalError)
-		return
+		return nil, fmt.Errorf("create run dir: %w", err)
 	}
 	// Journal (issue #90): status.json records "queued" the instant the run
-	// is accepted, and request.json the exact POSTed body — both BEFORE the
-	// goroutine is even started, so a crash in the gap between accept and the
-	// goroutine's first instruction still leaves an accurate, diagnosable
-	// trail on disk (see docs/USAGE.md's "Crash recovery" section).
+	// is accepted, and request.json the request behind it — both BEFORE the
+	// run is even started, so a crash in the gap between accept and its first
+	// instruction still leaves an accurate, diagnosable trail on disk (see
+	// docs/USAGE.md's "Crash recovery" section). A watch cycle journals the
+	// batch it assembled in the same shape; unlike a POSTed body that is a
+	// record of what ran, not a request anyone can re-POST.
 	writeRunStatus(dir, "queued", "")
 	writeRunRequest(dir, req)
-	s.busy[rc.cell.ID()] = true
+	s.busy[cellID] = true
 	s.activeRuns++
-	rec := &runRecord{id: runID, cellID: rc.cell.ID(), repo: rc.cell.Repo(), dir: dir, status: "queued", startedAt: time.Now()}
+	rec := &runRecord{id: runID, cellID: cellID, repo: rc.cell.Repo(), dir: dir, status: "queued", startedAt: time.Now()}
 	s.runs[runID] = rec
 	s.wg.Add(1)
 	s.mu.Unlock()
@@ -514,13 +571,7 @@ func (s *server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// The run id is the key the spot-audit sample is drawn on (see
 	// auditSelected): a recorded, replayable id, never a fresh random draw.
 	p.RunID = runID
-	go s.execRun(rec, p, req.Tasks, plan, haveGoal)
-
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"runId":  runID,
-		"cell":   rc.cell.ID(),
-		"status": "queued",
-	})
+	return rec, nil
 }
 
 // execRun is the async body of a run: plan (if a goal), driveRun, then persist
@@ -1742,6 +1793,7 @@ const (
 	codeQuotaConcurrency     = "quota_concurrency"      // 429: -max-concurrent-runs exceeded
 	codeQuotaAgents          = "quota_agents"           // 400: -max-agents-per-run exceeded
 	codeEnvWidenRefused      = "env_widen_refused"      // 400: request tried to widen scoped envMode
+	codeWatchDisabled        = "watch_disabled"         // 400: POST /queue on a server started without -watch
 	codeBadRequest           = "bad_request"            // 400: everything else validation-shaped
 	codeUnsupportedMediaType = "unsupported_media_type" // 415: Content-Type isn't application/json
 	codeInternalError        = "internal_error"         // 500: an operational failure, not caller error
@@ -1832,6 +1884,18 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	maxRunTime := fs.Duration("max-run-time", 0, "quota: cap every run's -budget at this duration (e.g. 10m); a request's own shorter -budget always wins (min of the two). 0 = unlimited (default)")
 	maxConcurrentRuns := fs.Int("max-concurrent-runs", 0, "quota: reject (429) a POST /runs once N runs are in flight across ALL cells, on top of the existing per-cell 409. 0 = unlimited (default)")
 	maxParallelAgents := fs.Int("max-parallel-agents", 0, "quota: cap every run's -parallel-agents (fan-out concurrency) at this value; a request's own smaller value always wins (min of the two), and an over-ask is silently capped, not rejected. 0 = unlimited (default)")
+	// Watch mode (issue #111): continuous cycles over each cell's arrivals. Off
+	// by default — serve stays request/response unless asked otherwise. The
+	// cell's sigbound.policy may set the cadence keys itself, in which case
+	// passing the matching flag EXPLICITLY is an error (see resolveWatchConfig).
+	watch := fs.Bool("watch", false, "watch each cell's agent/* and imported/*/* branches (plus POST /queue enqueues) and drive a continuous integration cycle over what arrives. "+
+		"Each cycle is an ordinary policy-gated, verify-gated run through the same path POST /runs uses; a cycle only differs in its manifest's source=watch")
+	watchBase := fs.String("watch-base", "main", "-watch: the branch each cycle integrates onto, and the base its cell's sigbound.policy is read from")
+	watchInterval := fs.Duration("watch-interval", 30*time.Second, "-watch: how often a cell may start a cycle. A cycle that finds nothing pending starts no run at all")
+	watchBatch := fs.Int("watch-batch", 0, "-watch: start a cycle EARLY once this many branches are pending, without waiting out -watch-interval. 0 = interval only (default)")
+	watchVerify := fs.String("watch-verify", "", "-watch: the verify command every cycle must pass before it lands, composed with the cell policy's own verify battery. "+
+		"Required unless the cell's sigbound.policy declares a verify line; pass `true` to accept landing every cycle unverified")
+	watchMaxRed := fs.Int("watch-max-red", 3, "-watch: exclude a branch after this many consecutive cycles that failed to land it, raising a red-branch inbox entry. Re-pushing the branch clears the count")
 
 	if err := fs.Parse(argv); err != nil {
 		if err == flag.ErrHelp {
@@ -1839,6 +1903,11 @@ func runServe(w io.Writer, argv []string) (int, error) {
 		}
 		return exitOperationalError, err
 	}
+	// Which flags were set EXPLICITLY, so a cadence the repo's own policy
+	// declares can refuse to be overridden by one silently (see
+	// resolveWatchConfig). Same fs.Visit set `sig run` builds for -config.
+	explicitFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicitFlags[f.Name] = true })
 	repos := splitCSV(*reposCSV)
 	if len(repos) == 0 {
 		return exitOperationalError, errors.New("-repos is required (comma-separated repo paths)")
@@ -1885,6 +1954,23 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	})
 	if err != nil {
 		return exitOperationalError, err
+	}
+
+	// Watch loops start BEFORE the listener binds: a cadence the cell's policy
+	// rejects (or a repo with no watch base) must be a startup error, not a
+	// daemon that is already serving when it discovers it cannot watch.
+	if *watch {
+		s.watchOn = true
+		s.watchEvents = &eventEmitter{enc: json.NewEncoder(w)}
+		if err := s.startWatch(baseCtx, watchConfig{
+			base:     *watchBase,
+			interval: *watchInterval,
+			batch:    *watchBatch,
+			maxRed:   *watchMaxRed,
+			verify:   *watchVerify,
+		}, explicitFlags); err != nil {
+			return exitOperationalError, err
+		}
 	}
 
 	// Bind before announcing, so a port already in use is an immediate,

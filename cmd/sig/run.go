@@ -287,6 +287,13 @@ type runReport struct {
 	// manifest's provenance: WHEN this ran, alongside WHAT ran (the commands
 	// above) and WHERE it landed (BaseSHA / Integrate.FinalSHA).
 	StartedAt string `json:"startedAt"`
+	// Source is WHO started this run, and it is the ONLY field that
+	// distinguishes a `sig serve -watch` cycle from an ordinary POSTed run
+	// (issue #111): watch cycles go through the identical internal path, so
+	// every other field is produced the same way. Empty (and omitted) for a
+	// `sig run` invocation or a POST /runs — a run that predates watch, or one
+	// a human asked for, reports byte-identical to before this field existed.
+	Source string `json:"source,omitempty"`
 	// Policy is the resolved landing policy (sigbound.policy at BaseSHA) — its
 	// sha256 (policyHash) plus the effective battery/ack-paths and the
 	// audit-sample/ack-timeout parking knobs. nil (and omitted from JSON) when
@@ -479,6 +486,20 @@ type runParams struct {
 	// again.
 	Resume        bool
 	ResumeBaseSHA string
+	// AdoptBranches maps a task id to an EXISTING branch whose work this run
+	// integrates as-is, running no agent for it at all — `sig serve -watch`'s
+	// cycle input (issue #111), where the work arrived on its own and there is
+	// nothing to fan out. A task in this map is handled by adoptBranch (which
+	// enforces the descend-from-base invariant every integrated branch must
+	// satisfy) instead of runAgentWithRetries; a task NOT in it runs the ordinary
+	// way, so a mixed run is well-defined even though nothing builds one today.
+	// Everything downstream — policy resolution, integrate, verify, parking,
+	// report — is byte-identically the ordinary path. Nil for every other caller.
+	AdoptBranches map[string]string
+	// Source records WHO started this run on the report/manifest (see
+	// runReport.Source): "watch" for a `sig serve -watch` cycle, empty for
+	// everything else. Provenance only — it never affects what runs or lands.
+	Source string
 	// RunID is `sig serve`'s durable run id for this run (see newRunID), the
 	// key the spot-audit sample is drawn on (auditSelected) — deterministic and
 	// replayable precisely because it is that recorded id, not a fresh random
@@ -1335,6 +1356,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		ParallelAgents: p.ParallelAgents,
 		Version:        Version,
 		StartedAt:      runStart.UTC().Format(time.RFC3339),
+		Source:         p.Source,
 		Policy:         policyReport(pol),
 	}
 	emit.emit("run_start", map[string]any{"repo": p.Repo, "base": p.Base, "baseSHA": baseSHA, "tasks": tasks, "parallelAgents": parallelAgents})
@@ -1358,7 +1380,17 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	// (diskspace.go) for the estimate and its fail-open posture; -no-disk-check
 	// skips this entirely.
 	if !p.NoDiskCheck {
-		if err := diskPreflight(ctx, g, baseSHA, wtRoot, len(tasks)); err != nil {
+		// Adopted tasks (see runParams.AdoptBranches) set up no worktree at all —
+		// their work is already committed — so they must not be counted into an
+		// estimate of the checkouts about to happen, or a watch cycle over a
+		// handful of arrived branches could be refused for disk it never uses.
+		fanOut := 0
+		for _, t := range tasks {
+			if _, adopted := p.AdoptBranches[t.ID]; !adopted {
+				fanOut++
+			}
+		}
+		if err := diskPreflight(ctx, g, baseSHA, wtRoot, fanOut); err != nil {
 			return rep, err
 		}
 	}
@@ -1403,6 +1435,18 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			defer wg.Done()
 			defer func() { <-sem }()
 			branch := "agent/" + tasks[i].ID
+			// Adopted branch (issue #111): the work already arrived on a branch
+			// this run did not create, so there is no agent to run — for it, the
+			// agent phase IS the adoption. Never falls through to running an
+			// agent: a watch cycle has no agent command and no task prompt to run
+			// one with, so an unusable branch is a failed agent (not landed),
+			// never a fresh invocation. See adoptBranch.
+			if b, ok := p.AdoptBranches[tasks[i].ID]; ok {
+				a := adoptBranch(ctx, c, b, baseSHA, p, tasks[i])
+				agents[i] = a
+				emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "adopted": true, "branch": a.Branch, "sha": a.SHA, "files": a.Files, "inLane": a.InLane, "setupMs": int64(0), "wallMs": int64(0)})
+				return
+			}
 			// -resume: a branch that already holds real work (its head
 			// differs from baseSHA) is reused outright, no agent invocation
 			// at all. resumeAgent also clears a STALE no-op branch (head ==
@@ -2748,8 +2792,93 @@ func resumeAgent(ctx context.Context, c *cell.Cell, branch, baseSHA string, p ru
 		_ = c.DeleteBranch(ctx, branch)
 		return perAgentJSON{}, false // stale no-op branch: cleared, run fresh
 	}
+	a := reuseBranch(ctx, c, branch, baseSHA, head, p, t)
+	a.Resumed = true
+	return a, true
+}
 
-	a := perAgentJSON{ID: t.ID, Branch: branch, SHA: head, Files: []string{}, InLane: true, Resumed: true}
+// adoptBranch is the agent phase for ONE branch a run ADOPTS rather than
+// produces (see runParams.AdoptBranches): the work is already committed, so
+// nothing runs and the branch is integrated exactly as a freshly-agented one
+// would be. Unlike resumeAgent there is no fresh-run fallback — a watch cycle
+// has no agent to fall back ON — so every rejection below is a NOT-ok agent,
+// which integrateBranches then leaves out entirely: recorded in the report,
+// never landed.
+//
+// The middle check is the one that matters, and it is a HARD INVARIANT of the
+// integration engine rather than a watch-specific nicety: a branch may only be
+// integrated onto a base it CONTAINS. Overlay computes each branch's
+// contribution as the two-tree diff from base to the branch tip (see
+// gitx.OverlayTrees), so a branch that forked from an OLDER base carries stale
+// content for every path the base has gained since — overlaying it REVERTS that
+// work, and the OCC partitioner cannot catch it, because the write-set it
+// partitions on is the three-dot `base...head` diff, which is empty for exactly
+// those already-merged branches. An already-landed branch re-offered by a lost
+// or corrupt watch-seen set is the common case, and it is stopped here.
+// `sig run` never needs this check (its agents fork from the pinned base by
+// construction) and -resume enforces the same invariant more bluntly, by
+// refusing to run at all once the base has moved.
+func adoptBranch(ctx context.Context, c *cell.Cell, branch, baseSHA string, p runParams, t taskSpec) perAgentJSON {
+	reject := func(why string) perAgentJSON {
+		return perAgentJSON{ID: t.ID, Branch: branch, Files: []string{}, InLane: true, Stderr: "adopt " + branch + ": " + why}
+	}
+	g := c.Git()
+	head, err := g.RevParse(ctx, branch)
+	if err != nil {
+		return reject("branch no longer resolves: " + err.Error())
+	}
+	// Fails CLOSED: an unreadable ancestry (a corrupt object store, a cancelled
+	// ctx) rejects the branch rather than integrating one that may not descend.
+	switch verdict, err := adoptableAgainst(ctx, g, baseSHA, head); {
+	case err != nil:
+		return reject("cannot determine whether it descends from base " + short(baseSHA) + ": " + err.Error())
+	case verdict == adoptMerged:
+		return reject("already contained in base " + short(baseSHA) + "; nothing to integrate")
+	case verdict == adoptStale:
+		return reject("does not contain base " + short(baseSHA) + "; rebase it onto the current base before it can land")
+	}
+	return reuseBranch(ctx, c, branch, baseSHA, head, p, t)
+}
+
+// Verdicts from adoptableAgainst.
+const (
+	adoptOK     = "ok"     // descends from base: integrating it applies exactly its own work
+	adoptMerged = "merged" // already contained in base (or IS base): nothing left to integrate
+	adoptStale  = "stale"  // diverged: it neither contains base nor is contained by it
+)
+
+// adoptableAgainst decides whether head may be integrated onto baseSHA — the
+// invariant adoptBranch enforces per branch and `sig serve -watch` pre-filters
+// on (see adoptBranch's doc comment for WHY a stale branch is dangerous rather
+// than merely useless). Pure ancestry, no trees: base must be reachable from
+// head. An error is never a verdict; the caller must fail closed on it.
+func adoptableAgainst(ctx context.Context, g *gitx.Git, baseSHA, head string) (string, error) {
+	if head == baseSHA {
+		return adoptMerged, nil
+	}
+	descends, err := g.IsAncestor(ctx, baseSHA, head)
+	if err != nil {
+		return "", err
+	}
+	if descends {
+		return adoptOK, nil
+	}
+	merged, err := g.IsAncestor(ctx, head, baseSHA)
+	if err != nil {
+		return "", err
+	}
+	if merged {
+		return adoptMerged, nil
+	}
+	return adoptStale, nil
+}
+
+// reuseBranch builds the perAgentJSON for a branch integrated WITHOUT running
+// an agent — the shared body of -resume's reuse and -watch's adoption. head must
+// already be known to differ from baseSHA and (for adoption) to descend from it.
+func reuseBranch(ctx context.Context, c *cell.Cell, branch, baseSHA, head string, p runParams, t taskSpec) perAgentJSON {
+	g := c.Git()
+	a := perAgentJSON{ID: t.ID, Branch: branch, SHA: head, Files: []string{}, InLane: true}
 	files, ferr := g.DiffNameOnly(ctx, baseSHA, head)
 	if ferr != nil {
 		// Same invariant runAgent enforces: a.Files must never silently stay
@@ -2758,15 +2887,15 @@ func resumeAgent(ctx context.Context, c *cell.Cell, branch, baseSHA string, p ru
 		// OCC partitioning) — so a failed diff fails the reuse instead. The
 		// branch itself is left untouched (its content is real, unlike the
 		// no-op case above): never delete on an error we don't understand.
-		a.Stderr = "resume: diff " + short(baseSHA) + ".." + short(head) + " failed: " + ferr.Error()
-		return a, true
+		a.Stderr = "reuse: diff " + short(baseSHA) + ".." + short(head) + " failed: " + ferr.Error()
+		return a
 	}
 	if len(files) > 0 {
 		a.Files = files
 	}
 	a.OK = true
 	applyLaneEnforcement(&a, t, p)
-	return a, true
+	return a
 }
 
 // runVerify runs -verify inside wtPath — an ALREADY checked-out detached
