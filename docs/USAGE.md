@@ -1283,6 +1283,11 @@ otherwise be the *deletion* of everything the base gained since that fork
 point. Rebase refused branches onto the coordinator's current base — or
 re-export from a worker synced to it — and integrate again.
 
+The requirement holds for every `-strategy`, including `porcelain`, which
+would merge such a branch correctly on its own: the strategies are documented
+to land the same tree, and a branch that predates the base is the one input
+that made them disagree.
+
 ### End-to-end example
 
 `sig integrate` on its own has no verify gate — unlike `sig run -verify`, it

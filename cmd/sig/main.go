@@ -176,6 +176,14 @@ func integrateBranches(ctx context.Context, c *cell.Cell, baseRef, baseSHA strin
 	// reaches the integrator; the invariant is adoptableAgainst's (the same one
 	// `sig serve -watch` adoption enforces — see adoptBranch), fails CLOSED on
 	// any error, and one refused branch refuses the whole batch: nothing lands.
+	//
+	// The guard binds EVERY strategy, not just the one that motivates it.
+	// porcelain would in fact merge a diverged branch correctly, since a real
+	// `git merge` uses the merge base rather than a two-tree diff — but the
+	// strategies are documented as equivalent in what they land (see
+	// cell/integrate.go), and a stale branch is the one input that made them
+	// disagree. Refusing it everywhere restores that equivalence; the cost is
+	// that porcelain loses an ability the others never had.
 	g := c.Git()
 	for _, b := range branches {
 		head, err := g.RevParse(ctx, b)
