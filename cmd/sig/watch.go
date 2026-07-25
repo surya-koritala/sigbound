@@ -1,0 +1,675 @@
+// `sig serve -watch` (issue #111): continuous integration cycles. Serve is
+// otherwise request/response — one POST /runs, one run. With -watch, each
+// registered cell also gets a loop that observes its designated sources
+// (local agent/* arrivals, imported/<worker>/* refs from `sig import`, and
+// explicit POST /queue enqueues), batches what has ARRIVED since the last
+// cycle, and drives an ordinary run over it on a cadence.
+//
+// A cycle adds NO landing path. It builds runParams and goes through the same
+// acquireRun + execRun + driveRun path a POSTed run does: same per-cell busy
+// lock, same crash journal, same policy resolution at the current base, same
+// verify gate, same parking, same usage record. The only thing that tells the
+// two apart is the manifest's "source": "watch" (see runReport.Source) — a
+// cycle run is otherwise indistinguishable, deliberately.
+//
+// THE ARRIVAL INVARIANT. A cycle integrates branches it did not create, which
+// is a sharper problem than it looks: the engine may only integrate a branch
+// that CONTAINS the base it is landing onto (see adoptBranch, which enforces
+// it, and adoptableAgainst, which decides it). A branch that has fallen behind
+// the base cannot land and is not offered again until it is re-pushed; an
+// already-landed branch is retired outright. That is what makes a LOST
+// watch-seen set safe: every branch re-qualifies, and every already-landed one
+// is recognized and retired without a run.
+//
+// IDEMPOTENCE. watch-seen.json (per cell, alongside the run journal) maps
+// branch -> the SHA this daemon last reached a decision about, so an unchanged
+// branch is never processed twice and a re-pushed one (new SHA) always
+// re-qualifies. It is a CACHE, not a ledger: losing or corrupting it costs a
+// re-examination, never a wrong landing.
+//
+// STARVATION. A branch whose cycle keeps failing to land it is retried, and
+// after -watch-max-red consecutive such cycles it is excluded and raised as a
+// red-branch inbox entry for a human. A re-push clears the count.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/surya-koritala/sigbound/cell"
+	"github.com/surya-koritala/sigbound/internal/gitx"
+)
+
+const (
+	// watchSeenFileName is the per-cell seen-set, written beside the run
+	// journal under <git-common-dir>/sigbound/.
+	watchSeenFileName = "watch-seen.json"
+	// redBranchFileName marks the branches a cycle EXCLUDED via backoff. It is
+	// written into that cycle's run dir, so GET /inbox surfaces it the same way
+	// it surfaces every other attention item: by reading what a run wrote.
+	redBranchFileName = "red-branches.json"
+	// watchSource is runReport.Source's value for a cycle run.
+	watchSource = "watch"
+	// watchRefPrefixes are the ref namespaces a cycle observes: agent/* (local
+	// arrivals) and imported/*/* (bundles landed by `sig import`). Same two
+	// namespaces `sig gc` sweeps.
+	watchRefPrefixes = "refs/heads/agent/,refs/heads/imported/"
+	// watchPollInterval is how often the loop LOOKS when -watch-batch is set: a
+	// batch trigger that only checked once per -watch-interval could not fire
+	// early, which is the whole point of it. Without -watch-batch the loop looks
+	// exactly once per interval and this is unused.
+	watchPollInterval = time.Second
+)
+
+// watchConfig is one cell's watch cadence, resolved once at startup from the
+// server flags and the cell's sigbound.policy (see resolveWatchConfig).
+type watchConfig struct {
+	base     string
+	interval time.Duration
+	batch    int // fire early once this many branches are pending (0 = interval only)
+	maxRed   int // exclude a branch after this many consecutive cycles that failed to land it
+	// verify is -watch-verify: the verify command every cycle runs, composed
+	// with the cell policy's own battery by resolvePolicy exactly as a POSTed
+	// request's verify is. A cycle has no requester to supply one, and a loop
+	// that lands unattended must not be the one path with no gate — so watch
+	// REFUSES to start when neither this nor a policy verify line exists (see
+	// resolveWatchConfig). `-watch-verify true` is the explicit way to say that
+	// landing unverified is what you meant.
+	verify string
+	// tick replaces the internal ticker when non-nil: each receive is one poll.
+	// Tests drive cycles through it so a cadence test never depends on a sleep
+	// producing the interleaving it hoped for. With interval 0 every poll is
+	// due, which makes "one send = one cycle" exactly true.
+	tick <-chan time.Time
+}
+
+// poll is how often the loop looks for arrivals: once per interval normally,
+// but at watchPollInterval when a batch trigger is armed (it must be able to
+// fire before the interval elapses). Never zero — a zero-interval config (what
+// tests use to make every poll due) still needs a real ticker period.
+func (c watchConfig) poll() time.Duration {
+	if c.batch > 0 && (c.interval <= 0 || c.interval > watchPollInterval) {
+		return watchPollInterval
+	}
+	if c.interval <= 0 {
+		return watchPollInterval
+	}
+	return c.interval
+}
+
+// watchSeenEntry is what one branch's last decision was, at the SHA it was
+// decided at. Any entry whose SHA no longer matches the branch's head is
+// ignored outright — that is what makes a re-push re-qualify, and what makes
+// Red a count of consecutive cycles over the SAME content rather than a
+// permanent mark against a branch name.
+type watchSeenEntry struct {
+	SHA string `json:"sha"`
+	// Done: this SHA reached a decision — it landed, it parked awaiting a human,
+	// or it was already in the base. Never offered again at this SHA.
+	Done bool `json:"done,omitempty"`
+	// Stale: this SHA does not contain the base, so integrating it would revert
+	// work (see adoptBranch). Permanent for this SHA — the base only moves
+	// forward — so the branch must be rebased and re-pushed to qualify.
+	Stale bool `json:"stale,omitempty"`
+	// Red counts consecutive cycles that took this SHA into a batch and failed
+	// to land it. At -watch-max-red the branch is excluded; see watchCycle.
+	Red int `json:"red,omitempty"`
+}
+
+// watchSeen is watch-seen.json's shape.
+type watchSeen struct {
+	Branches map[string]watchSeenEntry `json:"branches"`
+}
+
+// readWatchSeen reads a cell's seen-set. EVERY failure — missing, unreadable,
+// truncated, malformed, wrong shape — yields an EMPTY set, never an error: the
+// seen-set is a cache whose worst-case loss is re-examining branches that have
+// already been decided, and the arrival invariant (see adoptBranch) makes that
+// re-examination a no-op rather than a re-landing. Failing closed to empty is
+// therefore the safe direction, and the only one that keeps a corrupt file from
+// wedging a daemon's watch loop forever.
+func readWatchSeen(path string) watchSeen {
+	empty := watchSeen{Branches: map[string]watchSeenEntry{}}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return empty
+	}
+	var s watchSeen
+	if err := json.Unmarshal(data, &s); err != nil || s.Branches == nil {
+		return empty
+	}
+	for b, e := range s.Branches {
+		// A record with no SHA can never match a branch head, so it would sit
+		// there forever doing nothing; drop it rather than carry it.
+		if b == "" || e.SHA == "" || e.Red < 0 {
+			delete(s.Branches, b)
+		}
+	}
+	return s
+}
+
+// writeWatchSeen persists the seen-set atomically (write-then-rename, the same
+// pattern writeRunStatus and writePark use), so a daemon killed mid-write
+// leaves either the old file or the new one — never a torn one that the reader
+// above would have to discard. Best-effort: losing a write costs a
+// re-examination, so it must never fail a cycle.
+func writeWatchSeen(path string, s watchSeen) {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+	}
+}
+
+// watchSeenPath is this cell's seen-set, beside its runs dir.
+func (rc *registeredCell) watchSeenPath() string {
+	return filepath.Join(filepath.Dir(rc.runsDir), watchSeenFileName)
+}
+
+// redBranchJSON is one excluded branch in a cycle's red-branches.json.
+type redBranchJSON struct {
+	Branch string `json:"branch"`
+	SHA    string `json:"sha"`
+	Cycles int    `json:"cycles"`
+}
+
+// ---- collection ----
+
+// watchArrival is one branch a cycle may take, with the SHA it was seen at.
+type watchArrival struct {
+	Branch string
+	SHA    string
+}
+
+// watchCollect enumerates this cell's sources and splits them into the branches
+// that QUALIFY for a cycle at baseSHA and the seen-set updates that classifying
+// them produced (retiring an already-landed branch, marking one stale). Those
+// updates are returned rather than applied so the caller persists exactly once.
+//
+// A branch qualifies when its head differs from what the seen-set decided about
+// (a first sighting, or a re-push), it is not excluded by backoff, and it can
+// actually be integrated onto baseSHA. An ancestry check that ERRORS leaves the
+// branch alone entirely — unrecorded and un-offered — so a transient git failure
+// neither retires a branch nor feeds it to a run.
+func watchCollect(ctx context.Context, g *gitx.Git, seen watchSeen, baseSHA string, queued []string, cfg watchConfig, ev *eventEmitter, cellID string) (pending []watchArrival, updates map[string]watchSeenEntry) {
+	updates = map[string]watchSeenEntry{}
+	refs, err := g.ForEachRefCommit(ctx, strings.Split(watchRefPrefixes, ",")...)
+	if err != nil {
+		ev.emit("watch_error", map[string]any{"cell": cellID, "at": "list-refs", "error": err.Error()})
+		return nil, updates
+	}
+	arrivals := make([]watchArrival, 0, len(refs)+len(queued))
+	for _, r := range refs {
+		arrivals = append(arrivals, watchArrival{Branch: r.Name, SHA: r.SHA})
+	}
+	// Explicitly enqueued branches (POST /queue) may live outside the watched
+	// namespaces, so they are resolved individually. One that has since vanished
+	// is simply dropped: the enqueue is a hint, not a promise.
+	for _, b := range queued {
+		sha, err := g.RevParse(ctx, b)
+		if err != nil {
+			continue
+		}
+		arrivals = append(arrivals, watchArrival{Branch: b, SHA: sha})
+	}
+	sort.Slice(arrivals, func(i, j int) bool { return arrivals[i].Branch < arrivals[j].Branch })
+
+	seenBranch := map[string]bool{}
+	for _, a := range arrivals {
+		if seenBranch[a.Branch] { // a queued branch that is also under a watched prefix
+			continue
+		}
+		seenBranch[a.Branch] = true
+		if e, ok := seen.Branches[a.Branch]; ok && e.SHA == a.SHA {
+			if e.Done || e.Stale || (cfg.maxRed > 0 && e.Red >= cfg.maxRed) {
+				continue
+			}
+		}
+		verdict, err := adoptableAgainst(ctx, g, baseSHA, a.SHA)
+		if err != nil {
+			ev.emit("watch_error", map[string]any{"cell": cellID, "at": "classify", "branch": a.Branch, "error": err.Error()})
+			continue
+		}
+		switch verdict {
+		case adoptMerged:
+			// Already in the base: finished work, not a cycle's business. Retiring
+			// it here is what keeps a lost seen-set cheap AND silent.
+			updates[a.Branch] = watchSeenEntry{SHA: a.SHA, Done: true}
+		case adoptStale:
+			// Recorded so the operator is told ONCE per pushed SHA rather than
+			// every tick forever.
+			if e, ok := seen.Branches[a.Branch]; !ok || e.SHA != a.SHA || !e.Stale {
+				ev.emit("watch_stale", map[string]any{"cell": cellID, "branch": a.Branch, "sha": a.SHA, "baseSHA": baseSHA})
+			}
+			updates[a.Branch] = watchSeenEntry{SHA: a.SHA, Stale: true}
+		default:
+			pending = append(pending, a)
+		}
+	}
+	return pending, updates
+}
+
+// ---- the cycle ----
+
+// watchCycle runs at most one integration cycle for rc. due says the interval
+// has elapsed; when it has not, a cycle only fires if -watch-batch is armed and
+// that many branches are already pending. Returns whether a run was driven.
+//
+// It BLOCKS until the run it starts has finished. That is what makes the loop
+// serial by construction: there is never a second cycle to queue, because the
+// tick that would have started one finds this one still in flight.
+func (s *server) watchCycle(ctx context.Context, rc *registeredCell, cfg watchConfig, due bool) bool {
+	cellID := rc.cell.ID()
+	g := rc.cell.Git()
+	seenPath := rc.watchSeenPath()
+	seen := readWatchSeen(seenPath)
+
+	baseSHA, err := g.RevParse(ctx, cfg.base)
+	if err != nil {
+		s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "resolve-base", "base": cfg.base, "error": err.Error()})
+		return false
+	}
+	pending, updates := watchCollect(ctx, g, seen, baseSHA, s.queuedBranches(cellID), cfg, s.watchEvents, cellID)
+	if len(updates) > 0 {
+		for b, e := range updates {
+			seen.Branches[b] = e
+		}
+		writeWatchSeen(seenPath, seen)
+	}
+	if len(pending) == 0 {
+		return false
+	}
+	if !due && !(cfg.batch > 0 && len(pending) >= cfg.batch) {
+		return false // waiting for either the interval or a full batch
+	}
+
+	// Quota, per cycle: -max-agents-per-run is a REJECT for a POST (its caller
+	// asked for a run this server will not do), but rejecting a CYCLE would mean
+	// a server whose quota is below its arrival rate lands nothing, ever, while
+	// counting every branch toward exclusion. A cycle SPLITS instead: it takes
+	// the first N in branch-name order (deterministic, so every branch is
+	// eventually reached) and DEFERS the rest to the next cycle.
+	//
+	// Deferral has a consequence worth naming: this cycle is about to move the
+	// base, so a deferred branch will no longer contain it and must be rebased
+	// before it can land (it is reported as such — see watchCollect's stale
+	// case). That is not a quirk of the quota, it is the arrival invariant every
+	// branch lives under — anything that arrives while a cycle is landing is in
+	// the same position. Splitting merely makes it visible sooner.
+	//
+	// The repo policy's own max-agents keeps its reject semantics untouched: it
+	// is resolved inside driveRun, the one place policy is resolved, and an
+	// over-count there fails the cycle run exactly as it fails a POSTed one.
+	split := 0
+	if s.maxAgentsPerRun > 0 && len(pending) > s.maxAgentsPerRun {
+		split = len(pending) - s.maxAgentsPerRun
+		pending = pending[:s.maxAgentsPerRun]
+	}
+
+	tasks := make([]taskSpec, 0, len(pending))
+	adopt := make(map[string]string, len(pending))
+	branches := make([]string, 0, len(pending))
+	for _, a := range pending {
+		// The branch name IS the task id: unique by construction, and it makes
+		// perAgent[].id in the report name the thing that actually arrived.
+		tasks = append(tasks, taskSpec{ID: a.Branch})
+		adopt[a.Branch] = a.Branch
+		branches = append(branches, a.Branch)
+	}
+
+	p := s.watchParams(rc, cfg, adopt)
+	req := runRequest{Cell: cellID, Base: cfg.base, Tasks: tasks}
+	rec, err := s.acquireRun(rc, req, &p)
+	if err != nil {
+		// A manual POST /runs (or an ack) holds the cell. Skip this tick entirely
+		// rather than queue a second cycle: the branches are still pending, and
+		// the next tick picks them up unchanged.
+		s.watchEvents.emit("watch_skip", map[string]any{"cell": cellID, "pending": len(branches), "reason": err.Error()})
+		return false
+	}
+	s.watchEvents.emit("watch_tick", map[string]any{
+		"cell": cellID, "runId": rec.id, "baseSHA": baseSHA, "branches": branches, "deferred": split,
+	})
+	s.execRun(rec, p, tasks, planSpec{}, false)
+
+	s.watchSettle(ctx, rc, cfg, rec, pending, seenPath)
+	return true
+}
+
+// watchSettle records what the finished cycle decided about each branch it took.
+// Landed and parked branches are DONE at that SHA (a park is a decision pending
+// with a human, not a failure — re-offering it would park the same landing
+// twice). Anything else is a red cycle for that branch, and the count crossing
+// -watch-max-red excludes it and raises a red-branch inbox entry.
+//
+// A cycle the daemon ABORTED (shutdown cancelling baseCtx mid-run) records no
+// red counts at all: the branches were never judged, and holding a shutdown
+// against them would walk them toward exclusion for an operational reason.
+func (s *server) watchSettle(ctx context.Context, rc *registeredCell, cfg watchConfig, rec *runRecord, batch []watchArrival, seenPath string) {
+	seen := readWatchSeen(seenPath)
+	defer func() { writeWatchSeen(seenPath, seen) }()
+
+	if ctx.Err() != nil {
+		s.watchEvents.emit("watch_drain", map[string]any{"cell": rc.cell.ID(), "runId": rec.id, "branches": len(batch)})
+		return
+	}
+	done := map[string]bool{}
+	if rep, err := readRunReport(rec.dir); err == nil {
+		// integrate.landed names the branches that FOLDED cleanly, which is not
+		// the same as landed: the base ref only advances after verify goes green
+		// (that is the whole gate). Use the same predicate `sig log` does, so a
+		// red cycle's branches stay pending and keep counting toward backoff
+		// instead of being retired as decided.
+		if landed(rep) {
+			for _, b := range rep.Integrate.Landed {
+				done[b] = true
+			}
+		}
+		if rep.Park != nil {
+			for _, b := range rep.Park.branches() {
+				done[b] = true
+			}
+		}
+	}
+	var excluded []redBranchJSON
+	for _, a := range batch {
+		if done[a.Branch] {
+			seen.Branches[a.Branch] = watchSeenEntry{SHA: a.SHA, Done: true}
+			continue
+		}
+		red := 1
+		if e, ok := seen.Branches[a.Branch]; ok && e.SHA == a.SHA {
+			red = e.Red + 1
+		}
+		seen.Branches[a.Branch] = watchSeenEntry{SHA: a.SHA, Red: red}
+		s.watchEvents.emit("watch_backoff", map[string]any{"cell": rc.cell.ID(), "branch": a.Branch, "red": red, "max": cfg.maxRed})
+		if cfg.maxRed > 0 && red >= cfg.maxRed {
+			excluded = append(excluded, redBranchJSON{Branch: a.Branch, SHA: a.SHA, Cycles: red})
+		}
+	}
+	if len(excluded) > 0 {
+		writeRedBranches(rec.dir, excluded)
+	}
+}
+
+// writeRedBranches records the branches this cycle excluded, for GET /inbox.
+// Best-effort like the other run-dir writers: the seen-set already holds the
+// exclusion itself, so a lost marker costs the inbox entry, never the behavior.
+func writeRedBranches(dir string, red []redBranchJSON) {
+	data, err := json.MarshalIndent(map[string]any{"branches": red}, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, redBranchFileName), data, 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "sig serve: write red-branch marker %s: %v\n", dir, err)
+	}
+}
+
+// readRedBranches reads a run dir's red-branch marker; nil when there is none.
+func readRedBranches(dir string) []redBranchJSON {
+	data, err := os.ReadFile(filepath.Join(dir, redBranchFileName))
+	if err != nil {
+		return nil
+	}
+	var f struct {
+		Branches []redBranchJSON `json:"branches"`
+	}
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil
+	}
+	return f.Branches
+}
+
+// watchParams builds a cycle's runParams. Everything a POSTed run gets from the
+// SERVER (environment policy, the quota clamps) is applied identically here;
+// everything a POSTed run gets from its REQUEST has no analogue in a cycle —
+// there is no caller to ask — so those stay at their defaults and the repo's
+// sigbound.policy, resolved inside driveRun like always, is what actually sets
+// this cell's bar. Notably AgentCmd stays EMPTY: a cycle runs no agents, and
+// adoptBranch never falls back to running one.
+func (s *server) watchParams(rc *registeredCell, cfg watchConfig, adopt map[string]string) runParams {
+	p := runParams{
+		Repo:          rc.cell.Repo(),
+		Base:          cfg.base,
+		Strategy:      cell.StrategyOverlay,
+		Semantic:      semanticOff,
+		LaneMode:      laneWarn,
+		VerifyCmd:     cfg.verify,
+		Autocommit:    true,
+		AdoptBranches: adopt,
+		Source:        watchSource,
+		EnvMode:       s.envMode,
+		EnvAgent:      s.envAgent,
+		EnvResolver:   s.envResolver,
+		EnvVerify:     s.envVerify,
+		EnvRepair:     s.envRepair,
+		EnvPublish:    s.envPublish,
+		RepairMax:     2,
+	}
+	if s.maxRunTime > 0 {
+		p.Budget = s.maxRunTime
+	}
+	if s.maxParallelAgents > 0 {
+		p.ParallelAgents = s.maxParallelAgents
+	}
+	return p
+}
+
+// ---- the loop ----
+
+// watchLoop is one cell's ticker. It stops at the first tick after ctx is
+// cancelled; a cycle already in flight is not interrupted here (it runs
+// synchronously, and driveRun observes the same cancelled ctx), so shutdown
+// DRAINS it and its seen-set write happens before this returns.
+func (s *server) watchLoop(ctx context.Context, rc *registeredCell, cfg watchConfig) {
+	defer s.wg.Done()
+	tick := cfg.tick
+	if tick == nil {
+		t := time.NewTicker(cfg.poll())
+		defer t.Stop()
+		tick = t.C
+	}
+	last := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick:
+		}
+		// Re-checked after the tick: a tick that arrived at the same moment as the
+		// shutdown must not start a cycle whose ctx is already dead.
+		if ctx.Err() != nil {
+			return
+		}
+		if s.watchCycle(ctx, rc, cfg, time.Since(last) >= cfg.interval) {
+			last = time.Now()
+		}
+	}
+}
+
+// startWatch launches one loop per registered cell, resolving each cell's
+// cadence against its own sigbound.policy first. Every failure here is a
+// STARTUP error: a watch daemon that silently fell back to a default cadence
+// the repo did not ask for would be worse than one that refused to start.
+func (s *server) startWatch(ctx context.Context, cfg watchConfig, explicit map[string]bool) error {
+	if len(s.cells) == 0 {
+		return errors.New("-watch: no cells registered; -repos must name at least one repository to watch")
+	}
+	if cfg.interval < 0 {
+		return fmt.Errorf("-watch-interval must not be negative, got %s", cfg.interval)
+	}
+	if cfg.batch < 0 {
+		return fmt.Errorf("-watch-batch must not be negative, got %d", cfg.batch)
+	}
+	if cfg.maxRed < 1 {
+		return fmt.Errorf("-watch-max-red must be at least 1, got %d", cfg.maxRed)
+	}
+	resolved := make([]watchConfig, len(s.cells))
+	for i, rc := range s.cells {
+		c, err := resolveWatchConfig(ctx, rc.cell.Git(), cfg, explicit)
+		if err != nil {
+			return fmt.Errorf("cell %s: %w", rc.cell.ID(), err)
+		}
+		resolved[i] = c
+	}
+	for i, rc := range s.cells {
+		s.wg.Add(1)
+		go s.watchLoop(ctx, rc, resolved[i])
+	}
+	return nil
+}
+
+// resolveWatchConfig applies the cell's sigbound.policy cadence keys over the
+// server flags. Precedence is #108's, in the shape a cadence allows: the POLICY
+// sets the value when it declares one, and the flags are DEFAULTS beneath it.
+// Tightening cannot be defined here the way it can for a landing bar — a shorter
+// interval is not a stricter one, it is merely a different one — so a flag that
+// was set EXPLICITLY against a policy that also declares that key is a loud
+// error naming both sources, rather than a silent win for either.
+//
+// Read ONCE, at startup, from the policy at the cell's watch base: a cadence
+// that changed under a running loop would make the daemon's own behavior
+// unexplainable from its logs. A policy edit takes effect on restart.
+func resolveWatchConfig(ctx context.Context, g *gitx.Git, cfg watchConfig, explicit map[string]bool) (watchConfig, error) {
+	// The watch base must resolve NOW: every cycle pins it, and a daemon that
+	// only discovered a misspelled -watch-base on its first tick would report the
+	// failure to a log nobody is reading rather than to whoever started it.
+	if _, err := g.RevParse(ctx, cfg.base); err != nil {
+		return cfg, fmt.Errorf("-watch-base %q does not resolve: %w", cfg.base, err)
+	}
+	pol, err := loadPolicy(ctx, g, cfg.base)
+	if err != nil {
+		return cfg, err
+	}
+	// The one thing a cycle cannot be allowed to do quietly: land unattended
+	// work that nothing checked. A POSTed run gets its verify from its caller
+	// and `sig run` from its flags; a cycle has neither, so the verify must come
+	// from the repo's policy or from -watch-verify, and a cell with neither is a
+	// startup refusal rather than a loop that lands whatever arrives.
+	if len(pol.verify) == 0 && strings.TrimSpace(cfg.verify) == "" {
+		return cfg, fmt.Errorf("-watch: no verify command for this cell — add a verify line to %s at %s, or pass -watch-verify (use `-watch-verify true` to accept landing every cycle unverified)",
+			policyFileName, cfg.base)
+	}
+	conflict := func(flagName, polKey, polVal, flagVal string) error {
+		return fmt.Errorf("policy %s: %s=%s; flag -%s=%s — the policy sets the watch cadence, so remove the flag (or the policy line)",
+			policyFileName, polKey, polVal, flagName, flagVal)
+	}
+	if pol.watchInterval > 0 {
+		if explicit["watch-interval"] {
+			return cfg, conflict("watch-interval", "watch-interval", pol.watchInterval.String(), cfg.interval.String())
+		}
+		cfg.interval = pol.watchInterval
+	}
+	if pol.watchBatch > 0 {
+		if explicit["watch-batch"] {
+			return cfg, conflict("watch-batch", "watch-batch", fmt.Sprint(pol.watchBatch), fmt.Sprint(cfg.batch))
+		}
+		cfg.batch = pol.watchBatch
+	}
+	if pol.watchMaxRed > 0 {
+		if explicit["watch-max-red"] {
+			return cfg, conflict("watch-max-red", "watch-max-red", fmt.Sprint(pol.watchMaxRed), fmt.Sprint(cfg.maxRed))
+		}
+		cfg.maxRed = pol.watchMaxRed
+	}
+	return cfg, nil
+}
+
+// ---- POST /queue ----
+
+// queueRequest is POST /queue's body: name branches for a cell's next cycle
+// that its watched namespaces would not pick up on their own.
+type queueRequest struct {
+	Cell     string   `json:"cell"`
+	Branches []string `json:"branches"`
+}
+
+// queuedBranches drains nothing — it returns a snapshot of what is enqueued for
+// a cell. Entries stay until a cycle DECIDES them (the seen-set is what stops
+// them being offered again), so an enqueue survives a cycle that skipped.
+func (s *server) queuedBranches(cellID string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.queued[cellID]...)
+}
+
+// handleQueue serves POST /queue. Every named branch must ALREADY resolve in
+// that cell — an enqueue is a pointer at existing work, never a request to
+// create any — so an unknown ref is a 400 naming it rather than an entry that
+// silently never fires.
+//
+// ponytail: the queue is in memory only. A restart drops it, which costs
+// nothing for the agent/* and imported/* namespaces (they are re-enumerated
+// from refs every cycle) and costs an operator a re-POST for anything outside
+// them. Persist it beside the seen-set if that ever bites.
+func (s *server) handleQueue(w http.ResponseWriter, r *http.Request) {
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json", codeUnsupportedMediaType)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, serveMaxBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	var req queueRequest
+	if err := dec.Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), codeBadRequest)
+		return
+	}
+	if !s.watchOn {
+		writeErr(w, http.StatusBadRequest, "this server is not watching: start it with -watch to enqueue branches for a cycle", codeWatchDisabled)
+		return
+	}
+	rc := s.resolveCell(req.Cell)
+	if rc == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("unknown cell %q; known cells: %s", req.Cell, strings.Join(s.cellKeys(), ", ")), codeCellNotFound)
+		return
+	}
+	if len(req.Branches) == 0 {
+		writeErr(w, http.StatusBadRequest, "branches is required (at least one existing branch name)", codeBadRequest)
+		return
+	}
+	for _, b := range req.Branches {
+		if strings.TrimSpace(b) == "" {
+			writeErr(w, http.StatusBadRequest, "branches contains an empty name", codeBadRequest)
+			return
+		}
+		if _, err := rc.cell.Git().RevParse(r.Context(), b); err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("branch %q does not exist in cell %s", b, rc.cell.ID()), codeBadRequest)
+			return
+		}
+	}
+
+	cellID := rc.cell.ID()
+	s.mu.Lock()
+	have := map[string]bool{}
+	for _, b := range s.queued[cellID] {
+		have[b] = true
+	}
+	for _, b := range req.Branches {
+		if !have[b] {
+			have[b] = true
+			s.queued[cellID] = append(s.queued[cellID], b)
+		}
+	}
+	total := len(s.queued[cellID])
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"cell": cellID, "queued": total})
+}

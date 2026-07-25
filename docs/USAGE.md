@@ -868,6 +868,9 @@ budget = 30m
 | `audit-sample = N%` | `0..100`. Percentage of CLEAN landings sampled into non-blocking `audit` inbox entries (see [Spot-audit sampling](#spot-audit-sampling)). |
 | `ack-timeout = <duration>` | How long a parked landing waits before it auto-resolves. Absent (the default) parks forever. |
 | `ack-timeout-action = reject` | What an EXPIRED park becomes. `reject` is the only value; it is also the default whenever `ack-timeout` is set. |
+| `watch-interval = <duration>` | `sig serve -watch` cadence for this repo (see [Watch mode](#watch-mode)). Gates nothing. |
+| `watch-batch = N` | Start a cycle early once N branches are pending. Gates nothing. |
+| `watch-max-red = N` | Exclude a branch after N consecutive cycles that failed to land it. Gates nothing. |
 
 An UNKNOWN key, a malformed value, or a duplicate scalar key (a second
 `lanes =` silently overriding the first) is a hard error naming the file, line,
@@ -1684,6 +1687,7 @@ sig serve -repos /path/a,/path/b [-addr HOST:PORT] [-token-env NAME] [-allow-rem
 | `-max-run-time` | `0` (unlimited) | Cap every run's `-budget` at this duration (e.g. `10m`). See [Quotas and metering](#quotas-and-metering). |
 | `-max-parallel-agents` | `0` (unlimited) | Cap every run's `-parallel-agents` (fan-out concurrency) at N. See [Quotas and metering](#quotas-and-metering). |
 | `-max-concurrent-runs` | `0` (unlimited) | Reject (`429`) a `POST /runs` once N runs are in flight across ALL cells. See [Quotas and metering](#quotas-and-metering). |
+| `-watch` | `false` | Continuously integrate each cell's arrivals (see [Watch mode](#watch-mode)). `-watch-base`, `-watch-interval`, `-watch-batch`, `-watch-max-red`, and `-watch-verify` configure it. |
 
 ### Posture — single-user, single-process
 
@@ -1718,7 +1722,8 @@ All requests and responses are JSON (events are NDJSON).
 | `GET /runs/{id}/flagged/{branch}/{path...}` | `{path, base, ours, theirs, baseSHA}` — the three sides of one conflicted path. A side is `null` when the path is absent there (an add/delete conflict). `{branch}/{path...}` must **exactly** match a flagged pair from the listing above; anything else is `404` and reads nothing. |
 | `POST /runs/{id}/ack` | Release a parked landing (see [Run parking](#run-parking)). No body. `409` (`not_parked`) unless the run is `awaiting-ack`; `409` (`cell_busy`) if a run or another ack holds the cell. |
 | `POST /runs/{id}/reject` | Reject a parked landing; optional body `{"reason": "…"}`. Terminal, lands nothing, keeps the branches. |
-| `GET /inbox` | `{entries:[…]}` — everything across all cells waiting on a human, newest first. `?type=parked\|flagged\|dropped\|repair-failed\|audit`, `?limit=N` (default 100). See [The inbox](#the-inbox). |
+| `GET /inbox` | `{entries:[…]}` — everything across all cells waiting on a human, newest first. `?type=parked\|flagged\|dropped\|repair-failed\|audit\|red-branch`, `?limit=N` (default 100). See [The inbox](#the-inbox). |
+| `POST /queue` | `{"cell": id, "branches": [...]}` — name existing branches for that cell's next watch cycle (see [Watch mode](#watch-mode)). Returns **202** `{cell, queued}`. `400` (`watch_disabled`) without `-watch`; `400` for a branch that does not exist. |
 | `GET /ui` (and `/ui/`) | The review HTML page: conflict panes plus the Inbox tab (see [Review UI](#review-ui)). |
 | `GET /log` | `{cells:[{cell, repo, runs:[…]}]}` — the newest-first run history per cell, `?limit=N` (default 50). The HTTP mirror of [`sig log`](#sig-log). |
 | `GET /log/sha/{sha}` | `{cell, provenance:{…}}` — which run/task/agent landed `{sha}` (see [`sig log`](#sig-log)). `404` (`not_found`) for a commit no cell landed. |
@@ -1830,6 +1835,7 @@ disagree with the run behind it.
 | `dropped` | Groups `-verify-bisect` dropped to salvage a green subset. | No. |
 | `repair-failed` | Verify still red after the `-repair` loop exhausted. | No. |
 | `audit` | A clean landing the `audit-sample` rate selected. | No — informational. |
+| `red-branch` | Branches a watch cycle excluded after `-watch-max-red` consecutive cycles failed to land them (see [Watch mode](#watch-mode)). | No — rebase/fix and re-push. |
 
 Every entry carries `{type, cellId, runId, age, summary, links}`; a `parked` one
 adds `reason`, `matchedPaths`, `branches`, the re-verify `attempts` count, and
@@ -1891,7 +1897,10 @@ the right place to handle browser auth.
 
 `SIGINT`/`SIGTERM` stops accepting new requests, cancels every in-flight run's
 context (they honor it via the same `-budget` machinery), lets them write their
-final reports, and exits. A second `Ctrl-C` hard-kills.
+final reports, and exits. A second `Ctrl-C` hard-kills. With `-watch`, ticking
+stops at the same moment, the in-flight cycle drains through that same path (it
+reaches a terminal journal state, never `interrupted`), and its seen-set is
+persisted before the process exits.
 
 ### Quotas and metering
 
@@ -1959,6 +1968,131 @@ curl -s localhost:7777/runs/20260722T164530Z-a1b2c3d4e5f6/usage | jq
 # Fleet-wide totals:
 curl -s localhost:7777/usage | jq '.totals'
 ```
+
+### Watch mode
+
+`sig serve` is otherwise request/response: one `POST /runs`, one run. `-watch`
+adds a loop per cell that observes what ARRIVES and integrates it continuously.
+
+```sh
+sig serve -repos /work/api -watch -watch-interval 30s -watch-batch 5
+```
+
+A cycle adds **no landing path**. It assembles a batch, then drives an ordinary
+run through the same internal path a `POST /runs` takes — same per-cell busy
+lock, same crash journal, same policy resolution at the current base, same
+verify gate, same parking, same usage record. The only thing that tells a cycle
+apart from a POSTed run is `"source": "watch"` on its manifest.
+
+**Sources.** Local `agent/*` branches, `imported/<worker>/*` refs landed by
+[`sig import`](#sig-import), and anything explicitly named via `POST /queue`.
+
+**Flags.**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-watch` | off | Enable watch mode. |
+| `-watch-base` | `main` | The branch cycles integrate onto, and the base each cell's policy is read from. |
+| `-watch-interval` | `30s` | How often a cell may start a cycle. |
+| `-watch-batch` | `0` | Start a cycle early once N branches are pending. `0` = interval only. |
+| `-watch-max-red` | `3` | Exclude a branch after N consecutive cycles that failed to land it. |
+| `-watch-verify` | — | The verify command every cycle must pass, composed with the cell policy's own battery. |
+
+`sigbound.policy` may declare `watch-interval`, `watch-batch`, and
+`watch-max-red` itself. The policy SETS the value when present and the flags are
+defaults beneath it; passing the matching flag **explicitly** against a policy
+that declares that key is a startup error naming both sources. A cadence is read
+**once at startup** — a policy edit takes effect on restart, so a daemon's
+behavior is always explainable from how it was started.
+
+**Verify is required.** A POSTed run gets its verify from its caller and `sig
+run` from its flags; a cycle has neither. `-watch` therefore refuses to start on
+a cell with no `verify` line in its policy and no `-watch-verify` — an
+unattended loop must not be the one path that lands unchecked. Pass
+`-watch-verify true` to say explicitly that landing every cycle unverified is
+what you meant.
+
+#### The arrival invariant
+
+A cycle integrates branches it did not create, and the engine may only integrate
+a branch that **contains** the base it is landing onto. Overlay computes a
+branch's contribution as the two-tree diff from base to tip, so a branch that
+forked from an older base carries stale content for everything the base has
+gained since — integrating it would REVERT that work, and the write-set
+partitioner cannot catch it (a `base...head` diff is empty for exactly those
+already-merged branches).
+
+So a cycle classifies every arrival before it runs anything:
+
+- **contains the base** → it is taken into the batch;
+- **already in the base** → retired, silently, with no run;
+- **neither** (it fell behind) → skipped, reported once per pushed SHA as a
+  `watch_stale` event, and taken up again as soon as it is rebased and
+  re-pushed (a new SHA always re-qualifies).
+
+Because a landing moves the base, anything still pending when a cycle lands is
+left behind and must be rebased. That is the normal condition of this design,
+not an error state.
+
+#### The seen-set
+
+Each cell keeps `.git/sigbound/watch-seen.json`, mapping branch → the SHA this
+daemon last reached a decision about, written atomically (write-then-rename). An
+unchanged branch is never processed twice; a re-pushed one always re-qualifies.
+
+It is a **cache, not a ledger**. Every read failure — missing, truncated,
+corrupt, wrong shape — degrades to an empty set, and the worst that costs is
+re-examining branches that were already decided. That degradation is safe
+because of the arrival invariant above: every already-landed branch is
+recognized and retired without a run, so a lost seen-set changes nothing about
+what lands.
+
+#### Backoff
+
+A branch whose cycle fails to land it stays pending and is retried — a later
+batch composition may well let it through. After `-watch-max-red` consecutive
+such cycles the branch is EXCLUDED from future cycles and raised as a
+`red-branch` [inbox](#the-inbox) entry: an attention item, not a landing to
+release. Re-pushing the branch clears the count. Parked landings are not
+failures — a parked branch is decided, awaiting a human, and is never re-offered.
+
+#### Quotas
+
+`-max-concurrent-runs` and `-max-run-time` apply to a cycle exactly as they
+apply to a POSTed run. `-max-agents-per-run` is the one that differs: a POST
+that exceeds it is REJECTED (its caller asked for something the server will not
+do), but a cycle **splits** instead — it takes the first N in branch-name order
+and defers the rest, because refusing the cycle would mean a server whose quota
+sits below its arrival rate lands nothing at all. Deferred branches fall under
+the arrival invariant like any other pending work: once the cycle lands, they
+need a rebase. The repo policy's own `max-agents` keeps its reject semantics —
+it is resolved inside the run, for cycles and POSTs alike.
+
+#### Events
+
+Cycle-level events go to the daemon's own stdout as NDJSON (the per-run stream
+under `GET /runs/{id}/events` is unchanged):
+
+| Event | When |
+|-------|------|
+| `watch_tick` | A cycle started a run: its cell, run id, base SHA, batch, and how many branches it deferred. |
+| `watch_skip` | The tick found the cell busy with a manual run or an ack; the batch stays pending for the next tick. |
+| `watch_backoff` | A branch finished a cycle without landing: its consecutive red count and the limit. |
+| `watch_stale` | A branch cannot be integrated onto the base and needs a rebase (once per pushed SHA). |
+| `watch_drain` | A cycle was cut short by shutdown; nothing is counted against its branches. |
+| `watch_error` | A cycle could not read refs, ancestry, or its base. |
+
+#### Enqueueing by hand
+
+```sh
+curl -s localhost:7777/queue -d '{"cell":"/work/api","branches":["feature/x"]}'
+# -> {"cell":"api-9f2c","queued":1}
+```
+
+Every named branch must already exist in that cell; an unknown ref is a `400`
+rather than an entry that silently never fires. The queue is in memory: a
+restart drops it, which costs nothing for `agent/*` and `imported/*` (they are
+re-enumerated from refs every cycle) and costs a re-POST for anything else.
 
 ### curl examples
 

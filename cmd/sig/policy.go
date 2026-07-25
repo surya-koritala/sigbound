@@ -53,6 +53,17 @@ type policy struct {
 	parallel         int           // parallel-agents ceiling (0 = unset)
 	maxAgents        int           // task-count ceiling (0 = unset)
 	budget           time.Duration // budget ceiling (0 = unset)
+	// watchInterval/watchBatch/watchMaxRed are `sig serve -watch`'s cadence
+	// (issue #111), 0 when unset. Unlike every other key here these gate NOTHING
+	// — they set how often this repo wants its arrivals integrated, not what a
+	// landing must pass — so they are read by the watch loop at startup
+	// (resolveWatchConfig) rather than by resolvePolicy, and never appear on the
+	// report. They live here because the repo, not the invoker, owns the answer,
+	// and because parsePolicy must know them or a repo that sets one would fail
+	// every run with "unknown policy key".
+	watchInterval time.Duration
+	watchBatch    int
+	watchMaxRed   int
 }
 
 // policyExplicit names the policy-governed dimensions the invoker chose
@@ -207,6 +218,33 @@ func parsePolicy(data []byte) (policy, error) {
 				return policy{}, fmt.Errorf("line %d: budget must be a non-negative duration (e.g. 30m), got %q", e.Line, e.Value)
 			}
 			pol.budget = d
+		case "watch-interval":
+			if err := scalar(e); err != nil {
+				return policy{}, err
+			}
+			d, err := time.ParseDuration(e.Value)
+			if err != nil || d <= 0 {
+				return policy{}, fmt.Errorf("line %d: watch-interval must be a positive duration (e.g. 30s), got %q", e.Line, e.Value)
+			}
+			pol.watchInterval = d
+		case "watch-batch":
+			if err := scalar(e); err != nil {
+				return policy{}, err
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(e.Value))
+			if err != nil || n < 1 {
+				return policy{}, fmt.Errorf("line %d: watch-batch must be a positive integer, got %q", e.Line, e.Value)
+			}
+			pol.watchBatch = n
+		case "watch-max-red":
+			if err := scalar(e); err != nil {
+				return policy{}, err
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(e.Value))
+			if err != nil || n < 1 {
+				return policy{}, fmt.Errorf("line %d: watch-max-red must be a positive integer, got %q", e.Line, e.Value)
+			}
+			pol.watchMaxRed = n
 		default:
 			return policy{}, fmt.Errorf("line %d: unknown policy key %q", e.Line, e.Key)
 		}

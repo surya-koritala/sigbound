@@ -30,6 +30,11 @@ const (
 	inboxDropped      = "dropped"
 	inboxRepairFailed = "repair-failed"
 	inboxAudit        = "audit"
+	// inboxRedBranch: a watch cycle EXCLUDED these branches after -watch-max-red
+	// consecutive cycles failed to land them (issue #111). An attention item, not
+	// a landing awaiting release — there is nothing to ack. Re-pushing the branch
+	// clears it; the entry stays as the record that it happened.
+	inboxRedBranch = "red-branch"
 )
 
 // inboxDefaultLimit bounds GET /inbox when the caller names no ?limit. Audit
@@ -74,10 +79,10 @@ func (s *server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	}
 	want := strings.TrimSpace(r.URL.Query().Get("type"))
 	switch want {
-	case "", inboxParked, inboxFlagged, inboxDropped, inboxRepairFailed, inboxAudit:
+	case "", inboxParked, inboxFlagged, inboxDropped, inboxRepairFailed, inboxAudit, inboxRedBranch:
 	default:
 		writeErr(w, http.StatusBadRequest, "unknown type "+strconv.Quote(want)+
-			"; want parked|flagged|dropped|repair-failed|audit", codeBadRequest)
+			"; want parked|flagged|dropped|repair-failed|audit|red-branch", codeBadRequest)
 		return
 	}
 
@@ -173,6 +178,21 @@ func inboxEntriesFor(ctx context.Context, g *gitx.Git, cellID, dir, runID, want 
 				Links:   map[string]string{"run": runLink},
 			})
 		}
+	}
+	// red-branch: this cycle's backoff exclusions (issue #111). Read before the
+	// report is required below — a cycle whose run ERRORED still excludes the
+	// branches it took, and that is exactly when a human most needs telling.
+	if red := readRedBranches(dir); len(red) > 0 {
+		names := make([]string, 0, len(red))
+		for _, rb := range red {
+			names = append(names, rb.Branch)
+		}
+		add(inboxEntry{
+			Type:     inboxRedBranch,
+			Summary:  plural(len(red), "branch", "branches") + " excluded from watch cycles after " + plural(red[0].Cycles, "consecutive cycle", "consecutive cycles") + " that did not land it; re-push to re-qualify",
+			Branches: names,
+			Links:    map[string]string{"run": runLink, "events": runLink + "/events"},
+		})
 	}
 	if rep == nil {
 		return out
