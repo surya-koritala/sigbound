@@ -2,9 +2,12 @@ package gitx
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -266,6 +269,51 @@ func TestUpdateRefsBatch(t *testing.T) {
 	}
 }
 
+// TestUpdateRefCASRefusesAMovedRef pins the primitive every landing path now
+// swaps through: the update applies only while the ref still holds the value the
+// caller computed against, a lost race is ErrRefMoved (and writes NOTHING), and a
+// genuine update-ref failure is NOT reported as one — the two answers send a
+// caller in opposite directions, so conflating them is the bug this prevents.
+func TestUpdateRefCASRefusesAMovedRef(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+	c1 := branchFrom(t, g, base, "src1", func(d string) { write(t, d, "one.txt", "1\n") })
+	c2 := branchFrom(t, g, base, "src2", func(d string) { write(t, d, "two.txt", "2\n") })
+
+	// The ref is where the caller left it: the swap applies.
+	if err := g.UpdateRefCAS(ctx, "refs/heads/main", c1, base); err != nil {
+		t.Fatalf("CAS against the current value: %v", err)
+	}
+	if head, err := g.RevParse(ctx, "main"); err != nil || head != c1 {
+		t.Fatalf("main = %s (err %v), want %s", head, err, c1)
+	}
+
+	// Somebody else got there first: refused, and c1 survives untouched.
+	err := g.UpdateRefCAS(ctx, "refs/heads/main", c2, base)
+	if !errors.Is(err, ErrRefMoved) {
+		t.Fatalf("CAS against a stale value: err = %v, want ErrRefMoved", err)
+	}
+	if head, rerr := g.RevParse(ctx, "main"); rerr != nil || head != c1 {
+		t.Fatalf("a refused swap moved main to %s (err %v); it must still be %s", head, rerr, c1)
+	}
+	// git's message names both values, so an operator can see who won.
+	if !strings.Contains(err.Error(), c1) || !strings.Contains(err.Error(), base) {
+		t.Fatalf("refusal %q names neither the value found (%s) nor the one expected (%s)", err, c1, base)
+	}
+
+	// A ref that does not exist at all is a broken caller, not a lost race.
+	if err := g.UpdateRefCAS(ctx, "refs/heads/absent", c2, base); err == nil || errors.Is(err, ErrRefMoved) {
+		t.Fatalf("updating a missing ref: err = %v, want a plain failure (never ErrRefMoved)", err)
+	}
+	// Empty/whitespace fields never reach git: they would silently change the
+	// stdin directive's arity, turning a compare-and-swap into a plain write.
+	for _, bad := range [][3]string{{"refs/heads/main", c2, ""}, {"refs/heads/main", "", base}, {"refs/heads/a b", c2, base}} {
+		if err := g.UpdateRefCAS(ctx, bad[0], bad[1], bad[2]); err == nil {
+			t.Fatalf("UpdateRefCAS%v = nil, want a rejection", bad)
+		}
+	}
+}
+
 // TestOverlayManyDisjoint scales the overlay to many singleton branches and
 // checks it still matches a sequential merge-tree fold — the disjoint combine the
 // integrator relies on.
@@ -508,4 +556,68 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// TestUpdateRefCASPinsTheMessageLocale holds the LC_ALL=C pin, which nothing
+// else can: hermeticEnv passes os.Environ() straight through, so on a git with
+// translations installed the caller's own locale reaches the child and git's
+// refusal comes back translated. The discriminant is that message, and the cost
+// of missing it is NOT symmetric with the cost of a false positive — a lost race
+// read as a plain error is what leaves an ack terminally resolved with nothing
+// landed (writeParkCAS has already written resolvedAt/landedSHA by then, and
+// refuseAck never runs to take them back). A real git cannot demonstrate this
+// unless the machine has translations installed, so the git here is a shim that
+// speaks German to anyone who did not pin the locale.
+//
+// Remove the LC_ALL=C from UpdateRefCAS and this fails: the shim takes its
+// translated branch, "but expected" misses, and the refusal comes back as a
+// plain error. LC_ALL is set to a non-C value first so the pin is what makes the
+// difference and never the developer's ambient environment.
+func TestUpdateRefCASPinsTheMessageLocale(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell-script git shim, not executable on Windows")
+	}
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "git")
+	script := "#!/bin/sh\n" +
+		"if [ \"$LC_ALL\" = C ]; then\n" +
+		"  echo \"error: cannot lock ref 'refs/heads/main': is at 1111111111111111111111111111111111111111 but expected 2222222222222222222222222222222222222222\" >&2\n" +
+		"else\n" +
+		"  echo 'Fehler: Sperren der Referenz refs/heads/main nicht moeglich: steht auf 1111111111111111111111111111111111111111, erwartet wurde 2222222222222222222222222222222222222222' >&2\n" +
+		"fi\n" +
+		"exit 1\n"
+	if err := os.WriteFile(shim, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	g := New(dir).WithBinary(shim)
+	err := g.UpdateRefCAS(context.Background(), "refs/heads/main", strings.Repeat("1", 40), strings.Repeat("2", 40))
+	if !errors.Is(err, ErrRefMoved) {
+		t.Fatalf("refusal from a localized git = %v, want ErrRefMoved — LC_ALL=C did not reach the child, so the discriminant read a translated message", err)
+	}
+}
+
+// TestUpdateRefCASRejectsANameAsTheExpectedValue pins the field that must be an
+// OID. git resolves a NAME here at compare time, so passing the ref being
+// updated would compare it against whatever it holds right now and pass always —
+// a compare-and-swap silently degraded into the plain write it replaced. That
+// failure is invisible at every call site, so it is refused at this one.
+func TestUpdateRefCASRejectsANameAsTheExpectedValue(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+	c1 := branchFrom(t, g, base, "src1", func(d string) { write(t, d, "one.txt", "1\n") })
+
+	for _, name := range []string{"main", "refs/heads/main", "HEAD", base[:8]} {
+		if err := g.UpdateRefCAS(ctx, "refs/heads/main", c1, name); err == nil {
+			t.Fatalf("UpdateRefCAS accepted %q as the expected old value: a name resolves at compare time, so the swap can never refuse", name)
+		}
+	}
+	if head, err := g.RevParse(ctx, "main"); err != nil || head != base {
+		t.Fatalf("main = %s (err %v), want %s untouched — a rejected call must write nothing", head, err, base)
+	}
+	// The OID form of the very same value still works: the guard is on the
+	// SHAPE of the field, not on comparing a ref to itself.
+	if err := g.UpdateRefCAS(ctx, "refs/heads/main", c1, base); err != nil {
+		t.Fatalf("CAS with the base's own OID: %v", err)
+	}
 }

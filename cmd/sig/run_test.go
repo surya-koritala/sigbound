@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -3149,6 +3150,150 @@ func TestDriveRunAgentSurvivesLogWriteFailure(t *testing.T) {
 	}
 	if len(a.Files) != 1 || a.Files[0] != "landed.go" {
 		t.Fatalf("agent.Files=%v, want [landed.go]", a.Files)
+	}
+}
+
+// TestDriveRunRefusesToLandOverAnInterveningLanding is issue #138's failure mode
+// for the driver: the run pins the base, spends the agent + integrate + verify
+// phases computing against that pin, and then advanced the ref with no compare —
+// so anything that landed in between was silently reset away by a run that
+// reported success.
+//
+// The interleaving is FORCED by program order, not raced: the -verify command
+// itself lands a pre-built commit on the base, and verify runs immediately before
+// the landing. The base cannot NOT move during this run.
+func TestDriveRunRefusesToLandOverAnInterveningLanding(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	eventsPath := filepath.Join(t.TempDir(), "events.ndjson")
+
+	baseSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Build the competing landing up front, then put the base back where the run
+	// will find it; the commit stays in the object store for -verify to land.
+	if err := os.WriteFile(filepath.Join(repo, "intervening.go"), []byte("package main\n\nfunc intervening() int { return 8 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	intervening, err := g.CommitAll(ctx, "landing that arrives while the run is verifying")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.UpdateRef(ctx, "refs/heads/main", baseSHA); err != nil {
+		t.Fatal(err)
+	}
+
+	p := runParams{
+		Repo:       repo,
+		Base:       "main",
+		Strategy:   "overlay",
+		AgentCmd:   agent,
+		VerifyCmd:  fmt.Sprintf("git -C %q update-ref refs/heads/main %s", repo, intervening),
+		EventsPath: eventsPath,
+	}
+	task := taskSpec{ID: "t1", Prompt: mustJSON(t, map[string]any{
+		"write": map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"},
+	})}
+
+	rep, err := driveRun(ctx, p, []taskSpec{task})
+	if err == nil {
+		t.Fatal("driveRun succeeded; a run whose base moved under it must refuse to land")
+	}
+	if !errors.Is(err, gitx.ErrRefMoved) {
+		t.Fatalf("driveRun error %v, want one wrapping gitx.ErrRefMoved", err)
+	}
+
+	// The intervening landing survives, exactly where it landed.
+	head, herr := g.RevParse(ctx, "main")
+	if herr != nil || head != intervening {
+		t.Fatalf("main at %s (err %v), want the intervening landing %s — the run reset it away", short(head), herr, short(intervening))
+	}
+	if _, present, berr := g.BlobAt(ctx, head, "intervening.go"); berr != nil || !present {
+		t.Fatalf("intervening.go missing from the base after the refused landing (err=%v)", berr)
+	}
+	// And this run landed nothing.
+	if _, present, _ := g.BlobAt(ctx, head, "alpha.go"); present {
+		t.Fatal("the refused run landed its own tree anyway")
+	}
+
+	// The report says "someone else landed first", not "your change is broken":
+	// verify is GREEN and landRefused names the head that won.
+	if !rep.Verify.OK {
+		t.Fatalf("verify ok=false (%q); this run's tree was fine — the refusal must not read as a verify failure", rep.Verify.Output)
+	}
+	if rep.LandRefused != intervening {
+		t.Fatalf("rep.LandRefused=%q, want the intervening landing %s", rep.LandRefused, intervening)
+	}
+
+	names, recs := readEvents(t, eventsPath)
+	if i := indexOf(names, "land"); i != -1 {
+		t.Fatalf("a `land` event was emitted for a landing that was refused: %v", recs[i])
+	}
+	i := indexOf(names, "land_refused")
+	if i == -1 {
+		t.Fatalf("no land_refused event in %v", names)
+	}
+	if moved, _ := recs[i]["movedTo"].(string); moved != intervening {
+		t.Fatalf("land_refused.movedTo=%q, want %s", moved, intervening)
+	}
+	if from, _ := recs[i]["baseSHA"].(string); from != baseSHA {
+		t.Fatalf("land_refused.baseSHA=%q, want the head this run computed against %s", from, baseSHA)
+	}
+	// run_done still closes the stream, reporting the operational exit code.
+	if last := names[len(names)-1]; last != "run_done" {
+		t.Fatalf("last event=%q, want run_done", last)
+	}
+	if code, _ := recs[len(recs)-1]["exitCode"].(float64); int(code) != exitOperationalError {
+		t.Fatalf("run_done.exitCode=%v, want %d", recs[len(recs)-1]["exitCode"], exitOperationalError)
+	}
+}
+
+// TestDriveRunWithNothingToLandIgnoresAMovedBase is the other half of the
+// compare-and-swap's contract: a run that landed NOTHING (no agent succeeded,
+// or every branch got flagged) has no ref move to make, so a base that moved
+// under it is none of its business. Swapping the base's value for itself would
+// otherwise fail — turning "your agents all failed" into "the landing was
+// refused" for a run that never had a landing.
+func TestDriveRunWithNothingToLandIgnoresAMovedBase(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+
+	baseSHA, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "intervening.go"), []byte("package main\n\nfunc intervening() int { return 8 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	intervening, err := g.CommitAll(ctx, "landing that arrives while the run is verifying")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.UpdateRef(ctx, "refs/heads/main", baseSHA); err != nil {
+		t.Fatal(err)
+	}
+
+	p := runParams{
+		Repo:      repo,
+		Base:      "main",
+		Strategy:  "overlay",
+		AgentCmd:  "exit 1", // nothing to integrate, so nothing to land
+		VerifyCmd: fmt.Sprintf("git -C %q update-ref refs/heads/main %s", repo, intervening),
+	}
+	rep, err := driveRun(ctx, p, []taskSpec{{ID: "t1", Prompt: "x"}})
+	if err != nil {
+		t.Fatalf("driveRun: %v — a run with nothing to land must not fail because the base moved", err)
+	}
+	if rep.LandRefused != "" {
+		t.Fatalf("rep.LandRefused=%q, want empty: there was no landing to refuse", rep.LandRefused)
+	}
+	if code := runExitCode(rep); code != exitNoAgentSucceeded {
+		t.Fatalf("exit code %d, want %d (no agent succeeded)", code, exitNoAgentSucceeded)
+	}
+	if head, herr := g.RevParse(ctx, "main"); herr != nil || head != intervening {
+		t.Fatalf("main at %s (err %v), want the intervening landing %s", short(head), herr, short(intervening))
 	}
 }
 

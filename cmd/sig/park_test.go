@@ -1307,6 +1307,10 @@ func (f *parkFixture) interveningLanding() (moved, intervening string) {
 // head as it stood at the advance — so a landing that arrived mid-verify was
 // silently reset away by an ack that reported success. The ack must instead
 // refuse, land nothing, and leave the run parked and ackable.
+//
+// What refuses is now the landing swap itself (issue #138): the re-read this
+// originally pinned was a strictly weaker copy of that compare and is gone, so
+// dropping the swap's expected-old-value argument makes this test fail.
 func TestAckRefusesWhenBaseMovesDuringReverify(t *testing.T) {
 	f := newParkFixture(t, parkPolicyAckPaths)
 	ctx := context.Background()
@@ -1393,6 +1397,87 @@ func TestAckAfterRefusalLandsAgainstCurrentBase(t *testing.T) {
 	}
 	if f.status() != "done" {
 		t.Fatalf("status %q, want done", f.status())
+	}
+}
+
+// TestAckRefusesWhenTheBaseMovesInsideTheDirectLandWindow covers the OTHER ack
+// path (issue #138): the base has not moved, so the recorded commit is released
+// directly — but that release is still a read, a record write, and a ref move,
+// and a landing arriving between them used to be reset away by an ack that
+// reported success. This path holds the park lock throughout, so the window is
+// milliseconds rather than a verify battery; the compare-and-swap closes it for
+// the same cost either way.
+//
+// The interleaving is forced through writeParkCAS's existing seam, which sits
+// squarely between the ack's base read and its swap — no sleep, no hoping.
+func TestAckRefusesWhenTheBaseMovesInsideTheDirectLandWindow(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+
+	// Build the competing landing, then put the base back where the ack will find
+	// it: the record still matches the head, so the ack takes the DIRECT path and
+	// the commit lands from inside the window instead of before it.
+	parked := f.head()
+	intervening := f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
+	if err := f.g.UpdateRef(ctx, "refs/heads/main", parked); err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	parkCASDelay = func() {
+		// One-shot: the refusal's own re-park writes through here too, and moving
+		// the base a second time would test a different thing entirely.
+		once.Do(func() {
+			if err := f.g.UpdateRef(ctx, "refs/heads/main", intervening); err != nil {
+				f.t.Error(err)
+			}
+		})
+	}
+	t.Cleanup(func() { parkCASDelay = nil })
+
+	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err != nil {
+		t.Fatalf("ackRun: %v", err)
+	}
+	if out.Status != statusAwaitingAck || out.LandedSHA != "" || out.Reverified {
+		t.Fatalf("ack outcome %+v, want a refusal on the direct path that lands nothing", out)
+	}
+	if got := f.head(); got != intervening {
+		t.Fatalf("main at %s, want the intervening landing %s — the ack reset it away", short(got), short(intervening))
+	}
+	if _, present, _ := f.g.BlobAt(ctx, f.head(), "auth/token.go"); present {
+		t.Fatal("the refused ack landed the parked change anyway")
+	}
+	// The resolution was taken back: still parked, still unresolved, and still
+	// naming the tree that passed verify against the base it was verified on — so
+	// the next ack sees a moved base and re-verifies rather than trusting it.
+	if f.status() != statusAwaitingAck {
+		t.Fatalf("status %q, want %s", f.status(), statusAwaitingAck)
+	}
+	pk := f.reread()
+	if pk.ResolvedAt != "" || pk.LandedSHA != "" {
+		t.Fatalf("a refused ack resolved the park: %+v", pk)
+	}
+	if pk.VerifiedSHA != f.park.VerifiedSHA || pk.BaseSHA != f.park.BaseSHA {
+		t.Fatalf("the refusal rewrote the parked landing: %+v, want it untouched at %s/%s", pk, short(f.park.VerifiedSHA), short(f.park.BaseSHA))
+	}
+	assertEvent(t, f.dir, "ack_refused")
+
+	// Still ackable: the next ack takes the moved-base path and lands the work on
+	// top of the landing that beat it.
+	out2, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err != nil {
+		t.Fatalf("second ack: %v", err)
+	}
+	if out2.Status != "done" || !out2.Reverified || out2.LandedSHA == "" {
+		t.Fatalf("second ack outcome %+v, want a re-verified landing", out2)
+	}
+	if anc, aerr := f.g.IsAncestor(ctx, intervening, f.head()); aerr != nil || !anc {
+		t.Fatalf("the second ack's landing discarded the intervening landing (err=%v)", aerr)
+	}
+	for _, path := range []string{"auth/token.go", "extra.go"} {
+		if _, present, berr := f.g.BlobAt(ctx, f.head(), path); berr != nil || !present {
+			t.Fatalf("%s missing from the final landing (err=%v)", path, berr)
+		}
 	}
 }
 

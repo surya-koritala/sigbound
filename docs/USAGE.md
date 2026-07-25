@@ -1045,6 +1045,18 @@ lands the NEW commit and records it as the park's verified landing; a red one
 leaves the run parked with the failed attempt attached, which the inbox then
 shows. Either way the attempt is recorded in `attempts[]`.
 
+**Whoever lands first wins.** Both ack shapes advance the base with a
+compare-and-swap: git moves the ref only while it still holds the head the ack
+computed against. If anything landed in between — another run, a `-watch` cycle,
+an operator's own `sig integrate` — the ack lands **nothing** and says so, the
+run stays `awaiting-ack` with its verified result intact and its parking ref
+still pinning it, and acking again re-verifies against the head that won. `sig
+run` refuses the same way (see `landRefused` in the [JSON report](#json-report)
+and the `land_refused` [event](#events)), and so does `sig integrate`, which
+exits non-zero, prints no result JSON, and names the head that beat it. All
+three swap rather than write, so no landing path in Sigbound can reset another
+one away.
+
 **Reject** is terminal (`rejected`), lands nothing, records the optional reason,
 and **keeps every branch** — a rejection is a decision not to land, never a
 decision to destroy the work.
@@ -1362,8 +1374,11 @@ Re-running `sig integrate` a second time (without `-no-land`) recomputes and
 lands the identical tree because folding is deterministic — the second run
 isn't redoing the test, just publishing the SHA you already verified;
 advancing the ref by hand with `git update-ref` does the same thing without
-paying for a second fold. Either way, nothing lands on `main` until the
-`finalSHA` you tested is the `finalSHA` you land. Centrally-gated landing —
+paying for a second fold — with one difference worth knowing: `sig integrate`
+lands with a compare-and-swap and so refuses a base that moved under it, while a
+bare `git update-ref` is an unconditional write that would reset that landing
+away. Either way, nothing lands on `main` until the `finalSHA` you tested is the
+`finalSHA` you land. Centrally-gated landing —
 the coordinator itself running the `-verify` command, the way `sig run` does
 on a single machine — is the serve layer's job (issue #60, not yet built);
 until then, this `-no-land` → verify → land pattern is how you keep
@@ -2470,6 +2485,14 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   `audit-sample` (see [Spot-audit sampling](#spot-audit-sampling)); absent
   otherwise. It gates nothing. Sampling keys on `sig serve`'s run id, so a
   `sig run` invocation — which has none — is never sampled.
+- `landRefused` is present only when the landing was REFUSED: the base moved
+  off `baseSHA` while this run was computing against it, so the ref advance
+  would have reset somebody else's landing away. It names the commit the base
+  had actually reached. Nothing landed, and the run exits `1` with that message
+  on stderr. `-verify` had already passed (or was unset) by then — the tree was
+  fine, another writer simply got there first, so the recovery is a fresh run
+  against the new head rather than a fix to the change. Absent on every run that
+  landed.
 
 Without `-json`, the same run prints a short human summary.
 
@@ -2504,13 +2527,14 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 | `bisect_start` | `groups` | Once, when `-verify-bisect` starts (the full tree failed and there are ≥ 2 groups). `groups` is the group count being bisected. |
 | `bisect_attempt` | `groups`, `ok` | After each candidate-subset verify. `groups` is the branch names per group in that candidate; `ok` is its verdict. |
 | `bisect_done` | `landed`, `dropped` | Once, when bisect finishes. `landed`/`dropped` are the branch names per group that landed vs. were dropped (`landed` empty when nothing was salvaged). |
-| `land` | `sha` | Once, right after the base ref advances (never emitted when nothing lands). |
+| `land` | `sha` | Once, when the run reaches its landing. `sha` is what the base ref holds afterwards; it equals `run_start`'s `baseSHA` when the run had nothing to land (no agent succeeded, or every branch was flagged), in which case no ref move was made. Not emitted when `-verify` stayed red, nor when the landing swap was refused — `land_refused` is emitted instead. |
+| `land_refused` | `sha`, `baseSHA`, `movedTo` | Once, when the landing swap was refused: the base moved off `baseSHA` — the head this run computed against — to `movedTo` while the run was working, so the landing was refused rather than resetting it away. Nothing landed, `sha` is the commit that would have, and the run exits `1`. Emitted INSTEAD of `land`. |
 | `parked` | `reason`, `verifiedSHA`, `baseSHA`, `forkSHA`, `branches`, `matchedPaths` | Once, when a policy-held group's own tree verified green and was parked for an ack (see [Run parking](#run-parking)). |
 | `park_failed` | `branches`, `flagged`, `error`, `output` | Once, when a held group could NOT be offered as a landing (a conflict among the held branches, or a red verify). Nothing is parked; the branches stay flagged. |
 | `audit_selected` | `runId`, `sample`, `sha` | Once, when a clean landing was drawn into the `audit-sample` (see [Spot-audit sampling](#spot-audit-sampling)). |
 | `repark` † | `attempt`, `verdict`, `baseSHA`, `finalSHA` | Once per re-verify cycle an ack ran because the base had moved. `verdict` is `green` or `red`; a red one leaves the run parked. |
 | `ack` † | `actor`, `sha`, `reverified`, `attempt`* | Once, when an ack landed. `actor` is `cli` or `http`; `reverified` says whether the base had moved. *`attempt` only on a re-verified landing. |
-| `ack_refused` † | `actor`, `attempt`, `verifiedSHA`, `baseSHA`, `movedTo` | An ack re-verified green but the base moved again while it ran, so nothing landed. The green result is re-parked against `baseSHA` — the head it was verified on — and the run stays `awaiting-ack`; ack again to land it against current state. |
+| `ack_refused` † | `actor`, `attempt`, `verifiedSHA`, `baseSHA`, `movedTo` | An ack's landing swap was refused: the base had moved to `movedTo` by the time it landed, so nothing landed. `attempt` is the re-verify round on the base-moved path, and `0` on a direct ack — which neither re-verified nor re-parked, since its recorded result was already against the current head. Either way the resolution is taken back: the run returns to `awaiting-ack` with its verified result and parking ref intact and `baseSHA` naming the head it was verified on; ack again to re-verify against current state. |
 | `reject` † | `actor`, `reason` | Once, when a park was rejected. `actor` is `cli`, `http`, or `timeout` for an expired `ack-timeout`. |
 | `publish_start` | — | Once, right before the `-publish` command runs. Only emitted when `-publish` is set AND the run landed. |
 | `publish_done` | `ok`, `exit`, `wallMs` | Once, right after the `-publish` command finishes. |

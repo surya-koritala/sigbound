@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/surya-koritala/sigbound/cell"
+	"github.com/surya-koritala/sigbound/internal/gitx"
 )
 
 func main() {
@@ -334,6 +336,17 @@ func runIntegrate(argv []string) error {
 	start := time.Now()
 	res, err := integrateBranches(ctx, c, *base, baseSHA, branches, nil, *strategy, *resolverCmd, *resolverTimeout, *assert, !*noLand, nil, nil)
 	if err != nil {
+		// A refused landing swap (issue #138) is not a broken integration: the
+		// batch folded fine, somebody else simply advanced the base while it ran —
+		// a window as long as the fold plus any -resolver takes. Nothing landed,
+		// and the recovery is to integrate again against the head that won, so say
+		// that rather than let it read as a plumbing failure. The exit is non-zero
+		// either way, and no JSON is printed: there is no landing to report.
+		if errors.Is(err, gitx.ErrRefMoved) {
+			moved, _ := c.Git().RevParse(ctx, *base)
+			return fmt.Errorf("the base %q moved to %s while this integration was computing against %s; nothing landed — re-run against the new head: %w",
+				*base, shortMoved(moved), short(baseSHA), err)
+		}
 		return err
 	}
 	wall := time.Since(start)
