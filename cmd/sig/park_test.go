@@ -1274,6 +1274,121 @@ func TestConcurrentAcksLandExactlyOnce(t *testing.T) {
 	}
 }
 
+// interveningLanding arms the issue-#134 interleaving: it moves the base so an
+// ack takes the re-verify path, pre-creates one more commit on top of that head,
+// and rewrites the park's verify command to LAND that commit — so the re-verify
+// itself moves the base under the in-flight ack. The interleaving is forced by
+// construction, not raced: the base cannot NOT move during the verify. Returns
+// the head the re-verify will be computed against and the commit that lands
+// during it.
+func (f *parkFixture) interveningLanding() (moved, intervening string) {
+	f.t.Helper()
+	ctx := context.Background()
+	moved = f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
+	if err := os.WriteFile(filepath.Join(f.repo, "intervening.go"), []byte("package main\n\nfunc intervening() int { return 8 }\n"), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+	sha, err := f.g.CommitAll(ctx, "landing that arrives during the re-verify")
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	// Put the base back where the ack will find it; the commit stays in the
+	// object store for the verify command to land.
+	if err := f.g.UpdateRef(ctx, "refs/heads/main", moved); err != nil {
+		f.t.Fatal(err)
+	}
+	f.slowVerify(fmt.Sprintf("git -C %q update-ref refs/heads/main %s", f.repo, sha))
+	return moved, sha
+}
+
+// TestAckRefusesWhenBaseMovesDuringReverify is issue #134's exact failure mode:
+// the re-verify path read the base head, spent the verify battery's runtime
+// re-verifying against it, and then advanced the ref with no compare against the
+// head as it stood at the advance — so a landing that arrived mid-verify was
+// silently reset away by an ack that reported success. The ack must instead
+// refuse, land nothing, and leave the run parked and ackable.
+func TestAckRefusesWhenBaseMovesDuringReverify(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	moved, intervening := f.interveningLanding()
+
+	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err != nil {
+		t.Fatalf("ackRun: %v", err)
+	}
+	if out.Status != statusAwaitingAck || !out.Reverified || out.LandedSHA != "" {
+		t.Fatalf("ack outcome %+v, want a refusal that lands nothing", out)
+	}
+	if !strings.Contains(out.Message, "base moved") {
+		t.Fatalf("refusal message %q does not say the base moved under the ack", out.Message)
+	}
+	// The intervening landing survives, exactly where it landed.
+	if got := f.head(); got != intervening {
+		t.Fatalf("main at %s, want the intervening landing %s — the ack reset it away", short(got), short(intervening))
+	}
+	if _, present, err := f.g.BlobAt(ctx, f.head(), "intervening.go"); err != nil || !present {
+		t.Fatalf("intervening.go missing from the base after the refused ack (err=%v)", err)
+	}
+	// Nothing of the parked work landed.
+	if _, present, _ := f.g.BlobAt(ctx, f.head(), "auth/token.go"); present {
+		t.Fatal("the refused ack landed the parked change anyway")
+	}
+	// The run is still parked, unresolved, and re-armed against the head the
+	// green re-verify actually used, so the next ack starts from current state.
+	if f.status() != statusAwaitingAck {
+		t.Fatalf("status %q, want %s", f.status(), statusAwaitingAck)
+	}
+	pk := f.reread()
+	if pk.ResolvedAt != "" || pk.LandedSHA != "" {
+		t.Fatalf("a refused ack resolved the park: %+v", pk)
+	}
+	if pk.BaseSHA != moved || pk.VerifiedSHA == f.park.VerifiedSHA {
+		t.Fatalf("the refusal did not re-park the green result against %s: %+v", short(moved), pk)
+	}
+	last := pk.Attempts[len(pk.Attempts)-1]
+	if !last.VerifyOK || last.FinalSHA != pk.VerifiedSHA {
+		t.Fatalf("re-parked record does not carry its green attempt: %+v", last)
+	}
+	assertEvent(t, f.dir, "ack_refused")
+}
+
+// TestAckAfterRefusalLandsAgainstCurrentBase: a refusal is a retry, not a dead
+// end — the re-parked run acks again against the now-current base and lands the
+// work, carrying both the parked change and the landing that interrupted it.
+func TestAckAfterRefusalLandsAgainstCurrentBase(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+	_, intervening := f.interveningLanding()
+
+	if out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err != nil || out.Status != statusAwaitingAck {
+		t.Fatalf("first ack: out=%+v err=%v, want a refusal", out, err)
+	}
+	// Second ack: the base sits at the intervening landing and does not move
+	// again (the verify command's update-ref is now a no-op), so this one lands.
+	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	if err != nil {
+		t.Fatalf("second ack: %v", err)
+	}
+	if out.Status != "done" || !out.Reverified || out.LandedSHA == "" {
+		t.Fatalf("second ack outcome %+v, want a re-verified landing", out)
+	}
+	head := f.head()
+	if head != out.LandedSHA {
+		t.Fatalf("main at %s, want the landed commit %s", short(head), short(out.LandedSHA))
+	}
+	if anc, err := f.g.IsAncestor(ctx, intervening, head); err != nil || !anc {
+		t.Fatalf("the second ack's landing discarded the intervening landing (err=%v)", err)
+	}
+	for _, path := range []string{"auth/token.go", "intervening.go", "extra.go", "alpha.go"} {
+		if _, present, err := f.g.BlobAt(ctx, head, path); err != nil || !present {
+			t.Fatalf("%s missing from the final landing (err=%v)", path, err)
+		}
+	}
+	if f.status() != "done" {
+		t.Fatalf("status %q, want done", f.status())
+	}
+}
+
 // TestParkSurvivesCrashBetweenRecordAndStatus is the M-a regression: execRun
 // writes park.json and THEN status.json, so a crash in that gap left a genuinely
 // parked run marked "running". Startup recovery rewrote it to "interrupted" and
