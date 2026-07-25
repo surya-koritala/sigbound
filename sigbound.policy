@@ -1,0 +1,26 @@
+# Sigbound's own landing policy — the repo declares its own bar.
+#
+# This file is read from the base commit's tree, so changing the bar is
+# itself a change that must land through the bar.
+
+# Every landing builds, vets, and passes the race suite for the packages
+# that carry the engine. Members run in order; the first failure fails the
+# gate and is named in the report.
+verify = go build ./...
+verify = go vet ./...
+verify = go test -race ./cell/ ./internal/gitx/
+
+# An agent that writes outside its declared files is rejected, and Go
+# symbol-level conflicts are detected rather than merged textually.
+lanes = strict
+semantic = go
+assert = true
+
+# The engine's trust-critical surfaces need a human before anything lands
+# on them: the landing gate, the resolver, parking, and the git plumbing
+# every landing goes through. Work outside these lands on green alone.
+ack-paths = cmd/sig/policy.go, cmd/sig/park.go, cmd/sig/run.go, cell/**, internal/gitx/**
+
+# A sample of clean landings surfaces for review so the humans stay
+# calibrated on what the machines are actually doing.
+audit-sample = 25%
