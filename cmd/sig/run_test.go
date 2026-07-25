@@ -3217,15 +3217,15 @@ func TestNewEventEmitterModes(t *testing.T) {
 	var nilEmit *eventEmitter
 	nilEmit.emit("x", map[string]any{"a": 1}) // must not panic
 
-	e, closeFn, err := newEventEmitter("")
+	e, closeFn, err := newEventEmitter("", nil)
 	if err != nil || e != nil {
-		t.Fatalf(`newEventEmitter("") = (%v, _, %v), want (nil, _, nil)`, e, err)
+		t.Fatalf(`newEventEmitter("", nil) = (%v, _, %v), want (nil, _, nil)`, e, err)
 	}
 	closeFn()
 
-	e, closeFn, err = newEventEmitter("-")
+	e, closeFn, err = newEventEmitter("-", nil)
 	if err != nil || e == nil {
-		t.Fatalf(`newEventEmitter("-") = (%v, _, %v), want (non-nil, _, nil)`, e, err)
+		t.Fatalf(`newEventEmitter("-", nil) = (%v, _, %v), want (non-nil, _, nil)`, e, err)
 	}
 	closeFn() // stderr must not be closed; a second use elsewhere in the test binary must stay usable
 
@@ -3233,7 +3233,7 @@ func TestNewEventEmitterModes(t *testing.T) {
 	if err := os.WriteFile(path, []byte("stale content\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	e, closeFn, err = newEventEmitter(path)
+	e, closeFn, err = newEventEmitter(path, nil)
 	if err != nil || e == nil {
 		t.Fatalf("newEventEmitter(%q) = (%v, _, %v), want (non-nil, _, nil)", path, e, err)
 	}
@@ -3250,7 +3250,7 @@ func TestNewEventEmitterModes(t *testing.T) {
 		t.Fatalf("events file missing emitted line: %s", data)
 	}
 
-	if _, _, err := newEventEmitter(filepath.Join(path, "nested", "cant-create-under-a-file")); err == nil {
+	if _, _, err := newEventEmitter(filepath.Join(path, "nested", "cant-create-under-a-file"), nil); err == nil {
 		t.Fatal("newEventEmitter with an unopenable path: want error, got nil")
 	}
 }
