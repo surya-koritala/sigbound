@@ -1145,6 +1145,54 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 	if terr != nil {
 		return ackOutcome{}, fmt.Errorf("tree of re-verified %s: %w", short(finalSHA), terr)
 	}
+	// THE MOVED-BASE GUARD (issue #134). It NARROWS the window in which an ack
+	// advances the base to a commit computed against a head the base no longer
+	// holds — the same hazard issue #130 pinned for the driver, reached through
+	// this other door. It does not close it: the re-read below, writeParkCAS and
+	// landRef are three steps, not one, so a landing arriving between them is
+	// still reset away. What that leaves is exactly landRef's own documented
+	// window (see its ponytail note) — a file write plus a fork/exec, order
+	// 10ms — instead of a whole verify battery, order minutes. Closing it needs
+	// the compare-and-swap form `update-ref <ref> <new> <old>`, which would fix
+	// this path and driveRun's land together; tracked separately.
+	// finalSHA descends from `current`, but `current` was read BEFORE a re-verify
+	// that runs as long as the repo's verify battery does, and landRef is a plain
+	// update-ref with no compare-and-swap of its own (see its ponytail note): if
+	// anything landed on the base during that window — another run, a watch
+	// cycle, an operator's own `sig integrate` — advancing the ref here would
+	// silently reset it away and still report success. So re-read the head, under
+	// the claim, and refuse to land unless it is still exactly `current`. The
+	// direct-land branch needs no such re-read: it holds the park lock from its
+	// base read to its landRef with nothing but local git calls in between —
+	// landRef's documented sub-second window — while this path deliberately
+	// releases that lock across a minutes-long verify, which is what turns the
+	// window from theoretical into routine.
+	//
+	// A refusal lands NOTHING and loses nothing: the green result is RE-PARKED —
+	// verifiedSHA/verifiedTree/baseSHA re-recorded against `current`, the head it
+	// was actually verified on, with the keep-alive ref already pinning it — so
+	// the next ack re-verifies from current state instead of forfeiting the work.
+	// Recording `current` rather than `latest` is what makes that re-verify
+	// happen: the record must name the head the tree was actually verified on,
+	// so the next ack sees a moved base and re-verifies instead of trusting it.
+	latest, lerr := c.Git().RevParse(ctx, pk.Base)
+	if lerr != nil {
+		return ackOutcome{}, fmt.Errorf("re-resolve base %q (nothing was landed): %w", pk.Base, lerr)
+	}
+	if latest != current {
+		pk.VerifiedSHA, pk.VerifiedTree, pk.BaseSHA = finalSHA, tree, current
+		if err := writeParkCAS(dir, raw, pk); err != nil {
+			return ackOutcome{}, fmt.Errorf("re-park after the base moved (nothing was landed): %w", err)
+		}
+		writeRunStatus(dir, statusAwaitingAck, fmt.Sprintf("ack refused: the base moved to %s during re-verify attempt %d", short(latest), att.N))
+		appendRunEvent(dir, "ack_refused", map[string]any{
+			"actor": actor, "attempt": att.N, "verifiedSHA": finalSHA, "baseSHA": current, "movedTo": latest,
+		})
+		return ackOutcome{
+			RunID: runID, Status: statusAwaitingAck, Reverified: true, Attempts: att.N,
+			Message: fmt.Sprintf("nothing landed: the base moved to %s while the re-verify ran; the green result is re-parked — ack again to land it against current state", short(latest)),
+		}, nil
+	}
 	// Record before the ref moves, exactly as in ackRun's direct-land branch —
 	// under the resolution claim taken above. That ordering puts the crash window
 	// on the survivable side: a crash between the two leaves a park that says it
