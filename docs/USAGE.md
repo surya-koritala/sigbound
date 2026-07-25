@@ -76,7 +76,7 @@ sig run [-config PATH]
 | `-resolver` | — | Conflict-resolver command; low-confidence cases are flagged, never guessed. |
 | `-resolver-timeout` | `30s` | Per-conflict timeout for `-resolver` (`0` = none). |
 | `-verify` | — | Command run in a detached checkout of the integrated tree; non-zero exit = merge fails and does not land. |
-| `-verify-preset` | — | Expand a named per-language build+test preset (`go`, `node`, `python`, `rust`) into `-verify`'s command (see [Presets](#presets)). An explicit `-verify` always overrides its preset. |
+| `-verify-preset` | — | Expand a named preset into `-verify`'s command: a per-language build+test (`go`, `node`, `python`, `rust`) or a security scanner (`govulncheck`, `gitleaks`, `codeql`) — see [Presets](#presets). An explicit `-verify` always overrides its preset. |
 | `-verify-retries` | `0` | After a FAILING `-verify` invocation, re-run it up to N more times on the same tree; passes on any green. A pass on a retry marks the report `flaky=true`. `0` = today's behavior. |
 | `-verify-impact` | — | Command run INSTEAD of `-verify` when Sigbound can confidently scope it to the impacted Go packages (see [Scoped verification](#scoped-verification)). Requires `-verify` (or `-verify-preset`), which stays the fallback on any doubt. |
 | `-verify-cache` | `false` | Cache a PASSING verify verdict and skip re-running the command on an exact repeat (see [Cache](#cache)). A FAILING verdict is never cached. Off by default. |
@@ -460,8 +460,9 @@ Hand-writing the `sh -c` wiring for `-agent`/`-repair`/`-planner` (the
 idiomatic build+test command for `-verify` is the fiddliest part of a first
 `sig run` — especially off Go, where there's no worked example to copy.
 `-agent-preset`, `-repair-preset`, and `-planner-preset` (`claude` | `codex` |
-`aider`) and `-verify-preset` (`go` | `node` | `python` | `rust`) expand a
-short name into that exact command, so you start from a known-good invocation
+`aider`) and `-verify-preset` (`go` | `node` | `python` | `rust`, plus the
+security scanners `govulncheck` | `gitleaks` | `codeql` below) expand a short
+name into that exact command, so you start from a known-good invocation
 instead of typing it by hand.
 
 A preset encodes only the harness's CLI shape (how to invoke it
@@ -517,6 +518,88 @@ is equivalent to:
 ```bash
 ./sig run -repo /path/to/your/repo -tasks examples/tasks.json -agent-preset claude -verify-preset go
 ```
+
+#### Security scanners
+
+`-verify-preset` also names three scanners. Unlike the per-language presets,
+each runs a scan INSTEAD of a build+test, so it is meant to COMPOSE with one
+rather than replace it — see [the policy fragment](#composing-a-scanner-with-a-buildtest-battery)
+below.
+
+| Name | Scans | Scan command |
+|------|-------|--------------|
+| `govulncheck` | Go vulnerabilities (module + stdlib) actually reachable from this tree's code | `govulncheck ./...` |
+| `gitleaks` | secrets in the integrated WORKING TREE — `--no-git`, so it judges the tree this run would land, not the history behind it — with every match `--redact`ed | `gitleaks detect --no-git --redact` |
+| `codeql` | the CodeQL CLI's default query suite for the database language | `codeql database create .sigbound-codeql-db --language="${SIGBOUND_CODEQL_LANG:-go}" --overwrite && codeql database analyze .sigbound-codeql-db --format=csv --output=.sigbound-codeql.csv && [ -f .sigbound-codeql.csv ] && [ ! -s .sigbound-codeql.csv ]` |
+
+**A missing scanner fails the gate, loudly — it is never skipped.** Each of
+the three expands to a PATH check followed by its scan command:
+
+```sh
+command -v TOOL >/dev/null 2>&1 || { echo "sigbound -verify-preset=TOOL: TOOL is not on PATH (install: INSTALL) -- failing the gate rather than skipping the scan and reporting green" >&2; exit 1; }; SCAN
+```
+
+| Name | `INSTALL` |
+|------|-----------|
+| `govulncheck` | `go install golang.org/x/vuln/cmd/govulncheck@latest` |
+| `gitleaks` | `brew install gitleaks`, or a release binary from `https://github.com/gitleaks/gitleaks` |
+| `codeql` | download the CodeQL CLI from `https://github.com/github/codeql-cli-binaries/releases` |
+
+That failure mode is the point of these presets, more than the scan itself. A
+battery member that quietly skipped an absent tool is worse than not declaring
+that member at all: the run reports GREEN over a tree nothing scanned, and its
+[JSON report](#json-report) records a verify that passed while the scan it
+names never ran. So never soften a scanner into `command -v TOOL || exit 0`,
+and never suffix one with `|| true`.
+
+Honest limit on what the check itself buys: `sh -c` already fails a missing
+command with exit 127, so the prefix does not change the VERDICT — an absent
+tool failed the gate before it existed. What it adds is the message: which tool
+is missing and how to install it, instead of the shell's bare `not found` in
+the middle of an N-member battery.
+
+Two things are specific to `codeql`:
+
+- **It decides on findings, not on the CLI's exit code.** `codeql database
+  analyze` exits 0 whether or not it found anything, so the preset tests the
+  CSV it wrote: any row fails the gate. A results file that is MISSING fails
+  too — that means the scan did not happen, which must never read as "nothing
+  found". The database is built inside the throwaway verify checkout, which
+  sigbound wipes (`git clean -fdx`) before every verify attempt.
+- **The language is `SIGBOUND_CODEQL_LANG`, defaulting to `go`** — CodeQL
+  cannot infer it. Under [`-env-mode scoped`](#scoped-environments) that
+  variable reaches the verify command only if `-env-verify
+  SIGBOUND_CODEQL_LANG` allowlists it; unset, the scan runs against `go`.
+
+#### Composing a scanner with a build/test battery
+
+A scanner is not a build+test, so run both. Put the build+test members in the
+repo's [`sigbound.policy`](#landing-policy) — where they are the repo's own
+bar, not the invoker's — and pass the scanner as a flag:
+
+```
+# sigbound.policy — this repo's landing bar.
+verify = go build ./...
+verify = go test ./...
+```
+
+```bash
+./sig run -repo /path/to/your/repo -tasks examples/tasks.json \
+  -agent-preset claude -verify-preset govulncheck
+```
+
+The effective verify is the policy's members in file order, then the flag's
+verify appended last — the ordering is fixed, and a flag can only ADD to the
+battery, never replace or reorder it:
+
+```sh
+sh -c 'go build ./...' && sh -c 'go test ./...' && sh -c '<the govulncheck expansion>'
+```
+
+Every member is ANDed, so the first failure fails the gate and nothing lands.
+To make the scan the repo's bar rather than one invoker's choice, move it into
+the policy as a third `verify` line — paste the expansion `-verify-preset`
+prints to stderr, which is exactly what it would have run.
 
 ### Config file
 

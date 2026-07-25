@@ -559,7 +559,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-semantic go|off] [-resolver CMD] [-verify CMD | -verify-preset go|node|python|rust [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-parallel-agents N] [-budget D] [-no-disk-check] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-semantic go|off] [-resolver CMD] [-verify CMD | -verify-preset NAME [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-parallel-agents N] [-budget D] [-no-disk-check] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset); -publish succeeded or was unset")
@@ -605,8 +605,10 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	resolverCmd := fs.String("resolver", "", "optional conflict resolver command (see `sig integrate -h`); reads SIGBOUND_BASE/SIGBOUND_OURS/SIGBOUND_THEIRS/SIGBOUND_PATH, writes the resolved body to stdout")
 	resolverTimeout := fs.Duration("resolver-timeout", 30*time.Second, "per-conflict timeout for -resolver (0 = none)")
 	verifyCmd := fs.String("verify", "", "optional command run (via `sh -c`) in a detached checkout of the integrated tree; non-zero exit => verify failed")
-	verifyPreset := fs.String("verify-preset", "", "expand a known per-language build+test preset (go|node|python|rust) into -verify's sh -c command; an explicit -verify always overrides its preset. "+
-		"See docs/USAGE.md's Presets section for the exact expansion of each name")
+	verifyPreset := fs.String("verify-preset", "", "expand a known preset into -verify's sh -c command: a per-language build+test (go|node|python|rust), or a security scanner "+
+		"(govulncheck|gitleaks|codeql). A scanner runs INSTEAD of a build+test, so compose it with one: declare the build+test members in the repo's sigbound.policy (they run first) "+
+		"and pass the scanner here (appended last). A scanner preset whose tool is NOT on PATH fails the gate with a message naming the tool and how to install it -- it never skips "+
+		"the scan and lets the run report green. An explicit -verify always overrides its preset. See docs/USAGE.md's Presets section for the exact expansion of each name")
 	verifyRetries := fs.Int("verify-retries", 0, "after a FAILING -verify invocation, re-run it up to N more times on the same tree; passes on any green. "+
 		"A pass on a retry marks the report flaky=true (the passing run's output is reported). 0 = today's behavior: a single failing invocation fails verify. "+
 		"-verify must still be deterministic — retries mitigate flaky suites, not a license to skip that")
