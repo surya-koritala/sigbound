@@ -6,6 +6,7 @@ package main
 // never a hand-built fixture standing in for it.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1925,14 +1926,38 @@ func TestParkWriteHelperProcess(t *testing.T) {
 	if err := parkWriteBarrier(barrier, "go", 30*time.Second); err != nil {
 		t.Fatal(err)
 	}
+	// A write that FAILS is not a defect: on Windows a rename over a destination
+	// somebody else has open is refused outright (see renameOver), and refusing
+	// publishes nothing, which is the safe direction. Count them and hand the
+	// count back to the parent rather than failing — the invariant under test is
+	// about what gets published, never about every write winning.
+	failed := 0
 	for i := 0; i < n; i++ {
-		// Errorf, not Fatalf: a writer that stops early stops contending, and the
-		// parent still needs every other assertion (the reader's, the final parse)
-		// exercised at full concurrency before it looks at exit statuses.
 		if err := writePark(dir, parkWriteProbe(i%2 == 0)); err != nil {
-			t.Errorf("writePark: %v", err)
+			failed++
 		}
 	}
+	fmt.Printf("%s%d %d\n", parkWriteResultPrefix, failed, n)
+}
+
+// parkWriteResultPrefix marks the line a helper process reports its write
+// failure count on, for the parent to total up.
+const parkWriteResultPrefix = "parkwriter-failures: "
+
+// parkWriteFailuresOf pulls a helper process's "failed attempted" counts back
+// out of its output.
+func parkWriteFailuresOf(out string) (failed, attempted int, err error) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, parkWriteResultPrefix) {
+			continue
+		}
+		if _, err := fmt.Sscanf(strings.TrimPrefix(line, parkWriteResultPrefix), "%d %d", &failed, &attempted); err != nil {
+			return 0, 0, err
+		}
+		return failed, attempted, nil
+	}
+	return 0, 0, errors.New("no " + parkWriteResultPrefix + " line in the output")
 }
 
 // TestWriteParkNeverPublishesATornRecord is the regression for the fixed temp
@@ -1946,8 +1971,18 @@ func TestParkWriteHelperProcess(t *testing.T) {
 // the ENTIRE repository. One wedged park, no garbage collection anywhere.
 //
 // The record is hammered from 24 goroutines and 8 subprocesses at once while a
-// reader parses it continuously, so the assertion is not merely that the final
+// reader watches it continuously, so the assertion is not merely that the final
 // state is good but that no observer ever saw a bad one.
+//
+// WHAT IS ASSERTED is publication, not success. Every writer publishes one of
+// exactly two byte sequences, and the hard failure is observing anything else —
+// a record no writer ever wrote, i.e. a mixture. A writer that FAILS is not a
+// defect and is only counted: a failed rename publishes nothing, leaves the
+// previous record intact and returns an error, which is the fail-closed
+// direction. That distinction is not hypothetical — Windows refuses to rename
+// over a destination another handle has open (see renameOver), so on that
+// platform some of these writes legitimately fail, and an earlier version of
+// this test wrongly failed CI for it.
 func TestWriteParkNeverPublishesATornRecord(t *testing.T) {
 	const (
 		goroutines = 24
@@ -1987,25 +2022,55 @@ func TestWriteParkNeverPublishesATornRecord(t *testing.T) {
 		}
 	}
 
-	// A reader that never stops looking. Rename is atomic, so anything it fails
-	// to parse was corrupt BEFORE it was published.
+	// THE INVARIANT. Every writer publishes one of exactly two byte sequences, so
+	// any observation that is neither is a record no writer ever wrote — a
+	// mixture of two, which is precisely what the shared temp file produced.
+	// Byte equality rather than "it parses": a mixture can be valid JSON.
+	wantShort, err := json.MarshalIndent(parkWriteProbe(false), "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLong, err := json.MarshalIndent(parkWriteProbe(true), "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A reader that never stops looking, so the assertion is not merely that the
+	// final state is good but that no observer ever saw a bad one.
 	stop := make(chan struct{})
-	readErr := make(chan error, 1)
+	torn := make(chan string, 1)
+	readFails := make(chan int, 1)
 	go func() {
+		fails := 0
 		for {
 			select {
 			case <-stop:
-				close(readErr)
+				readFails <- fails
+				close(torn)
 				return
 			default:
 			}
-			if _, err := readPark(dir); err != nil {
-				readErr <- err
-				return
+			got, err := os.ReadFile(filepath.Join(dir, parkFileName))
+			if err != nil {
+				// Not a torn record: a read can be refused outright while a rename
+				// is in flight on Windows. Counted, not asserted on.
+				fails++
+				continue
 			}
+			if bytes.Equal(got, wantShort) || bytes.Equal(got, wantLong) {
+				continue
+			}
+			why := "it parses, so it is a VALID mixture of two records"
+			if _, perr := parsePark(got); perr != nil {
+				why = perr.Error()
+			}
+			torn <- fmt.Sprintf("%d bytes, matching neither record any writer wrote (%s)", len(got), why)
+			readFails <- fails
+			return
 		}
 	}()
 
+	writeFails := make([]int, goroutines)
 	var wg sync.WaitGroup
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
@@ -2016,8 +2081,10 @@ func TestWriteParkNeverPublishesATornRecord(t *testing.T) {
 				return
 			}
 			for j := 0; j < writes; j++ {
+				// A failed write is legitimate (see the helper): it publishes
+				// nothing, which is the safe direction. Count, do not assert.
 				if err := writePark(dir, parkWriteProbe((i+j)%2 == 0)); err != nil {
-					t.Errorf("writePark: %v", err)
+					writeFails[i]++
 				}
 			}
 		}(i)
@@ -2031,19 +2098,47 @@ func TestWriteParkNeverPublishesATornRecord(t *testing.T) {
 		procErr[i] = cmd.Wait()
 	}
 	close(stop)
-	// The record's own assertions come FIRST and none of them are fatal: a shared
-	// temp file breaks writePark several ways at once (a lost write, a corrupt
-	// publish, a leaked temp) and the point of the test is to say which.
-	if err := <-readErr; err != nil {
-		t.Errorf("a reader observed an unparseable park.json while writers were running: %v", err)
+
+	// THE assertion. Everything else in this test is a count.
+	if msg, ok := <-torn; ok {
+		t.Errorf("a reader observed a park.json no writer ever wrote: %s", msg)
 	}
-	if _, err := readPark(dir); err != nil {
-		t.Errorf("park.json is corrupt after %d concurrent writes: %v", goroutines*writes+subprocs*writes, err)
+	if got, err := os.ReadFile(filepath.Join(dir, parkFileName)); err != nil {
+		t.Errorf("park.json unreadable after the run: %v", err)
+	} else if !bytes.Equal(got, wantShort) && !bytes.Equal(got, wantLong) {
+		why := "it parses, so it is a VALID mixture"
+		if _, perr := parsePark(got); perr != nil {
+			why = perr.Error()
+		}
+		t.Errorf("the final park.json is %d bytes and matches neither record any writer wrote (%s)", len(got), why)
+	}
+
+	total := goroutines*writes + subprocs*writes
+	failed := 0
+	for _, n := range writeFails {
+		failed += n
 	}
 	for i, err := range procErr {
+		// A helper exits non-zero only for something that is NOT a failed write:
+		// it reports those as a count on stdout.
 		if err != nil {
 			t.Errorf("subprocess %d: %v (output: %s)", i, err, out[i].String())
+			continue
 		}
+		n, total2, perr := parkWriteFailuresOf(out[i].String())
+		if perr != nil {
+			t.Errorf("subprocess %d did not report its write count: %v (output: %s)", i, perr, out[i].String())
+			continue
+		}
+		if total2 != writes {
+			t.Errorf("subprocess %d reported %d writes, want %d", i, total2, writes)
+		}
+		failed += n
+	}
+	t.Logf("%d writes, %d failed (%.1f%%); reader saw %d unreadable moments", total, failed, 100*float64(failed)/float64(total), <-readFails)
+	// A run in which nothing was ever published proves nothing about publishing.
+	if failed == total {
+		t.Fatalf("every one of %d writes failed; the test asserted nothing", total)
 	}
 	// And no writer leaked its temp into the run dir, where a reader or `sig gc`
 	// would then have to know to ignore it.

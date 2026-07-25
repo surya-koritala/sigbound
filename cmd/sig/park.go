@@ -30,10 +30,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/surya-koritala/sigbound/cell"
@@ -379,11 +381,69 @@ func atomicWriteFile(dir, name string, data []byte, perm os.FileMode) error {
 	if err := os.Chmod(tmp, perm); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, filepath.Join(dir, name)); err != nil {
+	if err := renameOver(tmp, filepath.Join(dir, name)); err != nil {
 		return err
 	}
 	tmp = "" // renamed away: there is no temp left to clean up
 	return nil
+}
+
+// Windows error numbers, spelled numerically because syscall's names for them
+// exist only in the windows build while this file compiles everywhere: 5 is
+// ERROR_ACCESS_DENIED, 32 is ERROR_SHARING_VIOLATION.
+const (
+	winErrorAccessDenied     = syscall.Errno(5)
+	winErrorSharingViolation = syscall.Errno(32)
+)
+
+// The Windows rename retry budget: ten attempts backing off 10ms, 20ms ... 90ms,
+// so a contended rename gets about half a second before it gives up. Long enough
+// to outlast a reader or a virus scanner holding a handle, short enough that a
+// genuinely stuck destination still fails while somebody is watching.
+const (
+	atomicRenameAttempts = 10
+	atomicRenameBackoff  = 10 * time.Millisecond
+)
+
+// renameOver publishes tmp as dst, retrying briefly when Windows says the
+// destination is busy.
+//
+// On POSIX this is one os.Rename and nothing else: rename(2) replaces the
+// destination atomically no matter who has it open, so there is nothing to
+// retry. WINDOWS IS DIFFERENT, and it failed CI exactly this way. os.Rename
+// there is MoveFileEx with MOVEFILE_REPLACE_EXISTING, which needs delete access
+// to the destination — and Go opens files with FILE_SHARE_READ|FILE_SHARE_WRITE
+// and no FILE_SHARE_DELETE, so ANY concurrent reader of the destination,
+// including our own readPark, makes the rename fail with ERROR_ACCESS_DENIED.
+// It is not confined to our own concurrency either: virus scanners and search
+// indexers routinely take brief handles on a freshly written file, which makes a
+// single-shot rename fragile on Windows even in a single-threaded program.
+//
+// The failure was always SAFE — a rename that fails publishes nothing, the old
+// record stays intact and the caller gets an error — so this is about not
+// failing a write that would have succeeded a moment later, never about
+// correctness.
+func renameOver(tmp, dst string) error {
+	for attempt := 1; ; attempt++ {
+		err := os.Rename(tmp, dst)
+		if err == nil || attempt == atomicRenameAttempts || !renameContended(err) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt) * atomicRenameBackoff)
+	}
+}
+
+// renameContended reports whether err is Windows saying somebody else holds the
+// destination open. The GOOS test is what keeps POSIX behaviour byte-identical:
+// runtime.GOOS is a compile-time constant, so the loop above collapses to a
+// single os.Rename off Windows and a genuine EACCES on Unix is still returned
+// immediately rather than retried for half a second.
+func renameContended(err error) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	var errno syscall.Errno
+	return errors.As(err, &errno) && (errno == winErrorAccessDenied || errno == winErrorSharingViolation)
 }
 
 // writePark records pk atomically (see atomicWriteFile): a concurrent GET /inbox
