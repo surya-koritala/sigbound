@@ -512,3 +512,34 @@ func TestServeEventFlagsRejectBadConfig(t *testing.T) {
 		})
 	}
 }
+
+// TestEventPushAccountsForEveryLine is the invariant no test asserted, which is
+// why a real accounting bug survived a well-tested change: sent + failed +
+// dropped must equal every line that entered the sink. Review measured the sink
+// swallowing up to a queue's worth of lines after shutdown while the tally
+// printed "0 dropped" -- fail-open's whole safety argument is that loss is
+// counted rather than swallowed, so an uncounted loss is the failure.
+func TestEventPushAccountsForEveryLine(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := startEventPusher(ctx, "http://127.0.0.1:1/never", "", 8)
+	sink := &eventSink{p: p, runID: "r1", cell: "c1"}
+
+	// Stop the drain goroutine and wait for it to actually be gone: this is a
+	// run still draining after the daemon was told to shut down.
+	cancel()
+	<-p.stopped
+
+	const lines = 300 // more than the queue is deep, so a silent buffer would hide some
+	for i := 0; i < lines; i++ {
+		if _, err := sink.Write([]byte("{\"event\":\"x\"}\n")); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	st := p.stats()
+	if got := st.Sent + st.Failed + st.Dropped; got != lines {
+		t.Fatalf("sent+failed+dropped = %d, want %d — %d lines entered the sink and were never accounted for", got, lines, lines-got)
+	}
+	if st.Sent != 0 {
+		t.Fatalf("sent = %d, want 0: nothing can be delivered after the drain goroutine returned", st.Sent)
+	}
+}

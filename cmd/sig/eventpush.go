@@ -228,6 +228,19 @@ func (s *eventSink) Write(b []byte) (int, error) {
 	if len(line) == 0 {
 		return len(b), nil
 	}
+	// Once the drain goroutine has returned nobody will ever read the queue
+	// again, so a send that SUCCEEDS here is still a loss -- and a silent one,
+	// because the shutdown tally read len(q) once at cancel and stopped. A
+	// draining run emitting after that is the designed path, not an exotic
+	// race (s.wg.Wait() exists for exactly it), so check stopped first and
+	// count those lines as dropped rather than letting them vanish into a
+	// buffer with no reader.
+	select {
+	case <-s.p.stopped:
+		s.p.dropped.Add(1)
+		return len(b), nil
+	default:
+	}
 	select {
 	case s.p.q <- eventPost{runID: s.runID, cell: s.cell, line: line}:
 	default:
