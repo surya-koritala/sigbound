@@ -1167,11 +1167,15 @@ func (s *server) handleAckReject(w http.ResponseWriter, r *http.Request, ack boo
 		out, err = rejectRun(r.Context(), rc.cell.Git(), dir, "http", body.Reason)
 	}
 	if err != nil {
-		if errors.Is(err, errNotAwaitingAck) {
+		switch {
+		case errors.Is(err, errNotAwaitingAck):
+			// Covers an already-resolved run too: errParkResolved wraps this.
 			writeErr(w, http.StatusConflict, err.Error(), codeNotParked)
-			return
+		case errors.Is(err, errParkBusy):
+			writeErr(w, http.StatusConflict, err.Error(), codeCellBusy)
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error(), codeInternalError)
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error(), codeInternalError)
 		return
 	}
 	// Keep this process's in-memory view honest for a run it started itself;

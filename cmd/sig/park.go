@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/surya-koritala/sigbound/cell"
@@ -46,6 +47,30 @@ const parkFileName = "park.json"
 
 // parkLockName is the run dir's advisory cross-process lock (see lockPark).
 const parkLockName = ".park.lock"
+
+// parkClaimName is the run dir's ONE-SHOT terminal-resolution claim (see
+// claimPark). Distinct from parkLockName on purpose: the lock is a mutual-
+// exclusion hint that a caller takes and drops repeatedly, while this is a claim
+// on an event that happens exactly once in a run's life.
+const parkClaimName = ".park.claim"
+
+// parkClaimStale bounds how long a crashed resolver can wedge a park. A claim is
+// only ever held across the COMMIT of a resolution — a handful of git calls,
+// never the re-verify, which runs outside it — so anything approaching this is a
+// dead holder rather than a slow one. Deliberately generous: stealing early from
+// a resolver that is merely slow is the one mistake that reintroduces two
+// simultaneous winners, and waiting minutes after a crash costs nothing.
+const parkClaimStale = 10 * time.Minute
+
+// parkClaimSeq distinguishes claims made by the SAME process, which pid and a
+// timestamp alone cannot (two goroutines in one daemon, and the race tests).
+var parkClaimSeq atomic.Int64
+
+// parkCASDelay is a test-only seam: park_test.go widens the read-compare-write
+// window inside writeParkCAS so the interleaving a loaded machine produces on
+// its own is FORCED rather than hoped for. Nil in production, and the whole
+// point of claimPark is that widening this window changes nothing.
+var parkCASDelay func()
 
 // parkRefPrefix namespaces the KEEP-ALIVE ref every park holds on its verified
 // commit. That commit is created by commit-tree and is reachable from NOTHING
@@ -266,21 +291,21 @@ func (pk *parkJSON) validate() error {
 	return nil
 }
 
-// lockPark takes a best-effort cross-process lock on ONE run's parking record.
-// It is a TRY-lock: it never blocks, because every caller has a correct answer
-// for "someone else is mid-ack" — the lazy timeout sweep skips (it will fire
-// next time anyone looks) and ack/reject report a conflict.
+// lockPark is a WORK-SAVING try-lock, NOT a correctness boundary — claimPark is
+// the correctness boundary, and nothing below is allowed to matter to it.
 //
-// The lock spans processes, which the daemon's in-memory busy map cannot: `sig
-// ack` on the CLI and a POST to a running daemon are different processes acting
-// on the same run dir. A crashed holder is detected and its lock stolen via
-// pidAlive, so a kill -9 mid-ack cannot wedge a park forever.
+// Its single job is to stop two acks from both starting an expensive re-integrate
+// + re-verify on the same run: `sig serve`'s per-cell busy slot already prevents
+// that between two HTTP requests, but `sig ack` on the CLI and a POST to a
+// running daemon are different processes, which only an on-disk lock covers. It
+// never blocks — a caller that cannot get it has a correct answer already (the
+// lazy timeout sweep skips, ack reports a conflict) — and a crashed holder's
+// lock is stolen via pidAlive so a kill -9 cannot wedge a run.
 //
-// Windows note: pidAlive reports every pid as dead there (see its doc), so the
-// lock is stolen immediately and provides no mutual exclusion on that platform —
-// the same documented degradation `sig serve`'s crash recovery already has
-// (issue #94). The status re-check immediately before landRef is what makes a
-// rejected park un-landable, and that check is platform-independent.
+// Windows note: pidAlive reports every pid as dead there (see its doc), so this
+// is stolen immediately and provides no mutual exclusion at all on that
+// platform. That is now merely wasteful rather than dangerous: the atomic
+// resolution claim, which consults no pid, is what decides who resolves a run.
 // lockPark is a variable ONLY so a test can substitute a no-op and exercise the
 // platform-independent ordering guarantees on their own — the record-claim
 // ordering has to hold with no mutual exclusion at all, which is precisely the
@@ -375,7 +400,82 @@ func writeParkCAS(dir string, want []byte, pk *parkJSON) error {
 	if !bytes.Equal(got, want) {
 		return errParkChanged
 	}
+	if parkCASDelay != nil {
+		parkCASDelay()
+	}
 	return writePark(dir, pk)
+}
+
+// claimPark makes the ONE-SHOT claim on a run's TERMINAL resolution — the single
+// transition from awaiting-ack to landed or rejected, which happens exactly once
+// in a run's life. Every path that resolves a park goes through here first.
+//
+// WHY THIS EXISTS. writeParkCAS is read-compare-write with nothing making the
+// sequence atomic across processes, so two resolvers can both compare against
+// unchanged bytes and both believe they won. That guarantees the loser lands
+// nothing only if there IS a loser. On a loaded machine a scheduler preemption
+// between the read and the rename is ordinary — CI reproduced exactly that on
+// its first iteration, landing a change the operator had just been told was
+// rejected. Estimating the window as "too small to hit" was wrong.
+//
+// WHY THIS IS ATOMIC EVERYWHERE, WINDOWS INCLUDED. O_CREATE|O_EXCL is an atomic
+// test-and-set in the filesystem itself on POSIX and Windows alike: of any
+// number of concurrent creators exactly one succeeds and the rest get EEXIST.
+// Nothing here consults pidAlive, which is what degrades on Windows — that is
+// lockPark's staleness check, and lockPark is now only an early narrowing, never
+// the correctness boundary.
+//
+// A claim already present means one of two things, and they are distinguished by
+// reading the record rather than by probing a process:
+//
+//   - the park is already RESOLVED: the claim is vestigial, left by a holder
+//     that finished and died before releasing. Terminal answer, never re-resolve.
+//   - the park is UNRESOLVED: the holder is live (refuse) or crashed
+//     mid-resolution (steal, once the claim is older than parkClaimStale).
+//
+// ponytail: two resolvers arriving within microseconds of EACH OTHER, minutes
+// after a crash, can both judge the same claim stale and both steal it — the
+// post-create ownership re-read below closes the common ordering of that, and
+// the residual needs a doubly-nested interleaving on a path that only runs after
+// a crash. Upgrade to a rename-based steal with a content token if a real
+// deployment ever shows it.
+func claimPark(dir string) (release func(), err error) {
+	path := filepath.Join(dir, parkClaimName)
+	token := fmt.Sprintf("%d %d %s", os.Getpid(), parkClaimSeq.Add(1), time.Now().UTC().Format(time.RFC3339Nano))
+	for attempt := 0; attempt < 3; attempt++ {
+		f, cerr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if cerr == nil {
+			_, werr := f.WriteString(token + "\n")
+			cerr = f.Close()
+			if werr != nil || cerr != nil {
+				os.Remove(path)
+				return nil, fmt.Errorf("write resolution claim: %w", errors.Join(werr, cerr))
+			}
+			// Confirm the claim on disk is still OURS. A concurrent stealer that
+			// judged an older claim stale could have removed this one between the
+			// create and now; if so it owns the resolution and we do not.
+			if got, rerr := os.ReadFile(path); rerr != nil || strings.TrimSpace(string(got)) != token {
+				return nil, errParkBusy
+			}
+			return func() { os.Remove(path) }, nil
+		}
+		if !os.IsExist(cerr) {
+			return nil, fmt.Errorf("create resolution claim: %w", cerr)
+		}
+		if pk, rerr := readPark(dir); rerr == nil && pk.ResolvedAt != "" {
+			os.Remove(path) // vestigial; tidy up so it stops looking like a holder
+			return nil, errParkResolved
+		}
+		fi, serr := os.Stat(path)
+		if serr != nil {
+			continue // vanished between the create and the stat: retry the create
+		}
+		if time.Since(fi.ModTime()) < parkClaimStale {
+			return nil, errParkBusy
+		}
+		os.Remove(path) // holder crashed mid-resolution: steal once, then retry
+	}
+	return nil, errParkBusy
 }
 
 // parsePark decodes and validates park.json's bytes — split from readPark so the
@@ -630,8 +730,15 @@ var errParkBusy = errors.New("another ack or reject is in progress for this run"
 
 // errParkChanged is writeParkCAS's refusal: the record changed under a writer
 // that had already read it. Reported as a conflict rather than resolved by
-// overwriting, because the other writer's decision is the newer one.
+// overwriting, because the other writer's decision is the newer one. A SECONDARY
+// guard since claimPark exists — a resolver that holds the claim is alone.
 var errParkChanged = errors.New("the parking record changed while this ack was running")
+
+// errParkResolved is claimPark's terminal answer: this run has already been
+// acked or rejected, and a resolution happens exactly once. It WRAPS
+// errNotAwaitingAck so both front doors report it as the same 409 they report
+// for any other wrong-state ack, without either having to know about claims.
+var errParkResolved = fmt.Errorf("%w: it has already been resolved", errNotAwaitingAck)
 
 // ackEnv is the environment policy an ack's re-verify runs the recorded
 // verify/resolver commands under. It is NOT recorded in the park (a run's
@@ -711,21 +818,30 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 		// base-moved path below discards it entirely and rebuilds from the fork
 		// point, and refusing that because a commit it never reads looks wrong
 		// would strand a perfectly recoverable park.
+		// THE SERIALIZATION POINT: an atomic one-shot claim on this run's single
+		// terminal transition, taken before anything is decided and released only
+		// once it is committed. This — not the advisory lock, and not the CAS — is
+		// what makes `rejected` terminal, and it holds on every platform because
+		// O_EXCL create is atomic in the filesystem. See claimPark.
+		unclaim, cerr := claimPark(dir)
+		if cerr != nil {
+			return ackOutcome{}, cerr
+		}
+		defer unclaim()
+		// Revalidate UNDER the claim: the previous holder may have resolved this
+		// run and released between our status read above and the claim.
+		if err := recheckResolvable(dir, &raw, &pk); err != nil {
+			return ackOutcome{}, err
+		}
 		if err := validateParkedLanding(ctx, g, pk); err != nil {
 			return ackOutcome{}, err
 		}
 		pk.LandedSHA = pk.VerifiedSHA
 		pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
-		// THE SERIALIZATION POINT: claim the record BEFORE the ref moves, and
-		// treat losing the claim as fatal. The lock above only NARROWS the race —
-		// it is advisory and, on Windows, absent entirely — so the ordering here
-		// is what actually makes `rejected` terminal: whoever writes park.json
-		// first wins, and a loser's CAS fails against the bytes it read at entry.
-		// Landing first and merely warning on a failed CAS (what this used to do)
-		// meant a reject could complete, tell the operator nothing landed, and
-		// then watch this path advance the ref and overwrite `rejected` with
-		// `done`. Kept structurally identical to ackReverify's commit phase so
-		// nobody has to work out which of the two is the safe one.
+		// Record before the ref moves, so a crash leaves a park claiming a landing
+		// that did not happen (idempotently re-landed by the next ack) rather than
+		// losing the record of one that did. Kept structurally identical to
+		// ackReverify's commit phase so nobody has to work out which is safe.
 		if err := writeParkCAS(dir, raw, pk); err != nil {
 			return ackOutcome{}, fmt.Errorf("claim the parking record (nothing was landed): %w", err)
 		}
@@ -810,19 +926,20 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 			att.Error = "re-verify produced no result"
 		}
 	}
-	// ---- commit phase: everything below decides state, so re-take the lock ----
+	// ---- commit phase: everything below decides state ----
 	// The verify above may have taken minutes. In that window a human may have
 	// rejected this run, or its ack-timeout may have expired and auto-rejected
-	// it. Both must WIN: re-read the status under the lock and refuse to land
-	// against it, and compare-and-swap the record so a stale write cannot erase
-	// the reason someone else recorded.
-	unlock, ok := lockPark(dir)
-	if !ok {
-		return ackOutcome{}, errParkBusy
+	// it. Both must WIN. THE SERIALIZATION POINT is the same atomic one-shot
+	// claim ackRun's direct-land branch takes (see claimPark) — it covers the RED
+	// path too, so an attempt record can never interleave with somebody else's
+	// resolution either.
+	unclaim, cerr := claimPark(dir)
+	if cerr != nil {
+		return ackOutcome{}, cerr
 	}
-	defer unlock()
-	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
-		return ackOutcome{}, fmt.Errorf("%w (status %s changed while the re-verify was running; nothing was landed)", errNotAwaitingAck, st)
+	defer unclaim()
+	if err := recheckResolvable(dir, &raw, &pk); err != nil {
+		return ackOutcome{}, fmt.Errorf("%w (it changed while the re-verify was running; nothing was landed)", err)
 	}
 
 	// The keep-alive ref must cover the NEW commit before anything else: from
@@ -854,14 +971,12 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 	if terr != nil {
 		return ackOutcome{}, fmt.Errorf("tree of re-verified %s: %w", short(finalSHA), terr)
 	}
-	// THE SERIALIZATION POINT, exactly as in ackRun's direct-land branch: claim
-	// the record BEFORE moving the ref, and treat losing the claim as fatal. The
-	// lock only narrows the race (advisory, and absent on Windows); this ordering
-	// is what makes `rejected` terminal. It also orders the crash window the
-	// survivable way — a crash between the two leaves a park that says it landed
-	// when it did not, which the next ack resolves idempotently (the base is
-	// unchanged, so it re-lands the same commit), whereas the reverse order
-	// would lose the record of a landing that really happened.
+	// Record before the ref moves, exactly as in ackRun's direct-land branch —
+	// under the resolution claim taken above. That ordering also puts the crash
+	// window on the survivable side: a crash between the two leaves a park that
+	// says it landed when it did not, which the next ack resolves idempotently
+	// (the base is unchanged, so it re-lands the same commit), whereas the
+	// reverse order would lose the record of a landing that really happened.
 	pk.VerifiedSHA, pk.VerifiedTree, pk.BaseSHA = finalSHA, tree, current
 	pk.LandedSHA = finalSHA
 	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
@@ -878,6 +993,26 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 		RunID: runID, Status: "done", LandedSHA: finalSHA, Reverified: true, Attempts: att.N,
 		Message: fmt.Sprintf("base had moved to %s; re-verified green and landed %s", short(current), short(finalSHA)),
 	}, nil
+}
+
+// recheckResolvable re-reads a run's status and parking record while the caller
+// holds the resolution claim, refreshing both in place. It is what turns the
+// claim into a real gate: the claim can be won moments after a PREVIOUS holder
+// resolved the run and released, so holding it proves only that nobody else is
+// resolving right now — not that the run still needs resolving.
+func recheckResolvable(dir string, raw *[]byte, pk **parkJSON) error {
+	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
+		return fmt.Errorf("%w (status %s)", errNotAwaitingAck, st)
+	}
+	freshRaw, fresh, err := readParkAt(dir)
+	if err != nil {
+		return fmt.Errorf("re-read parking record: %w", err)
+	}
+	if fresh.ResolvedAt != "" {
+		return errParkResolved
+	}
+	*raw, *pk = freshRaw, fresh
+	return nil
 }
 
 // validateParkedLanding re-checks a recorded landing against the LIVE object
@@ -928,18 +1063,19 @@ func validateParkedLanding(ctx context.Context, g *gitx.Git, pk *parkJSON) error
 // never a decision to destroy the work. reason is optional and recorded verbatim.
 func rejectRun(ctx context.Context, g *gitx.Git, dir, actor, reason string) (ackOutcome, error) {
 	runID := filepath.Base(dir)
-	enforceParkTimeout(ctx, g, dir) // takes the same lock; must run before we hold it
-	unlock, ok := lockPark(dir)
-	if !ok {
-		return ackOutcome{}, errParkBusy
+	enforceParkTimeout(ctx, g, dir) // claims in its own right; must run before we hold one
+	// THE SERIALIZATION POINT, the same atomic one-shot claim both ack paths
+	// take: a rejection is a terminal resolution, and a run resolves exactly
+	// once. See claimPark.
+	unclaim, cerr := claimPark(dir)
+	if cerr != nil {
+		return ackOutcome{}, cerr
 	}
-	defer unlock()
-	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
-		return ackOutcome{}, fmt.Errorf("%w (status %s)", errNotAwaitingAck, st)
-	}
-	raw, pk, err := readParkAt(dir)
-	if err != nil {
-		return ackOutcome{}, fmt.Errorf("read parking record: %w", err)
+	defer unclaim()
+	var raw []byte
+	var pk *parkJSON
+	if err := recheckResolvable(dir, &raw, &pk); err != nil {
+		return ackOutcome{}, err
 	}
 	pk.RejectReason = strings.TrimSpace(reason)
 	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
@@ -977,16 +1113,19 @@ func enforceParkTimeout(ctx context.Context, g *gitx.Git, dir string) bool {
 	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
 		return false // cheap pre-check: skip the lock entirely for the common case
 	}
-	unlock, ok := lockPark(dir)
-	if !ok {
+	// An auto-rejection is a terminal resolution like any other, so it takes the
+	// same atomic one-shot claim (see claimPark). A claim it cannot get means
+	// somebody else is resolving this run right now: skip, which is exactly the
+	// right answer for a check whose whole contract is "true before anyone can
+	// observe otherwise".
+	unclaim, cerr := claimPark(dir)
+	if cerr != nil {
 		return false
 	}
-	defer unlock()
-	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
-		return false
-	}
-	raw, pk, err := readParkAt(dir)
-	if err != nil {
+	defer unclaim()
+	var raw []byte
+	var pk *parkJSON
+	if err := recheckResolvable(dir, &raw, &pk); err != nil {
 		return false
 	}
 	deadline, ok := pk.deadline()

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1523,75 +1524,6 @@ func TestWriteParkCASRefusesAStaleWrite(t *testing.T) {
 	}
 }
 
-// TestRejectBeatsAckWithNoLockAtAll is the platform-independent proof for the
-// direct-land (base-UNCHANGED) path — the ORDINARY ack, and the one that used to
-// land first and only warn when its record write lost.
-//
-// lockPark is stubbed to a no-op, which is exactly how Windows degrades: pidAlive
-// reports every pid dead there, so every caller steals the lock and there is no
-// mutual exclusion whatsoever. The guarantee under test does not depend on the
-// lock — it is the ordering, "claim the record before moving the ref, and fail if
-// the claim is lost". So this asserts the operator-facing invariant directly:
-//
-//	if reject returned success, the ref did not move.
-//
-// It says nothing about WHICH racer wins (that is genuinely a race); it asserts
-// that whatever the outcome, the two never both succeed.
-func TestRejectBeatsAckWithNoLockAtAll(t *testing.T) {
-	restore := lockPark
-	lockPark = func(string) (func(), bool) { return func() {}, true }
-	t.Cleanup(func() { lockPark = restore })
-
-	for i := 0; i < 12; i++ {
-		f := newParkFixture(t, parkPolicyAckPaths)
-		ctx := context.Background()
-		before := f.head()
-
-		var ackOut ackOutcome
-		var ackErr error
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			ackOut, ackErr = ackRun(ctx, f.cell, f.dir, "http", ackEnv{Mode: envModeInherit})
-		}()
-		rejOut, rejErr := rejectRun(ctx, f.g, f.dir, "cli", "no thanks")
-		<-done
-
-		head := f.head()
-		moved := head != before
-		switch {
-		case rejErr == nil && ackErr == nil:
-			t.Fatalf("iteration %d: reject AND ack both succeeded (reject=%+v ack=%+v)", i, rejOut, ackOut)
-		case rejErr == nil:
-			// The operator was told the run was rejected and nothing landed.
-			// That must be true.
-			if moved {
-				t.Fatalf("iteration %d: reject succeeded but the ref advanced to %s", i, short(head))
-			}
-			if f.status() != statusRejected {
-				t.Fatalf("iteration %d: reject succeeded but final status is %q", i, f.status())
-			}
-			if pk := f.reread(); pk.RejectReason != "no thanks" || pk.LandedSHA != "" {
-				t.Fatalf("iteration %d: the losing ack corrupted the rejection: %+v", i, pk)
-			}
-		case ackErr == nil:
-			// The ack won; then it really landed and the run is done.
-			if !moved || head != ackOut.LandedSHA {
-				t.Fatalf("iteration %d: ack reported landing %s but main is at %s", i, short(ackOut.LandedSHA), short(head))
-			}
-			if f.status() != "done" {
-				t.Fatalf("iteration %d: ack succeeded but final status is %q", i, f.status())
-			}
-		default:
-			// Both refused (each lost the record claim to the other's write).
-			// Nothing may have landed.
-			if moved {
-				t.Fatalf("iteration %d: both ack and reject failed but the ref advanced to %s", i, short(head))
-			}
-		}
-	}
-}
-
 // TestGCSweepsStrandedParkRefsOnly covers the keep-alive ref's other end. The
 // ref is released only AFTER a resolution is durably recorded — the correct
 // order — so a crash in that gap strands one. Nothing else sweeps
@@ -1648,5 +1580,258 @@ func TestGCSweepsStrandedParkRefsOnly(t *testing.T) {
 	}
 	if _, err := gcPlanFor(ctx, f2.g, -time.Hour, true); err == nil {
 		t.Fatal("gc planned a sweep despite an unreadable parking record")
+	}
+}
+
+// rearm restores the fixture to its just-parked state: base ref back where the
+// park was verified against, keep-alive ref re-pointed, a pristine copy of the
+// record, status awaiting-ack, and both the lock and the resolution claim
+// cleared. It exists so the ack/reject race can be run a hundred times without
+// paying for a full agent run each iteration — the state it writes is byte-for-
+// byte what a real park left behind, copied from one.
+func (f *parkFixture) rearm(pristine *parkJSON) {
+	f.t.Helper()
+	ctx := context.Background()
+	for _, name := range []string{parkClaimName, parkLockName} {
+		if err := os.Remove(filepath.Join(f.dir, name)); err != nil && !os.IsNotExist(err) {
+			f.t.Fatal(err)
+		}
+	}
+	if err := f.g.UpdateRef(ctx, "refs/heads/"+pristine.Base, pristine.BaseSHA); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := f.g.UpdateRef(ctx, pristine.KeepRef, pristine.VerifiedSHA); err != nil {
+		f.t.Fatal(err)
+	}
+	fresh := *pristine
+	if err := writePark(f.dir, &fresh); err != nil {
+		f.t.Fatal(err)
+	}
+	writeRunStatus(f.dir, statusAwaitingAck, "")
+}
+
+// parkRaceIterations is deliberately far past the point where one lucky
+// scheduling decision could hide the bug. CI caught the old code on iteration 0
+// of twelve; this runs 100 iterations WITH the window forced open, so a pass
+// means the guarantee holds rather than that the race happened not to land.
+const parkRaceIterations = 100
+
+// TestRejectAndAckNeverBothSucceed is the platform-independent proof for the
+// direct-land (base-UNCHANGED) path — the ORDINARY ack.
+//
+// Two things make it brutal rather than hopeful:
+//
+//   - lockPark is stubbed to a no-op, which is exactly how Windows degrades
+//     (pidAlive reports every pid dead there, so every caller steals it and there
+//     is no mutual exclusion whatsoever). The guarantee must not depend on it.
+//   - parkCASDelay holds writeParkCAS's read-compare-write window open for
+//     milliseconds, so the interleaving a loaded CI runner produces by scheduler
+//     preemption is FORCED on every iteration instead of hoped for. Under the
+//     pre-claim code that made both racers compare against unchanged bytes and
+//     both proceed; under claimPark, widening it changes nothing, because the
+//     winner was already decided by an atomic O_EXCL create.
+//
+// It asserts the operator-facing invariant, not a winner — which racer wins is
+// genuinely a race:
+//
+//	reject reported success  =>  the ref did not move.
+//	ack reported success     =>  it really landed, and the run is done.
+//	both reported success    =>  FAILURE. That is the catastrophe.
+func TestRejectAndAckNeverBothSucceed(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	pristine := f.reread()
+
+	restoreLock := lockPark
+	lockPark = func(string) (func(), bool) { return func() {}, true }
+
+	// A RENDEZVOUS, not a sleep. A fixed delay only produces the overlap if it
+	// happens to exceed how much further ahead one racer is, which varies by
+	// machine — the same "the timing will surely work out" reasoning that let the
+	// original bug reach CI. This instead holds the first racer inside the window
+	// until the second one is also inside it, so when both get here they are
+	// guaranteed to overlap on any hardware. It gives up after a moment, which is
+	// what happens once claimPark is doing its job and only one racer ever
+	// arrives.
+	var mu sync.Mutex
+	inWindow := 0
+	parkCASDelay = func() {
+		mu.Lock()
+		inWindow++
+		mu.Unlock()
+		deadline := time.Now().Add(120 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			n := inWindow
+			mu.Unlock()
+			if n >= 2 {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	t.Cleanup(func() { lockPark, parkCASDelay = restoreLock, nil })
+
+	ackWon, rejWon, neither := 0, 0, 0
+	for i := 0; i < parkRaceIterations; i++ {
+		f.rearm(pristine)
+		mu.Lock()
+		inWindow = 0
+		mu.Unlock()
+		ctx := context.Background()
+		before := f.head()
+
+		var ackOut ackOutcome
+		var ackErr error
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ackOut, ackErr = ackRun(ctx, f.cell, f.dir, "http", ackEnv{Mode: envModeInherit})
+		}()
+		_, rejErr := rejectRun(ctx, f.g, f.dir, "cli", "no thanks")
+		<-done
+
+		head := f.head()
+		moved := head != before
+		switch {
+		case rejErr == nil && ackErr == nil:
+			t.Fatalf("iteration %d: reject AND ack both succeeded — an operator was told nothing landed while %s landed",
+				i, short(ackOut.LandedSHA))
+		case rejErr == nil:
+			rejWon++
+			if moved {
+				t.Fatalf("iteration %d: reject succeeded but the ref advanced to %s", i, short(head))
+			}
+			if f.status() != statusRejected {
+				t.Fatalf("iteration %d: reject succeeded but final status is %q", i, f.status())
+			}
+			if pk := f.reread(); pk.RejectReason != "no thanks" || pk.LandedSHA != "" {
+				t.Fatalf("iteration %d: the losing ack corrupted the rejection: %+v", i, pk)
+			}
+		case ackErr == nil:
+			ackWon++
+			if !moved || head != ackOut.LandedSHA {
+				t.Fatalf("iteration %d: ack reported landing %s but main is at %s", i, short(ackOut.LandedSHA), short(head))
+			}
+			if f.status() != "done" {
+				t.Fatalf("iteration %d: ack succeeded but final status is %q", i, f.status())
+			}
+		default:
+			neither++
+			if moved {
+				t.Fatalf("iteration %d: both failed but the ref advanced to %s", i, short(head))
+			}
+		}
+	}
+	t.Logf("%d iterations: ack won %d, reject won %d, neither %d", parkRaceIterations, ackWon, rejWon, neither)
+	// Deliberately NOT asserting that each side wins at least once: which racer
+	// wins is genuinely timing-dependent, and an assertion on it would be the
+	// same flaky reasoning this whole test exists to replace. What keeps the test
+	// honest is the negative control — stubbing claimPark to a no-op makes it
+	// fail — plus the barrier above, which guarantees the windows overlap
+	// whenever both racers reach them.
+}
+
+// TestClaimParkIsAtomicAndRecovers pins the three properties the resolution
+// claim must have, none of which may depend on pidAlive — the thing that
+// degrades on Windows.
+func TestClaimParkIsAtomicAndRecovers(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	pristine := f.reread()
+
+	// (1) Exclusive, by O_EXCL alone: no pid is consulted anywhere here.
+	release, err := claimPark(f.dir)
+	if err != nil {
+		t.Fatalf("claimPark: %v", err)
+	}
+	if _, err := claimPark(f.dir); !errors.Is(err, errParkBusy) {
+		t.Fatalf("a second concurrent claim returned %v, want errParkBusy", err)
+	}
+	release()
+	release2, err := claimPark(f.dir)
+	if err != nil {
+		t.Fatalf("claim after release: %v", err)
+	}
+	release2()
+
+	// (1b) Exclusive under real concurrency with lockPark stubbed away: many
+	// simultaneous claimants, and holding is mutually exclusive throughout.
+	restoreLock := lockPark
+	lockPark = func(string) (func(), bool) { return func() {}, true }
+	t.Cleanup(func() { lockPark = restoreLock })
+	var mu sync.Mutex
+	concurrent, maxConcurrent, got := 0, 0, 0
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rel, err := claimPark(f.dir)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			got++
+			concurrent++
+			if concurrent > maxConcurrent {
+				maxConcurrent = concurrent
+			}
+			mu.Unlock()
+			time.Sleep(3 * time.Millisecond)
+			mu.Lock()
+			concurrent--
+			mu.Unlock()
+			rel()
+		}()
+	}
+	wg.Wait()
+	if got == 0 {
+		t.Fatal("no claimant ever got the claim")
+	}
+	if maxConcurrent != 1 {
+		t.Fatalf("%d claimants held the claim at once; it must be exclusive", maxConcurrent)
+	}
+
+	// (2) A crash mid-resolution must not wedge the park permanently. A FRESH
+	// claim is respected; one older than the threshold, over an UNRESOLVED park,
+	// is stolen.
+	claimPath := filepath.Join(f.dir, parkClaimName)
+	if err := os.WriteFile(claimPath, []byte("99999 1 whenever\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimPark(f.dir); !errors.Is(err, errParkBusy) {
+		t.Fatalf("a FRESH claim was not respected: %v", err)
+	}
+	old := time.Now().Add(-parkClaimStale - time.Minute)
+	if err := os.Chtimes(claimPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	rel3, err := claimPark(f.dir)
+	if err != nil {
+		t.Fatalf("a claim left by a crashed resolver was not stolen: %v", err)
+	}
+	rel3()
+
+	// (3) An already-resolved park is terminal, even with a claim file present.
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "done with it"); err != nil {
+		t.Fatalf("rejectRun: %v", err)
+	}
+	if err := os.WriteFile(claimPath, []byte("99999 2 whenever\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := claimPark(f.dir); !errors.Is(err, errParkResolved) {
+		t.Fatalf("claim on a resolved park returned %v, want errParkResolved", err)
+	}
+	// It surfaces as the ordinary wrong-state conflict, so both front doors
+	// answer 409 without knowing anything about claims.
+	if !errors.Is(errParkResolved, errNotAwaitingAck) {
+		t.Fatal("errParkResolved must wrap errNotAwaitingAck")
+	}
+	// Resolving twice is refused; re-arming makes it resolvable again exactly once.
+	f.rearm(pristine)
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "again"); err != nil {
+		t.Fatalf("a re-armed park should be resolvable: %v", err)
+	}
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "third time"); err == nil {
+		t.Fatal("a resolved park was resolved a second time")
 	}
 }

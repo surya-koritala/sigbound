@@ -1029,19 +1029,26 @@ race — a base-moved ack sits in a re-verify for as long as the repo's verify
 command takes, and a human may well reject it in that window. Two things keep
 the outcome coherent, and it is worth being precise about which does the work:
 
-- **The record write is the serialization point.** Both landing paths claim
-  `park.json` with a compare-and-swap against the bytes they read, *before* the
-  base ref moves, and treat losing that claim as fatal — nothing lands. So
-  whoever writes the record first wins, and the loser fails cleanly instead of
-  overwriting the winner's decision. That is what makes `rejected` terminal, and
-  it holds on every platform.
-- **The lock only narrows the race.** Each run has a lock file in its own run
-  directory, held across processes so `sig ack` on the CLI and a `POST` to a
-  daemon serialize, and stolen automatically if its holder was killed. The ack
-  deliberately releases it for the slow re-verify (holding it would make
-  `sig reject` hang for exactly as long) and re-takes it to commit. On Windows
-  it provides no mutual exclusion at all, since it rests on the same pid
-  liveness probe [crash recovery](#crash-recovery) does.
+- **An atomic one-shot claim decides who resolves.** A run resolves exactly once
+  in its life, so every path that resolves one — ack, reject, timeout — first
+  claims that single transition by creating a file in the run directory with
+  `O_CREATE|O_EXCL`. That is an atomic test-and-set in the filesystem itself on
+  every platform Sigbound runs on: of any number of concurrent claimants exactly
+  one succeeds and the rest are told the run is busy or already resolved. It
+  consults no process ids, so it does not degrade anywhere. **This is what makes
+  `rejected` terminal.**
+- **Everything else only narrows the race.** Both landing paths also write the
+  record before the ref moves, compare-and-swap it against the bytes they read,
+  and re-read the run's status under the claim — each a useful guard, none of
+  them sufficient alone, because read-then-write is not atomic across processes.
+  A separate advisory lock stops two acks from both starting an expensive
+  re-verify; it is released for the slow verify (holding it would make
+  `sig reject` hang for exactly as long) and provides no mutual exclusion on
+  Windows, which is now merely wasteful rather than dangerous.
+
+A resolver killed mid-resolution does not wedge the run: its claim is stolen
+once it is older than a generous threshold, and a claim left over a run that was
+already resolved is recognised as vestigial and reported as such.
 
 The ack also re-reads the run's status immediately before landing, so a run that
 became `rejected` — by a person or by an expired `ack-timeout` — is refused with
