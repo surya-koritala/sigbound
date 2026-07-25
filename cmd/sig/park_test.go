@@ -1345,6 +1345,13 @@ func TestAckRefusesWhenBaseMovesDuringReverify(t *testing.T) {
 	if pk.BaseSHA != moved || pk.VerifiedSHA == f.park.VerifiedSHA {
 		t.Fatalf("the refusal did not re-park the green result against %s: %+v", short(moved), pk)
 	}
+	// The keep-alive ref must follow the re-parked commit. Nothing else
+	// references it, so a pin left behind on the superseded commit would let an
+	// ordinary `git gc` prune the tree the next ack is supposed to land -- the
+	// hazard issue #109 closed, reachable again through the rewrite.
+	if pinned, err := f.cell.Git().RevParse(ctx, pk.KeepRef); err != nil || pinned != pk.VerifiedSHA {
+		t.Fatalf("keep-alive ref %s pins %q (err %v), want the re-parked %s", pk.KeepRef, pinned, err, short(pk.VerifiedSHA))
+	}
 	last := pk.Attempts[len(pk.Attempts)-1]
 	if !last.VerifyOK || last.FinalSHA != pk.VerifiedSHA {
 		t.Fatalf("re-parked record does not carry its green attempt: %+v", last)
