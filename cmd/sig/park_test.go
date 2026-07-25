@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1729,6 +1730,15 @@ func TestRejectAndAckNeverBothSucceed(t *testing.T) {
 	// honest is the negative control — stubbing claimPark to a no-op makes it
 	// fail — plus the barrier above, which guarantees the windows overlap
 	// whenever both racers reach them.
+	//
+	// What it does NOT pin, measured by mutation rather than assumed: removing
+	// the recheckResolvable call under the claim still passes here, and so does
+	// releasing the claim before the ref move. That is a property of the design,
+	// not a hole — the claim and writeParkCAS's compare are two overlapping
+	// guards and either alone closes THIS race. The interleavings only one of
+	// them covers are pinned separately, by
+	// TestAckRefusesAResolvedRecordUnderTheClaim and
+	// TestWriteParkCASRefusesAStaleWrite.
 }
 
 // TestClaimParkIsAtomicAndRecovers pins the three properties the resolution
@@ -1833,5 +1843,330 @@ func TestClaimParkIsAtomicAndRecovers(t *testing.T) {
 	}
 	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "third time"); err == nil {
 		t.Fatal("a resolved park was resolved a second time")
+	}
+}
+
+// ---- park.json durability under concurrent writers ----
+
+// The env vars that turn a re-exec of this test binary into a park writer. The
+// hammer below needs writers in OTHER PROCESSES, not just other goroutines: a
+// shared temp file is contended through the filesystem, and goroutines in one
+// process can be serialized by nothing more than the Go scheduler happening to
+// keep them apart. Real processes on real cores cannot be.
+const (
+	parkWriteDirEnv     = "SIG_TEST_PARK_WRITE_DIR"
+	parkWriteBarrierEnv = "SIG_TEST_PARK_WRITE_BARRIER"
+	parkWriteIDEnv      = "SIG_TEST_PARK_WRITE_ID"
+	parkWriteNEnv       = "SIG_TEST_PARK_WRITE_N"
+)
+
+// parkWriteProbe builds a VALID park record in one of two very different sizes.
+// The size difference is the point: two writers sharing one temp file interleave
+// their bytes in it, and a short record written over a long one leaves the long
+// one's tail behind — which the rename then publishes as park.json. Two writers
+// of identical bytes could corrupt the temp just as often and leave no trace.
+func parkWriteProbe(long bool) *parkJSON {
+	pk := &parkJSON{
+		VerifiedSHA:  strings.Repeat("a", 40),
+		VerifiedTree: strings.Repeat("b", 40),
+		BaseSHA:      strings.Repeat("c", 40),
+		ForkSHA:      strings.Repeat("d", 40),
+		Base:         "main",
+		Reason:       parkReasonAckPaths,
+		CreatedAt:    "2026-01-02T15:04:05Z",
+		Groups:       []parkGroupJSON{{Branches: []string{"sigbound/held"}}},
+	}
+	if long {
+		// Big enough that one writer is still inside its write when another
+		// truncates the shared temp under it — which is the exact mechanism, and
+		// with small records the loser's rename simply fails instead.
+		for i := 0; i < 200; i++ {
+			pk.Attempts = append(pk.Attempts, parkAttemptJSON{
+				N: i + 1, At: pk.CreatedAt, BaseSHA: pk.BaseSHA, Output: strings.Repeat("y", 1200),
+			})
+		}
+	}
+	return pk
+}
+
+// parkWriteBarrier blocks until name appears in the barrier dir. It is a
+// START-ALIGNMENT rendezvous, not a delay: every writer is already loaded and
+// spinning when the file lands, so they begin writing within microseconds of
+// each other on hardware the test does not get to choose. A sleep here would be
+// the "the timing will surely work out" reasoning that let the original race
+// reach CI.
+func parkWriteBarrier(barrier, name string, deadline time.Duration) error {
+	until := time.Now().Add(deadline)
+	for time.Now().Before(until) {
+		if _, err := os.Stat(filepath.Join(barrier, name)); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("barrier %q never opened", name)
+}
+
+// TestParkWriteHelperProcess is not a test. It is the body of the subprocess
+// writers TestWriteParkNeverPublishesATornRecord spawns, and skips out
+// immediately in an ordinary run.
+func TestParkWriteHelperProcess(t *testing.T) {
+	dir := os.Getenv(parkWriteDirEnv)
+	if dir == "" {
+		t.Skip("helper process for TestWriteParkNeverPublishesATornRecord")
+	}
+	barrier := os.Getenv(parkWriteBarrierEnv)
+	n, err := strconv.Atoi(os.Getenv(parkWriteNEnv))
+	if err != nil {
+		t.Fatalf("%s: %v", parkWriteNEnv, err)
+	}
+	id := os.Getenv(parkWriteIDEnv)
+	if err := os.WriteFile(filepath.Join(barrier, "ready."+id), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := parkWriteBarrier(barrier, "go", 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		// Errorf, not Fatalf: a writer that stops early stops contending, and the
+		// parent still needs every other assertion (the reader's, the final parse)
+		// exercised at full concurrency before it looks at exit statuses.
+		if err := writePark(dir, parkWriteProbe(i%2 == 0)); err != nil {
+			t.Errorf("writePark: %v", err)
+		}
+	}
+}
+
+// TestWriteParkNeverPublishesATornRecord is the regression for the fixed temp
+// path. writePark used to write through .park.json.tmp — one name, every writer
+// — so two concurrent writers opened the SAME file, interleaved their bytes, and
+// the rename published the mixture. Not a torn READ, which rename does prevent:
+// a permanently CORRUPT record. Its consequences are all terminal and all silent
+// until someone tries to act on the run: ack fails, reject fails, the timeout
+// sweep cannot resolve it, the run sits in awaiting-ack forever, and because
+// loadParkedBranches fails closed on an unreadable record, `sig gc` aborts for
+// the ENTIRE repository. One wedged park, no garbage collection anywhere.
+//
+// The record is hammered from 24 goroutines and 8 subprocesses at once while a
+// reader parses it continuously, so the assertion is not merely that the final
+// state is good but that no observer ever saw a bad one.
+func TestWriteParkNeverPublishesATornRecord(t *testing.T) {
+	const (
+		goroutines = 24
+		subprocs   = 8
+		writes     = 60
+	)
+	dir, barrier := t.TempDir(), t.TempDir()
+	if err := writePark(dir, parkWriteProbe(false)); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var procs []*exec.Cmd
+	var out []*strings.Builder
+	for i := 0; i < subprocs; i++ {
+		cmd := exec.Command(exe, "-test.run=^TestParkWriteHelperProcess$", "-test.v")
+		cmd.Env = append(os.Environ(),
+			parkWriteDirEnv+"="+dir,
+			parkWriteBarrierEnv+"="+barrier,
+			parkWriteIDEnv+"="+strconv.Itoa(i),
+			parkWriteNEnv+"="+strconv.Itoa(writes),
+		)
+		var sb strings.Builder
+		cmd.Stdout, cmd.Stderr = &sb, &sb
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		procs, out = append(procs, cmd), append(out, &sb)
+	}
+	// Every subprocess is up and spinning on the barrier before anyone writes.
+	for i := 0; i < subprocs; i++ {
+		if err := parkWriteBarrier(barrier, "ready."+strconv.Itoa(i), 60*time.Second); err != nil {
+			t.Fatalf("subprocess %d never started: %v (output: %s)", i, err, out[i].String())
+		}
+	}
+
+	// A reader that never stops looking. Rename is atomic, so anything it fails
+	// to parse was corrupt BEFORE it was published.
+	stop := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				close(readErr)
+				return
+			default:
+			}
+			if _, err := readPark(dir); err != nil {
+				readErr <- err
+				return
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := parkWriteBarrier(barrier, "go", 30*time.Second); err != nil {
+				t.Error(err)
+				return
+			}
+			for j := 0; j < writes; j++ {
+				if err := writePark(dir, parkWriteProbe((i+j)%2 == 0)); err != nil {
+					t.Errorf("writePark: %v", err)
+				}
+			}
+		}(i)
+	}
+	if err := os.WriteFile(filepath.Join(barrier, "go"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	procErr := make([]error, len(procs))
+	for i, cmd := range procs {
+		procErr[i] = cmd.Wait()
+	}
+	close(stop)
+	// The record's own assertions come FIRST and none of them are fatal: a shared
+	// temp file breaks writePark several ways at once (a lost write, a corrupt
+	// publish, a leaked temp) and the point of the test is to say which.
+	if err := <-readErr; err != nil {
+		t.Errorf("a reader observed an unparseable park.json while writers were running: %v", err)
+	}
+	if _, err := readPark(dir); err != nil {
+		t.Errorf("park.json is corrupt after %d concurrent writes: %v", goroutines*writes+subprocs*writes, err)
+	}
+	for i, err := range procErr {
+		if err != nil {
+			t.Errorf("subprocess %d: %v (output: %s)", i, err, out[i].String())
+		}
+	}
+	// And no writer leaked its temp into the run dir, where a reader or `sig gc`
+	// would then have to know to ignore it.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != parkFileName {
+			t.Fatalf("writePark leaked %q into the run dir", e.Name())
+		}
+	}
+}
+
+// plantStaleClaim writes the claim file a resolver that crashed mid-resolution
+// leaves behind, back-dated past parkClaimStale so the next claimant judges it
+// dead. Back-dating, not waiting: the ten-minute threshold is a property of the
+// code under test, never something a test may sit through.
+func (f *parkFixture) plantStaleClaim() {
+	f.t.Helper()
+	path := filepath.Join(f.dir, parkClaimName)
+	if err := os.WriteFile(path, []byte("999999 1 crashed\n"), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+	old := time.Now().Add(-parkClaimStale - time.Minute)
+	if err := os.Chtimes(path, old, old); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// TestFrontDoorsEnforceTimeoutBeforeClaiming pins the ordering the front doors'
+// safety rests on, which was INCIDENTAL and undocumented until it was measured.
+//
+// claimPark's stale-steal path does not guarantee exclusion: two resolvers
+// arriving together, minutes after a crash, can both judge the same claim dead
+// and both steal it (about 5% of rounds under CPU oversubscription). What keeps
+// `sig ack` and `sig reject` off that path is that both call enforceParkTimeout
+// FIRST, and its own claim+release reaps the crashed resolver's claim — so by
+// the time the front door takes its own claim, the file is absent or young, and
+// a young claim is refused rather than stolen. Reorder either call site below
+// its claim and the steal path is live again on the most common path in the
+// feature, which is precisely the sort of silent reopening this test exists to
+// prevent.
+func TestFrontDoorsEnforceTimeoutBeforeClaiming(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths+"ack-timeout = 1h\n")
+	ctx := context.Background()
+	pristine := f.reread()
+
+	// (1) The reaping itself. The park has NOT expired, so the sweep resolves
+	// nothing — but it still claims and releases, and that is what clears a
+	// crashed resolver's claim out of the way of everyone behind it.
+	f.plantStaleClaim()
+	if enforceParkTimeout(ctx, f.g, f.dir) {
+		t.Fatal("a park an hour from its deadline was auto-rejected")
+	}
+	if fi, err := os.Stat(filepath.Join(f.dir, parkClaimName)); err == nil && time.Since(fi.ModTime()) >= parkClaimStale {
+		t.Fatal("the sweep left the crashed resolver's stale claim in place; the next claimPark would have to STEAL it, and stealing is not exclusive")
+	}
+
+	// (2) The ordering, end to end. With the park expired AND a crashed
+	// resolver's claim in the way, both front doors must report an
+	// already-resolved run whose rejection is the TIMEOUT's, not the caller's.
+	// That is only reachable if the sweep ran before the front door's own claim:
+	// with the order reversed, the front door claims first, the sweep is refused,
+	// and the ack LANDS the park it should have found expired.
+	expired := *pristine
+	expired.CreatedAt = time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	for _, door := range []string{"ack", "reject"} {
+		f.rearm(&expired)
+		f.plantStaleClaim()
+		before := f.head()
+
+		var err error
+		if door == "ack" {
+			_, err = ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+		} else {
+			_, err = rejectRun(ctx, f.g, f.dir, "cli", "the operator's own reason")
+		}
+		if !errors.Is(err, errNotAwaitingAck) {
+			t.Fatalf("%s on an expired park returned %v, want errNotAwaitingAck — the timeout sweep did not run before the resolution claim", door, err)
+		}
+		if pk := f.reread(); !strings.Contains(pk.RejectReason, "ack-timeout") {
+			t.Fatalf("%s: rejectReason = %q, want the ack-timeout's — the sweep did not get there first", door, pk.RejectReason)
+		}
+		if got := f.head(); got != before {
+			t.Fatalf("%s: the ref advanced to %s on a park that had already expired", door, short(got))
+		}
+		if f.status() != statusRejected {
+			t.Fatalf("%s: final status %q, want %s", door, f.status(), statusRejected)
+		}
+	}
+}
+
+// TestAckRefusesAResolvedRecordUnderTheClaim pins the ONE thing the
+// recheckResolvable call under ackRun's claim contributes that writeParkCAS
+// cannot: the crash window the commit order deliberately leaves open.
+//
+// Every resolver writes the record first and the status marker second (so a
+// crash cannot lose the record of a landing that happened). A resolver that dies
+// in between therefore leaves a RESOLVED park.json under an awaiting-ack
+// status.json — a durable on-disk state needing no concurrency to reproduce. In
+// it, an arriving ack's early status read passes, and the bytes it read still
+// match disk, so the CAS would pass too. Only re-reading the record under the
+// claim catches it. Delete that call and this ack lands a park an operator
+// already rejected.
+func TestAckRefusesAResolvedRecordUnderTheClaim(t *testing.T) {
+	f := newParkFixture(t, parkPolicyAckPaths)
+	ctx := context.Background()
+
+	pk := f.reread()
+	pk.RejectReason = "an operator rejected this, then the process died"
+	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
+	f.writeParkRaw(pk)
+	writeRunStatus(f.dir, statusAwaitingAck, "") // the marker the crash never advanced
+
+	before := f.head()
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); !errors.Is(err, errNotAwaitingAck) {
+		t.Fatalf("ack over a resolved record returned %v, want errNotAwaitingAck", err)
+	}
+	if got := f.head(); got != before {
+		t.Fatalf("ack landed %s over a record that was already resolved", short(got))
+	}
+	if got := f.reread(); got.LandedSHA != "" || got.RejectReason != pk.RejectReason {
+		t.Fatalf("the refused ack rewrote the resolved record: landedSHA=%q rejectReason=%q", got.LandedSHA, got.RejectReason)
 	}
 }
