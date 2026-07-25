@@ -2779,6 +2779,95 @@ Events marked † are appended to a `sig serve` run's `events.ndjson` **after**
 the run itself finished — an ack can arrive days later — so `run_done` is the
 last event of the RUN, not necessarily the last line in the file.
 
+### Event push
+
+`sig serve -event-url URL` POSTs every event to one HTTP receiver as it is
+emitted, so an integration — a chat notifier, a dashboard, downstream
+automation — doesn't have to poll `GET /runs/{id}/events`:
+
+```sh
+sig serve -repos /work/api,/work/web \
+  -event-url https://hooks.example.com/sigbound \
+  -event-secret-env SIGBOUND_EVENT_SECRET
+```
+
+One POST per event. The body is the event **verbatim**, wrapped in the
+attribution a receiver can't recover from the line itself (events carry no run
+id, and two cells run concurrently):
+
+```json
+{"runId":"20260722T164530Z-a1b2c3d4e5f6","cell":"api-9f2c",
+ "event":{"event":"run_start","ts":"2026-07-22T16:45:30.891Z","repo":"/work/api","base":"main","baseSHA":"4b13b4c…","tasks":[…],"parallelAgents":8}}
+```
+
+The event object is nested rather than merged so it can never collide with the
+envelope's own keys — watch-mode events already carry a `cell` field of their
+own. Watch's daemon-level lines (`watch_*`, see [Watch mode](#watch-mode)) are
+pushed too, with no `runId`: they belong to no single run.
+
+**Delivery is fail-open, and that is the whole contract.** Delivery never
+blocks or fails a run: a receiver that 500s, hangs, or is gone cannot change a
+run's outcome, its duration, or what lands. The queue is 256 events deep,
+drained by ONE goroutine (so a receiver sees events in emission order), and
+each event gets at most 3 attempts — 5s per request, 200ms then 400ms of
+backoff — retried only on a transport error, `429`, or `5xx`; any other `4xx`
+is taken as a verdict on that body and not retried.
+
+Everything that budget can't deliver is **counted, not swallowed**:
+
+```sh
+curl -s localhost:7777/health
+# -> {"ok":true,"version":"…","cells":[…],
+#     "eventPush":{"sent":412,"dropped":7,"failed":2}}
+```
+
+`dropped` is the overflow of a receiver that fell behind the queue; `failed` is
+an event whose retry budget ran out. `sig serve` also prints the tally at
+shutdown. The configured URL is deliberately absent from `/health` — a webhook
+URL is often itself a secret.
+
+**Signature.** With `-event-secret-env NAME` set, every POST carries:
+
+```
+X-Sigbound-Signature: sha256=<hex>
+```
+
+That is the **HMAC-SHA256 of the raw request body bytes**, keyed by the value of
+the env var `NAME` names. Nothing else is in the signing input — no timestamp,
+no header, no canonicalization — so a receiver verifies by HMACing the bytes it
+read, before parsing them:
+
+```python
+expected = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+hmac.compare_digest(expected, request.headers["X-Sigbound-Signature"])
+```
+
+It authenticates the body, **not its freshness**: the same body replays with a
+valid signature, so a receiver that cares dedupes on the event's own `runId` +
+`ts`. Starting with `-event-secret-env` naming an empty variable is a startup
+error rather than a silent downgrade to unsigned.
+
+`-event-url` is validated when the flag is parsed, not at the first POST: the
+scheme must be `http` or `https`, the host non-empty, and credentials in the URL
+are refused (`-event-secret-env` is how you authenticate). Plaintext `http` is
+accepted only for a **loopback** receiver — event bodies carry repo paths,
+branch names and (on `park_failed`) command output, and the HMAC signs the body
+without encrypting it. For a remote receiver use `https`, or terminate TLS at a
+proxy on localhost.
+
+Two limits worth stating plainly:
+
+- **Post-run events (†) are not pushed.** They are appended to the run's
+  `events.ndjson` after `driveRun` returned — an ack can arrive days later, and
+  from `sig ack` on the CLI, where no daemon is running at all.
+- **Shutdown ends delivery.** The delivery goroutine's lifetime is the daemon's:
+  on shutdown it stops, and anything still queued (plus whatever a draining run
+  emits after that) is counted as dropped rather than delivered late.
+
+Each run's `events.ndjson` is written exactly as before — push is a second
+destination, never a replacement, so `GET /runs/{id}/events` stays the complete
+record of a run.
+
 ---
 
 ## GitHub Action

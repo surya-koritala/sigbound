@@ -444,11 +444,17 @@ type runParams struct {
 	// out-of-lane write (a build that needs an unmaterialized file) a failed
 	// agent rather than a silent partial land. See runAgent and docs/USAGE.md.
 	SparseWorktrees bool
-	KeepFailed      bool          // keep a FAILED agent's worktree on disk instead of removing it
-	LogDir          string        // when set, full per-command stdout+stderr logs are written here (see openLog)
-	EventsPath      string        // when set, one JSON event per line is streamed here as the run progresses ("-" = stderr); see eventEmitter
-	AgentTimeout    time.Duration // per-agent command timeout (0 = none); see runAgent
-	AgentRetries    int           // retry a FAILED agent (bad exit or -agent-timeout, never a lane-strict stray) up to this many more times; see runAgentWithRetries
+	KeepFailed      bool   // keep a FAILED agent's worktree on disk instead of removing it
+	LogDir          string // when set, full per-command stdout+stderr logs are written here (see openLog)
+	EventsPath      string // when set, one JSON event per line is streamed here as the run progresses ("-" = stderr); see eventEmitter
+	// EventSink is a SECOND destination for the same event lines, set by `sig
+	// serve -event-url` (see eventpush.go) and nil everywhere else. It composes
+	// with EventsPath rather than replacing it — the run's own events.ndjson is
+	// still written — and it is required never to block or error, so a
+	// misbehaving consumer cannot reach the run through it.
+	EventSink    io.Writer
+	AgentTimeout time.Duration // per-agent command timeout (0 = none); see runAgent
+	AgentRetries int           // retry a FAILED agent (bad exit or -agent-timeout, never a lane-strict stray) up to this many more times; see runAgentWithRetries
 	// ParallelAgents caps how many agents run concurrently -- the fan-out
 	// semaphore in driveRun. 0 (default, including a test's zero-value
 	// runParams{}) keeps today's behavior: the cap is runtime.GOMAXPROCS(0),
@@ -1275,24 +1281,49 @@ func (e *eventEmitter) emit(name string, fields map[string]any) {
 
 // newEventEmitter opens path for -events and returns the emitter plus a
 // closer to defer. "" disables events entirely (nil emitter — every emit
-// call becomes a no-op). "-" streams to stderr (left open; never closed by
-// the returned closer). Any other value is a file path, freshly truncated
-// (an events stream is this run's own trace, not a log to accumulate across
-// runs like -logdir). An open failure is returned as an error so the run
+// call becomes a no-op) UNLESS extra is set. "-" streams to stderr (left open;
+// never closed by the returned closer). Any other value is a file path, freshly
+// truncated (an events stream is this run's own trace, not a log to accumulate
+// across runs like -logdir). An open failure is returned as an error so the run
 // fails early, before any agent runs — same policy as -logdir.
-func newEventEmitter(path string) (*eventEmitter, func(), error) {
+//
+// extra is the optional second destination (`sig serve -event-url`, see
+// eventpush.go); nil means none.
+func newEventEmitter(path string, extra io.Writer) (*eventEmitter, func(), error) {
 	noop := func() {}
+	closer := noop
+	var w io.Writer
 	switch path {
 	case "":
-		return nil, noop, nil
 	case "-":
-		return &eventEmitter{enc: json.NewEncoder(os.Stderr)}, noop, nil
+		w = os.Stderr
 	default:
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 		if err != nil {
 			return nil, noop, fmt.Errorf("-events %s: %w", path, err)
 		}
-		return &eventEmitter{enc: json.NewEncoder(f)}, func() { f.Close() }, nil
+		w, closer = f, func() { f.Close() }
+	}
+	w = teeEvents(w, extra)
+	if w == nil {
+		return nil, noop, nil
+	}
+	return &eventEmitter{enc: json.NewEncoder(w)}, closer, nil
+}
+
+// teeEvents fans an event stream onto a push sink when one is configured,
+// returning nil when neither destination exists (io.MultiWriter over a nil
+// Writer would panic on the first line). The sink goes FIRST because
+// io.MultiWriter stops at the first error: a full -events disk must not also
+// silence delivery, and the sink itself never errors (see eventSink.Write).
+func teeEvents(base, push io.Writer) io.Writer {
+	switch {
+	case push == nil:
+		return base
+	case base == nil:
+		return push
+	default:
+		return io.MultiWriter(push, base)
 	}
 }
 
@@ -1300,7 +1331,7 @@ func newEventEmitter(path string) (*eventEmitter, func(), error) {
 // It is separated from flag parsing so tests can drive it in-process.
 func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport, err error) {
 	runStart := time.Now()
-	emit, closeEvents, err := newEventEmitter(p.EventsPath)
+	emit, closeEvents, err := newEventEmitter(p.EventsPath, p.EventSink)
 	if err != nil {
 		return runReport{}, err
 	}

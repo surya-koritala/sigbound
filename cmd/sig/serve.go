@@ -66,6 +66,13 @@
 // every run's report.json, derived from data driveRun already tracks.
 // Neither is a biller: no price, currency, or external metering call. See
 // docs/USAGE.md's "Quotas and metering" section.
+//
+// EVENT PUSH: -event-url mirrors every run's NDJSON event lines to one HTTP
+// receiver as they are emitted (optionally HMAC-signed via -event-secret-env),
+// so an integration doesn't have to poll GET /runs/{id}/events. Delivery is
+// FAIL-OPEN and can never block or fail a run — a receiver that hangs costs
+// dropped events, counted on GET /health. See eventpush.go and docs/USAGE.md's
+// "Event push" section.
 package main
 
 import (
@@ -157,6 +164,11 @@ type server struct {
 	watchOn     bool
 	watchEvents *eventEmitter
 
+	// Event push (issue #117), nil unless -event-url is set: every run's event
+	// lines (and the watch stream's) are mirrored to one HTTP receiver as they
+	// are emitted. Fail-open by construction — see eventpush.go.
+	eventPush *eventPusher
+
 	mu         sync.Mutex
 	busy       map[string]bool       // cell id -> a run is in flight (per-cell 409)
 	activeRuns int                   // runs in flight across ALL cells (maxConcurrentRuns' 429 counter)
@@ -199,6 +211,15 @@ type serverConfig struct {
 	maxRunTime        time.Duration
 	maxConcurrentRuns int
 	maxParallelAgents int
+
+	// Event push (issue #117): eventURL "" disables it entirely; eventSecret ""
+	// delivers unsigned. The URL is validated at flag-parse time (see
+	// validateEventURL) — newServer only starts the pusher. eventQueue is the
+	// delivery backlog, 0 => eventPushQueue; only a test sets it (see
+	// startEventPusher).
+	eventURL    string
+	eventSecret string
+	eventQueue  int
 }
 
 // newServer opens every repo as a cell (fail-fast on any bad repo) and resolves
@@ -227,6 +248,15 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		busy:              map[string]bool{},
 		runs:              map[string]*runRecord{},
 		queued:            map[string][]string{},
+	}
+	// One pusher per daemon, started here so its goroutine's lifetime is exactly
+	// baseCtx's — it cannot outlive the shutdown that cancels every run.
+	if cfg.eventURL != "" {
+		queue := cfg.eventQueue
+		if queue <= 0 {
+			queue = eventPushQueue
+		}
+		s.eventPush = startEventPusher(baseCtx, cfg.eventURL, cfg.eventSecret, queue)
 	}
 	ctx := context.Background()
 	for _, repo := range cfg.repos {
@@ -347,11 +377,18 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	for i, rc := range s.cells {
 		cells[i] = cellInfo{ID: rc.cell.ID(), Repo: rc.cell.Repo()}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"ok":      true,
 		"version": Version,
 		"cells":   cells,
-	})
+	}
+	// Event-push counters ride here (absent when -event-url isn't set): drops
+	// have to be READABLE, not just recorded, or the fail-open posture becomes
+	// silent loss. See eventPushStats.
+	if st := s.eventPush.stats(); st != nil {
+		resp["eventPush"] = st
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // runRequest is the POST /runs body. Fields mirror `sig run`'s flags by name
@@ -568,6 +605,10 @@ func (s *server) acquireRun(rc *registeredCell, req runRequest, p *runParams) (*
 	s.mu.Unlock()
 
 	p.EventsPath = filepath.Join(dir, "events.ndjson")
+	// Event push (issue #117) mirrors those same lines to -event-url, tagged with
+	// the run and cell a receiver can't infer from the line itself. nil when no
+	// -event-url is configured, which leaves driveRun's emitter untouched.
+	p.EventSink = s.eventPush.sink(runID, cellID)
 	// The run id is the key the spot-audit sample is drawn on (see
 	// auditSelected): a recorded, replayable id, never a fresh random draw.
 	p.RunID = runID
@@ -1821,16 +1862,22 @@ func addrIsLoopback(addr string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("invalid -addr %q: %w", addr, err)
 	}
-	if host == "" {
-		return false, nil
-	}
+	return hostIsLoopback(host), nil
+}
+
+// hostIsLoopback reports whether a bare host (no port) names only this machine.
+// An empty host means "every interface" and is NOT loopback; a name other than
+// localhost is not resolved — an unresolved name is treated as remote, the safe
+// direction for both callers (the bind posture above and -event-url's plaintext
+// rule in validateEventURL).
+func hostIsLoopback(host string) bool {
 	if host == "localhost" {
-		return true, nil
+		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback(), nil
+		return ip.IsLoopback()
 	}
-	return false, nil
+	return false
 }
 
 // serveStartupCheck enforces the network posture before binding: a non-loopback
@@ -1856,7 +1903,7 @@ func serveStartupCheck(addr string, allowRemote, tokenSet bool, tokenEnv string)
 func runServe(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig serve -repos PATH[,PATH...] [-addr HOST:PORT] [-token-env NAME] [-allow-remote] [-env-mode inherit|scoped] [-env-agent NAMES] ...")
+		fmt.Fprintln(fs.Output(), "usage: sig serve -repos PATH[,PATH...] [-addr HOST:PORT] [-token-env NAME] [-allow-remote] [-env-mode inherit|scoped] [-env-agent NAMES] [-event-url URL] ...")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nA single-process, single-user daemon over driveRun. Binds loopback by default;")
 		fmt.Fprintln(fs.Output(), "refuses a non-loopback -addr unless -allow-remote is set, and a non-loopback bind")
@@ -1896,6 +1943,12 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	watchVerify := fs.String("watch-verify", "", "-watch: the verify command every cycle must pass before it lands, composed with the cell policy's own verify battery. "+
 		"Required unless the cell's sigbound.policy declares a verify line; pass `true` to accept landing every cycle unverified")
 	watchMaxRed := fs.Int("watch-max-red", 3, "-watch: exclude a branch after this many consecutive cycles that failed to land it, raising a red-branch inbox entry. Re-pushing the branch clears the count")
+	// Event push (issue #117): mirror the NDJSON event stream to an HTTP
+	// receiver. Delivery is fail-open — see eventpush.go and docs/USAGE.md's
+	// "Event push" section.
+	eventURL := fs.String("event-url", "", "POST every run event to this URL as it is emitted, as {runId, cell, event} JSON. Delivery is fail-open: it never blocks or fails a run, and events a slow or broken receiver can't keep up with are DROPPED and counted (GET /health). "+
+		"http:// is accepted only for a loopback receiver")
+	eventSecretEnv := fs.String("event-secret-env", "", "-event-url: name of the env var holding the shared secret every POST is signed with — "+eventPushSigHeader+": sha256=<hex>, the HMAC-SHA256 of the raw request body. Unset = unsigned deliveries")
 
 	if err := fs.Parse(argv); err != nil {
 		if err == flag.ErrHelp {
@@ -1927,6 +1980,24 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	if err := serveStartupCheck(*addr, *allowRemote, token != "", *tokenEnv); err != nil {
 		return exitOperationalError, err
 	}
+	// Event push: refuse an unusable configuration HERE, not at the first POST.
+	// An empty named secret var is an error rather than a fallback to unsigned:
+	// an operator who asked for signing and silently got none is exactly the
+	// misconfiguration a receiver cannot detect.
+	eventSecret := ""
+	if *eventURL != "" {
+		if err := validateEventURL(*eventURL); err != nil {
+			return exitOperationalError, err
+		}
+	}
+	if *eventSecretEnv != "" {
+		if *eventURL == "" {
+			return exitOperationalError, errors.New("-event-secret-env has nothing to sign without -event-url")
+		}
+		if eventSecret = os.Getenv(*eventSecretEnv); eventSecret == "" {
+			return exitOperationalError, fmt.Errorf("-event-secret-env %s: that env var is empty; set it, or drop the flag to deliver unsigned", *eventSecretEnv)
+		}
+	}
 	// Same cheap git preflight sig run/integrate do before touching a repo.
 	if err := gitx.CheckMinVersion(context.Background(), "git"); err != nil {
 		return exitOperationalError, err
@@ -1951,6 +2022,8 @@ func runServe(w io.Writer, argv []string) (int, error) {
 		maxRunTime:        *maxRunTime,
 		maxConcurrentRuns: *maxConcurrentRuns,
 		maxParallelAgents: *maxParallelAgents,
+		eventURL:          *eventURL,
+		eventSecret:       eventSecret,
 	})
 	if err != nil {
 		return exitOperationalError, err
@@ -1961,7 +2034,10 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	// daemon that is already serving when it discovers it cannot watch.
 	if *watch {
 		s.watchOn = true
-		s.watchEvents = &eventEmitter{enc: json.NewEncoder(w)}
+		// The daemon-level stream goes to stdout AND, when configured, to the
+		// push receiver. Its lines belong to no single run, so they are pushed
+		// with no runId; each already names its own cell.
+		s.watchEvents = &eventEmitter{enc: json.NewEncoder(teeEvents(w, s.eventPush.sink("", "")))}
 		if err := s.startWatch(baseCtx, watchConfig{
 			base:     *watchBase,
 			interval: *watchInterval,
@@ -1986,6 +2062,13 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	fmt.Fprintf(w, "sig serve %s listening on %s — %d cell(s), auth %s\n", Version, ln.Addr(), len(s.cells), authDesc)
 	for _, rc := range s.cells {
 		fmt.Fprintf(w, "  cell %s  %s\n", rc.cell.ID(), rc.cell.Repo())
+	}
+	if s.eventPush != nil {
+		signed := "unsigned"
+		if eventSecret != "" {
+			signed = "signed with $" + *eventSecretEnv
+		}
+		fmt.Fprintf(w, "  event push -> %s (%s)\n", *eventURL, signed)
 	}
 	return s.serve(w, ln, stop)
 }
@@ -2021,6 +2104,12 @@ func (s *server) serve(w io.Writer, ln net.Listener, stop func()) (int, error) {
 		defer cancel()
 		_ = srv.Shutdown(shCtx)
 		s.wg.Wait()
+		// The push tally, once no run can add to it. Printed even when nothing
+		// was dropped: an operator who has to go looking for a loss count is one
+		// who won't find it. The pusher's own goroutine ended with baseCtx.
+		if st := s.eventPush.stats(); st != nil {
+			fmt.Fprintf(w, "sig serve: event push: %d sent, %d dropped, %d failed\n", st.Sent, st.Dropped, st.Failed)
+		}
 		fmt.Fprintln(w, "sig serve: stopped")
 		return exitOK, nil
 	}
