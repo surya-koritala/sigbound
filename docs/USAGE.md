@@ -913,6 +913,156 @@ memory.
 
 ---
 
+## Intents
+
+An intent is a standing statement of work that lives in the repo: what to do,
+which files it may touch, and what "done" means for it. They live one file per
+intent under `intents/`, and `sig run -intent ID` turns one into a run.
+
+```
+intents/
+  cache-honesty.intent
+  issue-42.intent          # written by `sig intent import-github`
+```
+
+The file is a flat `KEY = VALUE` file, the SAME format as
+[`sig.conf`](#config-file) and [`sigbound.policy`](#landing-policy): `#`
+comments, blank lines, and one `key = value` per line (the split is on the first
+`=`, so a value may itself contain `=`).
+
+```
+# intents/cache-honesty.intent
+goal = Make the cache honest.
+goal =
+goal = A hit must never serve an entry whose TTL has passed.
+acceptance = go test ./cache/...
+files = cache/store.go, cache/store_test.go
+priority = 5
+schedule = 24h
+```
+
+The intent's **id is its filename** minus `.intent` (`cache-honesty` above), and
+it must be slug-safe (`A-Za-z0-9._-`) — it becomes the run's task id and part of
+its branch name. Files in `intents/` that don't end in `.intent` are ignored, so
+a README can live alongside them.
+
+### Intent keys
+
+| Key | Meaning |
+|-----|---------|
+| `goal = <text>` | REQUIRED, REPEATABLE. The prose an agent is given as its task prompt; repeated lines are joined with newlines, in file order. |
+| `acceptance = <cmd>` | A verify command for runs started from this intent. APPENDED to the run's verify battery — see below. |
+| `files = <path>[, <path>…]` | REPEATABLE and/or comma-separated. The intent's lane: the exact repo-relative paths a run from it may create or modify, enforced by [`-lanes`](#file-lanes) like any task's declared files. |
+| `priority = N` | Integer, default `0`. Orders `sig intent list`, highest first. Nothing else reads it — it is a hint for whoever picks the next intent, not a queue the driver services. |
+| `schedule = <duration>` | How often this intent wants to run, e.g. `24h`. Parsed, validated and recorded; **acted on by nothing today** — there is no recurring runtime yet. |
+| `issue = N` | The GitHub issue this intent came from, recorded by `sig intent import-github` so a `-publish` command can close it. `sig` never closes an issue itself. |
+
+An UNKNOWN key, a malformed value, or a duplicate scalar key is a hard error
+naming the file, line, and key — the same fail-closed posture `sigbound.policy`
+has. A missing or blank `goal` is likewise an error, not an empty run.
+
+### Running an intent
+
+```
+sig run -repo /work/api -intent cache-honesty -agent-preset claude -verify 'go build ./...'
+```
+
+`-intent` is a task source, mutually exclusive with `-tasks`, `-goal` and
+`-resume`. The intent becomes ONE task — its `goal` is the prompt, its `files`
+are the lane — exactly as a `-tasks` entry with the same two fields would. It is
+not a planner: to fan an intent out across parallel agents, feed its goal to
+`-goal` instead.
+
+Intents are read from the **working tree**, not from the base commit's tree the
+way [`sigbound.policy`](#loaded-from-the-base-sha) is. That is deliberate: an
+intent is INPUT (what to work on), not a gate, so an intent just written by
+`sig intent import-github` can be run before it is committed.
+
+### `acceptance` may only tighten
+
+`acceptance` is the one key that touches the landing bar, and it can only ever
+ADD a way to fail. It is appended to whatever verify the run already has — a
+`-verify` flag and the repo's `sigbound.policy` battery — and the members are
+ANDed, each in its own shell, so any member's failure fails the gate. It never
+replaces a policy member, and no intent file, committed or not, can weaken what
+the repo requires.
+
+One limit, the same one a `-verify` flag has: `-verify-impact` runs a scoped
+command INSTEAD of the verify command, so a run that pairs the two scopes an
+intent's `acceptance` away exactly as it would a `-verify` flag. A policy
+battery is the only thing that suppresses `-verify-impact` (see
+[Flags may only tighten](#flags-may-only-tighten-never-loosen)).
+
+### Attribution
+
+A run started from an intent records its id on the report and manifest as
+`intent`, so a landing traces back to the work that asked for it:
+
+```
+sig log -repo /work/api -sha 9f2c1ab
+# -> commit 9f2c1ab: landed integration commit of run 2026...-a1b2 (intent cache-honesty) (overlay, 1 branch(es)), verify pass
+
+sig log -repo /work/api -json | jq -r 'select(.intent=="cache-honesty") | .id'
+```
+
+The id also rides on the landing note (`-notes`), which is what answers
+`sig log -sha` for a `sig run` invocation — a `sig run` writes no run-history
+directory, `sig serve` does. A `-resume` run carries the resumed manifest's
+intent forward, so a chain of resumes stays attributable to one intent.
+
+### `sig intent list` / `sig intent show`
+
+```
+sig intent list -repo /work/api [-json]
+sig intent show cache-honesty -repo /work/api [-json]
+```
+
+`list` prints every `intents/*.intent`, highest priority first, with the first
+line of each goal. `show` prints one intent AS PARSED — what `sig run -intent`
+would actually run. Both fail loudly on a malformed file rather than skipping
+it; a list that quietly dropped the one file it could not read would
+under-report what the repo is asking for.
+
+### `sig intent import-github`
+
+Turns labeled GitHub issues into intent files, via the [`gh`](https://cli.github.com)
+CLI:
+
+```
+sig intent import-github -repo /work/api [-label sigbound] [-limit 100] [-json]
+```
+
+It runs `gh issue list --label <label> --state open --json number,title,body`
+with `gh`'s working directory set to `-repo`, so `gh` resolves that repo's own
+GitHub remote. Each issue becomes `intents/issue-<N>.intent`, with the issue
+number recorded as `issue` and the title plus body as the `goal` lines. `gh`
+missing from `PATH`, `gh` failing (unauthenticated, no GitHub remote), or `gh`
+printing something other than the requested JSON are each a clear error naming
+what to fix — never a silent zero issues, which reads exactly like "nothing is
+labeled".
+
+The intent id comes from the issue NUMBER, never the title: a title is edited,
+a number is not, and an id that moved when someone retitled an issue would make
+re-import create a second file for the same work.
+
+**Re-import is idempotent, and never clobbers.** A file that already exists is
+SKIPPED — not read, not merged, not overwritten — so local edits always survive
+and re-importing an unchanged issue set changes nothing on disk. The cost of
+that rule, stated plainly: an issue EDITED after import does not re-sync. To
+take the new text, delete the file and import again:
+
+```
+rm intents/issue-42.intent && sig intent import-github -repo /work/api
+```
+
+Two limits worth knowing before you point this at a long issue: the format is
+line-oriented, so a body line's leading indentation is not preserved (prose
+survives; the exact layout of an indented code block does not), and the import
+fills only `issue` and `goal` — `files`, `acceptance`, `priority` and `schedule`
+are yours to add.
+
+---
+
 ## Landing policy
 
 A repo can own its own landing bar. Commit a `sigbound.policy` file at the

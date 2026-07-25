@@ -64,8 +64,12 @@ type logRow struct {
 	// Goal is the natural-language goal a -goal run was launched with. It is
 	// ONLY persisted for serve runs (request.json); a CLI -goal run records
 	// just the planned Tasks, so this is usually empty and Tasks is the handle.
-	Goal  string `json:"goal,omitempty"`
-	Tasks int    `json:"tasks"`
+	Goal string `json:"goal,omitempty"`
+	// Intent is the intents/<id>.intent this run was started from (`sig run
+	// -intent`), empty for every other task source — the handle that attributes
+	// a landing back to the work the repo asked for. See intent.go.
+	Intent string `json:"intent,omitempty"`
+	Tasks  int    `json:"tasks"`
 	// Agents is len(perAgent). AgentCmd is the RESOLVED agent command this run
 	// ran (after any -agent-preset expansion): sigbound records the expanded
 	// command, never the preset name, so this is the honest "which agent" — see
@@ -104,10 +108,15 @@ type logRow struct {
 //	member-flagged            an agent branch set aside as a real conflict
 //	member                    an agent branch of a run that did not land
 type provenance struct {
-	SHA       string `json:"sha"`
-	Landed    bool   `json:"landed"`
-	Role      string `json:"role"`
-	RunID     string `json:"runId,omitempty"` // empty when only a portable note answered
+	SHA    string `json:"sha"`
+	Landed bool   `json:"landed"`
+	Role   string `json:"role"`
+	RunID  string `json:"runId,omitempty"` // empty when only a portable note answered
+	// Intent is the intents/<id>.intent the landing run was started from
+	// (`sig run -intent`), empty for every other task source. It answers "which
+	// intent did this commit come from" — including from a portable landing
+	// note, since the note is the whole report.
+	Intent    string `json:"intent,omitempty"`
 	TaskID    string `json:"taskId,omitempty"`
 	Agent     string `json:"agent,omitempty"` // resolved agent command
 	Branch    string `json:"branch,omitempty"`
@@ -290,6 +299,7 @@ func readLogRow(runsDir, id string) (row logRow, incomplete bool) {
 // fillRowFromReport copies the rendered fields out of a parsed report.
 func fillRowFromReport(row *logRow, rep *runReport) {
 	row.StartedAt = rep.StartedAt
+	row.Intent = rep.Intent
 	row.Tasks = len(rep.Tasks)
 	row.Agents = len(rep.PerAgent)
 	row.AgentCmd = rep.AgentCmd
@@ -363,6 +373,7 @@ func matchProvenance(rep *runReport, sha string) *provenance {
 		}
 		p := &provenance{
 			SHA:       a.SHA,
+			Intent:    rep.Intent,
 			TaskID:    a.ID,
 			Agent:     rep.AgentCmd,
 			Branch:    a.Branch,
@@ -393,6 +404,7 @@ func provenanceFromFinal(rep *runReport, sha string) *provenance {
 		SHA:       sha,
 		Landed:    landed(rep),
 		Role:      "landed-commit",
+		Intent:    rep.Intent,
 		Agent:     rep.AgentCmd,
 		Strategy:  strategyOf(rep),
 		Verify:    verifyVerdict(rep.Verify),
@@ -599,13 +611,18 @@ func logSHA(ctx context.Context, w io.Writer, g *gitx.Git, runsDir, sha string, 
 	return exitOK, nil
 }
 
-// provenanceLine is the one-line human rendering of a provenance result.
+// provenanceLine is the one-line human rendering of a provenance result. The
+// intent clause is appended only when the run recorded one, so a commit landed
+// by a -tasks/-goal run reads exactly as it did before intents existed.
 func provenanceLine(p *provenance) string {
 	run := p.RunID
 	if run == "" {
 		run = "(from commit note, started " + p.StartedAt + ")"
 	} else {
 		run = "run " + run
+	}
+	if p.Intent != "" {
+		run += " (intent " + p.Intent + ")"
 	}
 	switch p.Role {
 	case "landed-commit":
