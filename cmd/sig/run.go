@@ -287,6 +287,13 @@ type runReport struct {
 	// manifest's provenance: WHEN this ran, alongside WHAT ran (the commands
 	// above) and WHERE it landed (BaseSHA / Integrate.FinalSHA).
 	StartedAt string `json:"startedAt"`
+	// Intent is the id of the intents/<id>.intent this run's tasks came from
+	// (see -intent), the handle `sig log` attributes a landing back to. Empty
+	// (and omitted) for a -tasks/-goal run, which came from no intent, so a run
+	// that predates intents reports byte-identical to before this field existed.
+	// A -resume run carries forward whatever intent the manifest it resumed
+	// recorded, so the chain of resumes stays attributable to one intent.
+	Intent string `json:"intent,omitempty"`
 	// Source is WHO started this run, and it is the ONLY field that
 	// distinguishes a `sig serve -watch` cycle from an ordinary POSTed run
 	// (issue #111): watch cycles go through the identical internal path, so
@@ -500,6 +507,13 @@ type runParams struct {
 	// runReport.Source): "watch" for a `sig serve -watch` cycle, empty for
 	// everything else. Provenance only — it never affects what runs or lands.
 	Source string
+	// Intent is the id of the intents/<id>.intent this run's tasks came from
+	// (see -intent and intent.go), recorded on the report/manifest so `sig log`
+	// can attribute the landing to it. Provenance only: the intent's actual
+	// effect on the run — its goal, lane and acceptance command — is already
+	// baked into Tasks and VerifyCmd by the time driveRun sees it, so this
+	// string never changes what runs or lands. Empty for every other task source.
+	Intent string
 	// RunID is `sig serve`'s durable run id for this run (see newRunID), the
 	// key the spot-audit sample is drawn on (auditSelected) — deterministic and
 	// replayable precisely because it is that recorded id, not a fresh random
@@ -579,6 +593,9 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	base := fs.String("base", "main", "base branch the agents fork from and the result lands onto")
 	tasksFile := fs.String("tasks", "", `path to a JSON file: [{"id":"..","prompt":".."}] (mutually exclusive with -goal)`)
 	goal := fs.String("goal", "", "natural-language goal; the -planner turns it into parallel disjoint tasks (mutually exclusive with -tasks)")
+	intentID := fs.String("intent", "", "run the intent of that id from the repo's intents/ directory (mutually exclusive with -tasks/-goal/-resume): its goal becomes the run's single task prompt "+
+		"and its files that task's lane, exactly as a -tasks entry would. The intent's acceptance command, when it has one, is APPENDED to the run's verify battery — it can only tighten "+
+		"the landing bar, never weaken it. The intent id is recorded on the report/manifest, so `sig log` attributes the landing to it. See docs/USAGE.md's Intents section")
 	plannerCmd := fs.String("planner", "", "planner command (run via `sh -c`), required with -goal: reads SIGBOUND_GOAL/SIGBOUND_REPOMAP/SIGBOUND_N/SIGBOUND_PROMPT and writes a JSON task array [{\"id\",\"prompt\"}] to stdout")
 	plannerPreset := fs.String("planner-preset", "", "expand a known planner-harness preset (claude|codex|aider) into -planner's sh -c command; an explicit -planner always overrides its preset. "+
 		"See docs/USAGE.md's Presets section for the exact expansion of each name")
@@ -752,14 +769,14 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	var resumeTasks []taskSpec
 	var resumeBaseSHA string
 	if *resume {
-		if strings.TrimSpace(*tasksFile) != "" || strings.TrimSpace(*goal) != "" {
-			return exitOperationalError, errors.New("-resume does not re-plan: -tasks/-goal must not be passed alongside it — the manifest already recorded the task list")
+		if strings.TrimSpace(*tasksFile) != "" || strings.TrimSpace(*goal) != "" || strings.TrimSpace(*intentID) != "" {
+			return exitOperationalError, errors.New("-resume does not re-plan: -tasks/-goal/-intent must not be passed alongside it — the manifest already recorded the task list")
 		}
 		if strings.TrimSpace(*manifest) == "" {
 			return exitOperationalError, errors.New("-resume requires -manifest pointing at the prior run's manifest")
 		}
 		var rerr error
-		resumeTasks, resumeBaseSHA, rerr = loadResumeManifest(*manifest, explicitFlags, base, strategy, agentCmd, resolverCmd, verifyCmd, repairCmd)
+		resumeTasks, resumeBaseSHA, rerr = loadResumeManifest(*manifest, explicitFlags, base, strategy, agentCmd, resolverCmd, verifyCmd, repairCmd, intentID)
 		if rerr != nil {
 			return exitOperationalError, rerr
 		}
@@ -851,17 +868,24 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		}
 	}
 
-	// Task source: exactly one of -tasks (explicit), -goal (planned), or
-	// -resume (replayed from a manifest — already validated exclusive of
-	// both, above). If both -tasks and -goal are set it is an error rather
-	// than silently ignoring one.
+	// Task source: exactly one of -tasks (explicit), -goal (planned), -intent
+	// (the repo's own statement of work) or -resume (replayed from a manifest —
+	// already validated exclusive of the other three, above). Two sources at once
+	// is an error rather than silently ignoring one.
 	haveTasks := strings.TrimSpace(*tasksFile) != ""
 	haveGoal := strings.TrimSpace(*goal) != ""
+	haveIntent := strings.TrimSpace(*intentID) != ""
+	sources := 0
+	for _, have := range []bool{haveTasks, haveGoal, haveIntent} {
+		if have {
+			sources++
+		}
+	}
 	switch {
-	case haveTasks && haveGoal:
-		return exitOperationalError, errors.New("-tasks and -goal are mutually exclusive; pass exactly one")
-	case !*resume && !haveTasks && !haveGoal:
-		return exitOperationalError, errors.New("one of -tasks or -goal is required")
+	case sources > 1:
+		return exitOperationalError, errors.New("-tasks, -goal and -intent are mutually exclusive; pass exactly one")
+	case !*resume && sources == 0:
+		return exitOperationalError, errors.New("one of -tasks, -goal or -intent is required")
 	}
 
 	var tasks []taskSpec
@@ -869,6 +893,28 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	switch {
 	case *resume:
 		tasks = resumeTasks
+	case haveIntent:
+		// An intent is ONE task: its goal is the prompt and its files are the
+		// lane, the same two fields a -tasks entry carries — the intent file is
+		// just where they were written down. Its acceptance command is appended
+		// to whatever verify the run already has, so it composes with the repo's
+		// sigbound.policy battery through resolvePolicy's ordinary flag path:
+		// tighten-only, in a nested shell per member (joinVerifyBattery), never
+		// replacing a member. -resume never reaches here (it is rejected above),
+		// so a resumed run cannot append this command a second time on top of the
+		// already-composed verify its manifest recorded.
+		it, ierr := loadIntent(*repo, strings.TrimSpace(*intentID))
+		if ierr != nil {
+			return exitOperationalError, ierr
+		}
+		tasks = []taskSpec{{ID: it.ID, Prompt: it.Goal, Files: it.Files}}
+		if acc := strings.TrimSpace(it.Acceptance); acc != "" {
+			battery := []string{acc}
+			if strings.TrimSpace(*verifyCmd) != "" {
+				battery = append(battery, *verifyCmd)
+			}
+			*verifyCmd = joinVerifyBattery(battery)
+		}
 	case haveTasks:
 		tasks, err = loadTasks(*tasksFile)
 		if err != nil {
@@ -970,6 +1016,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		Manifest:        manifestPath,
 		Resume:          *resume,
 		ResumeBaseSHA:   resumeBaseSHA,
+		Intent:          strings.TrimSpace(*intentID),
 		EnvMode:         *envMode,
 		EnvAgent:        splitCSV(*envAgent),
 		EnvResolver:     splitCSV(*envResolver),
@@ -1142,7 +1189,14 @@ func loadTasks(path string) ([]taskSpec, error) {
 // set runRun already threads through -config's precedence, so a config-file
 // choice counts as explicit here too. This is what gives -resume its
 // documented precedence: command-line flag > manifest.
-func loadResumeManifest(path string, explicit map[string]bool, base, strategy, agentCmd, resolverCmd, verifyCmd, repairCmd *string) ([]taskSpec, string, error) {
+//
+// intentID is the one field that is NOT a flag precedence question: -intent is
+// rejected alongside -resume (a resume never re-derives tasks), so this only
+// ever carries the prior run's recorded intent id forward for ATTRIBUTION. The
+// intent file is deliberately not re-read — its acceptance command is already
+// composed into the manifest's recorded verify, and re-appending it would run
+// that member twice.
+func loadResumeManifest(path string, explicit map[string]bool, base, strategy, agentCmd, resolverCmd, verifyCmd, repairCmd, intentID *string) ([]taskSpec, string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, "", fmt.Errorf("-resume: read -manifest %s: %w", path, err)
@@ -1175,6 +1229,7 @@ func loadResumeManifest(path string, explicit map[string]bool, base, strategy, a
 	if !explicit["repair"] && !explicit["repair-preset"] && prior.RepairCmd != "" {
 		*repairCmd = prior.RepairCmd
 	}
+	*intentID = prior.Intent
 	return prior.Tasks, prior.BaseSHA, nil
 }
 
@@ -1357,6 +1412,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		Version:        Version,
 		StartedAt:      runStart.UTC().Format(time.RFC3339),
 		Source:         p.Source,
+		Intent:         p.Intent,
 		Policy:         policyReport(pol),
 	}
 	emit.emit("run_start", map[string]any{"repo": p.Repo, "base": p.Base, "baseSHA": baseSHA, "tasks": tasks, "parallelAgents": parallelAgents})

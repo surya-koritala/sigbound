@@ -82,6 +82,14 @@ func main() {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "intent":
+		code, err := runIntent(os.Stdout, os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sig intent:", err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "replay":
 		code, err := runReplay(os.Stdout, os.Args[2:])
 		if err != nil {
@@ -132,6 +140,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  sig doctor    [-repo PATH]")
 	fmt.Fprintln(w, "  sig gc        -repo PATH [-older-than 72h] [-delete] [-force] [-json]  (sweep debris a crashed run left; dry-run by default; see 'sig gc -h')")
 	fmt.Fprintln(w, "  sig log       -repo PATH [-limit 50] [-sha COMMIT | -task ID] [-json]  (read-only run history + commit provenance; see 'sig log -h')")
+	fmt.Fprintln(w, "  sig intent    list|show ID|import-github -repo PATH  (the repo's intents/*.intent statements of work; run one with 'sig run -intent ID')")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))
 }

@@ -4,7 +4,9 @@ package main
 // the auto-planner's plan JSON (parsePlan — arbitrary model output, the highest
 // value target here), the path-validation predicates it depends on (relSafe,
 // slugSafe), the -config flags-file parser (parseConfigFile — an external
-// text file, hand-edited or generated), -verify-impact's `go list -json`
+// text file, hand-edited or generated), the intents/*.intent parser
+// (parseIntent — hand-edited, or rendered from whatever a GitHub issue body
+// said by `sig intent import-github`), -verify-impact's `go list -json`
 // output parser (parseGoListJSON — an external command's stdout), and
 // -semantic go's Go source extractor (extractFileSymbols — a git blob
 // holding whatever an agent committed). parsePlan is
@@ -251,6 +253,60 @@ func FuzzParsePolicy(f *testing.F) {
 			if strings.TrimSpace(v) == "" {
 				t.Fatalf("accepted an empty verify battery member")
 			}
+		}
+	})
+}
+
+// FuzzParseIntent fuzzes the intents/*.intent parser over (file bytes, id)
+// pairs — a hand-edited file plus a filename-derived id, and `sig intent
+// import-github` additionally feeds it whatever an issue body happened to say.
+// On the ACCEPT path it re-checks what parseIntent documents: the id it was
+// handed is slug-safe and is the id it returns (an intent cannot rename itself
+// through its contents), the goal is non-empty, every declared file is a safe
+// repo-relative path (it becomes a lane), and the scalars stay in their
+// validated ranges. A crasher here would wedge `sig run -intent` on a file
+// someone typed.
+func FuzzParseIntent(f *testing.F) {
+	f.Add([]byte("goal = make the cache honest\n"), "cache")
+	f.Add([]byte("goal = a\ngoal = b\nfiles = a.go, b.go\npriority = 3\nschedule = 24h\nissue = 42\n"), "multi")
+	f.Add([]byte("acceptance = go test ./...\ngoal = g\n"), "acc")
+	f.Add([]byte(""), "empty")                              // no goal
+	f.Add([]byte("# only a comment\n"), "comment")          // no goal
+	f.Add([]byte("goal = g\nnope = 1\n"), "unknown")        // unknown key
+	f.Add([]byte("goal = g\nfiles = /etc/passwd\n"), "abs") // unsafe lane path
+	f.Add([]byte("goal = g\nfiles = ../out.go\n"), "dotdot")
+	f.Add([]byte("goal = g\npriority = 1\npriority = 2\n"), "dup") // duplicate scalar
+	f.Add([]byte("goal = g\nschedule = -1h\n"), "negsched")
+	f.Add([]byte("goal = g\nissue = 0\n"), "zeroissue")
+	f.Add([]byte("goal = g\n"), "../../etc/passwd")  // unsafe id
+	f.Add([]byte("goal = g\n"), "")                  // empty id
+	f.Add([]byte("goal = g\n"), "..")                // dot-dot id
+	f.Add([]byte("goal = x=1 && echo done\n"), "eq") // '=' inside the value
+	f.Add([]byte("goal = g\r\nfiles = a.go\r\n"), "crlf")
+	f.Add([]byte("goal = 😀\n"), "emoji")
+	f.Add(append(bytes.Repeat([]byte("goal = g\n"), 5000), []byte("priority = 1\n")...), "many")
+
+	f.Fuzz(func(t *testing.T, data []byte, id string) {
+		it, err := parseIntent(data, id)
+		if err != nil {
+			return // rejecting a malformed intent is the point, as long as it did not panic
+		}
+		if !slugSafe(id) || it.ID != id {
+			t.Fatalf("accepted id %q as %q", id, it.ID)
+		}
+		if strings.TrimSpace(it.Goal) == "" {
+			t.Fatalf("accepted an intent with no goal: %+v", it)
+		}
+		for _, p := range it.Files {
+			if !relSafe(p) {
+				t.Fatalf("accepted unsafe lane path %q", p)
+			}
+		}
+		if it.Schedule < 0 || it.Issue < 0 {
+			t.Fatalf("accepted a negative schedule/issue: %+v", it)
+		}
+		if it.Acceptance != "" && strings.TrimSpace(it.Acceptance) == "" {
+			t.Fatalf("accepted a blank acceptance command")
 		}
 	})
 }
