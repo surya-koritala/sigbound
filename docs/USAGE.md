@@ -876,6 +876,28 @@ An UNKNOWN key, a malformed value, or a duplicate scalar key (a second
 `lanes =` silently overriding the first) is a hard error naming the file, line,
 and key. The file fails closed: a typo can never silently weaken the bar.
 
+### What the battery has to cover
+
+**A verify battery should cover the packages the repo's own changes land in.**
+A battery that builds and vets everything but runs tests over only some of it
+is a gate that can approve a change whose tests never ran — including the tests
+written for that change, which is the case where the green report is most
+convincing and least earned.
+
+The failure mode is quiet, so prefer a package set that cannot drift — the same
+whole-module command CI runs (`go test ./...`, `pytest`, `cargo test`) — over a
+hand-enumerated list, which stops covering each package added after it was
+written and reports nothing about the gap.
+
+Cost is the usual reason a battery gets narrowed, and battery ORDER is the
+cheaper answer than narrowing. Members are ANDed in file order and the first
+failure stops the chain, so put the seconds-long members first: with
+`go build ./...` and `go vet ./...` ahead of it, the slow suite only runs on a
+tree that already compiles and vets clean. Splitting the suite itself into a
+fast member and a slow one is a further option, but it serializes what the test
+runner would otherwise run in parallel — measure both before assuming it is
+cheaper.
+
 ### Loaded from the base SHA
 
 The policy that gates a landing is the one COMMITTED at the base the run lands
