@@ -8,6 +8,106 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-25
+
+The workflow milestone: a repository can now declare its own landing bar, work
+that needs human judgment waits in an inbox instead of blocking a queue, every
+landing is answerable, and the daemon can run the whole loop continuously. The
+engine is unchanged in what it lands -- the verify gate still decides, and what
+lands is still byte-for-byte the tree that passed.
+
+The major version marks a change in what the tool *is*, not a break in how it is
+called: every flag, environment variable, and JSON field from 1.x behaves as it
+did, and a repository with no `sigbound.policy` runs exactly as it did in 1.1.
+Two behaviours changed shape and are called out under Changed.
+
+### Added
+
+- **`sigbound.policy` -- a repo-owned landing bar.** A flat KEY=VALUE file
+  committed to the repository declares what a landing requires: a `verify`
+  battery (repeatable, ANDed), `lanes`, `semantic`, `assert`, `ack-paths`,
+  `audit-sample`, `ack-timeout`, and quota ceilings. It is read from the base
+  commit's tree, so the bar is versioned and landing-gated like any other file,
+  and it is resolved at one call site shared by `sig run` and `sig serve`, so
+  the two cannot drift. Flags may only tighten it: verify commands append to the
+  battery, booleans are floors, quotas take the minimum, and an explicitly
+  weaker flag is a loud error naming both sources. Unknown keys and malformed
+  values are errors naming file, line, and key -- a typo cannot silently weaken
+  a bar. The resolved policy's SHA-256 is recorded in the run manifest.
+
+- **Run parking -- ack and reject for landings that need a human.** A run whose
+  verified landing touches an `ack-paths` match, or whose own changes modify
+  `sigbound.policy`, completes verification and then parks instead of advancing
+  the ref: branches kept, reason recorded, `awaiting-ack` status durable across
+  daemon restarts. `POST /runs/{id}/ack` and `sig ack` release it through one
+  shared function; when the base has not moved the recorded commit is re-checked
+  against the object store and landed byte-for-byte, and when the base has moved
+  the recorded tree is discarded and the parked branches are re-integrated
+  against their own fork point and re-verified under the policy at the new head.
+  `POST /runs/{id}/reject` and `sig reject` are terminal and land nothing.
+  Resolution is claimed atomically, so a reject that wins the claim guarantees
+  nothing lands. The parked commit is pinned by a keep-alive ref under
+  `refs/sigbound/park/` and released when the park resolves.
+
+- **`GET /inbox` and an Inbox tab -- everything waiting on a human, in one
+  place.** Parked landings, flagged conflicts, bisect-dropped groups, repair
+  failures, and audit samples, newest first, filterable by type. Ack and reject
+  are the only mutating controls in the review UI, shown only on parked entries,
+  under the existing auth and CSP posture.
+
+- **Spot audits.** `audit-sample = N%` surfaces a deterministic sample of clean
+  landings as non-blocking inbox entries -- `sha256(runID) mod 100 < N`, so
+  selection is replayable with no RNG. Parked and flagged runs are never sampled.
+
+- **`sig log` -- the run ledger.** `sig log` lists runs newest-first with their
+  goal, agents, verdict, landed SHA, and policy hash; `sig log -sha <commit>`
+  answers which run landed a commit, from which task, by which agent, correctly
+  for overlay, octopus, and bisect-salvaged landings, and attributes commits a
+  bisect dropped rather than reporting them unknown; `sig log -task <id>` follows
+  a task across runs and resumes. `-json` is stable, and `GET /log` and
+  `GET /log/sha/{sha}` mirror the CLI through the same reader. A landing note is
+  trusted only when it concerns the commit being asked about; otherwise
+  resolution falls through to the local manifests.
+
+- **`sig serve -watch` -- continuous integration cycles.** The daemon observes
+  local `agent/*` arrivals, `imported/<worker>/*` bundle refs, and `POST /queue`
+  enqueues, batches them on `-watch-interval` or `-watch-batch`, and drives
+  normal policy-gated runs through the same path a POSTed run takes -- same busy
+  lock, same quotas, same journal, same policy resolution, differing only by
+  `"source": "watch"` in the manifest. A persisted per-cell seen-set makes cycles
+  idempotent; a branch red for `-watch-max-red` consecutive cycles is excluded
+  and posted to the inbox until it is re-pushed; shutdown drains the in-flight
+  cycle.
+
+### Changed
+
+- **`sig integrate` refuses a branch that does not contain the base.** Such a
+  branch's overlay contribution is the *deletion* of everything the base gained
+  since it forked, and the write-set partitioner cannot catch it because that
+  branch's `base...head` diff is empty -- so it previously landed silently and
+  reported success. Every branch is now checked against the base before anything
+  reaches the integrator, for every strategy; one refused branch refuses the
+  whole batch and nothing is written. Branches from `sig import` routinely
+  predate the coordinator's base and must be rebased. See [#130].
+
+- **`sig gc` protects parked runs and reclaims parking refs.** An open park's
+  branches are never candidates regardless of age or `-force`, an unreadable
+  park record aborts the sweep rather than guessing, and parking refs stranded
+  by a crash are reclaimed once their run has resolved.
+
+### Fixed
+
+- Every atomic write -- the park record, the run journal, and the verify cache
+  -- now uses a unique temporary file. A fixed name meant two concurrent writers
+  could tear a record, and a corrupt park record could neither be acked nor
+  rejected and failed `sig gc` closed for the whole repository. On Windows the
+  publishing rename retries briefly when another handle holds the destination.
+
+- Test-only: `sig gc`'s sweep root is injectable, so tests no longer sweep the
+  machine-wide temporary directory and delete the working state of a concurrent
+  test binary.
+
+
 ## [1.1.0] - 2026-07-24
 
 The faster-and-more-reliable milestone: the run pipeline's serial phases go
