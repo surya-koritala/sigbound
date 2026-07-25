@@ -21,9 +21,10 @@ import (
 )
 
 // usageEventRow matches a table row whose first cell is exactly one backticked
-// event name, optionally daggered as post-run. Header and separator rows do not
-// match, and neither does any row of the flag or action-input tables (their
-// first cells carry a leading `-` or a hyphenated name).
+// lower-snake name, optionally daggered as post-run. Header and separator rows
+// do not match. It does NOT on its own exclude the other backtick-first-cell
+// tables in this manual — several of their rows have the same shape — so it is
+// only ever applied to lines already bounded by the Events heading below.
 var usageEventRow = regexp.MustCompile("^\\|\\s*`([a-z_]+)`\\s*(†?)\\s*\\|")
 
 // docEventNames returns every event documented under a heading titled "Events"
