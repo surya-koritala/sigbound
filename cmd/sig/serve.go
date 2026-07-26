@@ -687,20 +687,16 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 		// runRun's partial-report emit) before recording the error.
 		if len(rep.PerAgent) > 0 {
 			writeRunReport(rec.dir, rep)
-			// A driveRun error only ever originates before or exactly at
-			// landing (see driveRun's err returns), so the ref never
-			// advanced — Landed is unconditionally false here, unlike
-			// computeUsage's report-field heuristic (accurate only for a
-			// completed, non-erroring driveRun return, i.e. the path below).
-			u := computeUsage(rec.dir, &rep, time.Since(rec.startedAt).Milliseconds())
-			u.Landed = false
-			writeRunUsage(rec.dir, u)
+			// Non-nil err forces Landed false — the ref never advanced. The rule
+			// and the reasoning live in recordRunUsage, shared with `sig run` so
+			// the two drive paths cannot record the same failure differently.
+			recordRunUsage(rec.dir, &rep, rec.startedAt, err)
 		}
 		s.failRun(rec, err.Error())
 		return
 	}
 	writeRunReport(rec.dir, rep)
-	writeRunUsage(rec.dir, computeUsage(rec.dir, &rep, time.Since(rec.startedAt).Milliseconds()))
+	recordRunUsage(rec.dir, &rep, rec.startedAt, nil)
 	// Parking (issue #109): a run that verified a landing but deliberately did
 	// not advance the ref is NOT done — it is awaiting a human. finishRunDir owns
 	// the record-before-marker ordering that makes that durable, shared with `sig
@@ -918,7 +914,7 @@ func (s *server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 // same way an unknown run does when the id doesn't resolve to any run dir,
 // and separately 404s (with a distinguishing message) when the dir exists
 // but usage.json doesn't yet — a still-running run, or one that errored
-// before any agent ran (see execRun's writeRunUsage gating).
+// before any agent ran (see execRun's recordRunUsage gating).
 func (s *server) handleRunUsage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validRunID(id) {
