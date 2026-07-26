@@ -827,7 +827,7 @@ func TestPolicyInitNoClobberSymlink(t *testing.T) {
 // workflowscan.go guarded only \r\n before).
 func TestScanWorkflowControlByteRefused(t *testing.T) {
 	data := []byte("on: [push]\njobs:\n  t:\n    steps:\n      - run: go test ./...\x00rm -rf /\n")
-	sc := scanWorkflow(".github/workflows/ci.yml", data)
+	sc := scanWorkflow(".github/workflows/ci.yml", data, "main")
 	if len(sc.Commands) != 0 {
 		t.Fatalf("a command with a NUL was emitted: %q", sc.Commands)
 	}
@@ -1028,7 +1028,7 @@ func FuzzScanWorkflow(f *testing.F) {
 	// draft was asserted to be text (assertRenderIsText).
 	f.Add([]byte("on: push\njobs:\n 0:\n  steps:\n   - run: \x7f"))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		sc := scanWorkflow(".github/workflows/f.yml", data)
+		sc := scanWorkflow(".github/workflows/f.yml", data, "main")
 		d := policyDraft{repo: "r", rev: "deadbeef"}
 		for _, c := range sc.Commands {
 			if c.Cmd == "" || strings.ContainsAny(c.Cmd, "\n\r") {
@@ -1160,7 +1160,7 @@ func TestPolicyInitOrdinaryPushStillDrafts(t *testing.T) {
 		"on:\n  push:\n",
 		"on:\n  push:\n    branches:\n      - main\n",
 		"on:\n  push:\n    branches: [main, develop]\n",
-		"on:\n  push:\n    branches:\n      - master\n",
+
 		// A wildcard that could still expand to the default branch counts as
 		// mergeable: refusing it would be a guess in the expensive direction.
 		"on:\n  push:\n    branches:\n      - '*'\n",
@@ -1203,5 +1203,90 @@ func TestPolicyInitDeploymentJobIsNotABar(t *testing.T) {
 	}
 	if !strings.Contains(draft, "production") {
 		t.Fatalf("no note naming the environment\n%s", draft)
+	}
+}
+
+// TestPolicyInitListItemBelongsToItsKey: a `- ` entry counts only for the key it
+// sits under. Testing "branches was seen anywhere earlier" instead let a
+// `- '**/*.md'` under paths-ignore: mark a release-only push as mergeable --
+// and since that pattern's fixed prefix is empty it matched every branch name,
+// so a routine paths-ignore line on a release workflow reopened the vacuous
+// draft the branch guard exists to prevent. It was order-dependent too: the
+// same two keys the other way round behaved correctly.
+func TestPolicyInitListItemBelongsToItsKey(t *testing.T) {
+	for _, tc := range []struct{ name, on string }{
+		{"paths-ignore after branches", "on:\n  push:\n    branches:\n      - release/**\n    paths-ignore:\n      - '**/*.md'\n"},
+		{"paths after branches", "on:\n  push:\n    branches:\n      - release/**\n    paths:\n      - '**'\n"},
+		{"tags after branches", "on:\n  push:\n    branches:\n      - release/**\n    tags:\n      - main\n"},
+		{"paths-ignore before branches", "on:\n  push:\n    paths-ignore:\n      - '**/*.md'\n    branches:\n      - release/**\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := initPolicyRepo(t, map[string]string{
+				".github/workflows/release.yml": tc.on + "jobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"publishing release artifacts\"\n",
+			})
+			_, _, err, draft := policyInit(t, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pol := mustParse(t, draft); len(pol.verify) != 0 {
+				t.Fatalf("a release-only push drafted %q as the landing bar; another key's list item made it look mergeable\n%s", pol.verify, draft)
+			}
+		})
+	}
+}
+
+// TestPolicyInitUsesTheReposOwnDefaultBranch: a gitflow repo gating merges on
+// `develop` keeps its real battery. A main/master name test discarded it and
+// fell back to the toolchain preset -- a genuine bar, but not the repo's own,
+// and with nothing saying why. The repo is asked what its default branch is.
+func TestPolicyInitUsesTheReposOwnDefaultBranch(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{
+		"go.mod":                   "module x\n\ngo 1.21\n",
+		".github/workflows/ci.yml": "on:\n  push:\n    branches:\n      - develop\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: golangci-lint run\n",
+	})
+	// Make develop the checked-out branch, which is what DefaultBranch falls
+	// back to when there is no origin/HEAD.
+	if out, err := exec.Command("git", "-C", repo, "branch", "-M", "develop").CombinedOutput(); err != nil {
+		t.Fatalf("rename the branch: %v\n%s", err, out)
+	}
+	_, _, err, draft := policyInit(t, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol := mustParse(t, draft)
+	if len(pol.verify) != 1 || pol.verify[0] != "golangci-lint run" {
+		t.Fatalf("a repo whose default branch is develop drafted %q, want its own CI command\n%s", pol.verify, draft)
+	}
+	// master is a default branch name only when the repo actually uses it --
+	// which is the whole point of asking the repo instead of matching names.
+	repoM := initPolicyRepo(t, map[string]string{
+		"go.mod":                   "module x\n\ngo 1.21\n",
+		".github/workflows/ci.yml": "on:\n  push:\n    branches:\n      - master\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test ./...\n",
+	})
+	if out, err := exec.Command("git", "-C", repoM, "branch", "-M", "master").CombinedOutput(); err != nil {
+		t.Fatalf("rename the branch: %v\n%s", err, out)
+	}
+	_, _, err, draftM := policyInit(t, repoM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol := mustParse(t, draftM); len(pol.verify) != 1 || pol.verify[0] != "go test ./..." {
+		t.Fatalf("a repo whose default branch is master drafted %q, want its own CI command\n%s", pol.verify, draftM)
+	}
+
+	// And the converse: on that same repo, a push filtered to main is NOT a
+	// merge gate, because main is not where this repo's merges land.
+	repo2 := initPolicyRepo(t, map[string]string{
+		".github/workflows/rel.yml": "on:\n  push:\n    branches:\n      - main\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo shipping\n",
+	})
+	if out, err := exec.Command("git", "-C", repo2, "branch", "-M", "develop").CombinedOutput(); err != nil {
+		t.Fatalf("rename the branch: %v\n%s", err, out)
+	}
+	_, _, err, draft2 := policyInit(t, repo2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol := mustParse(t, draft2); len(pol.verify) != 0 {
+		t.Fatalf("a push filtered to main drafted %q on a repo whose default branch is develop\n%s", pol.verify, draft2)
 	}
 }

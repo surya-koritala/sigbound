@@ -188,6 +188,24 @@ func (g *Git) FastImport(ctx context.Context, stream []byte) error {
 	return nil
 }
 
+// DefaultBranch reports the repository's default branch by name -- what a merge
+// actually lands on. It asks the remote's HEAD first (origin/HEAD, what a clone
+// records), then falls back to the checked-out branch. An empty string means
+// neither could be read (a bare or freshly-init'd repo, or a clone whose
+// origin/HEAD was never set); callers must treat that as "unknown" rather than
+// assuming a name.
+func (g *Git) DefaultBranch(ctx context.Context) string {
+	if out, err := g.run(ctx, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
+		if b := strings.TrimPrefix(strings.TrimSpace(out), "origin/"); b != "" {
+			return b
+		}
+	}
+	if out, err := g.run(ctx, "symbolic-ref", "--short", "HEAD"); err == nil {
+		return strings.TrimSpace(out)
+	}
+	return ""
+}
+
 // RevParse resolves any ref/commit-ish to a SHA.
 func (g *Git) RevParse(ctx context.Context, ref string) (string, error) {
 	return g.run(ctx, "rev-parse", "--verify", ref+"^{commit}")

@@ -423,6 +423,10 @@ func buildPolicyDraft(ctx context.Context, g *gitx.Git, repo, rev string) policy
 		return d
 	}
 	d.rev = short(sha)
+	// What a merge actually lands on. Empty when the repo cannot say, which the
+	// branch-filter guard treats as "fall back to main/master" rather than as a
+	// name.
+	defaultBranch := g.DefaultBranch(ctx)
 	// LsTreeSizes gives the path list AND each blob's size in one call, so an
 	// oversized blob is skipped BEFORE BlobsBatch reads it into memory — the cap
 	// binds before allocation, not after (a 500MB workflow must not become 500MB
@@ -499,7 +503,7 @@ func buildPolicyDraft(ctx context.Context, g *gitx.Git, repo, rev string) policy
 	// are not appended — they would be a duplicate battery running the same work
 	// twice, and picking between two disagreeing definitions of "the bar" is a
 	// judgement call this command does not have the standing to make.
-	verified := d.addWorkflowVerify(workflows, blobs)
+	verified := d.addWorkflowVerify(workflows, blobs, defaultBranch)
 	verified = d.addMakeVerify(ctx, blobs, verified)
 	d.addToolchainVerify(ctx, inTree, blobs, verified)
 	d.addCodeowners(inTree, blobs, tree)
@@ -526,7 +530,7 @@ func (d *policyDraft) noteGoTestTimeout() {
 // emits one verify member per usable run step, deduplicated by command text
 // (a repo whose ubuntu and windows jobs both run `go build ./...` gets one
 // member, not two).
-func (d *policyDraft) addWorkflowVerify(workflows []string, blobs map[string]string) bool {
+func (d *policyDraft) addWorkflowVerify(workflows []string, blobs map[string]string, defaultBranch string) bool {
 	if len(workflows) == 0 {
 		return false
 	}
@@ -543,7 +547,7 @@ func (d *policyDraft) addWorkflowVerify(workflows []string, blobs map[string]str
 			continue
 		}
 		files++
-		sc := scanWorkflow(p, []byte(content))
+		sc := scanWorkflow(p, []byte(content), defaultBranch)
 		for _, n := range sc.Notes {
 			d.note("workflows", n.Detail, n.Quote...)
 		}

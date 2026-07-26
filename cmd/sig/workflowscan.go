@@ -78,7 +78,7 @@ var shellKeywords = map[string]bool{
 // bytes. path is used only in note text. It never errors and never panics on
 // arbitrary bytes (FuzzScanWorkflow): unrecognized input yields an empty scan
 // plus notes.
-func scanWorkflow(path string, data []byte) wfScan {
+func scanWorkflow(path string, data []byte, defaultBranch string) wfScan {
 	var sc wfScan
 	if len(data) > wfMaxBytes {
 		sc.note("%s is %d bytes (cap %d) — not scanned", path, len(data), wfMaxBytes)
@@ -95,7 +95,7 @@ func scanWorkflow(path string, data []byte) wfScan {
 		}
 	}
 
-	trig, trigLine := workflowTriggers(lines)
+	trig, trigLine := workflowTriggers(lines, defaultBranch)
 	switch {
 	case trigLine == 0:
 		sc.note("%s has no top-level `on:` key — cannot tell whether it gates a merge", path)
@@ -466,7 +466,7 @@ func blockBody(lines []string, s, e, keyCol int) []string {
 // names plus the 1-based line `on:` was found on (0 when absent). GitHub
 // workflows sometimes quote the key ("on":) because bare `on` is a YAML 1.1
 // boolean, so quotes are stripped.
-func workflowTriggers(lines []string) (map[string]bool, int) {
+func workflowTriggers(lines []string, defaultBranch string) (map[string]bool, int) {
 	trig := map[string]bool{}
 	for i, ln := range lines {
 		if blankOrComment(ln) {
@@ -510,7 +510,7 @@ func workflowTriggers(lines []string) (map[string]bool, int) {
 			t = strings.Trim(t, `"'`)
 			switch {
 			case t == "":
-			case t == "push" && pushIsNotAMergeGate(lines, j, blockIndent):
+			case t == "push" && pushIsNotAMergeGate(lines, j, blockIndent, defaultBranch):
 				// Recorded under a DIFFERENT name so the push gate below does not
 				// see it: a release workflow's steps are release steps, and copying
 				// them into a landing bar would gate every merge on publishing.
@@ -542,9 +542,10 @@ func workflowTriggers(lines []string) (map[string]bool, int) {
 // would be exact; do that if this ever misfires. Over-refusing is the cheap
 // direction here -- a refused workflow falls back to the manifests and drafts a
 // better bar, never a worse one.
-func pushIsNotAMergeGate(lines []string, at, indent int) bool {
+func pushIsNotAMergeGate(lines []string, at, indent int, defaultBranch string) bool {
 	tags, branches := false, false
 	mergeable := false
+	lastKey := "" // the key any following `- ` items belong to
 	for j := at + 1; j < len(lines); j++ {
 		if blankOrComment(lines[j]) {
 			continue
@@ -555,8 +556,13 @@ func pushIsNotAMergeGate(lines []string, at, indent int) bool {
 		}
 		key, val, _, item, ok := splitKey(lines[j])
 		if item {
-			// A `- main` list entry under the branches key we last saw.
-			if branches && branchCouldBeDefault(listItemValue(lines[j])) {
+			// A `- main` entry belongs to the key it sits under, and ONLY that
+			// key. Testing `branches` seen-anywhere instead let a `- '**/*.md'`
+			// under paths-ignore: mark a release-only push as mergeable -- and
+			// since that pattern's fixed prefix is empty, every branch matched it.
+			// A routine `paths-ignore:` line then reopened the vacuous draft this
+			// guard exists to prevent, depending on key order.
+			if lastKey == "branches" && branchCouldBeDefault(listItemValue(lines[j]), defaultBranch) {
 				mergeable = true
 			}
 			continue
@@ -564,6 +570,7 @@ func pushIsNotAMergeGate(lines []string, at, indent int) bool {
 		if !ok {
 			continue
 		}
+		lastKey = key
 		switch key {
 		case "tags", "tags-ignore":
 			tags = true
@@ -571,7 +578,7 @@ func pushIsNotAMergeGate(lines []string, at, indent int) bool {
 			branches = true
 			// An inline list: `branches: [main, release/**]`.
 			for _, b := range inlineListValues(val) {
-				if branchCouldBeDefault(b) {
+				if branchCouldBeDefault(b, defaultBranch) {
 					mergeable = true
 				}
 			}
@@ -590,18 +597,34 @@ func pushIsNotAMergeGate(lines []string, at, indent int) bool {
 // branchCouldBeDefault reports whether a `branches:` entry could match the
 // repository's default branch. A wildcard that is not anchored to some other
 // prefix could expand to anything, so it counts.
-func branchCouldBeDefault(b string) bool {
+func branchCouldBeDefault(b, defaultBranch string) bool {
 	b = strings.Trim(strings.TrimSpace(b), `"'`)
-	switch b {
-	case "", "main", "master", "*", "**", "'*'":
-		return b != ""
+	if b == "" {
+		return false
 	}
-	// `*-stable` or `re*` could still cover the default branch; `release/**`
-	// cannot, because everything before the wildcard is a fixed prefix that
-	// main/master do not start with.
+	// The names to test against. When the repo told us its default branch, that
+	// is the only one that matters -- a gitflow repo on `develop` gating merges
+	// with `branches: [develop]` was previously refused by a main/master name
+	// test, silently discarding its real battery. main/master are the fallback
+	// for a repo that could not say (bare, freshly init'd, no origin/HEAD).
+	names := []string{"main", "master"}
+	if defaultBranch != "" {
+		names = []string{defaultBranch}
+	}
+	for _, n := range names {
+		if b == n {
+			return true
+		}
+	}
+	// A wildcard matches the default branch when everything before it is a
+	// prefix of that name: `ma*` could be `main`, `release/**` could not.
 	if i := strings.IndexAny(b, "*?["); i >= 0 {
 		prefix := b[:i]
-		return strings.HasPrefix("main", prefix) || strings.HasPrefix("master", prefix)
+		for _, n := range names {
+			if strings.HasPrefix(n, prefix) {
+				return true
+			}
+		}
 	}
 	return false
 }

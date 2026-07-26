@@ -1533,9 +1533,13 @@ Read it before you commit it. It is a starting point, and these are its limits:
   The same reasoning covers the trigger itself: `on: push:` filtered to
   branches that cannot include the default branch (`release/**`, `deploy`) is a
   release trigger, exactly like `on: push: tags:`, and is refused the same way.
-  A filter that could still match the default branch — `main`, `master`, a bare
-  `*`, or `branches-ignore:` — is not, because refusing an ordinary
-  merge-gating workflow would be the expensive mistake. **Known ceiling:**
+  A filter that could still match it is not, because refusing an ordinary
+  merge-gating workflow would be the expensive mistake. Which branch that is
+  comes from the repository itself (`origin/HEAD`, falling back to the checked-out
+  branch), so a repo that merges into `develop` or `trunk` keeps its own battery;
+  `main`/`master` are used only when the repo cannot say. A bare `*`, a wildcard
+  whose fixed prefix could still expand to that branch, and `branches-ignore:`
+  all count as matching it. **Known ceiling:**
   `paths:`/`paths-ignore:` are NOT read, so a job that only runs when certain
   files change is drafted as though it always runs. That is usually over-strict
   rather than vacuous, but it is a guess this command has not been taught to
