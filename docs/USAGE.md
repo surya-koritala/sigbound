@@ -2348,14 +2348,24 @@ release. An unresolvable endpoint **exits 1** and prints no partial document.
   **committer-date window** of the two endpoints. That window is an
   approximation — a rewritten history or a skewed committer clock shifts which
   runs fall inside it — which is why it is printed in the document. Landings are
-  unaffected: they are reachability, not time.
+  unaffected: they are reachability, not time. A range whose `FROM` commit is
+  **newer** than its `TO` commit has an empty window by construction; the
+  document says `inverted` rather than letting "no attention items" read as
+  "nothing needed a human".
+
+Each landing appears **once**: two notes describing the same landing (its
+integration commit and one of its member tips can each carry one) collapse on the
+run id, or on the landed sha when the note omits one.
 
 Commits in the range that **nothing** claims — hand-written, imported,
 cherry-picked, or landed by a run whose ledger and note are both gone — are
 counted as `unattributed` and reported in the footer. They are never silently
 dropped: the document does not claim a completeness it does not have. A run dir
-whose `report.json` crashed mid-write is counted in `incomplete`, and every
-other run still renders.
+whose `report.json` crashed mid-write is counted in `incomplete` — over the
+**whole** ledger, not just the window, since a dir that will not read cannot be
+placed in time either and may be exactly the ledger behind an unattributed
+commit. When `incomplete` is non-zero the footer says so and stops claiming the
+missing ledgers are *gone*. Every other run still renders.
 
 An **empty range** (`TO` is an ancestor of `FROM`) exits 0 with a document that
 says it is empty, plus a note on stderr — never an empty file.
@@ -2372,11 +2382,11 @@ recorded command strings — `agentCmd`/`verifyCmd`/`repairCmd`/`resolverCmd`/
 (see [Provenance](#provenance)). What it does carry instead:
 
 - `acceptance` is the repo's **own** `verify` lines from `sigbound.policy` at
-  the base SHA (`policy.verify` on the report — the policy's declared lines, not
-  the effective battery an invoker's `-verify` is appended to). Those bytes are
-  committed to the repo, so they are already exactly as public as the repo is. A
-  run with no policy file contributes no `acceptance` and its verify **verdict**
-  only.
+  the base SHA, **as the local run ledger recorded them** (`policy.verify` on the
+  report — the policy's declared lines, not the effective battery an invoker's
+  `-verify` is appended to). Those bytes were committed to the repo, so they are
+  already exactly as public as the repo is. A run with no policy file
+  contributes no `acceptance` and its verify **verdict** only.
 - `agent` is the **program name** of the resolved agent command — the basename
   of its first token, never an argument, so it cannot carry a flag-embedded key.
   `/usr/local/bin/claude -p` and `claude -p --model x` both attribute to
@@ -2388,6 +2398,26 @@ recorded command strings — `agentCmd`/`verifyCmd`/`repairCmd`/`resolverCmd`/
 `withCommands: true` and adds a `commands` object per landing, and the Markdown
 carries a leading `> commands are included verbatim and may contain secrets`
 line. The [serve mirror](#serve-mirror) deliberately has no equivalent knob.
+
+**A note-sourced landing carries less, on purpose.** A landing note is
+user-writable and rides in with the commit from whatever remote it was fetched
+from, so the authority test decides *which* commit it may claim and **nothing
+else**. Such a row (`provenanceSource: note`, marked `(from commit note)` in the
+Markdown) carries its landed sha, its run id, and the run's own recorded shape —
+and deliberately **no** `acceptance`, **no** `policyHash` and **no** `commands`,
+even under `-with-commands`. Their absence is the answer: those fields promise
+bytes this repo committed, and a note is not the repo. For the same reason a
+note contributes nothing to `policy` — the rollup that answers "did the landing
+bar move" is ledger-derived — and its agent is counted in a **separate**
+`unverified` attribution row instead of being merged into the ledger's count.
+
+In the **Markdown** shape, every value that came from a run — a `goal` posted to
+`POST /runs`, a branch name, a task id, an agent name, a whole report read out of
+a note — is rendered onto a single line, with control characters collapsed to
+spaces and `|` escaped. A multi-line goal would otherwise write `###` sections of
+its own into your release notes, and an agent named `cl|aude` would add a column
+to the attribution table. The `-json` shape is structured, so it carries those
+values verbatim.
 
 #### `-release` JSON shape
 
@@ -2402,6 +2432,7 @@ line. The [serve mirror](#serve-mirror) deliberately has no equivalent knob.
       "startedAt": "2026-07-24T17:05:03Z",
       "source": "watch",
       "intent": "billing-rates",
+      "goal": "raise the billing rates",
       "tasks": ["t1", "t2", "t3"],
       "landedSHA": "1a2b3c4d5e6f",
       "members": 3,
@@ -2411,7 +2442,9 @@ line. The [serve mirror](#serve-mirror) deliberately has no equivalent knob.
       "acceptance": ["go test ./...", "go vet ./..."],
       "agent": "claude",
       "policyHash": "9f2c…",
-      "provenanceSource": "manifest"
+      "provenanceSource": "manifest",
+      "commands": { "agent": "claude -p", "verify": "go test ./...",
+                    "repair": "…", "resolver": "…", "planner": "…" }
     }
   ],
   "parked":  [ { "runId": "…", "status": "awaiting-ack", "reason": "ack-paths",
@@ -2419,28 +2452,32 @@ line. The [serve mirror](#serve-mirror) deliberately has no equivalent knob.
                  "attempts": 1, "expiresAt": "2026-07-27T…Z" } ],
   "dropped": [ { "runId": "…", "branches": ["agent/t4"], "attempts": 3 } ],
   "flagged": [ { "runId": "…", "branches": ["agent/t9"] } ],
-  "agents":  [ { "agent": "claude", "runs": 31, "landed": 29 } ],
+  "agents":  [ { "agent": "claude", "runs": 31, "landed": 29 },
+               { "agent": "aider", "runs": 1, "landed": 1, "unverified": true } ],
   "policy":  { "changed": true,
                "hashes": [ { "hash": "3ab1…", "firstRunId": "…" },
                            { "hash": "9f2c…", "firstRunId": "…" } ] },
   "unattributed": 5,
   "incomplete": 0,
-  "withCommands": false
+  "withCommands": true
 }
 ```
 
-Field names match the run list and the [run report](#json-report) where they
-overlap (`runId`, `startedAt`, `source`, `intent`, `landedSHA`, `strategy`,
-`verify`, `policyHash`). Empty sections are omitted; `commits`, `window`,
-`policy`, `unattributed`, `incomplete` and `withCommands` are always present,
-because zero is an answer a consumer needs to read. `provenanceSource` is
+Every field the document can emit is above. Field names match the run list and
+the [run report](#json-report) where they overlap (`runId`, `startedAt`,
+`source`, `intent`, `goal`, `landedSHA`, `strategy`, `verify`, `policyHash`).
+Omit-empty fields appear only when they have something to say: `commits`,
+`window`, `policy`, `unattributed`, `incomplete` and `withCommands` are always
+present, because zero is an answer a consumer needs to read, while `commands`
+needs `-with-commands`, `verifyDetail` needs at least one of
+`cached`/`flaky`/`repaired`, `window.inverted` and `agents[].unverified` appear
+only when true, and empty sections are dropped whole. `provenanceSource` is
 `manifest` or `note`; `reason` on a parked entry is `ack-paths`,
 `policy-modified` (the [park reasons](#run-parking)), or `unreadable` with the
 error in `error` — a park that will not read back is surfaced, not dropped.
-`verifyDetail` appears only when at least one of `cached`/`flaky`/`repaired` is
-true. Landings are newest-first; `agents` is ordered by run count.
-`policy.changed` is true when more than one policy hash appears in the range,
-and each hash names the run it was first seen in.
+Landings are newest-first; `agents` is ordered by run count. `policy.changed` is
+true when more than one policy hash appears in the range, and each hash names the
+run it was first seen in.
 
 ### JSON shape (`-json`)
 

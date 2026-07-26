@@ -31,6 +31,16 @@
 // see docs/USAGE.md's Provenance section). What it does carry is the repo's own
 // committed policy `verify` lines and the agent's PROGRAM NAME. -with-commands
 // opts into the verbatim strings and says so in both output shapes.
+//
+// Being published is also why two rules hold over everything below:
+//
+//   - a note-SOURCED landing is quarantined (landingOf, cover). A note is
+//     user-writable and arrives with the commit, so matchProvenance decides which
+//     commit it may claim and nothing else: its acceptance lines, commands and
+//     policy hash are not republished, and its agent is counted in a separate
+//     "(unverified)" attribution row rather than merged into the ledger's.
+//   - every untrusted string is rendered through releaseText, because data that
+//     can start a new line can forge the document's own sections.
 package main
 
 import (
@@ -43,6 +53,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/surya-koritala/sigbound/internal/gitx"
 )
@@ -72,9 +83,12 @@ type releaseDoc struct {
 	// hand-written, imported, cherry-picked, or landed by a run whose ledger and
 	// note are both gone. Reported, never hidden.
 	Unattributed int `json:"unattributed"`
-	// Incomplete counts run dirs inside the window whose report.json was
-	// expected but missing or unparseable (a crash mid-write) — the same posture
-	// readLogRow takes: every other run still renders.
+	// Incomplete counts run dirs whose report.json was expected but is missing or
+	// unparseable (a crash mid-write) — the same posture readLogRow takes: every
+	// other run still renders. It is counted UNWINDOWED, exactly as landings are
+	// selected: a torn dir outside the committer-date window can still be the
+	// missing half of a range commit's attribution, and a counter that skipped it
+	// would let the footer claim a ledger is gone when it is merely unreadable.
 	Incomplete   int  `json:"incomplete"`
 	WithCommands bool `json:"withCommands"`
 }
@@ -85,6 +99,11 @@ type releaseDoc struct {
 type releaseWindow struct {
 	Start string `json:"start"`
 	End   string `json:"end"`
+	// Inverted says FROM's commit is NEWER than TO's — the window is then empty
+	// by construction and NO run can fall inside it, so the document lists no
+	// parked/dropped/flagged run whatever the ledger holds. Said out loud,
+	// because silence would read as "nothing needed a human".
+	Inverted bool `json:"inverted,omitempty"`
 }
 
 // releaseLanding is one run that landed at least one commit in the range.
@@ -93,6 +112,10 @@ type releaseWindow struct {
 // note-sourced landing RunID is the id the note itself records: the note already
 // passed matchProvenance's authority test for a commit in the range, and
 // ProvenanceSource says where the row came from.
+//
+// A note-sourced row is also QUARANTINED — see landingOf. Acceptance, PolicyHash
+// and Commands are absent on it by construction, because those are note bytes, and
+// a note is written by whoever pushed the commit.
 type releaseLanding struct {
 	RunID     string   `json:"runId,omitempty"`
 	StartedAt string   `json:"startedAt,omitempty"`
@@ -175,16 +198,26 @@ type releaseFlagged struct {
 // covers that agent program ran, and how many of them landed. "Covered" is every
 // run that contributes a row anywhere — a ledger run inside the window, a ledger
 // landing, or a landing that survives only as a note.
+//
+// Note-sourced runs get their OWN row, marked Unverified: the agent name in a
+// note is whatever the note's author wrote, so merging it into the ledger's
+// count would let a pushed note inflate (or invent) an agent's record silently.
+// Same program name, two rows, and the document says which is which.
 type releaseAgent struct {
-	Agent  string `json:"agent"`
-	Runs   int    `json:"runs"`
-	Landed int    `json:"landed"`
+	Agent      string `json:"agent"`
+	Runs       int    `json:"runs"`
+	Landed     int    `json:"landed"`
+	Unverified bool   `json:"unverified,omitempty"`
 }
 
 // releasePolicy answers "did the landing bar move inside this range". Hashes are
-// in first-seen order over the covered runs — the ledger walk is oldest-first,
-// and note-sourced landings follow it — each with the run that first recorded
-// it. Changed is len(Hashes) > 1 — one hash (or none) means the bar held.
+// in first-seen order over the covered LEDGER runs (the walk is oldest-first),
+// each with the run that first recorded it. Changed is len(Hashes) > 1 — one
+// hash (or none) means the bar held.
+//
+// Note-sourced landings contribute NOTHING here: a hash read out of a landing
+// note is a claim by whoever pushed the note, and "the landing bar moved" is
+// exactly the kind of statement that has to come from bytes this repo wrote.
 type releasePolicy struct {
 	Changed bool                `json:"changed"`
 	Hashes  []releasePolicyHash `json:"hashes,omitempty"`
@@ -257,8 +290,12 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 
 	doc := &releaseDoc{
 		From: from, FromSHA: fromSHA, To: to, ToSHA: toSHA,
-		Commits:      len(commits),
-		Window:       releaseWindow{Start: start.UTC().Format(time.RFC3339), End: end.UTC().Format(time.RFC3339)},
+		Commits: len(commits),
+		Window: releaseWindow{
+			Start:    start.UTC().Format(time.RFC3339),
+			End:      end.UTC().Format(time.RFC3339),
+			Inverted: end.Before(start),
+		},
 		WithCommands: withCommands,
 	}
 	inRange := make(map[string]bool, len(commits))
@@ -273,22 +310,35 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 	// cover folds one run this document covers into the cross-run rollups. Every
 	// run that contributes a row anywhere — a ledger run in the window, a ledger
 	// landing, or a landing that survives only as a note — goes through here, so
-	// the attribution table and the policy list can never disagree with the
-	// landings above them (a note-sourced landing naming an agent that the
-	// attribution table then omits is a document contradicting itself).
+	// the attribution table can never disagree with the landings above it (a
+	// note-sourced landing naming an agent that the attribution table then omits
+	// is a document contradicting itself).
+	//
+	// fromNote runs are QUARANTINED, because everything except WHICH commit they
+	// may claim is remote-writable: they land in their own "(unverified)"
+	// attribution bucket and contribute NO policy hash. The policy rollup is the
+	// document's answer to "did the landing bar move", and a pushed note must not
+	// be able to move it.
 	agents := map[string]*releaseAgent{}
 	seenPolicy := map[string]bool{}
 	claimedRuns := map[string]bool{}
-	cover := func(rep *runReport, runID string) {
+	cover := func(rep *runReport, runID string, fromNote bool) {
 		name := agentName(rep.AgentCmd)
-		a := agents[name]
+		key := name
+		if fromNote {
+			key += "\x00unverified" // a bucket of its own; \x00 cannot occur in a program name
+		}
+		a := agents[key]
 		if a == nil {
-			a = &releaseAgent{Agent: name}
-			agents[name] = a
+			a = &releaseAgent{Agent: name, Unverified: fromNote}
+			agents[key] = a
 		}
 		a.Runs++
 		if landed(rep) {
 			a.Landed++
+		}
+		if fromNote {
+			return
 		}
 		if rep.Policy != nil && rep.Policy.Hash != "" && !seenPolicy[rep.Policy.Hash] {
 			seenPolicy[rep.Policy.Hash] = true
@@ -304,15 +354,13 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 		dir := filepath.Join(runsDir, id)
 		rep, err := readRunReport(dir)
 		if err != nil {
-			// A run we cannot read is dated by its id alone. Only the ones the
-			// document claims to cover (inside the window) are counted, and only
-			// when a report was genuinely expected — readLogRow's exact test. A
-			// dir whose NAME carries no timestamp either cannot be placed in the
-			// range at all and is not counted; sigbound writes no such dir.
-			if inWindow(runStartedAt(id, nil)) {
-				if _, incomplete := readLogRow(runsDir, id); incomplete {
-					doc.Incomplete++
-				}
+			// Counted UNWINDOWED, the way landings are selected: a run we cannot
+			// read is a run we cannot place, so its id's timestamp is no reason to
+			// decide it is none of this range's business — it may be exactly the
+			// ledger behind a commit counted unattributed below. Only a dir where a
+			// report was genuinely expected counts (readLogRow's exact test).
+			if _, incomplete := readLogRow(runsDir, id); incomplete {
+				doc.Incomplete++
 			}
 			continue
 		}
@@ -325,10 +373,13 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 			for _, sha := range landedHere {
 				delete(unclaimed, sha)
 			}
+			// Claimed under BOTH identities a note might carry (see the note pass):
+			// a legacy note that omits runId still names this landing by its sha.
 			claimedRuns[id] = true
+			claimedRuns["landed:"+rep.Integrate.FinalSHA] = true
 			doc.Landings = append(doc.Landings, landingOf(rep, id, goalOf(dir), "manifest", withCommands))
 		}
-		cover(rep, id)
+		cover(rep, id, false)
 		// Attention items are LEDGER-ONLY: they are read from park.json and the
 		// local report, so a run whose dir is gone contributes its landing (from
 		// its note) but no park/dropped/flagged row. There is nothing local left
@@ -379,14 +430,24 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 				if p == nil || !p.Landed {
 					continue
 				}
+				// One landing, one row. A hand-written or legacy note may omit
+				// runId, so the landed sha is the fallback identity: two notes
+				// describing the SAME landing (its integration commit and one of its
+				// member tips both carry one) are that landing once, not twice. A
+				// note with neither is unattributable, so it claims nothing.
+				key := rep.RunID
+				if key == "" {
+					key = "landed:" + rep.Integrate.FinalSHA
+				}
+				if key == "landed:" { // no id and no landed sha: nothing to be one of
+					continue
+				}
 				delete(unclaimed, sha)
-				if rep.RunID != "" && claimedRuns[rep.RunID] {
-					continue // already rendered from the local ledger
+				if claimedRuns[key] {
+					continue // already rendered, from the local ledger or another note
 				}
-				if rep.RunID != "" {
-					claimedRuns[rep.RunID] = true
-				}
-				cover(&rep, rep.RunID)
+				claimedRuns[key] = true
+				cover(&rep, rep.RunID, true)
 				doc.Landings = append(doc.Landings, landingOf(&rep, rep.RunID, "", "note", withCommands))
 			}
 		}
@@ -410,7 +471,10 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 		if doc.Agents[i].Runs != doc.Agents[j].Runs {
 			return doc.Agents[i].Runs > doc.Agents[j].Runs
 		}
-		return doc.Agents[i].Agent < doc.Agents[j].Agent
+		if doc.Agents[i].Agent != doc.Agents[j].Agent {
+			return doc.Agents[i].Agent < doc.Agents[j].Agent
+		}
+		return !doc.Agents[i].Unverified // the ledger's row before the notes' row
 	})
 	doc.Policy.Changed = len(doc.Policy.Hashes) > 1
 	return doc, nil
@@ -440,6 +504,15 @@ func landedCommitsIn(rep *runReport, inRange map[string]bool) []string {
 
 // landingOf projects one report into a landing row. goal is read from the run
 // dir by the caller (a note-sourced landing has no dir, so none).
+//
+// A NOTE-SOURCED landing is QUARANTINED. matchProvenance decides which commits a
+// note may claim — and that is all it decides: the note itself is user-writable
+// and rides in on `git fetch` from wherever the commit came from, so its payload
+// is not repo bytes. Such a row therefore carries its landed sha, its run id and
+// (via releaseRunLabel) the "(from commit note)" marker — enough to audit — and
+// deliberately NO acceptance, NO policy hash and NO verbatim commands. Their
+// absence IS the answer: `acceptance` promises "the repo's own committed verify
+// lines" (docs/USAGE.md), and a note is not the repo.
 func landingOf(rep *runReport, runID, goal, source string, withCommands bool) releaseLanding {
 	l := releaseLanding{
 		RunID:            runID,
@@ -463,11 +536,11 @@ func landingOf(rep *runReport, runID, goal, source string, withCommands bool) re
 	if v := rep.Verify; v.Cached || v.Flaky || v.Repaired {
 		l.VerifyDetail = &releaseVerifyDetail{Cached: v.Cached, Flaky: v.Flaky, Repaired: v.Repaired}
 	}
-	if rep.Policy != nil {
+	if rep.Policy != nil && source != "note" {
 		l.Acceptance = rep.Policy.Verify
 		l.PolicyHash = rep.Policy.Hash
 	}
-	if withCommands {
+	if withCommands && source != "note" {
 		l.Commands = &releaseCommands{
 			Agent: rep.AgentCmd, Verify: rep.VerifyCmd, Repair: rep.RepairCmd,
 			Resolver: rep.ResolverCmd, Planner: rep.PlannerCmd,
@@ -522,6 +595,59 @@ func agentName(cmd string) string {
 
 // ---- rendering ----
 
+// releaseText makes one untrusted string safe to place INSIDE a Markdown line.
+// Almost everything this document renders arrived from somewhere a publisher
+// does not control — a POST /runs `goal`, a branch name, a task id, an agent
+// command, a run id or a whole report read out of a commit note — so it does
+// exactly two things:
+//
+//   - every control character (CR, LF, tab, NUL, …) collapses to a single space,
+//     so untrusted text can never LEAVE ITS LINE. A multi-line goal was enough to
+//     fabricate a "### Landed" section of its own and open an HTML comment over
+//     the real footer;
+//   - '|' is escaped, because it is the table cell separator: an agent program
+//     named "cl|aude" otherwise adds a column to the attribution row.
+//
+// It is NOT a Markdown escaper, deliberately. Line escape and table breakage are
+// STRUCTURE — they let data forge the document's own claims — while inline
+// emphasis (*, _, `) inside a goal only styles text in a slot the document
+// already gave to that run. Escaping all of Markdown would make legitimate
+// goals unreadable to buy nothing.
+func releaseText(s string) string {
+	b := &strings.Builder{}
+	b.Grow(len(s))
+	space := false
+	for _, r := range s {
+		switch {
+		case unicode.IsControl(r):
+			if !space {
+				b.WriteByte(' ')
+				space = true
+			}
+		case r == '|':
+			b.WriteString(`\|`)
+			space = false
+		default:
+			b.WriteRune(r)
+			space = r == ' '
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// safef is how renderReleaseMarkdown writes EVERY line: the format string is
+// always a literal, and every string argument goes through releaseText first. A
+// %s added here later is sanitized because of where it is written, not because
+// someone remembered to wrap it.
+func safef(format string, args ...any) string {
+	for i, a := range args {
+		if s, ok := a.(string); ok {
+			args[i] = releaseText(s)
+		}
+	}
+	return fmt.Sprintf(format, args...)
+}
+
 // renderReleaseMarkdown writes the paste-ready document: `###` sections under a
 // one-line summary and no document title, so the block drops straight in under a
 // Keep-a-Changelog `## [version]` heading.
@@ -532,87 +658,103 @@ func agentName(cmd string) string {
 func renderReleaseMarkdown(w io.Writer, doc *releaseDoc) error {
 	b := &strings.Builder{}
 	if doc.WithCommands {
-		fmt.Fprintf(b, "> commands are included verbatim and may contain secrets\n\n")
+		b.WriteString("> commands are included verbatim and may contain secrets\n\n")
 	}
 	if doc.Commits == 0 {
-		fmt.Fprintf(b, "_No commits in `%s..%s`._\n", doc.From, doc.To)
+		b.WriteString(safef("_No commits in `%s..%s`._\n", doc.From, doc.To))
 		_, err := io.WriteString(w, b.String())
 		return err
 	}
-	fmt.Fprintf(b, "`%s..%s` — %s, %s, %s unattributed.\n",
+	b.WriteString(safef("`%s..%s` — %s, %s, %s unattributed.\n",
 		doc.From, doc.To,
 		plural(doc.Commits, "commit", "commits"),
 		plural(len(doc.Landings), "landing", "landings"),
-		plural(doc.Unattributed, "commit", "commits"))
-	fmt.Fprintf(b, "Attention window (committer dates, approximate): %s .. %s\n", doc.Window.Start, doc.Window.End)
+		plural(doc.Unattributed, "commit", "commits")))
+	b.WriteString(safef("Attention window (committer dates, approximate): %s .. %s\n", doc.Window.Start, doc.Window.End))
+	if doc.Window.Inverted {
+		// Nothing can fall inside an inverted window, so every attention section
+		// below is empty for a reason that has nothing to do with the ledger.
+		b.WriteString("Window is INVERTED (from is newer than to): no run start can fall inside it, so no parked, dropped or flagged run is listed.\n")
+	}
 
 	if len(doc.Landings) > 0 {
-		fmt.Fprintf(b, "\n### Landed\n\n")
+		b.WriteString("\n### Landed\n\n")
 		for _, l := range doc.Landings {
-			fmt.Fprintf(b, "- **%s** — %s, %s, verify %s\n", l.LandedSHA, releaseRunLabel(l), plural(l.Members, "branch", "branches"), l.Verify)
+			b.WriteString(safef("- **%s** — %s, %s, verify %s\n", l.LandedSHA, releaseRunLabel(l), plural(l.Members, "branch", "branches"), l.Verify))
 			for _, line := range releaseLandingDetails(l) {
-				fmt.Fprintf(b, "  - %s\n", line)
+				b.WriteString(safef("  - %s\n", line))
 			}
 		}
 	}
 	if len(doc.Parked) > 0 {
-		fmt.Fprintf(b, "\n### Needed a human\n\n")
+		b.WriteString("\n### Needed a human\n\n")
 		for _, p := range doc.Parked {
-			fmt.Fprintf(b, "- %s — %s (%s)", p.RunID, p.Status, p.Reason)
+			b.WriteString(safef("- %s — %s (%s)", p.RunID, p.Status, p.Reason))
 			if p.Error != "" {
-				fmt.Fprintf(b, ": %s", p.Error)
+				b.WriteString(safef(": %s", p.Error))
 			}
 			if len(p.Branches) > 0 {
-				fmt.Fprintf(b, ", branches %s", strings.Join(p.Branches, ", "))
+				b.WriteString(safef(", branches %s", strings.Join(p.Branches, ", ")))
 			}
 			if len(p.MatchedPaths) > 0 {
-				fmt.Fprintf(b, ", matched %s", joinMatchedPaths(p.MatchedPaths))
+				b.WriteString(safef(", matched %s", joinMatchedPaths(p.MatchedPaths)))
 			}
 			if p.ExpiresAt != "" {
-				fmt.Fprintf(b, ", expires %s", p.ExpiresAt)
+				b.WriteString(safef(", expires %s", p.ExpiresAt))
 			}
-			fmt.Fprintln(b)
+			b.WriteString("\n")
 		}
 	}
 	if len(doc.Dropped) > 0 {
-		fmt.Fprintf(b, "\n### Dropped by bisect\n\n")
+		b.WriteString("\n### Dropped by bisect\n\n")
 		for _, d := range doc.Dropped {
-			fmt.Fprintf(b, "- %s — %s dropped to salvage a green subset: %s\n",
-				d.RunID, plural(len(d.Branches), "branch", "branches"), strings.Join(d.Branches, ", "))
+			b.WriteString(safef("- %s — %s dropped to salvage a green subset: %s\n",
+				d.RunID, plural(len(d.Branches), "branch", "branches"), strings.Join(d.Branches, ", ")))
 		}
 	}
 	if len(doc.Flagged) > 0 {
-		fmt.Fprintf(b, "\n### Flagged\n\n")
+		b.WriteString("\n### Flagged\n\n")
 		for _, f := range doc.Flagged {
-			fmt.Fprintf(b, "- %s — %s set aside as conflicts: %s\n",
-				f.RunID, plural(len(f.Branches), "branch", "branches"), strings.Join(f.Branches, ", "))
+			b.WriteString(safef("- %s — %s set aside as conflicts: %s\n",
+				f.RunID, plural(len(f.Branches), "branch", "branches"), strings.Join(f.Branches, ", ")))
 		}
 	}
 	if len(doc.Agents) > 0 {
-		fmt.Fprintf(b, "\n### Attribution\n\n| agent | runs | landed |\n|---|---|---|\n")
+		b.WriteString("\n### Attribution\n\n| agent | runs | landed |\n|---|---|---|\n")
 		for _, a := range doc.Agents {
-			fmt.Fprintf(b, "| %s | %d | %d |\n", a.Agent, a.Runs, a.Landed)
+			name := a.Agent
+			if a.Unverified {
+				// Its own row, and it says why: this count is what commit notes
+				// claim, not what this repo's ledger recorded.
+				name += " (unverified: from commit notes)"
+			}
+			b.WriteString(safef("| %s | %d | %d |\n", name, a.Runs, a.Landed))
 		}
 	}
-	fmt.Fprintf(b, "\n### Policy\n\n")
+	b.WriteString("\n### Policy\n\n")
 	switch {
 	case len(doc.Policy.Hashes) == 0:
-		fmt.Fprintf(b, "No run in this range recorded a `%s`.\n", policyFileName)
+		b.WriteString(safef("No run in this range recorded a `%s`.\n", policyFileName))
 	case doc.Policy.Changed:
-		fmt.Fprintf(b, "`%s` CHANGED inside this range:\n\n", policyFileName)
+		b.WriteString(safef("`%s` CHANGED inside this range:\n\n", policyFileName))
 		for _, h := range doc.Policy.Hashes {
-			fmt.Fprintf(b, "- `%s` — first seen in %s\n", short(h.Hash), h.FirstRunID)
+			b.WriteString(safef("- `%s` — first seen in %s\n", short(h.Hash), h.FirstRunID))
 		}
 	default:
-		fmt.Fprintf(b, "`%s` unchanged: `%s`.\n", policyFileName, short(doc.Policy.Hashes[0].Hash))
+		b.WriteString(safef("`%s` unchanged: `%s`.\n", policyFileName, short(doc.Policy.Hashes[0].Hash)))
 	}
 
-	fmt.Fprintf(b, "\n_%s in this range carry no sigbound landing", plural(doc.Unattributed, "commit", "commits"))
-	fmt.Fprintf(b, " (hand-written, imported, or landed by a run whose ledger and note are both gone)")
+	b.WriteString(safef("\n_%s in this range carry no sigbound landing", plural(doc.Unattributed, "commit", "commits")))
 	if doc.Incomplete > 0 {
-		fmt.Fprintf(b, "; %s unreadable", plural(doc.Incomplete, "run dir", "run dirs"))
+		// Only claim what was actually checked: with a torn run dir in the
+		// history, "the ledger is gone" is precisely what this document does NOT
+		// know — the ledger may be right there and unreadable.
+		b.WriteString(safef(" (hand-written, imported, or landed by a run this document could not read: %s unreadable)",
+			plural(doc.Incomplete, "run dir", "run dirs")))
+	} else {
+		b.WriteString(" (hand-written, imported, or landed by a run whose ledger and note are both gone)")
 	}
-	fmt.Fprintf(b, "._\n")
+	b.WriteString("._\n")
 	_, err := io.WriteString(w, b.String())
 	return err
 }
