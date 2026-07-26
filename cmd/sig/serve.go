@@ -12,7 +12,8 @@
 // status.json phase marker (queued/running/done/error), written atomically at
 // each transition, plus a request.json journal of the POSTed request body
 // written at accept time. On startup, any run a PRIOR process left
-// queued/running (its PID is gone) is rewritten to status "interrupted" — so a
+// queued/running (an owner this host cannot show to be alive — see
+// ownedByLiveProcess) is rewritten to status "interrupted" — so a
 // daemon killed mid-run is reported honestly instead of looking like it's still
 // running forever. See docs/USAGE.md's "Crash recovery" section.
 //
@@ -92,6 +93,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1785,8 +1787,8 @@ func parseDur(s string, def time.Duration) (time.Duration, error) {
 //
 // The startup crash-recovery sweep runs here too. It is `sig serve`'s at
 // newServer, but a repo that never runs a daemon has no other moment to heal a
-// dir a Ctrl-C left saying "running". Recovery only rewrites a run whose pid
-// the liveness probe reports gone (see recoverStaleRuns) -- which on unix
+// dir a Ctrl-C left saying "running". Recovery only rewrites a run whose owner
+// this host cannot show to be alive (see ownedByLiveProcess) -- which on unix
 // leaves a live daemon's runs alone, and on Windows leaves nothing alone,
 // because pidAlive has no implementation there and calls every pid dead (see
 // issue #94, and the recovery section in docs/USAGE.md for what that costs).
@@ -1914,7 +1916,8 @@ type runStatusFile struct {
 	Status    string `json:"status"` // queued | running | done | error | interrupted
 	UpdatedAt string `json:"updatedAt"`
 	PID       int    `json:"pid"`
-	Note      string `json:"note,omitempty"` // set on "interrupted": why (see recoverStaleRuns)
+	PIDScope  string `json:"pidScope,omitempty"` // where PID means something: see ownerScope
+	Note      string `json:"note,omitempty"`     // set on "interrupted": why (see recoverStaleRuns)
 }
 
 // writeRunStatus atomically records dir's current phase. Best-effort, like
@@ -1926,6 +1929,7 @@ func writeRunStatus(dir, status, note string) {
 		Status:    status,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 		PID:       os.Getpid(),
+		PIDScope:  ownerScope(),
 		Note:      note,
 	}, "", "  ")
 	if err != nil {
@@ -2009,32 +2013,40 @@ func writeRunRequest(dir string, req runRequest) {
 
 // recoverStaleRuns is newServer's startup recovery pass over one cell's runs
 // dir: a run whose status.json still says queued/running belongs to a dead
-// owner if its recorded PID no longer resolves to a live process. A dead
-// owner's entry gets rewritten to "interrupted" here, before the server
-// accepts its first request -- that's what keeps GET from reporting
-// "running" forever after a kill -9. A LIVE recorded PID is left alone
-// unconditionally, whether it's our own PID (a run this same process is
-// still doing -- restart recovery doesn't run mid-process, but the test
-// suite plants this case directly) or a sibling daemon's (multiple `sig
-// serve` processes can share a runs dir; recovery must never stomp another
-// daemon's in-flight run just because it isn't ours). ourPID is accepted as
-// a parameter (not read via os.Getpid() inside) purely so a test can name a
+// owner unless the owner it records -- the pid AND the scope that pid is a
+// name in -- is a process still running HERE. A dead owner's entry gets rewritten
+// to "interrupted" here, before the server accepts its first request -- that's
+// what keeps GET from reporting "running" forever after a kill -9. A live
+// owner is left alone whether it's our own pid (a run this same process is
+// still doing -- restart recovery doesn't run mid-process, but the test suite
+// plants this case directly) or a sibling daemon's (multiple `sig serve`
+// processes can share a runs dir; recovery must never stomp another daemon's
+// in-flight run just because it isn't ours). A live recorded pid does NOT on
+// its own earn that: a record naming another host or boot, or naming none at
+// all, is reclaimed even when its number resolves to a running process here,
+// because here that number is somebody else's. ourPID is accepted as a
+// parameter (not read via os.Getpid() inside) purely so a test can name a
 // specific "this process" pid without actually running as it; the recovery
 // decision itself no longer depends on it.
 //
-// Accepted residual: pidAlive only checks that SOME process holds sf.PID
-// right now, not that it's the same process that wrote the status. On a
-// system that recycles PIDs fast enough, a genuinely dead owner's pid could
-// already belong to an unrelated process by the time recovery runs, and that
-// run would be false-positived as still alive and left "running"/"queued"
-// forever (until manually inspected -- see docs/USAGE.md's "Crash recovery"
-// section). This is a narrow window and consistent with the rest of this
-// file's best-effort posture, not a correctness guarantee.
+// "Alive" is ownedByLiveProcess, not pidAlive -- a bare pid names nothing
+// outside its own boot and pid namespace. See that function for both failure
+// directions and for what an unscoped record from an older binary means.
+//
+// Accepted residual, now narrowed to ONE pid space: within the same boot and
+// namespace, pidAlive still only checks that SOME process holds sf.PID, not
+// that it is the same process that wrote the status. A machine that recycles
+// pids fast enough could hand a dead owner's number to an unrelated local
+// process before recovery runs, and that run would be false-positived as
+// still alive and left "running"/"queued" forever (until manually inspected
+// -- see docs/USAGE.md's "Crash recovery" section). Consistent with the rest
+// of this file's best-effort posture, not a correctness guarantee.
 func recoverStaleRuns(runsDir string, ourPID int) {
 	entries, err := os.ReadDir(runsDir)
 	if err != nil {
 		return // missing dir (no runs yet, or first startup) => nothing to recover
 	}
+	ours := ownerScope()
 	for _, de := range entries {
 		if !de.IsDir() {
 			continue
@@ -2044,8 +2056,8 @@ func recoverStaleRuns(runsDir string, ourPID int) {
 		if err != nil || (sf.Status != "queued" && sf.Status != "running") {
 			continue // no status.json, or already terminal -- nothing to do
 		}
-		if pidAlive(sf.PID) {
-			continue // owning process still alive -- ours or a sibling daemon's, never touch it
+		if ownedByLiveProcess(sf, ours) {
+			continue // owning process still alive HERE -- ours or a sibling daemon's, never touch it
 		}
 		// A dead owner that had already written an unresolved park.json got as far
 		// as producing a VERIFIED landing; it just never flipped the marker. That
@@ -2053,16 +2065,123 @@ func recoverStaleRuns(runsDir string, ourPID int) {
 		// landing permanently unreachable (see diskRunStatus). Heal the marker
 		// instead.
 		if pk, perr := readPark(dir); perr == nil && pk.ResolvedAt == "" {
-			writeRunStatus(dir, statusAwaitingAck, fmt.Sprintf("recovered at startup: owning process (pid %d) is gone, but this run had already parked a verified landing", sf.PID))
+			writeRunStatus(dir, statusAwaitingAck, "recovered at startup: "+staleOwnerReason(sf, ours)+", but this run had already parked a verified landing")
 			continue
 		}
-		writeRunStatus(dir, "interrupted", fmt.Sprintf("recovered at startup: owning process (pid %d) is gone", sf.PID))
+		writeRunStatus(dir, "interrupted", "recovered at startup: "+staleOwnerReason(sf, ours))
 	}
 }
 
-// pidAlive reports whether pid names a currently running process. On Unix,
-// os.FindProcess always succeeds without checking anything; sending signal 0
-// is the standard, side-effect-free way to actually probe existence.
+// ownerScope names the context a recorded pid is a NAME in. A pid identifies a
+// process only within one boot of one pid namespace; compared against a
+// status.json's recorded scope, this is what turns "some process holds that
+// number" into "a process of MINE holds that number".
+//
+// Composed of the best identifiers available with no dependencies:
+//
+//   - Linux: /proc/sys/kernel/random/boot_id, which is regenerated on every
+//     boot, so a pid reused after a reboot no longer reads as the same owner.
+//   - Everywhere: os.Hostname(). Under the isolation shape this exists for —
+//     a container per run over a shared clone — that is the container id
+//     (Docker) or the pod name (Kubernetes), i.e. it tracks the pid namespace,
+//     which boot_id alone does not: two containers on one host share a boot_id
+//     and share nothing about their pid numbering.
+//
+// CEILING, because the fallback is the common case: with no boot_id (macOS,
+// Windows, the BSDs) the scope is the hostname alone, so a pid reused after a
+// reboot of the same host still reads alive — which is exactly today's
+// behaviour, the floor this is not allowed to go below. A container run with
+// --pid=host, or two containers handed the same --hostname, defeats it in that
+// same direction. And in the extreme where os.Hostname itself fails off Linux,
+// the scope is empty and NOTHING matches it, so every queued/running record is
+// reclaimed; that costs a misreported phase, never work (see recoverStaleRuns
+// and docs/USAGE.md's "Crash recovery"). This narrows "alive", it does not
+// prove ownership.
+//
+// The hostname MOVING is the same ceiling from the other side, and it needs no
+// reboot and no container to reach: on macOS the `.local` name changes on
+// ordinary network events, so a run started under the old name stops matching,
+// and the next sweep -- every `sig run` does one, via startRunDir -- reclaims a
+// marker whose process is still running. The bare-pid check this replaces held
+// that case; this deliberately does not. The cost is the same misreported phase
+// (see ownedByLiveProcess), which the issue's fail-toward-reclaim direction
+// accepts on purpose.
+//
+// Computed once: the answer must not change under a process while its own
+// records are on disk, or it would reclaim itself.
+var ownerScope = sync.OnceValue(func() string {
+	host, _ := os.Hostname() // "" on failure; see the ceiling above
+	return ownerScopeFrom(runtime.GOOS, host, "/proc/sys/kernel/random/boot_id")
+})
+
+// ownerScopeFrom is ownerScope's body with its three inputs named. Split out
+// only so the fold-in can be tested: an end-to-end assertion on ownerScope()
+// can require non-empty and stable, and the hostname ALONE satisfies both on
+// every platform -- so the boot_id half, the half that closes issue #162's
+// named "pid reuse after a reboot" residual, would be silently deletable. See
+// TestOwnerScopeFrom.
+func ownerScopeFrom(goos, host, bootIDPath string) string {
+	if goos == "linux" {
+		if b, err := os.ReadFile(bootIDPath); err == nil {
+			return strings.TrimSpace(string(b)) + "/" + host
+		}
+	}
+	return host
+}
+
+// ownedByLiveProcess reports whether sf's recorded owner is a process still
+// running HERE. BOTH halves must hold — the pid scope must be ours, and the pid
+// must resolve — and every uncertainty answers no, deliberately:
+//
+//   - A wrong no costs a misreported phase. The live run overwrites its own
+//     marker at its terminal transition, an unresolved park.json outranks the
+//     marker regardless, and `sig gc` treats "interrupted" as protected, so a
+//     wrong "interrupted" only ever keeps more than it should.
+//   - A wrong yes wedges a cell in "running" forever with no process behind it,
+//     and it is the likelier error under a container per run: a stranger's pid
+//     number in a foreign namespace resolves here perfectly well.
+//
+// An ABSENT pidScope — every status.json written before that field existed —
+// therefore reads NOT ours. That is a deliberate behaviour change for anyone
+// with runs already on disk: the first startup after upgrading rewrites a live
+// old-binary run's marker to "interrupted" rather than leaving it alone, at the
+// cost above. Trusting an unscoped pid instead would be the exact false-alive
+// this exists to close, and would leave the guard opt-out-able by deleting one
+// field from a file anybody can edit. The empty check is separate from the
+// comparison on purpose: it is the guard for ownerScope's own degenerate case,
+// where OURS is empty too and an unscoped record would otherwise compare equal
+// to it and be trusted.
+//
+// ours is passed in rather than read from ownerScope() here for the same reason
+// recoverStaleRuns takes ourPID: a test can name a specific "this host" —
+// including the empty one — without arranging to run on it.
+func ownedByLiveProcess(sf *runStatusFile, ours string) bool {
+	return sf.PIDScope != "" && sf.PIDScope == ours && pidAlive(sf.PID)
+}
+
+// staleOwnerReason explains WHY a recorded owner is not live here, for the note
+// a human reads back off `GET /runs/{id}` or `sig log`. "That pid is gone" and
+// "that pid was never ours to look up" send an operator down completely
+// different paths, so recovery must not print the first when it means the
+// second. The foreign scope is quoted, not interpolated raw: it is read back off
+// a file on disk and lands in a note the UI and `sig log` print, same as
+// diskRunStatus quotes the phase it reads.
+func staleOwnerReason(sf *runStatusFile, ours string) string {
+	switch {
+	case sf.PIDScope == "":
+		return fmt.Sprintf("owning process (pid %d) recorded no host identity, so it cannot be shown alive here", sf.PID)
+	case sf.PIDScope != ours:
+		return fmt.Sprintf("owning process (pid %d) belongs to another host or boot %s", sf.PID, strconv.Quote(sf.PIDScope))
+	}
+	return fmt.Sprintf("owning process (pid %d) is gone", sf.PID)
+}
+
+// pidAlive reports whether pid names a currently running process IN THIS pid
+// namespace. On Unix, os.FindProcess always succeeds without checking anything;
+// sending signal 0 is the standard, side-effect-free way to actually probe
+// existence. It answers "a process holds this number", never "MY process holds
+// it", which is why recovery pairs it with ownerScope (see
+// ownedByLiveProcess) rather than trusting it alone.
 //
 // Windows note: Process.Signal rejects signal 0 ("not supported by windows"),
 // so this returns false for every pid there, live or dead. recoverStaleRuns

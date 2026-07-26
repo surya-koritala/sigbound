@@ -508,12 +508,15 @@ func TestParkSurvivesDaemonDeathAndRestart(t *testing.T) {
 	}
 }
 
-// writeRunStatusAsPID plants a status.json owned by a specific pid, so a test
-// can express "this run's owner is gone" without actually dying.
+// writeRunStatusAsPID plants a status.json owned by a specific pid ON THIS
+// HOST, so a test can express "this run's owner is gone" without actually
+// dying. The scope is ours deliberately: these tests are about a DEAD pid, and
+// leaving the scope off would make them pass for the unrelated reason that an
+// unscoped record is reclaimable too (see ownedByLiveProcess).
 func writeRunStatusAsPID(t *testing.T, dir, status string, pid int) {
 	t.Helper()
 	data, err := json.MarshalIndent(runStatusFile{
-		Status: status, UpdatedAt: time.Now().UTC().Format(time.RFC3339), PID: pid,
+		Status: status, UpdatedAt: time.Now().UTC().Format(time.RFC3339), PID: pid, PIDScope: ownerScope(),
 	}, "", "  ")
 	if err != nil {
 		t.Fatal(err)
