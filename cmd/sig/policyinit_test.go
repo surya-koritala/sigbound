@@ -1235,58 +1235,127 @@ func TestPolicyInitListItemBelongsToItsKey(t *testing.T) {
 	}
 }
 
-// TestPolicyInitUsesTheReposOwnDefaultBranch: a gitflow repo gating merges on
-// `develop` keeps its real battery. A main/master name test discarded it and
-// fell back to the toolchain preset -- a genuine bar, but not the repo's own,
-// and with nothing saying why. The repo is asked what its default branch is.
+// setDefaultBranch makes branch the repo's default the way a clone records it:
+// a remote-tracking ref plus origin/HEAD pointing at it. DefaultBranch reads
+// ONLY origin/HEAD -- the checked-out branch is where you are standing, not
+// where merges land -- so a test that merely renames the local branch is not
+// testing the thing.
+func setDefaultBranch(t *testing.T, repo, branch string) {
+	t.Helper()
+	for _, args := range [][]string{
+		{"update-ref", "refs/remotes/origin/" + branch, "HEAD"},
+		{"symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/" + branch},
+	} {
+		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
+// TestPolicyInitUsesTheReposOwnDefaultBranch: which branch a merge lands on is
+// the repository's answer, not a guess from a list of common names. A gitflow
+// repo gating merges on `develop` keeps its own battery; a main/master name test
+// discarded it and silently fell back to the toolchain preset.
 func TestPolicyInitUsesTheReposOwnDefaultBranch(t *testing.T) {
+	// The assertion is whether the WORKFLOW's command was adopted, not whether
+	// anything was drafted at all: a refused workflow correctly falls through to
+	// the manifest source, which drafts a real battery from go.mod. That fallback
+	// is the feature working, so testing for an empty policy would be testing the
+	// wrong thing.
+	const wfCmd = "golangci-lint run"
+	for _, tc := range []struct {
+		name, defaultBranch, filter string
+		wantAdopted                 bool
+	}{
+		// The repo's own default branch gates merges, whatever it is called.
+		{"develop", "develop", "develop", true},
+		{"trunk", "trunk", "trunk", true},
+		{"master", "master", "master", true},
+		{"mainline", "mainline", "mainline", true},
+		// THE PAIRED NEGATIVE: `master` is a merge gate only where master IS the
+		// default. On a develop repo it is some other branch, so the workflow is
+		// not a landing bar. Without this the suite cannot tell an exact lookup
+		// from one that merely also accepts main/master.
+		{"master on a develop repo", "develop", "master", false},
+		{"main on a develop repo", "develop", "main", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := initPolicyRepo(t, map[string]string{
+				"go.mod": "module x\n\ngo 1.21\n",
+				".github/workflows/ci.yml": "on:\n  push:\n    branches:\n      - " + tc.filter +
+					"\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: golangci-lint run\n",
+			})
+			setDefaultBranch(t, repo, tc.defaultBranch)
+			_, _, err, draft := policyInit(t, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pol := mustParse(t, draft)
+			adopted := false
+			for _, v := range pol.verify {
+				if v == wfCmd {
+					adopted = true
+				}
+			}
+			if adopted != tc.wantAdopted {
+				t.Fatalf("default branch %q, filter %q: workflow command adopted=%v, want %v; drafted %q\n%s",
+					tc.defaultBranch, tc.filter, adopted, tc.wantAdopted, pol.verify, draft)
+			}
+		})
+	}
+}
+
+// TestPolicyInitUnknownDefaultBranchFallsBack: a repo that cannot say which
+// branch is default -- no origin/HEAD, the normal state after `git init` plus
+// `git remote add`, and after actions/checkout -- must fall back to main/master
+// rather than trust a wrong answer. Reading the CHECKED-OUT branch instead made
+// this confidently wrong: standing on a feature branch made an ordinary
+// `branches: [main]` workflow look like it gated nothing, and the repo silently
+// lost its real battery.
+func TestPolicyInitUnknownDefaultBranchFallsBack(t *testing.T) {
 	repo := initPolicyRepo(t, map[string]string{
 		"go.mod":                   "module x\n\ngo 1.21\n",
-		".github/workflows/ci.yml": "on:\n  push:\n    branches:\n      - develop\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: golangci-lint run\n",
+		".github/workflows/ci.yml": "on:\n  push:\n    branches:\n      - main\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: golangci-lint run\n",
 	})
-	// Make develop the checked-out branch, which is what DefaultBranch falls
-	// back to when there is no origin/HEAD.
-	if out, err := exec.Command("git", "-C", repo, "branch", "-M", "develop").CombinedOutput(); err != nil {
-		t.Fatalf("rename the branch: %v\n%s", err, out)
+	// No origin/HEAD, and standing somewhere else entirely.
+	if out, err := exec.Command("git", "-C", repo, "checkout", "-qb", "feature/x").CombinedOutput(); err != nil {
+		t.Fatalf("checkout: %v\n%s", err, out)
 	}
 	_, _, err, draft := policyInit(t, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pol := mustParse(t, draft)
-	if len(pol.verify) != 1 || pol.verify[0] != "golangci-lint run" {
-		t.Fatalf("a repo whose default branch is develop drafted %q, want its own CI command\n%s", pol.verify, draft)
+	if pol := mustParse(t, draft); len(pol.verify) != 1 || pol.verify[0] != "golangci-lint run" {
+		t.Fatalf("on a feature branch with no origin/HEAD, drafted %q — a `branches: [main]` workflow is an ordinary merge gate\n%s", pol.verify, draft)
 	}
-	// master is a default branch name only when the repo actually uses it --
-	// which is the whole point of asking the repo instead of matching names.
-	repoM := initPolicyRepo(t, map[string]string{
-		"go.mod":                   "module x\n\ngo 1.21\n",
-		".github/workflows/ci.yml": "on:\n  push:\n    branches:\n      - master\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test ./...\n",
-	})
-	if out, err := exec.Command("git", "-C", repoM, "branch", "-M", "master").CombinedOutput(); err != nil {
-		t.Fatalf("rename the branch: %v\n%s", err, out)
-	}
-	_, _, err, draftM := policyInit(t, repoM)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pol := mustParse(t, draftM); len(pol.verify) != 1 || pol.verify[0] != "go test ./..." {
-		t.Fatalf("a repo whose default branch is master drafted %q, want its own CI command\n%s", pol.verify, draftM)
-	}
+}
 
-	// And the converse: on that same repo, a push filtered to main is NOT a
-	// merge gate, because main is not where this repo's merges land.
-	repo2 := initPolicyRepo(t, map[string]string{
-		".github/workflows/rel.yml": "on:\n  push:\n    branches:\n      - main\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo shipping\n",
+// TestPolicyInitStaleOriginHeadFallsBack: origin/HEAD outlives the branch it
+// names when that branch is renamed or deleted server-side. A stale pointer
+// names a branch nothing matches, so it must read as unknown, not as an answer.
+func TestPolicyInitStaleOriginHeadFallsBack(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{
+		"go.mod":                   "module x\n\ngo 1.21\n",
+		".github/workflows/ci.yml": "on:\n  push:\n    branches:\n      - main\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: golangci-lint run\n",
 	})
-	if out, err := exec.Command("git", "-C", repo2, "branch", "-M", "develop").CombinedOutput(); err != nil {
-		t.Fatalf("rename the branch: %v\n%s", err, out)
+	setDefaultBranch(t, repo, "oldname")
+	if out, err := exec.Command("git", "-C", repo, "update-ref", "-d", "refs/remotes/origin/oldname").CombinedOutput(); err != nil {
+		t.Fatalf("delete the tracking ref: %v\n%s", err, out)
 	}
-	_, _, err, draft2 := policyInit(t, repo2)
+	_, _, err, draft := policyInit(t, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pol := mustParse(t, draft2); len(pol.verify) != 0 {
-		t.Fatalf("a push filtered to main drafted %q on a repo whose default branch is develop\n%s", pol.verify, draft2)
+	// Assert the WORKFLOW's command was adopted. Checking the member count alone
+	// is vacuous here: the toolchain fallback also drafts exactly one member, so
+	// the count is 1 whether the stale pointer was believed or not.
+	adopted := false
+	for _, v := range mustParse(t, draft).verify {
+		if v == "golangci-lint run" {
+			adopted = true
+		}
+	}
+	if !adopted {
+		t.Fatalf("a stale origin/HEAD was trusted as an answer, so a `branches: [main]` workflow was refused\n%s", draft)
 	}
 }

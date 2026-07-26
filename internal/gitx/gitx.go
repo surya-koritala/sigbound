@@ -189,21 +189,33 @@ func (g *Git) FastImport(ctx context.Context, stream []byte) error {
 }
 
 // DefaultBranch reports the repository's default branch by name -- what a merge
-// actually lands on. It asks the remote's HEAD first (origin/HEAD, what a clone
-// records), then falls back to the checked-out branch. An empty string means
-// neither could be read (a bare or freshly-init'd repo, or a clone whose
-// origin/HEAD was never set); callers must treat that as "unknown" rather than
-// assuming a name.
+// actually lands on -- or "" when the repository cannot say. Callers must treat
+// "" as UNKNOWN and fall back; it never means "no branch matches".
+//
+// Only origin/HEAD answers this. The checked-out branch deliberately does NOT:
+// it is where you happen to be standing, not where merges land, so using it as a
+// fallback made this function confidently wrong in the ordinary case -- running
+// on a feature branch in a repo without origin/HEAD (git init + remote add never
+// sets it, and neither does actions/checkout), and in every linked worktree,
+// which matters because this is a worktree tool. A caller that trusts a wrong
+// name is worse off than one that knows it does not know.
+//
+// The target is verified to still exist: origin/HEAD outlives the branch it
+// points at when that branch is renamed or deleted server-side, and a stale
+// pointer would name a branch nothing matches.
 func (g *Git) DefaultBranch(ctx context.Context) string {
-	if out, err := g.run(ctx, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"); err == nil {
-		if b := strings.TrimPrefix(strings.TrimSpace(out), "origin/"); b != "" {
-			return b
-		}
+	out, err := g.run(ctx, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	if err != nil {
+		return ""
 	}
-	if out, err := g.run(ctx, "symbolic-ref", "--short", "HEAD"); err == nil {
-		return strings.TrimSpace(out)
+	b := strings.TrimPrefix(strings.TrimSpace(out), "origin/")
+	if b == "" {
+		return ""
 	}
-	return ""
+	if _, err := g.RevParse(ctx, "refs/remotes/origin/"+b); err != nil {
+		return "" // stale pointer: the branch it names is gone
+	}
+	return b
 }
 
 // RevParse resolves any ref/commit-ish to a SHA.
