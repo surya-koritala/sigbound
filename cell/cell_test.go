@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -226,5 +227,92 @@ func TestConcurrentCellsIntegrateDifferentRepos(t *testing.T) {
 	// would mean one cell's integration leaked into the other's store.
 	if r1.FinalSHA == r2.FinalSHA {
 		t.Fatal("different-content repos produced the same final commit — cells crosstalked")
+	}
+}
+
+// TestIntegrateRefusesBranchNotContainingBase drives issue #130's data-loss
+// scenario through the EXPORTED package API instead of the CLI (issue #163):
+// a branch forked from an older base, handed to Integrate against a base that
+// has since moved past it. Its overlay contribution versus the moved base is
+// the DELETION of everything the base gained, so the guard must refuse, move
+// no ref, and leave that content in the tree.
+//
+// The batch is MIXED and the stale branch is deliberately NOT first: a healthy
+// branch leads, the stale one sits behind it. That is what pins the "one refused
+// branch refuses the WHOLE batch" half of the contract. A guard that inspected
+// only changes[0] passes an all-stale batch and a batch of one — the two shapes
+// every other #130 test has — and then lands the stale branch, deleting landed
+// work exactly as #130 did.
+//
+// The landed.txt assertion is what makes this a real check: with the guard
+// removed the integrate succeeds, the CAS finds main exactly where it left it,
+// and main advances to a tree that no longer has the file. Asserting only the
+// error would pass against any refusal for any reason.
+func TestIntegrateRefusesBranchNotContainingBase(t *testing.T) {
+	ctx := context.Background()
+	g, pool, base := scenario(t, 2)
+	stale := spawnAgents(t, pool, base, 1, nil) // forked from the base as it stands now
+
+	// The base moves past the stale branch's fork point.
+	if err := os.WriteFile(filepath.Join(g.Dir(), "landed.txt"), []byte("landed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := g.CommitAll(ctx, "landed after the branch forked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved == base {
+		t.Fatal("base did not move; scenario not established")
+	}
+
+	// A healthy branch off the MOVED base, ahead of the stale one in the batch.
+	// spawnAgents names an agent's private file by its index, so ask for two and
+	// take the second: index 0 would write the same agent_000.txt the stale branch
+	// carries, and the "good branch did not land either" check below has to name a
+	// path only the good branch can produce.
+	fresh := spawnAgents(t, pool, moved, 2, nil)[1]
+	const freshFile = "agent_001.txt"
+	changes := []BranchChange{fresh, stale[0]}
+
+	c, err := Open(g.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	landMain := func(in *Integrator) { in.WithLandRef("refs/heads/main") }
+	_, err = c.Integrate(ctx, moved, changes, StrategyOverlay, landMain)
+	if err == nil {
+		t.Fatal("Integrate accepted a batch whose second branch does not contain the base; want refusal")
+	}
+	if !strings.Contains(err.Error(), stale[0].Branch) || !strings.Contains(err.Error(), "does not contain base") {
+		t.Fatalf("refusal must name the offending branch and why, got: %v", err)
+	}
+
+	head, err := g.RevParse(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != moved {
+		t.Fatalf("base ref moved on a refused integrate: %s -> %s", moved, head)
+	}
+	files, err := g.LsTree(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(files, "landed.txt") {
+		t.Fatalf("refused integrate deleted landed.txt from the base tree: %v", files)
+	}
+	// Whole batch, not just the offender: the healthy branch ahead of it in the
+	// batch did not land either.
+	if slices.Contains(files, freshFile) {
+		t.Fatalf("branch %q landed despite another branch in the batch being refused: %v", fresh.Branch, files)
+	}
+
+	// Fails CLOSED: an ancestry that cannot be read at all (here, a base that is
+	// not an object in this repo) refuses too, rather than letting a branch that
+	// may not contain the base through on an unanswered question.
+	if _, err := c.Integrate(ctx, strings.Repeat("0", 40), changes, StrategyOverlay); err == nil {
+		t.Fatal("Integrate accepted an unreadable base; want refusal")
+	} else if !strings.Contains(err.Error(), "cannot determine whether it contains base") {
+		t.Fatalf("unreadable ancestry must fail closed, got: %v", err)
 	}
 }

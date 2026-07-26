@@ -255,13 +255,78 @@ func (c *Cell) DeleteBranch(ctx context.Context, branch string) error {
 // opts apply the optional land-ref / assert / resolver knobs via the Integrator
 // With* builders. Holds no cross-call state, so it is safe to run concurrently
 // (on one cell or across cells).
+//
+// Every branch must CONTAIN base (or BE it). One that doesn't refuses the whole
+// batch before any strategy runs and nothing lands — see requireContainsBase for
+// WHY such a branch would silently delete landed work.
+//
+// The limits of that guarantee, so nobody assumes more: it is THIS method's, not
+// the engine's. Integrator and its per-strategy entry points are the raw engine
+// (what bench measures) and check nothing; IntegrateOnto is exempt on purpose,
+// since folding branches that forked somewhere else is the whole reason it
+// exists.
 func (c *Cell) Integrate(ctx context.Context, base string, changes []BranchChange, strategy string, opts ...func(*Integrator)) (IntegrationResult, error) {
+	if err := c.requireContainsBase(ctx, base, changes); err != nil {
+		return IntegrationResult{}, err
+	}
 	in := NewIntegrator(c.git)
 	for _, o := range opts {
 		o(in)
 	}
 	in.blobs = c // resolver blob reads route through this cell's daemon (fail-open)
 	return in.Integrate(ctx, base, changes, strategy)
+}
+
+// requireContainsBase is the ancestry guard (issue #130; it lived in cmd/sig
+// until #163 moved it here, where the exported API is safe without any
+// cooperation from its caller). The overlay strategy takes a branch's
+// contribution to be the TWO-tree diff base→tip, so a branch that does not
+// contain base carries, as its "contribution", the REMOVAL of everything the
+// base gained since that branch forked — and the OCC partitioner cannot catch
+// it, because such a branch's base...tip write-set is empty. Every branch must
+// therefore contain the base before anything reaches a strategy; the check is
+// pure ancestry (the same invariant `sig serve -watch` pre-filters adoptions
+// on — see cmd/sig's adoptableAgainst), fails CLOSED on any error, and one
+// refused branch refuses the whole batch: nothing lands.
+//
+// The guard binds EVERY strategy, not just the one that motivates it.
+// porcelain would in fact merge a diverged branch correctly, since a real
+// `git merge` uses the merge base rather than a two-tree diff — but the
+// strategies are documented as equivalent in what they land (see integrate.go),
+// and a stale branch is the one input that made them disagree. Refusing it
+// everywhere restores that equivalence; the cost is that porcelain loses an
+// ability the others never had.
+//
+// A refusal names the branch and the rebase that fixes it: a stale branch is an
+// operator-fixable condition, not a defect in the engine.
+func (c *Cell) requireContainsBase(ctx context.Context, base string, changes []BranchChange) error {
+	b := shortSHA(base)
+	for _, bc := range changes {
+		head, err := c.git.RevParse(ctx, bc.Branch)
+		if err != nil {
+			return fmt.Errorf("resolve branch %q: %w", bc.Branch, err)
+		}
+		if head == base {
+			continue // IS the base: contains it trivially, empty contribution
+		}
+		switch contains, err := c.git.IsAncestor(ctx, base, head); {
+		case err != nil:
+			return fmt.Errorf("branch %q: cannot determine whether it contains base %s; refusing to integrate: %w", bc.Branch, b, err)
+		case !contains:
+			return fmt.Errorf("branch %q does not contain base %s: integrating it would delete everything the base gained since the branch forked. "+
+				"Rebase the branch onto %s (or re-fork it from the current base) and retry. "+
+				"Branches from `sig import` (imported/<worker>/*) routinely predate the coordinator's base and need the same rebase. Nothing was landed", bc.Branch, b, b)
+		}
+	}
+	return nil
+}
+
+// shortSHA abbreviates a SHA for an error a human reads.
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 // IntegrateOnto is Integrate's counterpart for branches whose fork point is no
