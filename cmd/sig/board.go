@@ -1,8 +1,8 @@
 // GET /board (issue #114): the delivery board and its metrics, both DERIVED —
 // the board from the run journal (.git/sigbound/runs) and the repo's intents
-// directory, the metrics from the same journal plus the per-run metering records
-// every run already writes (usage.json, from either entry point). It stores
-// nothing and decides nothing.
+// directory, the metrics from the same journal plus the per-run metering record
+// any run that produced a report writes (usage.json, from either entry point).
+// It stores nothing and decides nothing.
 //
 // A card cannot be moved, because a card is a fact. An intent's column is
 // COMPUTED from its runs on every request (see boardColumn), so the board can

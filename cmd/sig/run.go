@@ -16,9 +16,10 @@
 //	SIGBOUND_REPO      the target repo path
 //	SIGBOUND_BRANCH    the branch the agent must commit to (agent/<id>)
 //
-// `sig serve` exports one more, SIGBOUND_USAGE_FILE: a path the agent MAY write
-// a token/cost JSON to, ingested into that run's usage.json. Purely optional —
-// unset outside serve, and an agent that ignores it is the normal case.
+// Both entry points export one more, SIGBOUND_USAGE_FILE: a path the agent MAY
+// write a token/cost JSON to, ingested into that run's usage.json. Purely
+// optional — nothing creates the file, and an agent that ignores it is the
+// normal case.
 //
 // The agent is expected to edit files AND commit in that worktree; the driver
 // reads the resulting branch head, never the main working tree.
@@ -95,8 +96,8 @@ type perAgentJSON struct {
 	// WallMs is this agent's full wall time — worktree setup, every retry, and
 	// the agent command itself — the same number the agent_done event carries.
 	// 0 (and omitted) for an ADOPTED or -resume-reused branch, which ran no
-	// agent at all. `sig serve`'s metering sums these into usage.json's
-	// agentWallMs; see usage.go.
+	// agent at all. Every run's metering sums these into usage.json's
+	// agentWallMs, whichever entry point drove it; see usage.go.
 	WallMs int64 `json:"wallMs,omitempty"`
 	// Resumed is true iff -resume reused this task's agent/<id> branch
 	// outright instead of running its agent again (see runParams.Resume /

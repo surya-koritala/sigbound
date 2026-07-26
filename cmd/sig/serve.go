@@ -914,7 +914,7 @@ func (s *server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
 // same way an unknown run does when the id doesn't resolve to any run dir,
 // and separately 404s (with a distinguishing message) when the dir exists
 // but usage.json doesn't yet — a still-running run, or one that errored
-// before any agent ran (see execRun's writeRunUsage gating).
+// before any agent ran (see execRun's recordRunUsage gating).
 func (s *server) handleRunUsage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !validRunID(id) {

@@ -39,10 +39,12 @@ type UsageJSON struct {
 	VerifyWallMs   int64 `json:"verifyWallMs"`
 	// TotalWallMs is the run's full wall clock as its driver saw it: from the
 	// moment the run was accepted (POST /runs for serve; the end of flag
-	// validation for `sig run`, which is the same point — everything before it
-	// is request validation on both paths) to the run's terminal write, which
-	// for a -goal run includes planning time driveRun itself never sees. NOT
-	// derivable from the report alone (it has no end timestamp).
+	// validation for `sig run`) to the run's terminal write, which for a -goal
+	// run includes planning time driveRun itself never sees. The two brackets
+	// are the same point to within the CLI's own -tasks read, which serve's
+	// caller did before it ever posted; validation that FAILS is metered on
+	// neither path, returning before any run dir exists. NOT derivable from the
+	// report alone (it has no end timestamp).
 	TotalWallMs int64 `json:"totalWallMs"`
 	// Landed is true iff the run's base ref actually advanced. This is NOT
 	// the same as report.integrate.finalSHA != report.baseSHA: finalSHA is
@@ -254,9 +256,10 @@ func reportFileSize(dir string) int64 {
 // silently costs the run its wall-clock and cost numbers for that response.
 //
 // Best-effort, like every other durable write around it: a failure here is a
-// line on stderr and nothing more. By the time this runs the work has already
-// landed, and losing the meter must never look like losing the run. The prefix
-// is the bare command name because both entry points reach this — a `sig run`
+// line on stderr and nothing more. By the time this is called the run is over
+// and its report already written, whatever the outcome was — landed or not —
+// so losing the meter must never look like losing the run itself. The prefix is
+// the bare command name because both entry points reach this — a `sig run`
 // warning that announced itself as `sig serve` would send its reader hunting a
 // daemon that isn't running.
 func writeRunUsage(dir string, u UsageJSON) {
