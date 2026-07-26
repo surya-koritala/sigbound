@@ -188,6 +188,36 @@ func (g *Git) FastImport(ctx context.Context, stream []byte) error {
 	return nil
 }
 
+// DefaultBranch reports the repository's default branch by name -- what a merge
+// actually lands on -- or "" when the repository cannot say. Callers must treat
+// "" as UNKNOWN and fall back; it never means "no branch matches".
+//
+// Only origin/HEAD answers this. The checked-out branch deliberately does NOT:
+// it is where you happen to be standing, not where merges land, so using it as a
+// fallback made this function confidently wrong in the ordinary case -- running
+// on a feature branch in a repo without origin/HEAD (git init + remote add never
+// sets it, and neither does actions/checkout), and in every linked worktree,
+// which matters because this is a worktree tool. A caller that trusts a wrong
+// name is worse off than one that knows it does not know.
+//
+// The target is verified to still exist: origin/HEAD outlives the branch it
+// points at when that branch is renamed or deleted server-side, and a stale
+// pointer would name a branch nothing matches.
+func (g *Git) DefaultBranch(ctx context.Context) string {
+	out, err := g.run(ctx, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	if err != nil {
+		return ""
+	}
+	b := strings.TrimPrefix(strings.TrimSpace(out), "origin/")
+	if b == "" {
+		return ""
+	}
+	if _, err := g.RevParse(ctx, "refs/remotes/origin/"+b); err != nil {
+		return "" // stale pointer: the branch it names is gone
+	}
+	return b
+}
+
 // RevParse resolves any ref/commit-ish to a SHA.
 func (g *Git) RevParse(ctx context.Context, ref string) (string, error) {
 	return g.run(ctx, "rev-parse", "--verify", ref+"^{commit}")
@@ -700,6 +730,52 @@ func (g *Git) TreeSize(ctx context.Context, rev string) (int64, error) {
 		return 0, err
 	}
 	return parseLsTreeSizesZ(out)
+}
+
+// LsTreeSizes lists every blob in rev's tree as a path -> raw content size (in
+// bytes) map, via `git ls-tree -r -l -z` — LsTree plus the size field, in the
+// same one call. A caller that means to read a subset of blobs can skip an
+// oversized one before it reads it into memory, so a size cap binds before
+// allocation rather than after. Submodule entries (git reports their size as
+// "-", their content living in another object store) are omitted, same as they
+// contribute 0 to TreeSize.
+func (g *Git) LsTreeSizes(ctx context.Context, rev string) (map[string]int64, error) {
+	out, err := g.run(ctx, "ls-tree", "-r", "-l", "-z", rev)
+	if err != nil {
+		return nil, err
+	}
+	return parseLsTreeSizesMapZ(out)
+}
+
+// parseLsTreeSizesMapZ decodes `git ls-tree -r -l -z` into a path -> size map.
+// It parses the same record shape as parseLsTreeSizesZ ("<mode> SP <type> SP
+// <oid> SP <size>\t<path>\0") but keyed by path rather than summed; kept a
+// sibling rather than sharing a primitive so the fuzzed disk-preflight summer
+// stays untouched. Pure function of untrusted git output; must never panic.
+func parseLsTreeSizesMapZ(out string) (map[string]int64, error) {
+	sizes := map[string]int64{}
+	for _, rec := range strings.Split(out, "\x00") {
+		if rec == "" { // trailing empty after final NUL
+			continue
+		}
+		tab := strings.IndexByte(rec, '\t')
+		if tab < 0 {
+			return nil, fmt.Errorf("ls-tree -l: malformed record %q", rec)
+		}
+		fields := strings.Fields(rec[:tab])
+		if len(fields) < 4 {
+			return nil, fmt.Errorf("ls-tree -l: malformed record %q", rec)
+		}
+		if fields[3] == "-" { // submodule: no size in this object store
+			continue
+		}
+		n, err := strconv.ParseInt(fields[3], 10, 64)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("ls-tree -l: bad size in record %q", rec)
+		}
+		sizes[rec[tab+1:]] = n
+	}
+	return sizes, nil
 }
 
 // parseLsTreeSizesZ sums the blob sizes from `git ls-tree -r -l -z` output.

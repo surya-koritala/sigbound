@@ -68,6 +68,14 @@ func main() {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "unland":
+		code, err := runUnland(os.Stdout, os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sig unland:", err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "gc":
 		code, err := runGC(os.Stdout, os.Args[2:])
 		if err != nil {
@@ -88,6 +96,14 @@ func main() {
 		code, err := runIntent(os.Stdout, os.Args[2:])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "sig intent:", err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
+	case "policy":
+		code, err := runPolicy(os.Stdout, os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sig policy:", err)
 		}
 		if code != 0 {
 			os.Exit(code)
@@ -139,10 +155,12 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  sig serve     -repos PATH[,PATH..] [-addr HOST:PORT]  (HTTP run API over driveRun; see 'sig serve -h')")
 	fmt.Fprintln(w, "  sig ack       RUN_ID -repo PATH  (release a parked landing: lands the exact verified tree; see 'sig ack -h')")
 	fmt.Fprintln(w, "  sig reject    RUN_ID -repo PATH [-reason TEXT]  (reject a parked landing; branches kept, nothing lands)")
+	fmt.Fprintln(w, "  sig unland    RUN_ID -repo PATH [-verify CMD] [-dry-run]  (take one landed run back out, verify-gated; see 'sig unland -h')")
 	fmt.Fprintln(w, "  sig doctor    [-repo PATH]")
 	fmt.Fprintln(w, "  sig gc        -repo PATH [-older-than 72h] [-delete] [-force] [-json]  (sweep debris a crashed run left; dry-run by default; see 'sig gc -h')")
 	fmt.Fprintln(w, "  sig log       -repo PATH [-limit 50] [-sha COMMIT | -task ID] [-json]  (read-only run history + commit provenance; see 'sig log -h')")
 	fmt.Fprintln(w, "  sig intent    list|show ID|new ID|import-github -repo PATH  (the repo's intents/*.intent statements of work; run one with 'sig run -intent ID')")
+	fmt.Fprintln(w, "  sig policy    init [-repo PATH]  (write a starting sigbound.policy from the repo's CI workflows, Makefile, manifests and CODEOWNERS; never overwrites)")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))
 }
