@@ -204,6 +204,21 @@ func (sc *wfScan) scanJob(path, name string, lines []string, s, e int) {
 		case "defaults":
 			sc.note("%s:%d job %q has `defaults:` — it can redirect the shell or working directory of every step, so the job contributes nothing", path, i+1, name)
 			return
+		case "if":
+			// The step-scope twin of this guard refuses a conditional STEP. A
+			// conditional JOB is strictly broader -- the condition decides whether
+			// any of its steps run at all -- so a schedule-only job in a workflow
+			// that also fires on push would otherwise contribute a bar that gates
+			// nothing in CI. Same reasoning as the tags-only trigger refusal.
+			sc.note("%s:%d job %q is conditional (`if:`) — the whole job may not run, so it contributes nothing", path, i+1, name)
+			return
+		case "continue-on-error":
+			// Also the step-scope twin: a job whose failure does not fail the
+			// workflow is not a gate, so its steps are not a landing bar.
+			if strings.TrimSpace(stripInlineComment(val)) == "true" {
+				sc.note("%s:%d job %q has `continue-on-error: true` — its failure does not fail CI, so it is not a gate and contributes nothing", path, i+1, name)
+				return
+			}
 		case "strategy":
 			// A matrix runs the SAME step text N times over different values.
 			// Emitting that text once is faithful; a step that interpolates a
@@ -323,18 +338,11 @@ func (sc *wfScan) scanStep(path, job string, lines []string, s, e int) {
 	// but is to plenty of other readers) ends the line early and turns the
 	// remainder into a policy key of its own, and a NUL reaches the value and then
 	// exec. Refuse rather than strip: silently rewriting somebody's command is
-	// exactly the wrong-suggestion failure this scanner avoids. Checked per byte,
-	// so a NUL or high C0 control inside invalid UTF-8 is caught too; a tab is left
-	// alone (legitimate whitespace in a command). DEL (0x7f) counts as a control
-	// byte here for the same reason emitComment's scrubber treats it as one — one
-	// definition of "control byte" across this command, not two.
-	if refuse == "" {
-		for i := 0; i < len(run); i++ {
-			if b := run[i]; (b < 0x20 && b != '\t') || b == 0x7f {
-				refuse = "the command contains a control character (a NUL, DEL, carriage return, or newline), which cannot be a single `verify` line"
-				break
-			}
-		}
+	// exactly the wrong-suggestion failure this scanner avoids. What counts as a
+	// control byte is isControlByte's call, not this function's -- see the note
+	// there on why there is exactly one of them.
+	if refuse == "" && hasControlByte(run) {
+		refuse = "the command contains a control character (a NUL, DEL, carriage return, or newline), which cannot be a single `verify` line"
 	}
 	if refuse == "" && strings.Contains(run, "${{") {
 		refuse = "the command interpolates a `${{ }}` expression, which cannot be evaluated here — an empty substitution can leave a command that exits 0 and gates nothing"

@@ -337,16 +337,40 @@ func emitComment(b *strings.Builder, s string) {
 	}
 }
 
-// scrubControl replaces C0 control bytes (except tab) with '?'. Operates on
-// bytes, not runes, so a control byte inside invalid UTF-8 is caught too.
+// isControlByte is the ONE definition of "a byte that must not reach the drafted
+// file" -- C0 controls and DEL, with tab exempt. Every consumer asks this and
+// nothing re-states it: the scan that refuses a command, the CODEOWNERS pattern
+// check, and scrubControl below all route here.
+//
+// It is one function because it was three. A copy that checked `< 0x20` without
+// DEL let `run: \x7f` through to a live verify value, and a copy that omitted the
+// tab exemption disagreed with the other two on a byte that only happened to be
+// unreachable. Two predicates that currently agree are a defect waiting for one
+// of them to be edited.
+//
+// Bytes, not runes, so a control byte inside invalid UTF-8 is caught too.
+func isControlByte(b byte) bool { return (b < 0x20 && b != '\t') || b == 0x7f }
+
+// hasControlByte reports whether s holds any byte isControlByte rejects. A rune
+// scan would miss one inside invalid UTF-8 (it decodes to RuneError, which is
+// not a control), so this walks bytes.
+func hasControlByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if isControlByte(s[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// scrubControl replaces every byte isControlByte rejects with '?'.
 func scrubControl(s string) string {
-	if strings.IndexFunc(s, func(r rune) bool { return r < 0x20 && r != '\t' }) < 0 &&
-		!strings.ContainsRune(s, 0x7f) {
+	if !hasControlByte(s) {
 		return s // the overwhelmingly common case: nothing to do
 	}
 	out := []byte(s)
 	for i, c := range out {
-		if (c < 0x20 && c != '\t') || c == 0x7f {
+		if isControlByte(c) {
 			out[i] = '?'
 		}
 	}
@@ -719,7 +743,7 @@ func codeownersGlobs(pattern string, tree []string) (globs []string, refuse stri
 		return nil, "a negation cannot be expressed — ack-paths only adds paths that need an ack"
 	case strings.Contains(pattern, `\`):
 		return nil, "globMatch has no backslash escape, so the pattern cannot be translated faithfully"
-	case strings.IndexFunc(pattern, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0:
+	case hasControlByte(pattern):
 		// A control byte here would reach a LIVE `ack-paths` value (strings.Fields
 		// does not split on NUL, so `auth\x00x` is one pattern), putting a NUL in
 		// the drafted file — git then calls it binary and the diff is unreviewable.

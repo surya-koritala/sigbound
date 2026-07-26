@@ -529,6 +529,13 @@ func TestPolicyInitJobLevelRefusals(t *testing.T) {
 		{"container", "    container: golang:1.22\n", "environment this run does not provide"},
 		{"job env", "    env:\n        CGO_ENABLED: '0'\n", "job-level `env:`"},
 		{"defaults", "    defaults:\n      run:\n        working-directory: ./sub\n", "`defaults:`"},
+		// The step-scope twins, mirrored down. A conditional JOB is strictly
+		// broader than a conditional step -- its condition decides whether any of
+		// its steps run at all -- and a job whose failure does not fail the
+		// workflow is not a gate. Both were unguarded at this scope while being
+		// refused one level down.
+		{"job if", "    if: github.event_name == 'schedule'\n", "conditional (`if:`)"},
+		{"job continue-on-error", "    continue-on-error: true\n", "does not fail CI"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := initPolicyRepo(t, map[string]string{
@@ -1058,4 +1065,80 @@ func FuzzCodeownersDraft(f *testing.F) {
 			globMatch(glob, "apps/web/main.go") // must not panic on any emitted glob
 		}
 	})
+}
+
+// TestPolicyInitScheduleOnlyJobIsNotABar is the vacuous-bar case the job-scope
+// `if:` guard exists for, in the shape a real repo has it: a workflow that fires
+// on push AND on a schedule, whose only jobs are a schedule-gated smoke job and
+// an advisory job that is allowed to fail. The file passes the trigger check
+// because `push` is there, but its real gate content is ZERO -- neither job
+// blocks a merge. Drafting either one produces a bar that reports green
+// unconditionally, which is the one output this command must never produce.
+func TestPolicyInitScheduleOnlyJobIsNotABar(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{
+		".github/workflows/ci.yml": "on:\n  push:\n  schedule:\n    - cron: '0 3 * * *'\n" +
+			"jobs:\n" +
+			"  nightly-smoke:\n    if: github.event_name == 'schedule'\n    steps:\n      - run: echo \"nightly smoke placeholder\"\n" +
+			"  flaky-e2e:\n    continue-on-error: true\n    steps:\n      - run: ./e2e.sh || true\n",
+	})
+	_, _, err, draft := policyInit(t, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol := mustParse(t, draft); len(pol.verify) != 0 {
+		t.Fatalf("a schedule-only job and an advisory job drafted %q as the landing bar; neither gates a merge\n%s", pol.verify, draft)
+	}
+	for _, want := range []string{"nightly-smoke", "flaky-e2e"} {
+		if !strings.Contains(draft, want) {
+			t.Fatalf("no note naming the skipped job %q — the draft must say what it did not use\n%s", want, draft)
+		}
+	}
+}
+
+// TestControlBytePredicateIsOne pins the property whose absence caused two
+// escapes: every consumer of "is this byte allowed in the drafted file" must
+// answer identically. The scan that refuses a command, the CODEOWNERS pattern
+// check and the comment scrubber previously each carried their own copy -- one
+// omitted DEL (so `run: \x7f` reached a live verify value) and one omitted the
+// tab exemption (harmless only because no CODEOWNERS pattern can hold a tab).
+//
+// This asserts agreement across all three, so a future edit to one of them fails
+// here instead of shipping a byte that only one consumer lets through.
+func TestControlBytePredicateIsOne(t *testing.T) {
+	// The agreement loop below compares every consumer AGAINST isControlByte, so
+	// it cannot notice the predicate itself changing -- both sides move together.
+	// Pin the content first: what it must and must not reject, independent of
+	// what it currently says. Without this, dropping the tab exemption passes.
+	for _, c := range []byte{0x00, 0x01, 0x08, '\n', '\r', 0x1f, 0x7f} {
+		if !isControlByte(c) {
+			t.Fatalf("byte %#02x must be rejected: it corrupts the drafted line or reaches exec", c)
+		}
+	}
+	for _, c := range []byte{'\t', ' ', 'a', '~', 0x80, 0xff} {
+		if isControlByte(c) {
+			t.Fatalf("byte %#02x must be allowed: a tab is legitimate whitespace in a command, and high bytes are UTF-8 continuation", c)
+		}
+	}
+	for b := 0; b < 0x100; b++ {
+		c := byte(b)
+		want := isControlByte(c)
+		s := "a" + string(c) + "b"
+		if got := hasControlByte(s); got != want {
+			t.Fatalf("byte %#02x: hasControlByte=%v, isControlByte=%v", c, got, want)
+		}
+		// The scrubber rewrites exactly the bytes the predicate rejects.
+		if got := scrubControl(s) != s; got != want {
+			t.Fatalf("byte %#02x: scrubControl rewrote=%v, isControlByte=%v", c, got, want)
+		}
+		// The CODEOWNERS pattern check refuses exactly those bytes. Patterns are
+		// whitespace-split before they reach it, so feed the byte in a pattern
+		// shape and skip the ones splitKey/Fields would never deliver.
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			continue
+		}
+		_, refuse := codeownersGlobs("x"+string(c)+"y", nil)
+		if refused := strings.Contains(refuse, "control character"); refused != want {
+			t.Fatalf("byte %#02x: codeownersGlobs refused=%v, isControlByte=%v (refuse=%q)", c, refused, want, refuse)
+		}
+	}
 }
