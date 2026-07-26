@@ -45,6 +45,7 @@
 //	GET  /usage            -> usage totals across all run history, + a per-cell rollup
 //	GET  /runs/{id}/flagged                    -> {runId, cell, flagged:[{branch, paths}]}
 //	GET  /runs/{id}/flagged/{branch}/{path...} -> {path, base, ours, theirs, baseSHA} (three sides)
+//	GET  /board            -> intents x runs x parks, plus delivery metrics (see board.go)
 //	GET  /ui (and /ui/)    -> the read-only conflict-review HTML page (see handleUI)
 //
 // The /flagged endpoints + /ui are the conflict-review surface (issue #62): a
@@ -336,6 +337,10 @@ func (s *server) handler() http.Handler {
 	// the same bearer gate and read-only posture as every data route above.
 	mux.HandleFunc("GET /log", s.handleLog)
 	mux.HandleFunc("GET /log/sha/{sha}", s.handleLogSHA)
+	// Board + metrics (issue #114): a READ-ONLY projection of the same journal
+	// /log reads, plus the intents directory. It adds no mutating endpoint and no
+	// state of its own — see board.go.
+	mux.HandleFunc("GET /board", s.handleBoard)
 	if s.token == "" {
 		return mux
 	}
@@ -612,6 +617,11 @@ func (s *server) acquireRun(rc *registeredCell, req runRequest, p *runParams) (*
 	// The run id is the key the spot-audit sample is drawn on (see
 	// auditSelected): a recorded, replayable id, never a fresh random draw.
 	p.RunID = runID
+	// Optional cost seam (issue #114): each agent gets SIGBOUND_USAGE_FILE
+	// pointing into this same durable dir, and execRun's computeUsage sums
+	// whatever was written there. Nothing is created here — an agent that
+	// ignores the variable leaves no file, which is the normal case.
+	p.AgentUsageDir = dir
 	return rec, nil
 }
 
@@ -662,7 +672,7 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 			// advanced — Landed is unconditionally false here, unlike
 			// computeUsage's report-field heuristic (accurate only for a
 			// completed, non-erroring driveRun return, i.e. the path below).
-			u := computeUsage(&rep, time.Since(rec.startedAt).Milliseconds(), reportFileSize(rec.dir))
+			u := computeUsage(rec.dir, &rep, time.Since(rec.startedAt).Milliseconds())
 			u.Landed = false
 			writeRunUsage(rec.dir, u)
 		}
@@ -670,7 +680,7 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 		return
 	}
 	writeRunReport(rec.dir, rep)
-	writeRunUsage(rec.dir, computeUsage(&rep, time.Since(rec.startedAt).Milliseconds(), reportFileSize(rec.dir)))
+	writeRunUsage(rec.dir, computeUsage(rec.dir, &rep, time.Since(rec.startedAt).Milliseconds()))
 	// Parking (issue #109): a run that verified a landing but deliberately did
 	// not advance the ref is NOT done — it is awaiting a human. park.json is
 	// written BEFORE the status flips, so a crash in between leaves a parked run

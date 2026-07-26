@@ -11,6 +11,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -45,14 +46,33 @@ type UsageJSON struct {
 	// ReportBytes is the size of report.json on disk, one crude proxy for
 	// how much this run cost to store/transfer.
 	ReportBytes int64 `json:"reportBytes"`
+	// AgentWallMs is the summed wall time of this run's agent invocations
+	// (report.perAgent[].wallMs). Agents run CONCURRENTLY, so this is machine
+	// time spent on agents, not elapsed time — it can exceed TotalWallMs. An
+	// adopted or -resume-reused branch ran no agent and contributes 0. Written
+	// from v2.1 on: a run recorded by an older binary has no per-agent wallMs
+	// and so reads back 0 here.
+	AgentWallMs int64 `json:"agentWallMs,omitempty"`
+	// InputTokens/OutputTokens/CostUSD are INGESTED, not measured: they are the
+	// sum of whatever the run's agents wrote to SIGBOUND_USAGE_FILE (see
+	// ingestAgentUsage). Sigbound never sees a token or a price itself — this is
+	// an optional seam, and every field here is 0 (and omitted) for the normal
+	// case where no agent wrote anything. CostAgents is how many agents actually
+	// reported, so a reader can tell a genuine zero from partial coverage.
+	InputTokens  int64   `json:"inputTokens,omitempty"`
+	OutputTokens int64   `json:"outputTokens,omitempty"`
+	CostUSD      float64 `json:"costUsd,omitempty"`
+	CostAgents   int     `json:"costAgents,omitempty"`
 }
 
-// computeUsage derives a run's usage record from its finished report and the
-// wall-clock total the caller measured around the whole run (see execRun).
-// landed can only be told apart from "verify failed, nothing written to the
-// ref" by combining BaseSHA/Integrate.FinalSHA with Verify.Ran/Verify.OK, per
-// Landed's doc comment above.
-func computeUsage(rep *runReport, totalWallMs, reportBytes int64) UsageJSON {
+// computeUsage derives a run's usage record from its finished report, the
+// wall-clock total the caller measured around the whole run (see execRun), and
+// the run's own directory — which is where report.json's size and the optional
+// per-agent cost files both come from. landed can only be told apart from
+// "verify failed, nothing written to the ref" by combining
+// BaseSHA/Integrate.FinalSHA with Verify.Ran/Verify.OK, per Landed's doc comment
+// above.
+func computeUsage(dir string, rep *runReport, totalWallMs int64) UsageJSON {
 	u := UsageJSON{
 		AgentsTotal:     len(rep.PerAgent),
 		IntegrateWallMs: rep.Integrate.WallMs,
@@ -61,7 +81,7 @@ func computeUsage(rep *runReport, totalWallMs, reportBytes int64) UsageJSON {
 		VerifyWallMs:    rep.Verify.WallMs,
 		TotalWallMs:     totalWallMs,
 		Landed:          rep.Integrate.FinalSHA != rep.BaseSHA && (!rep.Verify.Ran || rep.Verify.OK),
-		ReportBytes:     reportBytes,
+		ReportBytes:     reportFileSize(dir),
 	}
 	for _, a := range rep.PerAgent {
 		if a.OK {
@@ -69,8 +89,57 @@ func computeUsage(rep *runReport, totalWallMs, reportBytes int64) UsageJSON {
 		} else {
 			u.AgentsFailed++
 		}
+		u.AgentWallMs += a.WallMs
 	}
+	ingestAgentUsage(dir, &u)
 	return u
+}
+
+// agentUsagePrefix names the per-agent cost files an agent MAY write via
+// SIGBOUND_USAGE_FILE. They live directly in the run directory (one per agent,
+// so concurrent agents never share a file) rather than in a subdirectory, so no
+// directory has to exist before an agent runs and the filename is always a plain
+// name under the run dir whatever the task id contains. See runAgent.
+const agentUsagePrefix = "agent-usage-"
+
+// agentUsageJSON is the OPTIONAL token/cost record an agent may write to the
+// path in SIGBOUND_USAGE_FILE. Every field is optional and unknown fields are
+// IGNORED, not rejected: an agent will usually be dumping its own vendor's usage
+// blob, and a seam that only accepted an exact schema would go unused.
+type agentUsageJSON struct {
+	InputTokens  int64   `json:"inputTokens"`
+	OutputTokens int64   `json:"outputTokens"`
+	CostUSD      float64 `json:"costUsd"`
+}
+
+// ingestAgentUsage sums every agent-usage-*.json in dir into u. It is silent by
+// construction: no file (the normal case), an unreadable file, one that is not
+// JSON, or one carrying a negative number is skipped without a word, because
+// this is a best-effort seam that must never affect a run or its report. A
+// skipped file is simply absent from CostAgents, which is what makes partial
+// coverage visible instead of pretending to a total.
+func ingestAgentUsage(dir string, u *UsageJSON) {
+	paths, err := filepath.Glob(filepath.Join(dir, agentUsagePrefix+"*.json"))
+	if err != nil {
+		return // only ErrBadPattern, which this fixed pattern cannot produce
+	}
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var a agentUsageJSON
+		if json.Unmarshal(data, &a) != nil {
+			continue
+		}
+		if a.InputTokens < 0 || a.OutputTokens < 0 || a.CostUSD < 0 || math.IsNaN(a.CostUSD) || math.IsInf(a.CostUSD, 0) {
+			continue
+		}
+		u.InputTokens += a.InputTokens
+		u.OutputTokens += a.OutputTokens
+		u.CostUSD += a.CostUSD
+		u.CostAgents++
+	}
 }
 
 // reportFileSize returns report.json's on-disk size for dir, 0 if it isn't

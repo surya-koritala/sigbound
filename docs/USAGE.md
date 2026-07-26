@@ -2008,9 +2008,10 @@ All requests and responses are JSON (events are NDJSON).
 | `POST /runs/{id}/reject` | Reject a parked landing; optional body `{"reason": "…"}`. Terminal, lands nothing, keeps the branches. |
 | `GET /inbox` | `{entries:[…]}` — everything across all cells waiting on a human, newest first. `?type=parked\|flagged\|dropped\|repair-failed\|audit\|red-branch`, `?limit=N` (default 100). See [The inbox](#the-inbox). |
 | `POST /queue` | `{"cell": id, "branches": [...]}` — name existing branches for that cell's next watch cycle (see [Watch mode](#watch-mode)). Returns **202** `{cell, queued}`. `400` (`watch_disabled`) without `-watch`; `400` for a branch that does not exist. |
-| `GET /ui` (and `/ui/`) | The review HTML page: conflict panes plus the Inbox tab (see [Review UI](#review-ui)). |
+| `GET /ui` (and `/ui/`) | The review HTML page: conflict panes plus the Inbox and Board tabs (see [Review UI](#review-ui)). |
 | `GET /log` | `{cells:[{cell, repo, runs:[…]}]}` — the newest-first run history per cell, `?limit=N` (default 50). The HTTP mirror of [`sig log`](#sig-log). |
 | `GET /log/sha/{sha}` | `{cell, provenance:{…}}` — which run/task/agent landed `{sha}` (see [`sig log`](#sig-log)). `404` (`not_found`) for a commit no cell landed. |
+| `GET /board` | `{cells:[{cell, repo, intents:[…]}], metrics:{…}}` — intents × runs × parks plus delivery metrics, `?limit=N` (default 50 runs per cell, `0` = all). Read-only and fully derived. See [Board and metrics](#board-and-metrics). |
 
 The `POST /runs` body mirrors `sig run`'s flags by name (camelCased); durations
 are Go duration strings (`"30s"`, `"2m"`). `cell` is a cell id (from `/health`)
@@ -2138,11 +2139,12 @@ set — Sigbound's fail-safe **flags, never guesses**: those branches don't land
 and a human decides. `sig serve` surfaces exactly that, so you can **see** what
 was flagged without leaving the daemon or digging blobs out of git by hand.
 
-Open **`GET /ui`** (e.g. `http://127.0.0.1:7777/ui`) in a browser. It has two
+Open **`GET /ui`** (e.g. `http://127.0.0.1:7777/ui`) in a browser. It has three
 tabs. **Conflicts** lists runs; pick one to see its flagged branches, then a
 branch's path to see the **three sides side by side — `base` | `ours` (the landed
 tree) | `theirs` (the flagged branch)**. **Inbox** renders
-[`GET /inbox`](#the-inbox). It's a single self-contained HTML page: vanilla
+[`GET /inbox`](#the-inbox). **Board** renders
+[`GET /board`](#board-and-metrics). It's a single self-contained HTML page: vanilla
 HTML/CSS/JS, **no framework, no CDN, no external asset of any kind**, so it works
 offline on an air-gapped daemon. Everything from the server — file contents,
 branch names, paths, summaries — is rendered with `textContent` only (never
@@ -2176,6 +2178,90 @@ has a field to paste it: it's kept in `sessionStorage` and sent as
 localhost single-user tool, not a multi-tenant auth system; for a token-protected
 or exposed daemon, the reverse proxy you already put in front of it (see above) is
 the right place to handle browser auth.
+
+### Board and metrics
+
+The **Board** tab (and `GET /board` behind it) is the third view on the same
+page: every intent in the repo's `intents/` directory, every run in the journal,
+and every park, laid out in five columns. It is **derived on every request** from
+`.git/sigbound/runs` and `intents/*.intent` — it stores nothing, and **no card
+can be moved**, because a card is a fact. Delete a run directory and the card
+moves. Ack a park and the card moves. There is no board state that could ever
+disagree with the journal, and this view adds **no mutating endpoint**: ack and
+reject on a parked entry remain the only things the whole UI can change.
+
+The columns, and how each is derived from a card's runs (newest first):
+
+| Column | Derivation |
+|--------|------------|
+| **Open** | The intent has no runs in the journal. |
+| **Running** | Some run is `queued` or `running`. |
+| **Awaiting ack** | Some run is `awaiting-ack`. This **outranks** a newer landing: verified work being held for a human must not be hidden by a later green run. |
+| **Landed** | The newest run is `done` and advanced the base ref. |
+| **Needs attention** | Everything else — the newest run finished without landing, errored, was interrupted, or its park was **rejected**. A rejected park's report records the commit an ack *would* have released, so the sha alone is never taken as proof of a landing. |
+
+The run rows are `sig log`'s rows, from the same reader ([`sig log`](#sig-log),
+[`GET /log`](#endpoints)), so the board and the log cannot drift. A run whose
+intent file has since been deleted still appears, on a card marked as having no
+file on disk — the journal wins over the directory in both directions. An
+`intents/` directory that will not parse costs the intent cards and says why; it
+never costs the runs.
+
+**Attribution today.** A run carries an intent id only when it was started by
+`sig run -intent ID` (see [Attribution](#attribution)). `POST /runs` has no
+`intent` field, so runs the daemon starts land on the board's `(no intent)` card
+and every intent file shows as **Open**. The board reads whatever the journal
+records; it lights up per intent as soon as a journaled run carries one.
+
+**Metrics** are computed over the same `?limit` window (the last 50 runs per cell
+by default, `0` for all history) from the reports and the per-run metering
+records described in [Quotas and metering](#quotas-and-metering). They are
+**counters, not rates** — a consumer divides the two numbers itself and can see
+the sample size:
+
+| Metric | Counters | Notes |
+|--------|----------|-------|
+| Verify pass rate | `verifyPassed` / `verifyRan` | Runs with no `-verify` are in neither. |
+| Salvage rate | `bisectSalvaged` / `bisectRan` | `bisectRan` only counts runs where the full tree already failed verify, so these are runs that would otherwise have landed nothing. |
+| Flag rate | `flaggedRuns` / `runs` | Per run, not per branch. |
+| Mean time to land | `landedWallMs` / `landedWallRuns` | From `usage.totalWallMs`. A `sig run` landing has no metering record and is in neither. |
+| Agent wall-time per landed change | `agentWallMs` / `agentWallLanded` | From `usage.agentWallMs`, the sum of `report.perAgent[].wallMs`. Agents run concurrently, so this is machine time, not elapsed time. |
+| Per-preset landing success | `presets[].landed` / `presets[].runs` | Sigbound records the **resolved** agent command, never the preset name (see [Provenance](#provenance)), so the preset is recovered by an exact reverse match on its expansion. A hand-written or hand-edited command reads as `custom`. |
+| Cost per landed change | `costUsd` / `costLanded` | Only present when agents used the optional seam below; `costRuns` is how many runs reported anything. |
+
+A run whose report cannot be read contributes **nothing** — not a zero. The same
+rule holds per metric: a run without a metering record is absent from the
+wall-clock and cost numbers rather than counted as zero in them.
+
+**Optional cost ingestion.** Every agent `sig serve` runs gets
+`SIGBOUND_USAGE_FILE`, a path it MAY write a JSON object to:
+
+```json
+{"inputTokens": 18400, "outputTokens": 3120, "costUsd": 0.42}
+```
+
+Every field is optional and **unknown fields are ignored**, so an agent can dump
+its own vendor's usage blob. The file lives in the run's directory, outside the
+agent's worktree, so writing it can never look like a stray in-lane edit. After
+the run, whatever was written is summed into `usage.json` as `inputTokens`,
+`outputTokens`, `costUsd` and `costAgents` (how many agents actually reported —
+partial coverage stays visible), and cost per landed change appears in the
+metrics.
+
+This is a **seam, not a requirement**. No file is the normal case and produces no
+output, no warning, and no error; a file that is missing, unreadable, not JSON,
+or carrying a negative number is skipped silently. Sigbound still never sees a
+token or a price of its own — as with the rest of metering, **this is not a
+biller**.
+
+```sh
+# The board and its metrics over all history:
+curl -s localhost:7777/board?limit=0 | jq '.metrics'
+
+# An agent that reports its cost (the seam is just a file path):
+sig serve -repos /work/api   # then, inside your agent command:
+#   my-agent "$SIGBOUND_TASK" --usage-json > "$SIGBOUND_USAGE_FILE"
+```
 
 ### Graceful shutdown
 
@@ -2509,6 +2595,7 @@ command **you** supply, run via `sh -c`. Sigbound passes context through
 | `SIGBOUND_TASK_ID` | `-agent` | The task id. |
 | `SIGBOUND_REPO` | `-agent`, `-repair`, `-publish` | Path to the repository. cwd for `-publish` too (unlike `-agent`/`-repair`, which run in a throwaway worktree). |
 | `SIGBOUND_BRANCH` | `-agent` | The task's branch name. |
+| `SIGBOUND_USAGE_FILE` | `-agent` | **`sig serve` only, and entirely optional.** A path the agent MAY write a token/cost JSON to; it is ingested into that run's `usage.json`. Not set by `sig run`, which has no run directory. Writing nothing is the normal case. See [Board and metrics](#board-and-metrics). |
 | `SIGBOUND_BASE` | `-resolver` | Path to the base (common-ancestor) version of a conflicted file. |
 | `SIGBOUND_OURS` | `-resolver` | Path to the "ours" version. |
 | `SIGBOUND_THEIRS` | `-resolver` | Path to the "theirs" version. |
