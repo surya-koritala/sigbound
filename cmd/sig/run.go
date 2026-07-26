@@ -615,7 +615,7 @@ func validateLaneMode(m string) error {
 func runRun(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-semantic go|off] [-resolver CMD] [-verify CMD | -verify-preset NAME [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-parallel-agents N] [-budget D] [-no-disk-check] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [-publish CMD [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig run [-config PATH] -repo PATH -base BRANCH (-tasks FILE | -goal STRING (-planner CMD | -planner-preset claude|codex|aider) [-n N] [-min-tasks N] | -resume -manifest FILE) (-agent CMD | -agent-preset claude|codex|aider) [-agent-timeout D] [-agent-retries N] [-strategy overlay] [-assert] [-semantic go|off] [-resolver CMD] [-verify CMD | -verify-preset NAME [-verify-retries N] [-verify-impact CMD] [-verify-cache] [-verify-bisect] [(-repair CMD | -repair-preset claude|codex|aider) [-repair-max N]]] [-lanes off|warn|strict] [-no-autocommit] [-keep-failed] [-parallel-agents N] [-budget D] [-no-disk-check] [-logdir DIR] [-events FILE] [-manifest FILE] [-notes] [(-publish CMD | -publish-preset github-receipt|gitlab-receipt) [-publish-timeout D]] [-env-mode inherit|scoped] [-env-agent NAMES] [-env-resolver NAMES] [-env-verify NAMES] [-env-repair NAMES] [-env-planner NAMES] [-env-publish NAMES] [-dry-run] [-json]")
 		fs.PrintDefaults()
 		fmt.Fprintln(fs.Output(), "\nexit codes:")
 		fmt.Fprintln(fs.Output(), "  0  landed and verified (or -verify unset); -publish succeeded or was unset")
@@ -746,9 +746,17 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		"flagged). Sigbound stays host-agnostic: this is a BYO seam for pushing the landed branch and opening a PR/MR with whatever host CLI the repo already uses (gh, glab, ...); "+
 		"sigbound never calls one itself. The full JSON run report is piped to the command's STDIN (its own \"publish\" field is absent there — it hasn't run yet); "+
 		"e.g. `jq -r .integrate.finalSHA` reads the landed commit from stdin. Also receives SIGBOUND_FINAL_SHA (the landed commit), SIGBOUND_BASE_BRANCH (the base branch name), "+
-		"SIGBOUND_BASE_SHA (the base commit BEFORE this run), SIGBOUND_REPO, SIGBOUND_LANDED (space-separated landed branch names), and SIGBOUND_MANIFEST (the -manifest path when "+
+		"SIGBOUND_BASE_SHA (the base commit BEFORE this run), SIGBOUND_REPO, SIGBOUND_LANDED (space-separated landed branch names), SIGBOUND_RECEIPT (a ready-to-post Markdown "+
+		"summary of what landed: run id, intent, landed SHA, verify verdict, agents, tasks), and SIGBOUND_MANIFEST (the -manifest path when "+
 		"set, else empty — a path pointer only, since -manifest itself is written after the run returns; use stdin for the report's actual contents). A publish FAILURE does NOT "+
 		"unland the work or flip verify's verdict — it's reported as its own report.publish field and the run exits 6 instead of 0. See docs/USAGE.md's Publish section. Default \"\": off")
+	publishPreset := fs.String("publish-preset", "", "expand a known RECEIPT preset (github-receipt|gitlab-receipt) into -publish's sh -c command: push the landed -base branch to ${SIGBOUND_REMOTE:-origin} "+
+		"and open a pull/merge request against the remote's default branch whose BODY is SIGBOUND_RECEIPT, via gh/glab — or, when one is already open for that branch (every run after the first), "+
+		"comment this run's receipt onto it. Requires -base to be an integration branch, NOT the remote's default branch (no request can be opened from a branch onto itself; the preset says so and "+
+		"stops before pushing). Under -env-mode scoped, also pass -env-publish GH_TOKEN (or GLAB_TOKEN): the scoped base env carries neither. Publishing happens AFTER the landing, so a receipt that "+
+		"fails — gh/glab missing or unauthenticated, a rejected push, a host outage — changes NOTHING about what landed: the reason is captured in report.publish.output (and -logdir's publish.log), "+
+		"and the run exits 6 instead of 0 unless a higher-precedence condition already claimed the code (e.g. 4 when a branch was flagged). An explicit -publish always overrides its preset. "+
+		"See docs/USAGE.md's Presets section for the exact expansion of each name")
 	publishTimeout := fs.Duration("publish-timeout", 120*time.Second, "timeout for the -publish command (0 = none)")
 	envMode := fs.String("env-mode", envModeInherit, "environment given to every -agent/-resolver/-verify/-repair/-planner/-publish command: inherit (default) hands each the "+
 		"FULL parent environment plus its own SIGBOUND_* vars, today's behavior, byte-identical. scoped hands each ONLY a minimal base environment (PATH, HOME, USER, SHELL, "+
@@ -797,6 +805,15 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		return exitOperationalError, presetErr
 	}
 	*agentCmd, *repairCmd, *plannerCmd, *verifyCmd = newAgentCmd, newRepairCmd, newPlannerCmd, newVerifyCmd
+	// -publish-preset resolves through the same presetSlot (raw -publish wins;
+	// an unknown name is a loud error listing every valid one), just not through
+	// applyPresets — see its doc. A bad preset name fails HERE, before any agent
+	// runs, rather than at publish time on a run that has already landed.
+	newPublishCmd, publishPresetErr := presetSlot(os.Stderr, publishPresets, *publishCmd, *publishPreset, "-publish", "-publish-preset")
+	if publishPresetErr != nil {
+		return exitOperationalError, publishPresetErr
+	}
+	*publishCmd = newPublishCmd
 	// -resume never re-plans: its task list, base, strategy, and
 	// agent/resolver/verify/repair commands come from a PRIOR run's
 	// -manifest file instead of -tasks/-goal, which is why it demands
@@ -1872,9 +1889,13 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 // JSON-marshaled and piped to the command's stdin: the delivery mechanism
 // for the full run report, per -publish's contract. rep.Integrate.FinalSHA/
 // rep.BaseSHA/rep.Integrate.Landed also populate the SIGBOUND_* env vars
-// documented on -publish; p.Manifest supplies SIGBOUND_MANIFEST (empty when
-// -manifest wasn't set — just a path pointer, since -manifest itself isn't
-// written until after the run returns; stdin carries the actual report).
+// documented on -publish, and rep as a whole renders SIGBOUND_RECEIPT — the
+// ready-to-post summary the -publish-preset receipts comment with (see
+// receiptBody), exported for EVERY -publish command rather than only those,
+// since a hand-written one wants the same paragraph; p.Manifest supplies
+// SIGBOUND_MANIFEST (empty when -manifest wasn't set — just a path pointer,
+// since -manifest itself isn't written until after the run returns; stdin
+// carries the actual report).
 // Mirrors runAgent/runRepair/runVerify's exec pattern: WaitDelay so a hung
 // command can't block the run past -publish-timeout, full output
 // tail-bounded for the report, and streamed to -logdir's publish.log when
@@ -1895,6 +1916,7 @@ func runPublish(ctx context.Context, p runParams, rep runReport) publishJSON {
 		"SIGBOUND_BASE_SHA=" + rep.BaseSHA,
 		"SIGBOUND_REPO=" + p.Repo,
 		"SIGBOUND_LANDED=" + strings.Join(rep.Integrate.Landed, " "),
+		"SIGBOUND_RECEIPT=" + receiptBody(p.RunID, rep),
 		"SIGBOUND_MANIFEST=" + p.Manifest,
 	})
 	if reportJSON, err := json.Marshal(rep); err != nil {
