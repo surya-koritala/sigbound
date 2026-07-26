@@ -335,10 +335,19 @@ func readIntentFired(path string) intentFired {
 		return empty
 	}
 	for id, e := range f.Intents {
-		// An entry with no id or no time can never mean anything but "never
-		// fired", which is what its absence already means; drop it rather than
-		// carry it forward forever.
-		if id == "" || e.FiredAt.IsZero() {
+		// The two fields fail open in OPPOSITE directions, so they are dropped
+		// separately. An unknown fire time means "never fired" -- the same thing
+		// its absence means, and firing one extra time is the safe answer. An
+		// unknown branch list is NOT safe to forget: those names are what
+		// watchCollect refuses to adopt, and dropping them makes a red fire's
+		// branch adoptable by the cycle bar, which does not apply the intent's
+		// acceptance. So an entry with no time keeps its branches and simply
+		// reads as never-fired.
+		if id == "" {
+			delete(f.Intents, id)
+			continue
+		}
+		if e.FiredAt.IsZero() && len(e.Branches) == 0 {
 			delete(f.Intents, id)
 		}
 	}

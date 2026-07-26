@@ -1156,10 +1156,15 @@ verify-gated run, so an extra one wastes a cycle, while failing closed would be 
 schedule that silently stopped.
 
 Losing the record also drops the fire-branch exclusions it holds (below). The
-seen-set still covers the branches it knows about, so the practical cost is one
-extra fire; only wiping BOTH files — `rm -rf .git/sigbound`, which resets this
-daemon's whole state for the cell — puts an old fire's branch back in front of an
-ordinary cycle, to be judged by the cycle bar alone.
+seen-set covers the branches it knows about, so the usual cost is one extra fire.
+It does not cover a branch whose run was killed before the cycle classified it,
+so losing BOTH — `rm -rf .git/sigbound`, or an unreadable record combined with a
+crash mid-run — puts that fire's branch back in front of an ordinary cycle, to be
+judged by the cycle bar alone. That bar is still the repo's policy and
+`-watch-verify`; what it does not apply is that intent's own `acceptance`. An
+unreadable record is the narrower half of that: it reads as empty, but the
+branches it named are kept even when the fire time in it is unusable, so only
+losing the file's contents outright drops them.
 
 **A red fire waits for its window.** A fire that fails verify lands nothing, like
 any red run, and is not retried before its next window — the schedule IS the

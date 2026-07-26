@@ -110,6 +110,22 @@ func TestIntentFiredRecordRoundTripAndDegradation(t *testing.T) {
 	if got := readIntentFired(path); len(got.Intents) != 0 {
 		t.Fatalf("degenerate entries survived as %+v", got)
 	}
+	// But an unusable fire time must NOT take the branch names with it. The two
+	// fields fail open in opposite directions: forgetting WHEN it fired costs
+	// one extra fire, while forgetting WHICH branch it produced puts that branch
+	// back in front of an ordinary cycle, to be judged without the intent's
+	// acceptance. Dropping the entry wholesale would do the second to do the
+	// first.
+	if err := os.WriteFile(path, []byte(`{"intents":{"a":{"firedAt":"0001-01-01T00:00:00Z","branches":["agent/a-1"]}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := readIntentFired(path)
+	if !got.fireBranches()["agent/a-1"] {
+		t.Fatalf("an entry with no usable fire time dropped its branches: %+v — that branch is now adoptable", got)
+	}
+	if !got.Intents["a"].FiredAt.IsZero() {
+		t.Fatalf("the unusable fire time survived as %v, want it to read as never fired", got.Intents["a"].FiredAt)
+	}
 }
 
 // ---- the fixture's scheduled-intent helpers ----
