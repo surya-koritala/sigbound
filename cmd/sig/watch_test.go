@@ -1270,6 +1270,103 @@ func TestPolicyWatchKeys(t *testing.T) {
 	}
 }
 
+// ---- the loop's cadence ----
+
+// TestWatchStepResetsTheIntervalOnEveryDueCycle pins what -watch-interval
+// actually bounds. The loop only ever reset its clock when a cycle DROVE a run,
+// so one due poll that found nothing left every later poll due — and with a
+// batch trigger armed that is a poll a second: an intent's schedule checked 30x
+// per interval, and a red branch's backoff counted in polls.
+//
+// Driven through watchStep with the caller owning `last`, so a cadence is proven
+// without waiting out an interval.
+func TestWatchStepResetsTheIntervalOnEveryDueCycle(t *testing.T) {
+	requirePOSIXShell(t)
+	f := newWatchFixture(t, "true")
+	f.cfg.interval = time.Hour
+	// A due intent with no -watch-agent reports itself on every DUE poll and
+	// drives no run: that is what makes "was this poll due?" observable.
+	writeIntent(t, f.repo, "deps-current", "goal = update dependencies\nschedule = 24h\n")
+
+	last := f.s.watchStep(f.ctx, f.rc, f.cfg, time.Now().Add(-2*time.Hour))
+	if n := f.ev.countEvent("watch_error"); n != 1 {
+		t.Fatalf("watch_error events = %d after an overdue poll, want 1 (the poll was not treated as due)", n)
+	}
+	if time.Since(last) > time.Minute {
+		t.Fatal("a due poll that drove no run left the interval clock where it was: every later poll is due")
+	}
+	// The next poll is inside the interval, so it must NOT be due.
+	next := f.s.watchStep(f.ctx, f.rc, f.cfg, last)
+	if !next.Equal(last) {
+		t.Fatalf("a non-due poll moved the clock: %s -> %s", last, next)
+	}
+	if n := f.ev.countEvent("watch_error"); n != 1 {
+		t.Fatalf("watch_error events = %d, want 1: a poll inside the interval was treated as due", n)
+	}
+}
+
+// TestWatchPrunesSeenEntriesForBranchesThatAreGone: an entry whose branch no
+// longer exists can never match a head again, so keeping it is permanent growth
+// — one line per branch this daemon has ever decided about, forever.
+func TestWatchPrunesSeenEntriesForBranchesThatAreGone(t *testing.T) {
+	requirePOSIXShell(t)
+	f := newWatchFixture(t, "true")
+	f.arrive("agent/a", "a.txt", "a\n")
+	f.arrive("agent/b", "b.txt", "b\n")
+	if !f.cycle() {
+		t.Fatal("the first cycle did not run")
+	}
+	if n := len(f.seen().Branches); n != 2 {
+		t.Fatalf("seen-set holds %d entries, want both landed branches", n)
+	}
+	if err := f.g.BranchDelete(context.Background(), "agent/a"); err != nil {
+		t.Fatal(err)
+	}
+	if f.cycle() {
+		t.Fatal("a cycle ran over already-decided branches")
+	}
+	seen := f.seen()
+	if _, ok := seen.Branches["agent/a"]; ok {
+		t.Fatal("the seen-set kept an entry for a branch that no longer exists")
+	}
+	// Negative control: the branch that DOES still exist keeps its decision, or
+	// pruning would just be re-examining everything every cycle.
+	if e := seen.Branches["agent/b"]; !e.Done {
+		t.Fatalf("seen[agent/b] = %+v, want the decision it already reached", e)
+	}
+}
+
+// ---- one cell per git directory ----
+
+// TestServerRefusesTwoCellsOverOneGitDir: a repo and its own linked worktree are
+// two paths to ONE git directory. Everything durable — the run journal, the
+// watch seen-set, intent-fired.json — lives under that shared directory, while
+// the busy lock that serializes writers is per cell, so registering both would
+// give two "cells" that race each other's read-modify-writes and double-fire one
+// scheduled intent. It is the same rule one-run-per-cell already states.
+func TestServerRefusesTwoCellsOverOneGitDir(t *testing.T) {
+	ctx := context.Background()
+	g, repo := makeGoRepo(t)
+	linked := filepath.Join(t.TempDir(), "linked")
+	if err := g.WorktreeAdd(ctx, linked, "linked-wt", "main"); err != nil {
+		t.Fatal(err)
+	}
+	_, err := newServer(ctx, serverConfig{repos: []string{repo, linked}, envMode: envModeInherit})
+	if err == nil {
+		t.Fatal("a repo and its own linked worktree were registered as two cells")
+	}
+	for _, want := range []string{repo, linked, "share one git directory"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	// Negative control: two independent repos are still two cells.
+	_, other := makeGoRepo(t)
+	if _, err := newServer(ctx, serverConfig{repos: []string{repo, other}, envMode: envModeInherit}); err != nil {
+		t.Fatalf("two independent repos refused: %v", err)
+	}
+}
+
 // ---- seen-set reader ----
 
 func TestReadWatchSeenFailsClosed(t *testing.T) {

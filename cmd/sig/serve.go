@@ -175,6 +175,7 @@ type server struct {
 	activeRuns int                   // runs in flight across ALL cells (maxConcurrentRuns' 429 counter)
 	runs       map[string]*runRecord // runId -> live record for THIS process
 	queued     map[string][]string   // cell id -> branches enqueued via POST /queue
+	intentTick map[string]bool       // cell id -> the previous DUE tick fired an intent (see watchCycle's fairness)
 	wg         sync.WaitGroup        // in-flight run goroutines AND watch loops, waited on shutdown
 }
 
@@ -249,6 +250,7 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		busy:              map[string]bool{},
 		runs:              map[string]*runRecord{},
 		queued:            map[string][]string{},
+		intentTick:        map[string]bool{},
 	}
 	// One pusher per daemon, started here so its goroutine's lifetime is exactly
 	// baseCtx's — it cannot outlive the shutdown that cancels every run.
@@ -260,6 +262,7 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		s.eventPush = startEventPusher(baseCtx, cfg.eventURL, cfg.eventSecret, queue)
 	}
 	ctx := context.Background()
+	byCommon := map[string]string{} // git common dir -> the repo that claimed it
 	for _, repo := range cfg.repos {
 		c, err := cell.Open(repo)
 		if err != nil {
@@ -272,6 +275,17 @@ func newServer(baseCtx context.Context, cfg serverConfig) (*server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("resolve git dir for %s: %w", repo, err)
 		}
+		// Two paths that resolve to ONE git directory — a repo and its own linked
+		// worktree, most often a `-repos` list that names both — are not two cells.
+		// Everything durable lives under that shared directory (the run journal,
+		// watch-seen.json, intent-fired.json), while the busy lock that serializes
+		// writers is per CELL: they would race each other's read-modify-writes,
+		// double-fire one scheduled intent, and break the one-run-per-cell rule
+		// that the exactly-once argument rests on. Refuse at startup, naming both.
+		if first, dup := byCommon[common]; dup {
+			return nil, fmt.Errorf("repos %s and %s share one git directory (%s): they would share the run journal, the watch seen-set and the intent fired record while holding separate run slots — register only one of them", first, c.Repo(), common)
+		}
+		byCommon[common] = c.Repo()
 		rc := &registeredCell{cell: c, runsDir: filepath.Join(common, "sigbound", "runs")}
 		s.cells = append(s.cells, rc)
 		s.byKey[c.ID()] = rc
@@ -2012,13 +2026,16 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	// cell's sigbound.policy may set the cadence keys itself, in which case
 	// passing the matching flag EXPLICITLY is an error (see resolveWatchConfig).
 	watch := fs.Bool("watch", false, "watch each cell's agent/* and imported/*/* branches (plus POST /queue enqueues) and drive a continuous integration cycle over what arrives. "+
-		"Each cycle is an ordinary policy-gated, verify-gated run through the same path POST /runs uses; a cycle only differs in its manifest's source=watch")
+		"Each cycle is an ordinary policy-gated, verify-gated run through the same path POST /runs uses; a cycle only differs in its manifest's source=watch. "+
+		"TRUST: with -watch-agent, a scheduled intent is read from each repo's WORKING TREE and fired unattended, so write access to that tree is execute access on this machine (a landing is not — it never touches the working tree)")
 	watchBase := fs.String("watch-base", "main", "-watch: the branch each cycle integrates onto, and the base its cell's sigbound.policy is read from")
 	watchInterval := fs.Duration("watch-interval", 30*time.Second, "-watch: how often a cell may start a cycle. A cycle that finds nothing pending starts no run at all")
 	watchBatch := fs.Int("watch-batch", 0, "-watch: start a cycle EARLY once this many branches are pending, without waiting out -watch-interval. 0 = interval only (default)")
 	watchVerify := fs.String("watch-verify", "", "-watch: the verify command every cycle must pass before it lands, composed with the cell policy's own verify battery. "+
 		"Required unless the cell's sigbound.policy declares a verify line; pass `true` to accept landing every cycle unverified")
 	watchMaxRed := fs.Int("watch-max-red", 3, "-watch: exclude a branch after this many consecutive cycles that failed to land it, raising a red-branch inbox entry. Re-pushing the branch clears the count")
+	watchAgent := fs.String("watch-agent", "", "-watch: the agent command a due SCHEDULED intent's run invokes (an intents/*.intent file with a `schedule` line; see docs/USAGE.md's Intents section). "+
+		"Unset means scheduled intents never fire — a cycle over arriving branches runs no agent and does not need this")
 	// Event push (issue #117): mirror the NDJSON event stream to an HTTP
 	// receiver. Delivery is fail-open — see eventpush.go and docs/USAGE.md's
 	// "Event push" section.
@@ -2120,6 +2137,7 @@ func runServe(w io.Writer, argv []string) (int, error) {
 			batch:    *watchBatch,
 			maxRed:   *watchMaxRed,
 			verify:   *watchVerify,
+			agent:    *watchAgent,
 		}, explicitFlags); err != nil {
 			return exitOperationalError, err
 		}
