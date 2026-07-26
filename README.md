@@ -3,8 +3,8 @@
 Run multiple AI coding agents on one repository in parallel, and merge their work automatically — landing only changes that build and pass your tests.
 
 [![build](https://img.shields.io/badge/build-passing-brightgreen)](#testing)
-[![tests](https://img.shields.io/badge/tests-306-brightgreen)](#testing)
-[![coverage](https://img.shields.io/badge/coverage-83%25-brightgreen)](#testing)
+[![tests](https://img.shields.io/badge/tests-547-brightgreen)](#testing)
+[![coverage](https://img.shields.io/badge/coverage-84%25-brightgreen)](#testing)
 [![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)](go.mod)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
@@ -28,6 +28,9 @@ Cursor's [Origin](https://cursor.com/origin) announced a closed, hosted version 
 - **Self-repair** — a merge that breaks the build is sent back to an agent to fix, then re-checked.
 - **File lanes** — each task declares the files it may touch; an agent that strays is rejected.
 - **Landing policy** — a `sigbound.policy` file committed in the repo declares the bar every landing must clear; flags can tighten it, never loosen it.
+- **Run parking** — changes to paths you mark sensitive are verified and then held for a human `sig ack`, instead of landing on their own.
+- **Run ledger** — `sig log` records every run: what it was asked to do, which commands ran, whether verify passed, and what SHA landed.
+- **Continuous mode** — `sig serve -watch` picks up new work as it appears and runs the same gated loop without an operator.
 - **Bring your own model** — planner, agent, resolver, and repair are each a command you supply.
 - **On top of git** — uses worktrees and `merge-tree`; no server, no lock-in, any host.
 
@@ -180,9 +183,10 @@ exponent and where the first bottleneck would be.
 
 ## Testing
 
-- 306 tests, including end-to-end runs against real git repositories.
-- Coverage: 83% on the integration engine, 90% on the git plumbing.
-- 16 fuzz targets covering every parser of git and model output. Fuzzing found and fixed a bug in the `ls-tree` parser that could have produced a silently incorrect merged tree; the triggering input is kept as a regression test.
+- 547 tests, including end-to-end runs against real git repositories.
+- Coverage: 84% on the integration engine, 84% on the git plumbing
+  (`go test -cover ./cell/ ./internal/gitx/`).
+- 24 fuzz targets covering every parser of git and model output. Fuzzing found and fixed a bug in the `ls-tree` parser that could have produced a silently incorrect merged tree; the triggering input is kept as a regression test.
 
 ```bash
 go test -race ./...
@@ -190,7 +194,12 @@ go test -race ./...
 
 ## Status
 
-Working: the engine, the `sig` CLI, the benchmark, multi-machine execution (`sig export`/`sig import` bundles), and `sig serve` — an HTTP run API with a read-only conflict-review UI — all verified on real repositories.
+Working: the engine, the `sig` CLI, the benchmark, multi-machine execution
+(`sig export`/`sig import` bundles), the repo-owned landing policy with run
+parking, the `sig log` run ledger, and `sig serve` — an HTTP run API with a UI
+for reviewing conflicts and acking parked landings — all verified on real
+repositories. Sigbound develops itself: changes to this repository are landed
+by `sig`, gated by the [`sigbound.policy`](sigbound.policy) committed here.
 
 Sigbound builds on top of git and does not aim to become a git host: `sig serve` runs and lets you inspect work over a repo you already host, it does not host repos, review pull requests, or replace your forge.
 
