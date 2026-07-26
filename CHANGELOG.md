@@ -8,6 +8,139 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-26
+
+The agent-operation milestone. 2.0 gave a repository a landing bar and a way to
+hold work for a human; 2.1 makes the loop something you can point at a codebase,
+leave running, answer for afterwards, and take back when it was wrong.
+
+Nothing about what lands changed. The verify gate still decides, the tree that
+lands is still byte-for-byte the tree that passed, and every path that moves a
+ref still does it with a compare-and-swap.
+
+### Added
+
+- **`sig policy init` -- a starting `sigbound.policy` drafted from the repo's own
+  configuration.** Reads GitHub Actions workflows, Makefile targets, language
+  manifests and CODEOWNERS, and writes a policy with every emitted key commented
+  with the file and line it came from. It is deliberately conservative: anything
+  it cannot justify from the repo becomes a `# unmapped:` note rather than a
+  guess, because a `verify` member that is subtly wrong is a bar that gates
+  nothing while reporting green. Workflow reading is a line-oriented heuristic,
+  not a YAML parser (this binary has no dependencies and is keeping it), and an
+  unrecognised shape yields fewer suggestions, never a wrong one. It never
+  overwrites an existing policy -- it prints the lines it would have added and
+  exits non-zero. Known ceilings, stated rather than guessed: `paths:` /
+  `paths-ignore:` are not read, and `merge_group:` is not treated as a merge gate.
+
+- **`sig unland` -- take a landing back out, through the gate.** Reverts what a
+  run landed as a new commit on the base, never a history rewrite. An unland is
+  itself a landing: the reverted tree is built, the policy's verify battery runs
+  against it, and the ref advances only through the same compare-and-swap. A
+  reverted tree that fails verify lands nothing; a base whose revert conflicts is
+  refused with the conflicting paths named; `ack-paths` park an unland like any
+  other landing. It is recorded in the ledger attributed to the run it reverses,
+  so `sig log` shows both halves and the reverse edge.
+
+- **`sig log -release FROM..TO` -- release notes from the ledger.** Assembles a
+  release document from what actually landed -- each landing's intent, goal,
+  agents, verify verdict and landed SHA -- rather than from commit subjects, with
+  `-json` for tooling. Commits sigbound did not land are listed as unattributed
+  rather than silently omitted: the document never claims a completeness it does
+  not have. Untrusted text is confined to its line so a run's goal cannot forge
+  sections into a paste-ready document, and a landing recovered from a commit
+  note renders in a separate, marked bucket -- a note is user-writable, so its
+  payload is never republished as policy or acceptance.
+
+- **Recurring intents and templates.** An intent may declare a `schedule`, which
+  `sig serve -watch` makes live: a due intent fires as an ordinary run, through
+  the same policy-gated path a hand-started one takes. Firing is bounded -- one
+  intent per due tick, alternating with branch collection so a schedule cannot
+  starve arrivals, and least-recently-fired first among due intents. The branch a
+  fire produces is recorded durably before the agent runs, so losing the watch
+  cache costs a re-examination and never a landing judged without the intent's
+  own `acceptance`. Templates under `intents/templates/` are instantiated by
+  `sig intent new`.
+
+- **Intents -- in-repo statements of work.** One file per intent under `intents/`,
+  in the same flat KEY=VALUE dialect as `sig.conf` and `sigbound.policy`, runnable
+  with `sig run -intent ID` and attributable in the ledger. An intent's
+  `acceptance` composes exactly as a `-verify` flag does -- appended to the policy
+  battery, never replacing it -- so an intent can only make a landing bar
+  stricter. `sig intent import-github` turns an issue into one.
+
+- **A board and delivery metrics on `sig serve`.** `GET /board` derives intents x
+  runs x parks into columns, with delivery metrics beside them, rendered in the
+  UI. Read-only and fully derived from the journal -- there is no state to drag a
+  card into, and the board cannot disagree with `sig log` about what happened.
+
+- **Publish presets `github-receipt` and `gitlab-receipt`.** After a landing,
+  push the landed base and open a pull/merge request whose body is the run's
+  receipt -- run id, goal, verify verdict, landed SHA, agent tally, and what did
+  *not* land: parked branches awaiting an ack, conflict-flagged branches, and
+  bisect-dropped members. On later runs onto the same branch the receipt is
+  appended to the open request rather than lost. Every failure path says the
+  landing already happened and still stands.
+
+- **Security verify presets.** `govulncheck`, `gitleaks` and `codeql` as
+  `-verify-preset` values, each failing loudly when the tool is absent rather
+  than passing vacuously.
+
+- **Run event push.** `sig serve` can push its NDJSON run events to an HTTP
+  receiver, with the drop counter reporting honestly what it dropped.
+
+- **Metering from `sig run`.** The CLI path now records the same `usage.json`
+  `sig serve` records -- agent wall time, token and cost totals, and the per-agent
+  cost seam via `SIGBOUND_USAGE_FILE`. Both paths share one writer, so they cannot
+  diverge on the rule that matters: a run that failed before landing records
+  `landed: false` rather than inheriting a heuristic that is only accurate for a
+  completed run.
+
+- **Provenance for acked landings.** A landing released by a human `sig ack` now
+  carries a `refs/notes/sigbound` note and is recognised by `sig log -sha` with a
+  role that distinguishes it from an automatic landing. These are the landings
+  most worth auditing, and the note is the half that travels: it rides on the
+  commit and is readable from a clone that never had the run directory.
+
+- **A run directory for `sig run`**, so a park created from the CLI can be acked.
+
+### Changed
+
+- **`cell.Integrate` carries its own stale-branch guard.** The ancestry check
+  that prevents a branch forked before the current base from silently deleting
+  everything the base gained now lives inside the exported API rather than in the
+  CLI that wrapped it. A caller importing the package no longer has to know to
+  add it.
+
+- **A run's owner is a process id *and* the scope that id is meaningful in.** A
+  bare PID answers wrongly in both directions once runs execute in separate
+  namespaces over a shared clone -- a live run reclaimed underneath itself, or a
+  dead one never reclaimed because an unrelated process holds the number. A
+  record whose scope does not match reads as reclaimable rather than trusted.
+
+- **Every landing path lands with a compare-and-swap.** The ref advances only
+  while the base still holds the commit the landing was computed against, so a
+  landing that arrived in between is refused rather than reset away.
+
+### Fixed
+
+- **`GET /runs` reported what was integrated, not what landed.** A run that
+  integrated a tree and then failed verify showed a SHA as though it had landed,
+  and an acked parked landing showed none at all. Both surfaces now share one
+  rule, so `/runs` and `/log` cannot disagree.
+
+- **A forged commit note could dress its claim in a real run's identity.** The
+  marker that says an answer came from a user-writable note was keyed on a field
+  happening to be empty; it is now keyed on where the answer actually came from,
+  and a note's payload can no longer supply a run id.
+
+- **The policy battery gates every package the repo's changes land in**, and the
+  event vocabulary is held to its documentation in both directions.
+
+- **README figures** corrected: test and fuzz-target counts and coverage had
+  drifted a full major version behind.
+
+
 ## [2.0.0] - 2026-07-25
 
 The workflow milestone: a repository can now declare its own landing bar, work
@@ -460,7 +593,10 @@ Initial public release.
 - **`sig version`** — reports the version, and the git commit and build date
   when built from a checkout.
 
-[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/surya-koritala/sigbound/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/surya-koritala/sigbound/compare/v1.1.0...v2.0.0
+[1.1.0]: https://github.com/surya-koritala/sigbound/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/surya-koritala/sigbound/compare/v0.3.0...v1.0.0
 [0.3.0]: https://github.com/surya-koritala/sigbound/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/surya-koritala/sigbound/compare/v0.1.0...v0.2.0
