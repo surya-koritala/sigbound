@@ -321,7 +321,13 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 	// be able to move it.
 	agents := map[string]*releaseAgent{}
 	seenPolicy := map[string]bool{}
-	claimedRuns := map[string]bool{}
+	// claimedRuns maps a rendered landing's IDENTITY — its run id, and for a note
+	// that omits one its landed sha — to the range commits that landing actually
+	// landed. A landing's identity is public (run ids are printed in every
+	// document; the landed sha is right there in the range), so a note can borrow
+	// one; the commit set is what tells a second note about the SAME landing apart
+	// from a note that merely wears its name.
+	claimedRuns := map[string][]string{}
 	cover := func(rep *runReport, runID string, fromNote bool) {
 		name := agentName(rep.AgentCmd)
 		key := name
@@ -375,8 +381,8 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 			}
 			// Claimed under BOTH identities a note might carry (see the note pass):
 			// a legacy note that omits runId still names this landing by its sha.
-			claimedRuns[id] = true
-			claimedRuns["landed:"+rep.Integrate.FinalSHA] = true
+			claimedRuns[id] = landedHere
+			claimedRuns["landed:"+rep.Integrate.FinalSHA] = landedHere
 			doc.Landings = append(doc.Landings, landingOf(rep, id, goalOf(dir), "manifest", withCommands))
 		}
 		cover(rep, id, false)
@@ -442,11 +448,21 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 				if key == "landed:" { // no id and no landed sha: nothing to be one of
 					continue
 				}
-				delete(unclaimed, sha)
-				if claimedRuns[key] {
-					continue // already rendered, from the local ledger or another note
+				if landedThere, rendered := claimedRuns[key]; rendered {
+					// This identity's landing is already in the document, so this
+					// note adds no row — and therefore may only claim a commit that
+					// landing GENUINELY landed. The second note about one landing
+					// does (it names a member tip that landing's own payload lists);
+					// a note wearing a published run id, or a published landed sha,
+					// does not, and its commit stays counted rather than being
+					// dropped from both the landings and the unattributed total.
+					if hasString(landedThere, sha) {
+						delete(unclaimed, sha)
+					}
+					continue
 				}
-				claimedRuns[key] = true
+				claimedRuns[key] = landedCommitsIn(&rep, inRange)
+				delete(unclaimed, sha)
 				cover(&rep, rep.RunID, true)
 				doc.Landings = append(doc.Landings, landingOf(&rep, rep.RunID, "", "note", withCommands))
 			}
@@ -601,10 +617,14 @@ func agentName(cmd string) string {
 // command, a run id or a whole report read out of a commit note — so it does
 // exactly two things:
 //
-//   - every control character (CR, LF, tab, NUL, …) collapses to a single space,
-//     so untrusted text can never LEAVE ITS LINE. A multi-line goal was enough to
-//     fabricate a "### Landed" section of its own and open an HTML comment over
-//     the real footer;
+//   - every control character (CR, LF, tab, NUL, …), Unicode line/paragraph
+//     separator (U+2028/U+2029) and format character (Cf: the BOM, the bidi
+//     overrides, the zero-width joiners) collapses to a single space, so
+//     untrusted text can never LEAVE ITS LINE — not "cannot in CommonMark",
+//     which honours only \n and \r, but cannot in any renderer that treats those
+//     as breaks. A multi-line goal was enough to fabricate a "### Landed"
+//     section of its own and open an HTML comment over the real footer. Cf costs
+//     an emoji sequence in a goal its joiner; the invariant is worth more;
 //   - '|' is escaped, because it is the table cell separator: an agent program
 //     named "cl|aude" otherwise adds a column to the attribution row.
 //
@@ -619,7 +639,7 @@ func releaseText(s string) string {
 	space := false
 	for _, r := range s {
 		switch {
-		case unicode.IsControl(r):
+		case unicode.IsControl(r), unicode.In(r, unicode.Zl, unicode.Zp, unicode.Cf):
 			if !space {
 				b.WriteByte(' ')
 				space = true

@@ -2355,7 +2355,14 @@ release. An unresolvable endpoint **exits 1** and prints no partial document.
 
 Each landing appears **once**: two notes describing the same landing (its
 integration commit and one of its member tips can each carry one) collapse on the
-run id, or on the landed sha when the note omits one.
+run id, or on the landed sha when the note omits one. Both identities are
+public — run ids are printed in this very document — so a note that merely
+*wears* one renders no row and claims no commit: it can only claim a commit the
+landing it names actually landed, and anything else stays counted in
+`unattributed`. That also means a note cannot **extend** a landing the local
+ledger already rendered: the ledger is ground truth for its own landing, so a
+commit its report does not record as landed stays unattributed instead of
+disappearing into a row that never mentions it.
 
 Commits in the range that **nothing** claims — hand-written, imported,
 cherry-picked, or landed by a run whose ledger and note are both gone — are
@@ -2413,8 +2420,9 @@ bar move" is ledger-derived — and its agent is counted in a **separate**
 
 In the **Markdown** shape, every value that came from a run — a `goal` posted to
 `POST /runs`, a branch name, a task id, an agent name, a whole report read out of
-a note — is rendered onto a single line, with control characters collapsed to
-spaces and `|` escaped. A multi-line goal would otherwise write `###` sections of
+a note — is rendered onto a single line, with control characters, Unicode
+line/paragraph separators and format characters (the BOM, the bidi overrides)
+collapsed to spaces and `|` escaped. A multi-line goal would otherwise write `###` sections of
 its own into your release notes, and an agent named `cl|aude` would add a column
 to the attribution table. The `-json` shape is structured, so it carries those
 values verbatim.

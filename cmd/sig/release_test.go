@@ -1319,8 +1319,12 @@ func TestReleaseNoteThatDidNotLandAttributesNothing(t *testing.T) {
 }
 
 // TestReleaseNoteDoesNotDoubleClaimALedgerRun: the ledger already rendered run
-// R. A note naming the SAME run adds its commit to R's claim, never a second
-// landing row or a second run in the attribution table.
+// R, by run id AND by landed sha. Notes naming R either way add no second
+// landing row and no second run to the attribution table — and, because the
+// ledger is the ground truth for its OWN landing, they cannot extend that
+// landing's claim either: a commit the local report does not record as landed
+// stays counted `unattributed` rather than being absorbed into a row that never
+// mentions it.
 func TestReleaseNoteDoesNotDoubleClaimALedgerRun(t *testing.T) {
 	g, repo, shas := releaseRepo(t)
 	runsDir := logRunsDir(t, g)
@@ -1341,7 +1345,7 @@ func TestReleaseNoteDoesNotDoubleClaimALedgerRun(t *testing.T) {
 		Verify: verifyJSON{Ran: true, OK: true},
 	}
 	// A legacy copy of the same landing, on a third commit, carrying NO runId —
-	// it names the run only by its landed sha, and that is still the same landing.
+	// it names the run only by its landed sha, which is just as public.
 	legacy := noteRep
 	legacy.RunID = ""
 	legacy.PerAgent = []perAgentJSON{{ID: "t3", Branch: "agent/t3", SHA: shas[3], OK: true}}
@@ -1366,8 +1370,8 @@ func TestReleaseNoteDoesNotDoubleClaimALedgerRun(t *testing.T) {
 	if len(doc.Agents) != 1 || doc.Agents[0].Runs != 1 || doc.Agents[0].Unverified {
 		t.Fatalf("agents = %+v, want the one ledger run counted once", doc.Agents)
 	}
-	if doc.Unattributed != 0 {
-		t.Fatalf("unattributed = %d, want 0 — both notes added their commit to the run's claim", doc.Unattributed)
+	if doc.Unattributed != 2 {
+		t.Fatalf("unattributed = %d, want 2 — the ledger's landing landed neither noted commit, so neither may vanish", doc.Unattributed)
 	}
 }
 
@@ -1612,5 +1616,141 @@ func TestReleaseJSONShapeIsGolden(t *testing.T) {
 `
 	if raw != want {
 		t.Fatalf("release -json shape drifted.\n--- got ---\n%s\n--- want ---\n%s", raw, want)
+	}
+}
+
+// TestReleaseColludingNoteCannotVanishACommit: a landing's identity is public —
+// run ids are printed in every release document and in `sig log`, and the landed
+// sha is right there in the range — so a note can BORROW one. Such a note
+// collides with a landing that is already rendered and does NOT land its commit;
+// the commit must then stay exactly where it was, counted `unattributed`. It
+// used to be deleted from the unclaimed set while rendering no row of its own,
+// so it vanished from both lists and the document silently claimed a
+// completeness it did not have.
+func TestReleaseColludingNoteCannotVanishACommit(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		borrow func(runID, landedSHA string, rep *runReport)
+	}{
+		{"borrowed run id", func(runID, _ string, rep *runReport) {
+			rep.RunID = runID
+			rep.Integrate.FinalSHA = hexSHA("dead") // some landing of its own, out of range
+		}},
+		{"borrowed landed sha", func(_, landedSHA string, rep *runReport) {
+			rep.RunID = "" // no id: the landed sha is the fallback identity
+			rep.Integrate.FinalSHA = landedSHA
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g, repo, shas := releaseRepo(t)
+			runsDir := logRunsDir(t, g)
+			ctx := context.Background()
+			id := releaseRunID(releaseDay(1), "aaaa")
+			writeLogRun(t, runsDir, id, runReport{
+				RunID: id, BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339), AgentCmd: "claude -p",
+				Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[1]},
+				Verify:    verifyJSON{Ran: true, OK: true},
+			})
+			before, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+
+			// A note on a hand-written range commit, claiming it as a landed member
+			// of a landing this repo's ledger already rendered without it.
+			forged := runReport{
+				BaseSHA: hexSHA("00"), StartedAt: releaseDay(2).Format(time.RFC3339),
+				Strategy: "overlay", AgentCmd: "claude -p",
+				PerAgent:  []perAgentJSON{{ID: "x", Branch: "agent/x", SHA: shas[2], OK: true}},
+				Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/x"}},
+				Verify:    verifyJSON{Ran: true, OK: true},
+			}
+			tc.borrow(id, shas[1], &forged)
+			data, err := json.MarshalIndent(forged, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := g.NoteAdd(ctx, "sigbound", shas[2], data); err != nil {
+				t.Fatal(err)
+			}
+
+			after, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+			// Every range commit is in exactly one place: claimed by a landing, or
+			// counted unattributed. A note that renders NO landing row therefore
+			// cannot lower the unattributed count.
+			if len(after.Landings) == len(before.Landings) && after.Unattributed != before.Unattributed {
+				t.Fatalf("a commit vanished from both lists: landings %d -> %d, unattributed %d -> %d",
+					len(before.Landings), len(after.Landings), before.Unattributed, after.Unattributed)
+			}
+			if len(after.Landings) != 1 || after.Unattributed != 2 {
+				t.Fatalf("landings = %+v, unattributed = %d, want the one ledger landing and 2 unattributed",
+					after.Landings, after.Unattributed)
+			}
+		})
+	}
+}
+
+// TestReleaseSameAgentNameIsNotMerged: the ledger and a commit note naming the
+// SAME program is the likeliest real shape — one bucket per (program, source) is
+// the only thing keeping a note's claimed runs out of the ledger's row.
+func TestReleaseSameAgentNameIsNotMerged(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+	id := releaseRunID(releaseDay(1), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339), AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[1]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+	noteRep := runReport{
+		RunID: releaseRunID(releaseDay(2), "bbbb"), BaseSHA: hexSHA("00"),
+		StartedAt: releaseDay(2).Format(time.RFC3339), Strategy: "overlay", AgentCmd: "/usr/local/bin/claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/n1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	}
+	data, err := json.MarshalIndent(noteRep, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", shas[2], data); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	want := []releaseAgent{
+		{Agent: "claude", Runs: 1, Landed: 1},
+		{Agent: "claude", Runs: 1, Landed: 1, Unverified: true},
+	}
+	if !reflect.DeepEqual(doc.Agents, want) {
+		t.Fatalf("agents = %+v, want the ledger row and the note row kept apart: %+v", doc.Agents, want)
+	}
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	if !strings.Contains(md, "| claude | 1 | 1 |") || !strings.Contains(md, "unverified") {
+		t.Fatalf("attribution table merged or mislabelled the rows:\n%s", md)
+	}
+}
+
+// TestReleaseTextKeepsTextOnItsLine is releaseText's own contract: nothing a run
+// recorded can end the line it is rendered on, in ANY renderer's idea of a line
+// break, and nothing can add a table cell. Emphasis is left alone on purpose.
+func TestReleaseTextKeepsTextOnItsLine(t *testing.T) {
+	cases := map[string]string{
+		"a\nb":            "a b",
+		"a\r\n\n\tb":      "a b",
+		"a\u2028b":        "a b", // LINE SEPARATOR
+		"a\u2029b":        "a b", // PARAGRAPH SEPARATOR
+		"a\ufeffb":        "a b", // ZERO WIDTH NO-BREAK SPACE / BOM
+		"a\u202eb":        "a b", // RIGHT-TO-LEFT OVERRIDE
+		"cl|aude":         `cl\|aude`,
+		"  ship it  ":     "ship it",
+		"*bold* `code`":   "*bold* `code`",
+		"### not a break": "### not a break",
+	}
+	for in, want := range cases {
+		got := releaseText(in)
+		if got != want {
+			t.Fatalf("releaseText(%q) = %q, want %q", in, got, want)
+		}
+		if strings.ContainsAny(got, "\n\r\u2028\u2029") {
+			t.Fatalf("releaseText(%q) still carries a line break", in)
+		}
 	}
 }
