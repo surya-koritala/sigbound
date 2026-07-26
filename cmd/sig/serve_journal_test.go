@@ -14,14 +14,16 @@ import (
 )
 
 // plantRunStatus writes status.json directly (bypassing writeRunStatus'
-// atomic rename, and its "always os.Getpid()" pid) so a test can simulate a
-// specific process's phase marker, including a foreign/dead pid.
-func plantRunStatus(t *testing.T, dir, status string, pid int) {
+// atomic rename, and its "always os.Getpid()/ownerScope()" owner) so a test can
+// simulate a specific process's phase marker: a foreign/dead pid, a pid scope
+// from another host, or the absent scope an older binary wrote.
+func plantRunStatus(t *testing.T, dir, status string, pid int, scope string) {
 	t.Helper()
 	data, err := json.MarshalIndent(runStatusFile{
 		Status:    status,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 		PID:       pid,
+		PIDScope:  scope,
 	}, "", "  ")
 	if err != nil {
 		t.Fatal(err)
@@ -145,7 +147,7 @@ func TestServeStartupRecoveryMarksDeadRunInterrupted(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	plantRunStatus(t, dir, "running", deadPID)
+	plantRunStatus(t, dir, "running", deadPID, ownerScope())
 
 	// "Restart": a brand-new server instance over the same repo. newServer
 	// runs the recovery scan before returning, i.e. before any request is
@@ -215,7 +217,7 @@ func TestServeRecoveryProtectsLiveRun(t *testing.T) {
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	plantRunStatus(t, runDir, "running", os.Getpid())
+	plantRunStatus(t, runDir, "running", os.Getpid(), ownerScope())
 
 	recoverStaleRuns(runsDir, os.Getpid())
 
@@ -243,7 +245,7 @@ func TestServeRecoveryProtectsAliveForeignPid(t *testing.T) {
 	}
 	// os.Getpid() is definitely alive (it's us), but recoverStaleRuns is told
 	// a DIFFERENT pid is "us" -- simulating a sibling daemon's live run.
-	plantRunStatus(t, runDir, "running", os.Getpid())
+	plantRunStatus(t, runDir, "running", os.Getpid(), ownerScope())
 
 	recoverStaleRuns(runsDir, os.Getpid()+1)
 
@@ -273,7 +275,7 @@ func TestServeRecoveryFlipsDeadForeignPid(t *testing.T) {
 		t.Fatalf("spawn+wait short-lived process: %v", err)
 	}
 	deadPID := cmd.Process.Pid
-	plantRunStatus(t, runDir, "running", deadPID)
+	plantRunStatus(t, runDir, "running", deadPID, ownerScope())
 
 	recoverStaleRuns(runsDir, os.Getpid())
 
@@ -296,7 +298,7 @@ func TestServeRecoveryLeavesTerminalRunsAlone(t *testing.T) {
 		if err := os.MkdirAll(runDir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		plantRunStatus(t, runDir, status, 999999999)
+		plantRunStatus(t, runDir, status, 999999999, ownerScope())
 	}
 	recoverStaleRuns(runsDir, os.Getpid())
 	for _, status := range []string{"done", "error"} {
@@ -307,6 +309,160 @@ func TestServeRecoveryLeavesTerminalRunsAlone(t *testing.T) {
 		if sf.Status != status {
 			t.Fatalf("terminal run %q became %q, want unchanged", status, sf.Status)
 		}
+	}
+}
+
+// TestServeRecoveryReclaimsForeignHostRecord is the fail-safe direction of
+// issue #162, and the one a bare pid gets WRONG: the recorded pid is
+// os.Getpid(), which is unarguably alive in this namespace, but the record was
+// written somewhere else. Under a container per run over a shared clone that is
+// the routine case — a stranger's pid number resolves here perfectly well — and
+// trusting it wedges the cell in "running" with no process behind it. A record
+// this host cannot vouch for must read NOT alive, i.e. reclaimable.
+//
+// Deliberately NOT gated on unix process semantics: the whole point is that the
+// decision is reached before pidAlive is ever consulted, so it must hold on
+// Windows too.
+func TestServeRecoveryReclaimsForeignHostRecord(t *testing.T) {
+	runsDir := t.TempDir()
+	runDir := filepath.Join(runsDir, "run1")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plantRunStatus(t, runDir, "running", os.Getpid(), "some-other-host-entirely")
+
+	recoverStaleRuns(runsDir, os.Getpid())
+
+	sf, err := readRunStatus(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sf.Status != "interrupted" {
+		t.Fatalf("status = %q, want interrupted: a live LOCAL pid under a FOREIGN pid scope must not read as alive", sf.Status)
+	}
+	// The note has to say why, or an operator debugging a wedged cell is told
+	// "that process is gone" about a process that is very much running.
+	if !strings.Contains(sf.Note, "another host or boot") {
+		t.Fatalf("note = %q, want it to name the foreign host/boot rather than claiming the pid is gone", sf.Note)
+	}
+}
+
+// TestServeRecoveryReclaimsUnscopedRecord pins the documented behaviour change
+// for status.json files already on disk from a binary that predates pidScope:
+// with no identity recorded, the run cannot be shown to belong to a live
+// process here, so it is reclaimed rather than trusted. Trusting it would leave
+// the guard opt-out-able by deleting one field.
+//
+// Not gated on unix process semantics, for the same reason as the foreign-host
+// case: the decision precedes pidAlive.
+func TestServeRecoveryReclaimsUnscopedRecord(t *testing.T) {
+	runsDir := t.TempDir()
+	runDir := filepath.Join(runsDir, "run1")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Exactly what the older binary wrote: a live pid, no pidScope at all.
+	plantRunStatus(t, runDir, "running", os.Getpid(), "")
+	raw, err := os.ReadFile(filepath.Join(runDir, "status.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "pidScope") {
+		t.Fatalf("the pre-upgrade fixture must have NO pidScope key at all, got: %s", raw)
+	}
+
+	recoverStaleRuns(runsDir, os.Getpid())
+
+	sf, err := readRunStatus(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sf.Status != "interrupted" {
+		t.Fatalf("status = %q, want interrupted: a record with no recorded host identity must not read as alive", sf.Status)
+	}
+	if !strings.Contains(sf.Note, "no host identity") {
+		t.Fatalf("note = %q, want it to say the record carried no host identity", sf.Note)
+	}
+}
+
+// TestServeRecoveryProtectsOwnHostRecord is the other direction, end to end
+// through the REAL writer: writeRunStatus stamps the scope, recoverStaleRuns
+// reads it, and a live run of this process must survive the sweep untouched.
+// Written this way on purpose — a test that planted ownerScope() by hand would
+// still pass if writeRunStatus stopped recording the field at all, and every
+// live run on every host would then be reclaimed at the next startup.
+func TestServeRecoveryProtectsOwnHostRecord(t *testing.T) {
+	requireUnixProcessSemantics(t)
+	runsDir := t.TempDir()
+	runDir := filepath.Join(runsDir, "run1")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRunStatus(runDir, "running", "")
+
+	recoverStaleRuns(runsDir, os.Getpid())
+
+	sf, err := readRunStatus(runDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sf.Status != "running" {
+		t.Fatalf("status = %q, want running: this process wrote it and is still alive", sf.Status)
+	}
+	if sf.PIDScope == "" {
+		t.Fatal("writeRunStatus recorded no pidScope; every record it writes would then be reclaimable")
+	}
+}
+
+// TestOwnedByLiveProcess pins the decision itself, on a pid that is
+// unarguably alive (this test's own), so the only variable left is the
+// recorded host identity. The row that matters most is the last: when THIS
+// host cannot name itself either, an unscoped record must still not match —
+// two empty strings comparing equal is precisely how the false-alive would
+// come back.
+//
+// Unix-gated because pidAlive is unimplemented on Windows and answers false
+// for every pid: every row would pass there for a reason that has nothing to
+// do with what is being tested. The two fail-safe directions that must hold on
+// Windows are covered ungated by the recoverStaleRuns tests above.
+func TestOwnedByLiveProcess(t *testing.T) {
+	requireUnixProcessSemantics(t)
+	live := os.Getpid()
+	for _, tc := range []struct {
+		name  string
+		scope string
+		ours  string
+		want  bool
+	}{
+		{"same host, live pid", "host-a", "host-a", true},
+		{"another host, live pid", "host-b", "host-a", false},
+		{"no recorded identity", "", "host-a", false},
+		{"no recorded identity and this host unknown", "", "", false},
+	} {
+		if got := ownedByLiveProcess(&runStatusFile{PID: live, PIDScope: tc.scope}, tc.ours); got != tc.want {
+			t.Errorf("%s: ownedByLiveProcess(scope=%q, ours=%q) = %v, want %v", tc.name, tc.scope, tc.ours, got, tc.want)
+		}
+	}
+
+	// And a dead pid is dead however well the host matches -- the scope check
+	// narrows "alive", it never substitutes for it.
+	if ownedByLiveProcess(&runStatusFile{PID: deadPID(t), PIDScope: "host-a"}, "host-a") {
+		t.Error("a dead pid under a matching host scope read as alive")
+	}
+}
+
+// TestOwnerScopeIsStableAndNonEmpty: the scope is compared across processes, so
+// a value that varies between two calls in the same process would make a live
+// run reclaim itself, and an empty one would make every record reclaimable.
+// Neither is a hypothetical -- both are silent, and both look like recovery
+// working.
+func TestOwnerScopeIsStableAndNonEmpty(t *testing.T) {
+	first := ownerScope()
+	if first == "" {
+		t.Fatal("ownerScope() is empty; every status.json this host writes would then be reclaimable by its own next startup")
+	}
+	if second := ownerScope(); second != first {
+		t.Fatalf("ownerScope() returned %q then %q; it must not vary within a process", first, second)
 	}
 }
 
