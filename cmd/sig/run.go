@@ -340,6 +340,17 @@ type runReport struct {
 	// false (and omitted) without a run id to sample on, i.e. for an in-process
 	// driveRun caller that made no run dir.
 	Audit bool `json:"audit,omitempty"`
+	// Unlands is the run id whose landed contribution this run took back
+	// (`sig unland`, issue #149) — the forward edge `sig log` renders and the
+	// reverse edge (unlandedBy) it derives. Set only on an unland run, which also
+	// carries Source "unland"; empty and omitted on every other run, so a report
+	// written before unlanding existed reads back identically.
+	Unlands string `json:"unlands,omitempty"`
+	// Entangled names the later landed runs whose write-sets overlap the run this
+	// unland reverses, with the shared paths (see unland.go's blast radius).
+	// Advisory: an overlap that still merges cleanly lands. Empty on every run
+	// that is not an unland, and on an unland nothing later touched.
+	Entangled []entangledRun `json:"entangled,omitempty"`
 	// LandRefused names the commit the base was actually at when the landing
 	// swap was refused: somebody else advanced it while this run was computing
 	// against BaseSHA (see landRef). Set only on that refusal — empty and
@@ -362,9 +373,13 @@ type runReport struct {
 // USAGE section. Every list/scalar is omitempty so a minimal policy records
 // minimally.
 type policyJSON struct {
-	Hash        string   `json:"hash"`
-	Verify      []string `json:"verify,omitempty"`
-	AckPaths    []string `json:"ackPaths,omitempty"`
+	Hash     string   `json:"hash"`
+	Verify   []string `json:"verify,omitempty"`
+	AckPaths []string `json:"ackPaths,omitempty"`
+	// UnlandPaths is the unland-paths glob set (issue #149) — the paths an
+	// UNLAND's inverse must be acked to touch. Omitted when the policy declares
+	// none, so a policy that predates unlanding records byte-identically.
+	UnlandPaths []string `json:"unlandPaths,omitempty"`
 	AuditSample *int     `json:"auditSample,omitempty"` // pointer so 0% (never audit) is distinct from unset (nil)
 	AckTimeout  string   `json:"ackTimeout,omitempty"`
 	// AckTimeoutAction is what an expired park auto-transitions to; recorded

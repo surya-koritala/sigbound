@@ -337,6 +337,11 @@ func (s *server) handler() http.Handler {
 	// already computed and verified. GET /inbox is the read side.
 	mux.HandleFunc("POST /runs/{id}/ack", s.handleAck)
 	mux.HandleFunc("POST /runs/{id}/reject", s.handleReject)
+	// Unlanding (issue #149). POST holds the cell's run slot for its whole
+	// integrate + verify + land, exactly as POST .../ack does and for the
+	// identical reason. GET .../entangled computes no verdicts and writes nothing.
+	mux.HandleFunc("POST /runs/{id}/unland", s.handleUnland)
+	mux.HandleFunc("GET /runs/{id}/entangled", s.handleEntangled)
 	mux.HandleFunc("GET /inbox", s.handleInbox)
 	// Watch mode's one enqueue endpoint (issue #111). It starts nothing by
 	// itself: it names existing branches for the next cycle, which drives the
@@ -1354,6 +1359,132 @@ func (s *server) handleAckReject(w http.ResponseWriter, r *http.Request, ack boo
 	writeJSON(w, http.StatusOK, out)
 }
 
+// ---- unlanding surface (issue #149) ----
+
+// unlandRequest is the POST /runs/{id}/unland body. Only `reason` is accepted:
+// an unland decides nothing else about WHAT lands — the inverse is determined by
+// the target run's own ledger entry, and the bar it must clear by the repo's
+// sigbound.policy at the current head, never by the caller.
+type unlandRequest struct {
+	Reason string `json:"reason"`
+}
+
+// entangledResponse is GET /runs/{id}/entangled: the blast radius, read-only.
+// Unlandable is whether the preconditions pass RIGHT NOW; Reason says why not.
+// It is the same data `sig unland -dry-run -json` prints, from the same
+// planUnland — and, now that this door honors ?limit= exactly as the flag does,
+// the two agree for the same limit rather than only for the default.
+type entangledResponse struct {
+	RunID      string         `json:"runId"`
+	WriteSet   []string       `json:"writeSet,omitempty"`
+	Unlandable bool           `json:"unlandable"`
+	Reason     string         `json:"reason,omitempty"`
+	Entangled  []entangledRun `json:"entangled"`
+	// ScanLimited mirrors unlandOutcome.ScanLimited: the scan stopped at limit
+	// before reaching the target, so Entangled may be missing later runs.
+	ScanLimited bool `json:"scanLimited,omitempty"`
+}
+
+// handleEntangled serves the read-only blast radius for a landed run. It writes
+// nothing and computes no verdict about landing — a GET must never be able to
+// move a ref — so it takes no cell slot and runs on the request context.
+func (s *server) handleEntangled(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRunID(id) {
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
+		return
+	}
+	rc, _, ok := s.locateRun(id)
+	if !ok || rc == nil {
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
+		return
+	}
+	// Honor ?limit= exactly as `sig unland -limit` does (default unlandDefaultLimit,
+	// 0 = every newer run), so this read and the flag return the same blast radius.
+	limit := unlandDefaultLimit
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "limit must be a non-negative integer", codeBadRequest)
+			return
+		}
+		limit = n
+	}
+	plan, err := planUnland(r.Context(), rc.cell.Git(), rc.runsDir, id, limit)
+	if err != nil {
+		writeJSON(w, http.StatusOK, entangledResponse{RunID: id, Unlandable: false, Reason: err.Error(), Entangled: []entangledRun{}})
+		return
+	}
+	ent := plan.Entangled
+	if ent == nil {
+		ent = []entangledRun{}
+	}
+	writeJSON(w, http.StatusOK, entangledResponse{RunID: id, WriteSet: plan.WriteSet, Unlandable: true, Entangled: ent, ScanLimited: plan.Truncated})
+}
+
+// handleUnland is the HTTP front door onto unlandRun. It holds the cell's run
+// slot for the whole integrate + verify + land, the same slot POST /runs and
+// POST .../ack take and for the identical reason: it runs a real verify and then
+// moves a ref, so it must serialize with runs and acks exactly as they do.
+//
+// The verify battery comes from the repo's sigbound.policy alone here — a
+// request never chooses the bar its own landing must clear, so there is no
+// -verify equivalent on this door. A repo with no `verify` line gets an unland
+// gated by nothing, which is the same posture `sig run` has without -verify.
+func (s *server) handleUnland(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !validRunID(id) {
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
+		return
+	}
+	rc, _, ok := s.locateRun(id)
+	if !ok || rc == nil {
+		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
+		return
+	}
+	var body unlandRequest
+	r.Body = http.MaxBytesReader(w, r.Body, serveMaxBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body: "+err.Error(), codeBadRequest)
+		return
+	}
+
+	cellID := rc.cell.ID()
+	s.mu.Lock()
+	if s.busy[cellID] {
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, fmt.Sprintf("cell %s (%s) is busy with a run, an ack, or another unland; one at a time", cellID, rc.cell.Repo()), codeCellBusy)
+		return
+	}
+	s.busy[cellID] = true
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.busy[cellID] = false
+		s.mu.Unlock()
+	}()
+
+	// s.baseCtx, NOT the request's, for the same reason an ack uses it: this runs
+	// a real verify that can take as long as the repo's battery does, and a client
+	// timeout or a closed browser tab must not abort it partway and record that as
+	// a red inverse. Only a daemon shutdown cancels it.
+	out, err := unlandRun(s.baseCtx, rc.cell, unlandParams{
+		TargetID: id, Reason: body.Reason, Limit: unlandDefaultLimit, Actor: "http",
+		Env: ackEnv{Mode: s.envMode, Verify: s.envVerify, Resolver: s.envResolver},
+	})
+	if err != nil {
+		if errors.Is(err, errNotLanded) {
+			writeErr(w, http.StatusConflict, err.Error(), codeNotLanded)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, err.Error(), codeInternalError)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 // handleUI serves the single self-contained conflict-review page (uiHTML). A
 // strict CSP declares the page needs NOTHING external — same-origin fetches
 // only, inline script/style (the page IS one inline file), no remote src of any
@@ -1602,10 +1733,19 @@ func validRunID(id string) bool {
 	return len(id) <= 128 && slugSafe(id)
 }
 
-// newRunID is a timestamp prefix (second precision, so a lexical sort is
+// newRunID is a variable ONLY so a test can force a strictly increasing id
+// sequence. The whole ledger reads chronology out of the id's timestamp prefix
+// (`sig log`'s newest-first walk, the inbox's, and the unland blast radius's
+// "everything from here back is older" cut), and that prefix has SECOND
+// resolution: two runs a test drives inside one second order by their random
+// suffix instead, which is not chronological. Production never reassigns this —
+// the ordering it relies on is the wall clock's, not a test's.
+var newRunID = newRunIDNow
+
+// newRunIDNow is a timestamp prefix (second precision, so a lexical sort is
 // chronological) plus 6 random bytes, so two runs in the same second — only ever
 // on DIFFERENT cells, since one cell serializes — never collide.
-func newRunID() string {
+func newRunIDNow() string {
 	var b [6]byte
 	_, _ = rand.Read(b[:]) // crypto/rand; a read error only weakens uniqueness, never correctness
 	return time.Now().UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
@@ -1968,6 +2108,7 @@ const (
 	codeCellNotFound         = "cell_not_found"         // 400: POST /runs named an unregistered cell
 	codeCellBusy             = "cell_busy"              // 409: that cell already has a run (or an ack's re-verify) in flight
 	codeNotParked            = "not_parked"             // 409: ack/reject on a run that isn't awaiting-ack
+	codeNotLanded            = "not_landed"             // 409: unland on a run that never landed, or whose landing is no longer in the base's history
 	codeQuotaConcurrency     = "quota_concurrency"      // 429: -max-concurrent-runs exceeded
 	codeQuotaAgents          = "quota_agents"           // 400: -max-agents-per-run exceeded
 	codeEnvWidenRefused      = "env_widen_refused"      // 400: request tried to widen scoped envMode

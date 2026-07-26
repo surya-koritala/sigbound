@@ -34,15 +34,20 @@ const policyFileName = "sigbound.policy"
 // is what an absent file resolves to: exactly today's flag behavior, zero
 // migration. auditSample is -1 when unset (0 is a leg, meaningful value).
 type policy struct {
-	present     bool
-	hash        string   // sha256 (hex) of the exact file bytes; recorded as policyHash
-	verify      []string // the verify battery, in file order (repeatable key), ANDed at resolve
-	lanes       string   // "" | laneOff | laneStrict — only laneStrict is a floor
-	semantic    string   // "" | semanticOff | semanticGo — only semanticGo is a floor
-	assertSet   bool     // whether an assert= line was present
-	assert      bool     // policy's assert value (a floor only when true)
-	ackPaths    []string // globs; a landed change touching one PARKS the landing for a human ack (#109)
-	auditSample int      // 0..100, or -1 when unset: the spot-audit sampling rate (see auditSelected)
+	present   bool
+	hash      string   // sha256 (hex) of the exact file bytes; recorded as policyHash
+	verify    []string // the verify battery, in file order (repeatable key), ANDed at resolve
+	lanes     string   // "" | laneOff | laneStrict — only laneStrict is a floor
+	semantic  string   // "" | semanticOff | semanticGo — only semanticGo is a floor
+	assertSet bool     // whether an assert= line was present
+	assert    bool     // policy's assert value (a floor only when true)
+	ackPaths  []string // globs; a landed change touching one PARKS the landing for a human ack (#109)
+	// unlandPaths are globs that park an UNLAND's inverse specifically (#149).
+	// ackPaths applies to an inverse too — a path that needs an ack to change
+	// needs an ack to change back — so this key exists only for the asymmetric
+	// case: paths cheap to land forward and expensive to take back.
+	unlandPaths []string
+	auditSample int // 0..100, or -1 when unset: the spot-audit sampling rate (see auditSelected)
 	ackTimeout  time.Duration
 	// ackTimeoutAction is what an EXPIRED park auto-transitions to (see
 	// enforceParkTimeout). parkActionReject is the only value v2.0 accepts; the
@@ -133,6 +138,12 @@ func parsePolicy(data []byte) (policy, error) {
 				return policy{}, fmt.Errorf("line %d: ack-paths requires at least one glob", e.Line)
 			}
 			pol.ackPaths = append(pol.ackPaths, globs...)
+		case "unland-paths":
+			globs := splitCSV(e.Value)
+			if len(globs) == 0 {
+				return policy{}, fmt.Errorf("line %d: unland-paths requires at least one glob", e.Line)
+			}
+			pol.unlandPaths = append(pol.unlandPaths, globs...)
 		case "lanes":
 			if err := scalar(e); err != nil {
 				return policy{}, err
@@ -365,7 +376,7 @@ func policyReport(pol policy) *policyJSON {
 	if !pol.present {
 		return nil
 	}
-	out := &policyJSON{Hash: pol.hash, Verify: pol.verify, AckPaths: pol.ackPaths}
+	out := &policyJSON{Hash: pol.hash, Verify: pol.verify, AckPaths: pol.ackPaths, UnlandPaths: pol.unlandPaths}
 	if pol.auditSample >= 0 {
 		n := pol.auditSample
 		out.AuditSample = &n
@@ -480,7 +491,7 @@ func policyHoldback(pol policy, okBranches []string, writeSets map[string][]stri
 		entries := make([]flaggedJSON, 0, len(g))
 		pg := parkGroupJSON{MatchedPaths: map[string]string{}}
 		for _, bc := range g {
-			kind, reason, matched := branchHoldReason(writeSets[bc.Branch], pol)
+			kind, reason, matched := branchHoldReason(writeSets[bc.Branch], pol, false)
 			if reason != "" && groupReason == "" {
 				groupReason = reason
 			}
@@ -519,23 +530,40 @@ func policyHoldback(pol policy, okBranches []string, writeSets map[string][]stri
 }
 
 // branchHoldReason reports why one branch's own write-set holds it (kind empty
-// when it triggers nothing): self-modification of the policy file takes
-// precedence over an ack-path match. kind is the machine-readable park reason
-// (parkReason*), reason its human wording, and matched maps each triggering path
-// to the ack-paths GLOB that matched it (policyFileName maps to itself, since
-// self-protection is not glob-driven).
-func branchHoldReason(paths []string, pol policy) (kind, reason string, matched map[string]string) {
+// when it triggers nothing). Precedence, most to least specific:
+// policy-modified > unland-paths > ack-paths. kind is the machine-readable park
+// reason (parkReason*), reason its human wording, and matched maps each
+// triggering path to the GLOB that matched it (policyFileName maps to itself,
+// since self-protection is not glob-driven).
+//
+// unland selects which glob sets apply. An UNLAND's inverse is tested against
+// unland-paths first and then ack-paths — a path that needs an ack to change
+// needs an ack to change back, so both bind it — while an ordinary landing sees
+// ack-paths alone. Self-protection binds both by construction.
+func branchHoldReason(paths []string, pol policy, unland bool) (kind, reason string, matched map[string]string) {
 	for _, p := range paths {
 		if p == policyFileName {
 			return parkReasonPolicyModified, "policy: run modifies " + policyFileName, map[string]string{policyFileName: policyFileName}
 		}
 	}
-	acked := map[string]string{}
+	if unland {
+		if kind, reason, matched = globHold(paths, pol.unlandPaths, parkReasonUnlandPaths, "policy: ack required to unland "); kind != "" {
+			return kind, reason, matched
+		}
+	}
+	return globHold(paths, pol.ackPaths, parkReasonAckPaths, "policy: ack required for ")
+}
+
+// globHold matches paths against one glob set, returning kind (empty when
+// nothing matched), the human wording prefixed with the alphabetically first
+// triggering path, and the path -> glob map the park record and inbox render.
+func globHold(paths, globs []string, kind, wording string) (string, string, map[string]string) {
+	matched := map[string]string{}
 	first := ""
 	for _, p := range paths {
-		for _, glob := range pol.ackPaths {
+		for _, glob := range globs {
 			if globMatch(glob, p) {
-				acked[p] = glob
+				matched[p] = glob
 				if first == "" || p < first {
 					first = p
 				}
@@ -543,10 +571,10 @@ func branchHoldReason(paths []string, pol policy) (kind, reason string, matched 
 			}
 		}
 	}
-	if len(acked) > 0 {
-		return parkReasonAckPaths, "policy: ack required for " + first, acked
+	if len(matched) == 0 {
+		return "", "", nil
 	}
-	return "", "", nil
+	return kind, wording + first, matched
 }
 
 // globMatch reports whether pattern matches name, both slash-separated

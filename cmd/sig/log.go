@@ -98,6 +98,12 @@ type logRow struct {
 	// top-level policyHash key, which nothing has ever written). Empty and
 	// omitted for a run against a repo with no policy file.
 	PolicyHash string `json:"policyHash,omitempty"`
+	// Unlands is the run id this run took back (`sig unland`, issue #149), empty
+	// for every ordinary run. Only the FORWARD edge appears in this list: the
+	// reverse one (who unlanded a given run) would need every newer manifest read,
+	// and the list deliberately reads at most -limit of them. `sig log -sha`
+	// reports the reverse edge as unlandedBy, since its walk visits them all.
+	Unlands    string `json:"unlands,omitempty"`
 	Error      string `json:"error,omitempty"`      // error/interrupted runs: the recorded reason
 	Incomplete bool   `json:"incomplete,omitempty"` // report expected but missing/unparseable (crash mid-write)
 }
@@ -108,6 +114,9 @@ type logRow struct {
 // run ledger). Role classifies the commit:
 //
 //	landed-commit             the run's integrated commit that advanced the base
+//	unland-commit             a landed-commit whose run was an unland (see
+//	                          unland.go): it advanced the base by taking another
+//	                          run's contribution back, and Unlands names that run
 //	ack-landed-commit         a parked landing a HUMAN released with `sig ack`,
 //	                          which is the only role a person had to approve
 //	member-landed             an agent branch tip that landed as part of a run
@@ -139,7 +148,14 @@ type provenance struct {
 	StartedAt string `json:"startedAt,omitempty"`
 	FinalSHA  string `json:"finalSHA,omitempty"` // the run's landed integration commit
 	Members   int    `json:"members,omitempty"`  // branches that landed together (landed-commit / ack-landed-commit only)
-	Source    string `json:"source"`
+	// Unlands is the run id an unland-commit took back (issue #149).
+	Unlands string `json:"unlands,omitempty"`
+	// UnlandedBy names the unland run that took THIS commit's run back — the
+	// reverse edge. Populated only on the manifest-walk path, which visits every
+	// run dir and so answers exactly; a portable landing note carries the run's
+	// own report and cannot know what a later run did to it, so it is empty there.
+	UnlandedBy string `json:"unlandedBy,omitempty"`
+	Source     string `json:"source"`
 }
 
 // roleAckLanded is the provenance role for a landing a human released with `sig
@@ -347,6 +363,7 @@ func fillRowFromReport(row *logRow, rep *runReport) {
 	if rep.Policy != nil {
 		row.PolicyHash = rep.Policy.Hash
 	}
+	row.Unlands = rep.Unlands
 	if landed(rep) {
 		row.LandedSHA = short(rep.Integrate.FinalSHA)
 	}
@@ -387,11 +404,21 @@ func resolveProvenance(ctx context.Context, g *gitx.Git, runsDir, sha string) (*
 			// non-authoritative and fall through to the manifest walk.
 		}
 	}
+	// The reverse unland edge is collected AS the walk goes (issue #149) rather
+	// than by a second pass: run ids are timestamp-prefixed and this walk is
+	// newest-first, so an unland run is always visited before the run it reverses.
+	// Only a LANDED unland counts — one that was blocked or parked took nothing
+	// back — and the edge costs nothing, since the walk already reads every
+	// manifest it passes.
+	unlandedBy := map[string]string{}
 	for _, id := range runDirNames(runsDir) {
 		dir := filepath.Join(runsDir, id)
 		rep, err := readRunReport(dir)
 		if err != nil {
 			continue // unreadable/partial dir: never crash a provenance query, just skip it
+		}
+		if rep.Unlands != "" && landed(rep) && unlandedBy[rep.Unlands] == "" {
+			unlandedBy[rep.Unlands] = id
 		}
 		// An ACK lands after this report was written and records the commit in
 		// park.json, which is never folded back into the report (see
@@ -405,6 +432,7 @@ func resolveProvenance(ctx context.Context, g *gitx.Git, runsDir, sha string) (*
 		if p := matchProvenance(rep, sha); p != nil {
 			p.RunID = id
 			p.Source = "manifest"
+			p.UnlandedBy = unlandedBy[id]
 			return p, true
 		}
 	}
@@ -486,9 +514,11 @@ func matchProvenance(rep *runReport, sha string) *provenance {
 }
 
 // provenanceFromFinal builds the provenance for a run's landed integration
-// commit — the aggregate of every landed branch, so it names no single task.
+// commit — the aggregate of every landed branch, so it names no single task. An
+// unland's landing gets its own role: it advanced the base by REMOVING another
+// run's contribution, which "landed-commit" alone would not say.
 func provenanceFromFinal(rep *runReport, sha string) *provenance {
-	return &provenance{
+	p := &provenance{
 		SHA:       sha,
 		Landed:    landed(rep),
 		Role:      "landed-commit",
@@ -500,6 +530,10 @@ func provenanceFromFinal(rep *runReport, sha string) *provenance {
 		FinalSHA:  rep.Integrate.FinalSHA,
 		Members:   len(rep.Integrate.Landed),
 	}
+	if rep.Unlands != "" {
+		p.Role, p.Unlands = "unland-commit", rep.Unlands
+	}
+	return p
 }
 
 // scanTask follows one task id across the whole history, oldest-first (the
@@ -716,13 +750,25 @@ func provenanceLine(p *provenance) string {
 	if p.Intent != "" {
 		run += " (intent " + p.Intent + ")"
 	}
+	unlanded := ""
+	if p.UnlandedBy != "" {
+		unlanded = ", since unlanded by run " + p.UnlandedBy
+	}
 	switch p.Role {
+	case "unland-commit":
+		// An unland commit can itself be unlanded (you take back a take-back), and
+		// that reverse edge is most informative exactly here. The no-op-unland case
+		// leaves UnlandedBy unset upstream, so this stays silent for it.
+		return fmt.Sprintf("commit %s: %s took run %s back out of the base, verify %s%s",
+			short(p.SHA), run, p.Unlands, p.Verify, unlanded)
 	case "landed-commit":
-		return fmt.Sprintf("commit %s: landed integration commit of %s (%s, %d branch(es)), verify %s",
-			short(p.SHA), run, p.Strategy, p.Members, p.Verify)
+		return fmt.Sprintf("commit %s: landed integration commit of %s (%s, %d branch(es)), verify %s%s",
+			short(p.SHA), run, p.Strategy, p.Members, p.Verify, unlanded)
 	case roleAckLanded:
-		return fmt.Sprintf("commit %s: released by a human ACK of %s (%s, %d parked branch(es)), verify %s",
-			short(p.SHA), run, p.Strategy, p.Members, p.Verify)
+		// An acked landing is a landing, so it carries the same reverse edge: a
+		// later unland can take it back exactly like any other.
+		return fmt.Sprintf("commit %s: released by a human ACK of %s (%s, %d parked branch(es)), verify %s%s",
+			short(p.SHA), run, p.Strategy, p.Members, p.Verify, unlanded)
 	case "member-landed":
 		return fmt.Sprintf("commit %s: landed by %s, task %s, agent %s (%s), verify %s",
 			short(p.SHA), run, p.TaskID, quote(p.Agent), p.Strategy, p.Verify)

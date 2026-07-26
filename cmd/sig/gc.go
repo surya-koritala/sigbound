@@ -73,8 +73,11 @@ var gcTempRoot = os.TempDir
 
 // gcBranchPrefixes are the ONLY ref prefixes gc will ever consider removing.
 // Nothing outside these -- most importantly the base branch itself -- is a
-// gc candidate at all.
-var gcBranchPrefixes = []string{"refs/heads/agent/", "refs/heads/imported/"}
+// gc candidate at all. refs/heads/unland/ is an unland's inverse branch (issue
+// #149): once its unland has landed the inverse is reachable from the base and
+// the ref is debris, and while the unland is PARKED loadParkedBranches protects
+// it unconditionally by name, exactly as it does an agent branch.
+var gcBranchPrefixes = []string{"refs/heads/agent/", "refs/heads/imported/", "refs/heads/" + unlandBranchPrefix}
 
 // gcReport is `sig gc`'s -json contract. WorktreesPruned/Tempdirs are
 // stages (1)/(2) of the sweep (see package doc); BranchesDeleted/
