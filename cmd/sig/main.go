@@ -92,6 +92,14 @@ func main() {
 		if code != 0 {
 			os.Exit(code)
 		}
+	case "policy":
+		code, err := runPolicy(os.Stdout, os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "sig policy:", err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
 	case "replay":
 		code, err := runReplay(os.Stdout, os.Args[2:])
 		if err != nil {
@@ -143,6 +151,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  sig gc        -repo PATH [-older-than 72h] [-delete] [-force] [-json]  (sweep debris a crashed run left; dry-run by default; see 'sig gc -h')")
 	fmt.Fprintln(w, "  sig log       -repo PATH [-limit 50] [-sha COMMIT | -task ID] [-json]  (read-only run history + commit provenance; see 'sig log -h')")
 	fmt.Fprintln(w, "  sig intent    list|show ID|new ID|import-github -repo PATH  (the repo's intents/*.intent statements of work; run one with 'sig run -intent ID')")
+	fmt.Fprintln(w, "  sig policy    init [-repo PATH]  (write a starting sigbound.policy from the repo's CI workflows, Makefile, manifests and CODEOWNERS; never overwrites)")
 	fmt.Fprintln(w, "  sig version")
 	fmt.Fprintln(w, "strategies:", strings.Join(cell.AvailableStrategies(), ", "))
 }
