@@ -38,7 +38,7 @@
 //
 //	GET  /health           -> {ok, version, cells:[{id, repo}]}
 //	POST /runs             -> Content-Type: application/json required; 202 {runId,...}; runs ASYNC via driveRun
-//	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}; finalSHA is what LANDED (see landedSHA)
+//	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}; finalSHA is what this run LANDED, whatever its status (see landedSHA)
 //	GET  /runs/{id}        -> {status: queued|running|done|error|interrupted, report?, usage?}
 //	GET  /runs/{id}/events -> the run's events.ndjson (application/x-ndjson)
 //	GET  /runs/{id}/usage  -> that run's metering record (see usage.go)
@@ -794,7 +794,12 @@ func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	if status == "done" || status == statusAwaitingAck || status == statusRejected {
 		if rep, err := readRunReport(dir); err == nil {
 			resp.Report = rep
-			if resp.StartedAt == "" {
+			// The report's startedAt outranks the in-memory one on BOTH /runs
+			// surfaces (see handleListRuns): the record is stamped when POST /runs
+			// accepted the run, the report when driveRun actually began, and a
+			// -goal run runs its whole planner in between. Taking the report means
+			// this field does not change when a restart drops the record.
+			if rep.StartedAt != "" {
 				resp.StartedAt = rep.StartedAt
 			}
 		}
@@ -832,9 +837,10 @@ func (s *server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	// ponytail: list reads each done run's report.json for finalSHA; fine for a
-	// single-process daemon over a handful of repos. Add a per-cell index file
-	// if run history ever grows large enough for this scan to matter.
+	// ponytail: list reads every run's report.json for finalSHA, exactly as GET
+	// /log already does; fine for a single-process daemon over a handful of
+	// repos. Add a per-cell index file if run history ever grows large enough
+	// for this scan to matter.
 	var entries []runListEntry
 	for _, rc := range s.cells {
 		names, _ := os.ReadDir(rc.runsDir) // missing dir => no runs yet
@@ -854,17 +860,26 @@ func (s *server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 			// finalSHA is a LANDING, never integrate.finalSHA raw: a run whose
 			// -verify went red records the integrated commit it never landed, and
 			// an acked park landed a commit written after its report. landedSHA is
-			// the rule `sig log` and GET /log apply, read from the same disk they
-			// read, so no in-memory shortcut can make the surfaces disagree
-			// (issue #161). Disk is never staler than memory here — the report and
+			// the rule, and it is applied to the run dir with NOTHING layered on
+			// top: parse report.json, hand it and the dir to landedSHA, which is
+			// what readLogRow does and all it does (issue #161). In particular
+			// there is no status gate here — a run that lands its clean
+			// groups and only THEN parks a held one is awaiting-ack with the base
+			// ref genuinely moved (issue #109), so gating on "done" would be a
+			// second, stronger copy of "did this land" and would erase a landing
+			// GET /log reports. Disk is never staler than memory — the report and
 			// the ack's park.json are both written before this process marks the
-			// run done.
-			if e.Status == "done" {
-				if rep, err := readRunReport(dir); err == nil {
-					e.FinalSHA = landedSHA(rep, dir)
-					if e.StartedAt == "" {
-						e.StartedAt = rep.StartedAt
-					}
+			// run done — and a run with no report yet simply has no landing to
+			// show.
+			if rep, err := readRunReport(dir); err == nil {
+				e.FinalSHA = landedSHA(rep, dir)
+				// The report's startedAt is when the run actually began (driveRun's
+				// entry); rec.startedAt is when POST /runs accepted it, and on a
+				// -goal run the whole planner call sits between the two. Preferring
+				// the report is what makes this field the same before and after a
+				// daemon restart drops the record from memory.
+				if rep.StartedAt != "" {
+					e.StartedAt = rep.StartedAt
 				}
 			}
 			entries = append(entries, e)

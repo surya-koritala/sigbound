@@ -486,7 +486,11 @@ func landed(rep *runReport) bool {
 // It lives here because deriving it twice is exactly how the surfaces drifted:
 // GET /runs used to read integrate.finalSHA raw, so it showed a SHA for a run
 // whose -verify went red and never moved the ref, and showed nothing for an
-// acked park that really did land (issue #161).
+// acked park that really did land (issue #161). For the same reason no caller
+// may put a condition in FRONT of it, least of all a status gate: a run that
+// lands its clean groups and only then parks a held one (issue #109) sits at
+// awaiting-ack with the base ref already moved, so "ask this only for a done
+// run" is a second, stronger copy of the rule that drops a real landing.
 //
 // The limit: it answers from the run's OWN report, so a dir whose report.json is
 // missing or torn reports no landing. That is the same conservative answer
