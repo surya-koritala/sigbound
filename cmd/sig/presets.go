@@ -1,6 +1,7 @@
-// Named presets for -agent/-repair/-planner/-verify (issue #17): a known-good
-// sh -c command for a harness/ecosystem, keyed by a short name, so wiring up
-// the SIGBOUND_* env by hand (see examples/README.md and docs/USAGE.md) is
+// Named presets for -agent/-repair/-planner/-verify (issue #17) and -publish
+// (issue #116): a known-good sh -c command for a harness/ecosystem/host CLI,
+// keyed by a short name, so wiring up the SIGBOUND_* env by hand (see
+// examples/README.md and docs/USAGE.md) is
 // optional rather than the only way in. A preset encodes only the harness's
 // CLI shape (how to invoke it non-interactively), never the model — bring
 // your own model is unaffected. There is deliberately no -resolver-preset:
@@ -118,6 +119,175 @@ func securityVerify(tool, install, scan string) string {
 		tool, tool, tool, install, scan)
 }
 
+// publishPresets are -publish's known-good wiring, selected by
+// -publish-preset=NAME: push the landed base branch to the remote and open a
+// pull/merge request whose BODY is this run's receipt (see receiptBody). The
+// landing stays local until a human merges that request — the receipt is the
+// provenance record attached to it, so what sigbound did is reviewable where
+// the team already reviews.
+//
+// These are the only presets in this file that run AFTER the landing gate.
+// Nothing here can un-land a landing: by the time -publish runs, the base ref
+// has already advanced. A receipt that fails — no gh/glab, an unauthenticated
+// one, a rejected push, a host outage — leaves the landed tree and verify's
+// verdict exactly as they are. Its message is captured in
+// report.publish.output (runPublish records the command's own stdout+stderr;
+// it never streams them) and the run exits 6 rather than 0, the same way any
+// -publish failure has always been handled (see runPublish/exitPublishFailed).
+//
+// The body travels as an ENVIRONMENT VARIABLE and is referenced inside double
+// quotes, which is what keeps it inert. It is arbitrary user prose — task
+// prompts are free text written for an LLM — and sh does not re-scan the
+// result of a parameter expansion for metacharacters, so a prompt containing
+// `'; rm -rf ~; echo '` is one --body argument and never a command. These
+// strings are constants: no run data is interpolated into the command itself.
+//
+// HONEST LIMIT: the receipt is a request DESCRIPTION, and both hosts act on
+// closing keywords there. A task prompt containing "Closes #12" will close
+// issue 12 when the receipt request merges. That is the issue-close linkage
+// issue #116 asks for when the run came from an imported issue — and it fires
+// just the same for a prompt that only happens to mention an issue number.
+var publishPresets = map[string]string{
+	"github-receipt": receiptPublish("github-receipt", "gh", "https://cli.github.com", "pull request",
+		`gh pr create --base "$sb_target" --head "$SIGBOUND_BASE_BRANCH" --title "sigbound: $SIGBOUND_LANDED" --body "$SIGBOUND_RECEIPT"`),
+	"gitlab-receipt": receiptPublish("gitlab-receipt", "glab", "https://gitlab.com/gitlab-org/cli", "merge request",
+		`glab mr create --source-branch "$SIGBOUND_BASE_BRANCH" --target-branch "$sb_target" --title "sigbound: $SIGBOUND_LANDED" --description "$SIGBOUND_RECEIPT" --yes`),
+}
+
+// receiptStands closes every receipt failure message. The person reading one is
+// looking at a red publish step wondering what happened to their work, and the
+// answer — nothing — is the first thing they need.
+const receiptStands = ` -- the landing already happened and still stands; only this receipt is missing`
+
+// receiptPublish composes one receipt preset: four preflight checks, then push,
+// then open. `create` is the host's request-opening command; it reads $sb_target
+// (the remote's default branch, resolved below) and pr names what that host
+// calls the thing, for the messages.
+//
+// Every check FAILS LOUDLY rather than skipping, the same discipline
+// securityVerify has for an absent scanner and for the same reason: a skipped
+// receipt leaves report.publish claiming ok on a run whose landing nobody was
+// ever told about. So never soften one into `|| exit 0`, and never suffix the
+// chain with `|| true`.
+//
+//   - CLI on PATH, naming the install.
+//   - CLI authenticated. HONEST LIMIT: `auth status` checks credentials, not
+//     permissions — a token that cannot open a request on this repo passes here
+//     and fails at the create, reported the same way.
+//   - The remote's default branch is readable. `git ls-remote --symref` asks the
+//     remote itself, which is host-agnostic (one expression serves both presets)
+//     and needs no JSON parsing out of either CLI. It is resolved ONCE and used
+//     for both the guard below and the request's base, so the branch checked is
+//     exactly the branch targeted — passing --base explicitly also sidesteps
+//     gh's `gh-merge-base` git-config fallback, which could otherwise retarget
+//     the request at something this never inspected.
+//   - The landed branch is NOT that default branch. Neither host can open a
+//     request from a branch onto itself, and this catches it BEFORE the push
+//     rather than leaving a pushed branch and a failed create behind. `-base
+//     main` on a repo whose default is main is the common shape of this: there
+//     is no request to open, the push IS the publish.
+//
+// The remote is ${SIGBOUND_REMOTE:-origin} — the same ${VAR:-default} shape
+// codeqlScan uses for SIGBOUND_CODEQL_LANG, and with the same limit: under
+// -env-mode scoped it reaches this command only if -env-publish allowlists it,
+// so unset, this uses origin (which is what every -publish example in
+// docs/USAGE.md hardcodes; no Go code in this repo assumes a remote name at
+// all). The push is an ordinary fast-forward push and is never forced: a remote
+// branch that has moved underneath this run rejects it, loudly, as it should.
+func receiptPublish(preset, tool, install, pr, create string) string {
+	return fmt.Sprintf(`command -v %[2]s >/dev/null 2>&1 || { echo "sigbound -publish-preset=%[1]s: %[2]s is not on PATH (install: %[3]s)`+receiptStands+`" >&2; exit 1; }; `+
+		`%[2]s auth status >/dev/null 2>&1 || { echo "sigbound -publish-preset=%[1]s: %[2]s is not authenticated (run: %[2]s auth login)`+receiptStands+`" >&2; exit 1; }; `+
+		`sb_remote=${SIGBOUND_REMOTE:-origin}; `+
+		`sb_target=$(git ls-remote --symref "$sb_remote" HEAD | awk '$1=="ref:" && $3=="HEAD"{sub("refs/heads/","",$2); print $2; exit}'); `+
+		`[ -n "$sb_target" ] || { echo "sigbound -publish-preset=%[1]s: cannot read the default branch of remote $sb_remote (git ls-remote failed; set SIGBOUND_REMOTE if the remote is not named origin)`+receiptStands+`" >&2; exit 1; }; `+
+		`[ "$sb_target" != "$SIGBOUND_BASE_BRANCH" ] || { echo "sigbound -publish-preset=%[1]s: -base $SIGBOUND_BASE_BRANCH IS the default branch of remote $sb_remote, and a %[4]s cannot be opened from a branch onto itself -- re-run with -base on an integration branch, or drop the preset and publish with -publish 'git push $sb_remote $SIGBOUND_BASE_BRANCH'`+receiptStands+`" >&2; exit 1; }; `+
+		`git push "$sb_remote" "$SIGBOUND_BASE_BRANCH" && %[5]s`,
+		preset, tool, install, pr, create)
+}
+
+// receiptPromptMax/receiptMaxTasks bound the receipt. A task prompt is
+// arbitrary prose written for an LLM, and this string is handed to a child
+// process as one environment variable (Linux caps a single one at 128 KiB) and
+// then posted as a comment: first line only, this many runes of it, this many
+// tasks, with the count of whatever was left out stated rather than silently
+// dropped.
+const (
+	receiptPromptMax = 200
+	receiptMaxTasks  = 20
+)
+
+// receiptBody renders the receipt every -publish command receives as
+// SIGBOUND_RECEIPT (see runPublish): what landed, from which run, under which
+// verdict. It reports ONLY what the report already recorded — provenance for a
+// landing that has already happened, never a second opinion about it. Markdown,
+// because both hosts render a comment as Markdown and it degrades to readable
+// plain text anywhere else.
+//
+// There is no run-level "goal" to print: -goal is planned into tasks before
+// driveRun ever sees it, and -intent becomes a single task whose prompt IS the
+// intent's goal (see runRun). The task prompts are therefore the honest answer
+// to "what was this asked to do", bounded per the constants above.
+func receiptBody(runID string, rep runReport) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**sigbound receipt** — landed `%s` onto `%s`.\n\n", short(rep.Integrate.FinalSHA), rep.Base)
+	if id := strings.TrimSpace(runID); id != "" {
+		fmt.Fprintf(&b, "- run: `%s`\n", id)
+	}
+	if id := strings.TrimSpace(rep.Intent); id != "" {
+		fmt.Fprintf(&b, "- intent: `%s`\n", id)
+	}
+	fmt.Fprintf(&b, "- landed sha: `%s` (base was `%s`)\n", rep.Integrate.FinalSHA, rep.BaseSHA)
+	fmt.Fprintf(&b, "- verify: %s\n", receiptVerdict(rep.Verify))
+	okAgents := 0
+	for _, a := range rep.PerAgent {
+		if a.OK {
+			okAgents++
+		}
+	}
+	landed := "none"
+	if len(rep.Integrate.Landed) > 0 {
+		landed = "`" + strings.Join(rep.Integrate.Landed, "`, `") + "`"
+	}
+	fmt.Fprintf(&b, "- agents: %d of %d succeeded; landed: %s\n", okAgents, len(rep.PerAgent), landed)
+	b.WriteString("- tasks:\n")
+	for i, t := range rep.Tasks {
+		if i == receiptMaxTasks {
+			fmt.Fprintf(&b, "  - … and %d more\n", len(rep.Tasks)-receiptMaxTasks)
+			break
+		}
+		fmt.Fprintf(&b, "  - `%s`: %s\n", t.ID, receiptPrompt(t.Prompt))
+	}
+	fmt.Fprintf(&b, "\nsigbound %s, run started %s.\n", rep.Version, rep.StartedAt)
+	return b.String()
+}
+
+// receiptVerdict states -verify's verdict for the receipt. "not configured" is
+// its own answer, distinct from a pass: a receipt reading "verify: passed" on a
+// run with no -verify would claim a check that never ran.
+func receiptVerdict(v verifyJSON) string {
+	switch {
+	case !v.Ran:
+		return "not configured for this run"
+	case v.OK && v.Repaired:
+		return "passed (after repair)"
+	case v.OK:
+		return "passed"
+	default:
+		return "FAILED"
+	}
+}
+
+// receiptPrompt reduces one task prompt to a bounded single line: first line
+// only (reusing firstLine, `sig intent list`'s own summarizer), cut on a rune
+// boundary so a multi-byte prompt can't be truncated into invalid UTF-8.
+func receiptPrompt(s string) string {
+	s = strings.TrimSpace(firstLine(strings.TrimSpace(s)))
+	if r := []rune(s); len(r) > receiptPromptMax {
+		return string(r[:receiptPromptMax]) + "..."
+	}
+	return s
+}
+
 // presetSlot resolves one -X / -X-preset flag pair. A raw cmd, when already
 // set, always wins — the preset name isn't even looked up, so a stray or
 // misspelled -X-preset never breaks a run that already supplies its own -X
@@ -155,6 +325,11 @@ func presetSlot(stderrW io.Writer, table map[string]string, cmd, preset, cmdFlag
 // (os.Stderr in production; a buffer in tests). Returns the resolved
 // agent/repair/planner/verify commands, or the first unknown-preset error
 // encountered (agent, then repair, then planner, then verify).
+//
+// -publish-preset is deliberately NOT resolved here: nothing between this call
+// and runParams reads -publish, so it goes through presetSlot at its own call
+// site in runRun rather than widening this signature by another pair. Both
+// paths share presetSlot, so raw-wins and the unknown-name error are identical.
 func applyPresets(stderrW io.Writer, agentCmd, agentPreset, repairCmd, repairPreset, plannerCmd, plannerPreset, verifyCmd, verifyPreset string) (newAgentCmd, newRepairCmd, newPlannerCmd, newVerifyCmd string, err error) {
 	if newAgentCmd, err = presetSlot(stderrW, agentPresets, agentCmd, agentPreset, "-agent", "-agent-preset"); err != nil {
 		return "", "", "", "", err

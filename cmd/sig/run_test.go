@@ -4846,7 +4846,11 @@ func TestDriveRunPublishRunsOnceWithFullEnvOnGreenLand(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "publish.count")
 	envOut := filepath.Join(t.TempDir(), "publish.env")
 	stdinOut := filepath.Join(t.TempDir(), "publish.stdin")
-	publishCmd := fmt.Sprintf(`cat > %q; echo ran >> %q; pwd > %q.cwd; env > %q`, stdinOut, marker, marker, envOut)
+	// SIGBOUND_RECEIPT is multi-line, so it gets its own dump rather than
+	// riding `env`'s line-per-variable output (which parseEnvFile can only
+	// read one line at a time).
+	receiptOut := filepath.Join(t.TempDir(), "publish.receipt")
+	publishCmd := fmt.Sprintf(`cat > %q; echo ran >> %q; pwd > %q.cwd; env > %q; printf '%%s' "$SIGBOUND_RECEIPT" > %q`, stdinOut, marker, marker, envOut, receiptOut)
 
 	p := runParams{
 		Repo: repo, Base: "main", Strategy: "overlay", AgentCmd: agent,
@@ -4911,6 +4915,21 @@ func TestDriveRunPublishRunsOnceWithFullEnvOnGreenLand(t *testing.T) {
 	}
 	if rep.Integrate.FinalSHA == rep.BaseSHA {
 		t.Fatal("test setup: finalSHA == baseSHA, SIGBOUND_FINAL_SHA/SIGBOUND_BASE_SHA distinctness wouldn't be exercised")
+	}
+
+	// SIGBOUND_RECEIPT is the ready-to-post summary the -publish-preset
+	// receipts comment with (see receiptBody), and EVERY -publish command gets
+	// it, not just those. It must arrive whole — a preset that references a
+	// variable the driver never exports posts an empty receipt.
+	gotReceipt, err := os.ReadFile(receiptOut)
+	if err != nil {
+		t.Fatalf("read publish receipt dump: %v", err)
+	}
+	if want := receiptBody(p.RunID, rep); string(gotReceipt) != want {
+		t.Fatalf("SIGBOUND_RECEIPT=%q, want the report's own receipt %q", gotReceipt, want)
+	}
+	if !strings.Contains(string(gotReceipt), rep.Integrate.FinalSHA) {
+		t.Fatalf("SIGBOUND_RECEIPT does not name the landed commit:\n%s", gotReceipt)
 	}
 
 	// The full JSON run report must arrive on stdin, with the report's own
