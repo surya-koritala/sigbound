@@ -1372,13 +1372,17 @@ type unlandRequest struct {
 // entangledResponse is GET /runs/{id}/entangled: the blast radius, read-only.
 // Unlandable is whether the preconditions pass RIGHT NOW; Reason says why not.
 // It is the same data `sig unland -dry-run -json` prints, from the same
-// planUnland, so the two can never disagree.
+// planUnland — and, now that this door honors ?limit= exactly as the flag does,
+// the two agree for the same limit rather than only for the default.
 type entangledResponse struct {
 	RunID      string         `json:"runId"`
 	WriteSet   []string       `json:"writeSet,omitempty"`
 	Unlandable bool           `json:"unlandable"`
 	Reason     string         `json:"reason,omitempty"`
 	Entangled  []entangledRun `json:"entangled"`
+	// ScanLimited mirrors unlandOutcome.ScanLimited: the scan stopped at limit
+	// before reaching the target, so Entangled may be missing later runs.
+	ScanLimited bool `json:"scanLimited,omitempty"`
 }
 
 // handleEntangled serves the read-only blast radius for a landed run. It writes
@@ -1395,7 +1399,18 @@ func (s *server) handleEntangled(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "unknown run", codeRunNotFound)
 		return
 	}
-	plan, err := planUnland(r.Context(), rc.cell.Git(), rc.runsDir, id, unlandDefaultLimit)
+	// Honor ?limit= exactly as `sig unland -limit` does (default unlandDefaultLimit,
+	// 0 = every newer run), so this read and the flag return the same blast radius.
+	limit := unlandDefaultLimit
+	if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "limit must be a non-negative integer", codeBadRequest)
+			return
+		}
+		limit = n
+	}
+	plan, err := planUnland(r.Context(), rc.cell.Git(), rc.runsDir, id, limit)
 	if err != nil {
 		writeJSON(w, http.StatusOK, entangledResponse{RunID: id, Unlandable: false, Reason: err.Error(), Entangled: []entangledRun{}})
 		return
@@ -1404,7 +1419,7 @@ func (s *server) handleEntangled(w http.ResponseWriter, r *http.Request) {
 	if ent == nil {
 		ent = []entangledRun{}
 	}
-	writeJSON(w, http.StatusOK, entangledResponse{RunID: id, WriteSet: plan.WriteSet, Unlandable: true, Entangled: ent})
+	writeJSON(w, http.StatusOK, entangledResponse{RunID: id, WriteSet: plan.WriteSet, Unlandable: true, Entangled: ent, ScanLimited: plan.Truncated})
 }
 
 // handleUnland is the HTTP front door onto unlandRun. It holds the cell's run

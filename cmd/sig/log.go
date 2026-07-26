@@ -690,8 +690,11 @@ func provenanceLine(p *provenance) string {
 	}
 	switch p.Role {
 	case "unland-commit":
-		return fmt.Sprintf("commit %s: %s took run %s back out of the base, verify %s",
-			short(p.SHA), run, p.Unlands, p.Verify)
+		// An unland commit can itself be unlanded (you take back a take-back), and
+		// that reverse edge is most informative exactly here. The no-op-unland case
+		// leaves UnlandedBy unset upstream, so this stays silent for it.
+		return fmt.Sprintf("commit %s: %s took run %s back out of the base, verify %s%s",
+			short(p.SHA), run, p.Unlands, p.Verify, unlanded)
 	case "landed-commit":
 		return fmt.Sprintf("commit %s: landed integration commit of %s (%s, %d branch(es)), verify %s%s",
 			short(p.SHA), run, p.Strategy, p.Members, p.Verify, unlanded)

@@ -107,9 +107,13 @@ type unlandOutcome struct {
 	LandedSHA string         `json:"landedSHA,omitempty"`
 	WriteSet  []string       `json:"writeSet,omitempty"`
 	Entangled []entangledRun `json:"entangled,omitempty"`
-	Flagged   []flaggedJSON  `json:"flagged,omitempty"`
-	Verify    *verifyJSON    `json:"verify,omitempty"`
-	Message   string         `json:"message"`
+	// ScanLimited is true when the blast-radius scan stopped at -limit before
+	// reaching the target, so Entangled may be missing later runs. A -json
+	// consumer sees the list is partial rather than trusting it as complete.
+	ScanLimited bool          `json:"scanLimited,omitempty"`
+	Flagged     []flaggedJSON `json:"flagged,omitempty"`
+	Verify      *verifyJSON   `json:"verify,omitempty"`
+	Message     string        `json:"message"`
 }
 
 // unlandParams is one unland's resolved configuration. Verify/Resolver come from
@@ -140,6 +144,11 @@ type unlandPlan struct {
 	// what makes the policy check below honest without building anything.
 	WriteSet  []string
 	Entangled []entangledRun
+	// Truncated is set when the blast-radius scan stopped at -limit with newer
+	// runs still unread, so the entangled list may be incomplete — reported, not
+	// silently swallowed, since -limit exists for the long-history repo that is
+	// exactly where the scan gets cut short.
+	Truncated bool
 }
 
 // planUnland runs every precondition and the blast-radius scan. It touches
@@ -163,6 +172,15 @@ func planUnland(ctx context.Context, g *gitx.Git, runsDir, targetID string, limi
 	}
 	if !landed(rep) {
 		return nil, fmt.Errorf("%w: run %s (%s)", errNotLanded, targetID, notLandedReason(dir, rep))
+	}
+	// The report's base decides which ref an unland moves, and landRef prepends
+	// "refs/heads/" to it, so it must be a plain branch name — validated the same
+	// way park.json's base is (usableBranchName), plus a guard on an already-
+	// qualified ref, BEFORE the whole verify is paid. A crafted base like
+	// "refs/heads/main" would otherwise run the entire fold and verify only to die
+	// in `git update-ref` on "refs/heads/refs/heads/main".
+	if !usableBranchName(rep.Base) || strings.HasPrefix(rep.Base, "refs/") {
+		return nil, fmt.Errorf("run %s records base %q, which is not a usable branch name", targetID, rep.Base)
 	}
 	head, err := g.RevParse(ctx, rep.Base)
 	if err != nil {
@@ -189,13 +207,13 @@ func planUnland(ctx context.Context, g *gitx.Git, runsDir, targetID string, limi
 	if err != nil {
 		return nil, fmt.Errorf("write-set of run %s: %w", targetID, err)
 	}
-	ent, err := blastRadius(ctx, g, runsDir, targetID, ws, limit)
+	ent, truncated, err := blastRadius(ctx, g, runsDir, targetID, ws, limit)
 	if err != nil {
 		return nil, err
 	}
 	return &unlandPlan{
 		Base: rep.Base, BaseSHA: rep.BaseSHA, FinalSHA: rep.Integrate.FinalSHA,
-		Head: head, WriteSet: ws, Entangled: ent,
+		Head: head, WriteSet: ws, Entangled: ent, Truncated: truncated,
 	}, nil
 }
 
@@ -208,7 +226,10 @@ func planUnland(ctx context.Context, g *gitx.Git, runsDir, targetID string, limi
 // inverts what the run REPORT says landed; a park an ack released has to be
 // undone by hand (or by a fresh run) until the ledger records it.
 func notLandedReason(dir string, rep *runReport) string {
-	if pk, err := readPark(dir); err == nil && pk.LandedSHA != "" {
+	// ackedLandedSHA, not a raw park read: it is the one definition of "did this
+	// ack actually land" (see park.go), so a park whose landRef failed is not
+	// described here as a landing an ack released.
+	if ackedLandedSHA(dir) != "" {
 		return "its landing was released by an ack, which the run's own ledger entry does not record — unland inverts what the report says landed, so it cannot invert this one"
 	}
 	switch {
@@ -231,7 +252,7 @@ func notLandedReason(dir string, rep *runReport) string {
 // A newer run whose report or diff cannot be read is SKIPPED rather than fatal:
 // this scan is advisory (the conflict is the gate), so an unreadable neighbour
 // costs a line of reporting, never a wrong landing.
-func blastRadius(ctx context.Context, g *gitx.Git, runsDir, targetID string, writeSet []string, limit int) ([]entangledRun, error) {
+func blastRadius(ctx context.Context, g *gitx.Git, runsDir, targetID string, writeSet []string, limit int) (ent []entangledRun, truncated bool, err error) {
 	ws := cell.NewWriteSet(writeSet...)
 	var out []entangledRun
 	walked := 0
@@ -240,14 +261,40 @@ func blastRadius(ctx context.Context, g *gitx.Git, runsDir, targetID string, wri
 			break // reached the target: everything from here back is older
 		}
 		if limit > 0 && walked >= limit {
+			truncated = true // stopped early: newer runs beyond the bound went unread
 			break
 		}
 		walked++
-		rep, err := readRunReport(filepath.Join(runsDir, id))
-		if err != nil || !landed(rep) {
+		dir := filepath.Join(runsDir, id)
+		rep, rerr := readRunReport(dir)
+		if rerr != nil {
 			continue
 		}
-		paths, derr := g.DiffNameOnly(ctx, rep.BaseSHA, rep.Integrate.FinalSHA)
+		base, final := rep.BaseSHA, rep.Integrate.FinalSHA
+		if !landed(rep) {
+			// An ACK released this landing: its SHA lives in park.json, not the
+			// report's integrate block — the same asymmetry notLandedReason reads
+			// for the target run. Without this, an acked landing that overwrote a
+			// shared path is invisible to the scan, and the block message would tell
+			// the operator to "unland those runs first" while naming none.
+			//
+			// ackedLandedSHA is the ONE definition of "did this ack actually land"
+			// (shared with landed/readLogRow/foldMetrics): it gates on the run
+			// status as well as resolvedAt, so a park whose landRef failed for any
+			// reason other than ErrRefMoved is never counted. The park is then read
+			// for its baseSHA — the fork point this landing's contribution is
+			// measured from, which the SHA alone does not carry.
+			sha := ackedLandedSHA(dir)
+			if sha == "" {
+				continue
+			}
+			pk, perr := readPark(dir)
+			if perr != nil {
+				continue
+			}
+			base, final = pk.BaseSHA, sha
+		}
+		paths, derr := g.DiffNameOnly(ctx, base, final)
 		if derr != nil {
 			continue
 		}
@@ -260,9 +307,9 @@ func blastRadius(ctx context.Context, g *gitx.Git, runsDir, targetID string, wri
 				shared = append(shared, p)
 			}
 		}
-		out = append(out, entangledRun{RunID: id, StartedAt: rep.StartedAt, FinalSHA: rep.Integrate.FinalSHA, Paths: shared})
+		out = append(out, entangledRun{RunID: id, StartedAt: rep.StartedAt, FinalSHA: final, Paths: shared})
 	}
-	return out, nil
+	return out, truncated, nil
 }
 
 // unlandRun is THE unland code path — `sig unland` and POST /runs/{id}/unland
@@ -286,7 +333,7 @@ func unlandRun(ctx context.Context, c *cell.Cell, p unlandParams) (unlandOutcome
 	if err != nil {
 		return out, err
 	}
-	out.WriteSet, out.Entangled = plan.WriteSet, plan.Entangled
+	out.WriteSet, out.Entangled, out.ScanLimited = plan.WriteSet, plan.Entangled, plan.Truncated
 	// The policy at the head this would land on, loaded BEFORE anything is built:
 	// a typo in sigbound.policy must not silently drop the bar an inverse has to
 	// clear, exactly as for a run.
@@ -411,6 +458,11 @@ func unlandRun(ctx context.Context, c *cell.Cell, p unlandParams) (unlandOutcome
 		pk.UnlandsRun, pk.Entangled = p.TargetID, plan.Entangled
 		rep.Park = pk
 		rep.Integrate.Flagged = []flaggedJSON{{Branch: branch, Paths: sortedKeys(matched), Reason: reason}}
+		// Surface the hold on the outcome too: out.Flagged was set once from the
+		// (clean) integrate above and never updated on this branch, so a -json
+		// consumer could not see which path forced the ack. Issue #149's
+		// unlandOutcome example shows it populated.
+		out.Flagged = rep.Integrate.Flagged
 		out.Status = statusAwaitingAck
 		out.Message = fmt.Sprintf("verified the inverse of %s as %s but did not land it: %s — ack or reject it",
 			p.TargetID, short(finalSHA), reason)
@@ -425,6 +477,10 @@ func unlandRun(ctx context.Context, c *cell.Cell, p unlandParams) (unlandOutcome
 		if errors.Is(err, gitx.ErrRefMoved) {
 			moved, _ := g.RevParse(ctx, plan.Base)
 			rep.LandRefused = moved
+			// Same event, same shape, as driveRun's identical refusal (run.go): a
+			// consumer watching for a refused landing must see it on this path too,
+			// or the fourth ref-mover is the one that stays silent.
+			emit.emit("land_refused", map[string]any{"sha": finalSHA, "baseSHA": plan.Head, "movedTo": moved})
 			out.Status = statusUnlandBlocked
 			out.Message = fmt.Sprintf("nothing landed: %s moved to %s while this unland was computing against %s — run it again against the new head",
 				plan.Base, shortMoved(moved), short(plan.Head))
@@ -434,6 +490,17 @@ func unlandRun(ctx context.Context, c *cell.Cell, p unlandParams) (unlandOutcome
 	}
 	rep.Integrate.Landed, rep.Integrate.FinalSHA = []string{branch}, finalSHA
 	emit.emit("land", map[string]any{"sha": finalSHA})
+	// Record the unland on the landed commit as a git note — the same shape,
+	// condition, and best-effort posture as driveRun's -notes default-flip (issue
+	// #110): a sigbound.policy at the head means the repo wants its landings
+	// recorded. A clone carries refs/notes/sigbound but not .git/sigbound/runs, so
+	// without this an unland is invisible to `sig log -sha` there. Namespaced and
+	// non-pushing by default, exactly like a run's; there is simply no -notes flag
+	// to opt out on this door.
+	if _, present, perr := g.BlobAt(ctx, plan.Head, policyFileName); perr == nil && present {
+		rep.Verify = derefVerify(out.Verify)
+		attachNote(ctx, g, finalSHA, rep)
+	}
 	out.Status, out.LandedSHA = unlandStatusDone, finalSHA
 	out.Message = fmt.Sprintf("unlanded run %s: %s now at %s", p.TargetID, plan.Base, short(finalSHA))
 	// The reverse edge on the TARGET run's own journal, through the same
@@ -613,6 +680,11 @@ func writeUnlandSummary(w io.Writer, out unlandOutcome) {
 	fmt.Fprintf(w, "unland %s: %s\n", out.Unlands, out.Message)
 	for _, e := range out.Entangled {
 		fmt.Fprintf(w, "  entangled: run %s (%s) also touched %s\n", e.RunID, short(e.FinalSHA), strings.Join(e.Paths, ", "))
+	}
+	// The scan stopped at -limit: the entangled list above is a floor, and the
+	// long-history repo the flag exists for is exactly where it gets cut short.
+	if out.ScanLimited {
+		fmt.Fprintln(w, "  note: the -limit was reached; later runs beyond it were not scanned, so this list may be incomplete")
 	}
 }
 

@@ -301,6 +301,16 @@ func relSafe(p string) bool {
 	return true
 }
 
+// usableBranchName reports whether s is a branch name this binary could safely
+// hand to git after prepending "refs/heads/": a safe relative path with none of
+// the ref-glob/whitespace metacharacters git forbids. It is the one predicate
+// parkJSON.validate and planUnland both gate a recorded base on, so the two
+// cannot drift. It does NOT reject an already-qualified "refs/…" name — a caller
+// that prepends "refs/heads/" must guard that separately (see planUnland).
+func usableBranchName(s string) bool {
+	return s != "" && relSafe(s) && !strings.ContainsAny(s, " \t\n:?*[\\")
+}
+
 // slugSafe reports whether s is safe to use as a git branch component and a
 // worktree directory name: non-empty, only [A-Za-z0-9._-], and not the special
 // path names "." / ".." (which would be valid characters but unsafe paths).

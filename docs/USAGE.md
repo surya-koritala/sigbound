@@ -1820,7 +1820,12 @@ conflict, and the conflict is the gate. A later run that overlaps but whose
 changes still merge cleanly lands. Reporting it up front is what makes the
 outcome predictable before the verify cost is paid. `-limit` (default `200`,
 `0` = all) bounds how many newer runs the scan reads — one manifest read plus one
-`git diff` each — so a long history pays a bound rather than a full walk.
+`git diff` each — so a long history pays a bound rather than a full walk. When the
+scan stops at that bound with newer runs still unread, it **says so** — a note in
+the summary, and `scanLimited: true` in `-json` — so a truncated list is never
+mistaken for a complete one. An **ack-released** landing is scanned too: its SHA
+lives in the run's `park.json`, not its report, and the scan reads it there so an
+acked landing that overwrote a shared path is still named.
 
 ### Flags
 
@@ -1934,8 +1939,22 @@ verify partway and record it as red. Its verify battery comes from
 `sigbound.policy` alone: a request never chooses the bar its own landing must
 clear, so there is no `-verify` equivalent on this door.
 
+**What this door can do, stated plainly.** It reverses an arbitrary past landing
+from a 2-byte body. On the default posture — a token-less loopback daemon — that
+means **any local process can revert any landed run**, and in a repo with **no
+`verify` line** in `sigbound.policy` the revert lands **unverified**, gated by
+nothing. That is the same posture `POST /runs` has without a policy — but an
+unland *reverses history*, which neither `/runs` nor `/ack` can. What gates it is
+what gates every other endpoint: set `SIGBOUND_SERVE_TOKEN` (the `-token-env`
+var) and every call, this one included, must carry `Authorization: Bearer
+<token>`; a non-loopback bind requires it (see [Auth model](#auth-model)). There
+is no separate switch for this endpoint — the loopback bind and the optional
+token are the whole access model, and a policy with a `verify` line is what makes
+the revert a *verified* one.
+
 `GET /runs/{id}/entangled` writes nothing and computes no verdict about landing.
-It returns the same data `-dry-run` prints:
+It honors `?limit=N` (default `200`, `0` = every newer run) exactly as the flag
+does, so it returns the same data `sig unland -dry-run -limit N` prints:
 
 ```json
 {"runId":"20260701T090000Z-ff01aa","writeSet":["cell/occ.go","cell/writeset.go"],

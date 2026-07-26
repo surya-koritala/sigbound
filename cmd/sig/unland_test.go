@@ -387,6 +387,11 @@ func TestUnlandParksUnderUnlandPaths(t *testing.T) {
 	if out.Status != statusAwaitingAck {
 		t.Fatalf("status %q, want %q: %s", out.Status, statusAwaitingAck, out.Message)
 	}
+	// (finding 8) the outcome, not only the report, names which path held the ack,
+	// so a -json consumer on the park path sees it — it was empty here before.
+	if len(out.Flagged) != 1 || !hasString(out.Flagged[0].Paths, "migrations/001.sql") {
+		t.Fatalf("outcome flagged %+v, want the ack-held path named", out.Flagged)
+	}
 	if f.head() != before {
 		t.Fatalf("a parked unland moved the base from %s to %s", short(before), short(f.head()))
 	}
@@ -827,5 +832,319 @@ func TestUnlandRefusesAnInvalidPolicyBeforeBuildingAnything(t *testing.T) {
 	}
 	if got := f.runDirs(); len(got) != len(beforeDirs) {
 		t.Fatalf("a refused unland created a run dir: %v -> %v", beforeDirs, got)
+	}
+}
+
+// TestUnlandRefusesWhenTheBaseMovesUnderIt is the compare-and-swap for the FOURTH
+// ref-moving path (findings 2 and 3): the inverse verifies GREEN, but the base
+// moved out from under the landing swap, so the CAS refuses and NOTHING of the
+// inverse lands. The interleaving is FORCED by program order, not raced — the
+// -verify command itself advances refs/heads/main to a pre-built commit, exactly
+// the technique TestDriveRunRefusesToLandOverAnInterveningLanding uses — so no
+// sleeps, no goroutines. Downgrading landRef's UpdateRefCAS to UpdateRef makes
+// this fail: the swap then resets the intervening landing away.
+func TestUnlandRefusesWhenTheBaseMovesUnderIt(t *testing.T) {
+	f := newUnlandFixture(t, "")
+	target := f.land("t1", map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"}, "-verify", "go build ./...")
+	head := target.Integrate.FinalSHA // the head the unland computes against
+
+	// Build a competing landing on top of head, then put main back where the
+	// unland will find it; the commit stays in the object store for -verify to land.
+	f.syncWorktree()
+	if err := os.WriteFile(filepath.Join(f.repo, "intervening.go"), []byte("package main\n\nfunc intervening() int { return 8 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	intervening, err := f.g.CommitAll(context.Background(), "landing that arrives while the unland verifies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.g.UpdateRef(context.Background(), "refs/heads/main", head); err != nil {
+		t.Fatal(err)
+	}
+	if f.head() != head {
+		t.Fatalf("setup: main is %s, want it restored to %s", short(f.head()), short(head))
+	}
+
+	// -verify moves main to the intervening commit, then exits 0: the inverse
+	// verifies green, but the base is no longer at head when the CAS runs.
+	out, code, uerr := f.unland(target.RunID, "-verify",
+		fmt.Sprintf("git -C %q update-ref refs/heads/main %s", f.repo, intervening))
+	if uerr != nil {
+		t.Fatalf("unland returned an operational error: %v", uerr)
+	}
+	if out.Status != statusUnlandBlocked || code != exitOperationalError {
+		t.Fatalf("status %q exit %d, want unland-blocked / %d: %s", out.Status, code, exitOperationalError, out.Message)
+	}
+	// The intervening landing survives, and the inverse landed NOTHING.
+	if f.head() != intervening {
+		t.Fatalf("main is %s, want the intervening landing %s — the CAS reset it away", short(f.head()), short(intervening))
+	}
+	if _, present := f.blobAt(f.head(), "alpha.go"); !present {
+		t.Fatal("alpha.go is gone — the inverse landed over the moved base")
+	}
+	if out.Verify == nil || !out.Verify.OK {
+		t.Fatalf("verify %+v, want GREEN — the refusal must not read as a broken revert", out.Verify)
+	}
+	// The report says "someone else landed first": landRefused names the winner.
+	rep, rerr := readRunReport(filepath.Join(f.runsDir, out.RunID))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if rep.LandRefused != intervening {
+		t.Fatalf("rep.LandRefused=%q, want the intervening landing %s", rep.LandRefused, intervening)
+	}
+	// (finding 2) the land_refused event fires here, the same shape driveRun uses.
+	names, recs := readEvents(t, filepath.Join(f.runsDir, out.RunID, "events.ndjson"))
+	if indexOf(names, "land") != -1 {
+		t.Fatal("a `land` event fired for a landing that was refused")
+	}
+	i := indexOf(names, "land_refused")
+	if i == -1 {
+		t.Fatalf("no land_refused event in %v", names)
+	}
+	if mv, _ := recs[i]["movedTo"].(string); mv != intervening {
+		t.Fatalf("land_refused.movedTo=%q, want %s", mv, intervening)
+	}
+	if bs, _ := recs[i]["baseSHA"].(string); bs != head {
+		t.Fatalf("land_refused.baseSHA=%q, want the head the unland computed against %s", bs, head)
+	}
+	if sha, _ := recs[i]["sha"].(string); sha == "" {
+		t.Fatal("land_refused.sha is empty; it must name the commit that would have landed")
+	}
+}
+
+// TestUnlandNamesAnAckReleasedLaterLanding is finding 4 / acceptance (4) for
+// ack-released landings: a later run whose landing an ACK released records its
+// SHA in park.json, not the report's integrate block, so the blast-radius scan
+// once missed it — the block would say "unland those runs first" while naming
+// none. The scan now reads the park's landedSHA (the same asymmetry
+// notLandedReason already applies to the target), so the later run is named.
+func TestUnlandNamesAnAckReleasedLaterLanding(t *testing.T) {
+	f := newUnlandFixture(t, "")
+	target := f.land("t1", map[string]string{"shared.txt": "first\n"}, "-verify", "go build ./...")
+	// A policy that tightened AFTER the target landed, so the later run's forward
+	// landing trips ack-paths and PARKS rather than landing outright (ack-paths is
+	// symmetric, so this is the honest way to get a parked landing on shared.txt).
+	f.syncWorktree()
+	commitPolicy(t, f.g, f.repo, "ack-paths = shared.txt\n")
+
+	later, _, lout := runRunJSON(t, f.repo, f.agent,
+		[]taskSpec{taskWrite(t, "t2", map[string]string{"shared.txt": "second\n"})}, "-verify", "go build ./...")
+	if later.RunID == "" {
+		t.Fatalf("later run has no id\n%s", lout)
+	}
+	laterDir := filepath.Join(f.runsDir, later.RunID)
+	if st, _ := diskRunStatus(laterDir); st != statusAwaitingAck {
+		t.Fatalf("later run status %q, want %s (setup expects it to park)\n%s", st, statusAwaitingAck, lout)
+	}
+	// Ack it: NOW it has landed, but only park.json records the landedSHA.
+	if _, aerr := ackRun(context.Background(), f.c, laterDir, "test", ackEnv{Mode: envModeInherit}); aerr != nil {
+		t.Fatalf("ack the later run: %v", aerr)
+	}
+	if lrep, _ := readRunReport(laterDir); landed(lrep) {
+		t.Fatal("setup invalid: the acked run's REPORT reads as landed, so the park.json path would be untested")
+	}
+
+	// Unland the target. The ack-released landing overwrote shared.txt, so it must
+	// be NAMED (and the conflict blocks the unland — the gate holds either way).
+	out, code, err := f.unland(target.RunID, "-verify", "go build ./...")
+	if err != nil {
+		t.Fatalf("unland returned an operational error: %v", err)
+	}
+	if out.Status != statusUnlandBlocked || code != exitOperationalError {
+		t.Fatalf("status %q exit %d, want unland-blocked: %s", out.Status, code, out.Message)
+	}
+	if len(out.Entangled) != 1 || out.Entangled[0].RunID != later.RunID {
+		t.Fatalf("entangled %+v, want the acked later run %s named", out.Entangled, later.RunID)
+	}
+	if !hasString(out.Entangled[0].Paths, "shared.txt") {
+		t.Fatalf("entangled paths %v, want shared.txt", out.Entangled[0].Paths)
+	}
+}
+
+// TestUnlandRefusesWhenBaseSHADoesNotPrecedeFinalSHA is finding 6: the M6 guard
+// (baseSHA must be an ancestor of finalSHA, or tree(baseSHA) is not the pre-run
+// tree) had no test. An orphan baseSHA — a root commit off the landing's history
+// — makes the pair undescribable, and the guard refuses it before anything is
+// built. Removing the guard makes this fail.
+func TestUnlandRefusesWhenBaseSHADoesNotPrecedeFinalSHA(t *testing.T) {
+	f := newUnlandFixture(t, "")
+	target := f.land("t1", map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"}, "-verify", "go build ./...")
+	// An ORPHAN: a root commit with no path to the landing, so it is an ancestor
+	// of nothing.
+	orphan, err := f.g.CommitTree(context.Background(), f.tree(target.BaseSHA), nil, "orphan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// finalSHA is the REAL landing (still in main's history, so the later ancestry
+	// guard would pass); landed() is satisfied (finalSHA != baseSHA), so control
+	// reaches the precedence guard rather than stopping at an earlier one.
+	seeded := seedRunID(t, f.runsDir, "20260725T235900Z-ffff01", runReport{
+		Base: "main", BaseSHA: orphan, Integrate: integrateJSON{FinalSHA: target.Integrate.FinalSHA},
+	})
+	beforeDirs := f.runDirs()
+	_, code, uerr := f.unland(seeded, "-verify", "go build ./...")
+	if uerr == nil {
+		t.Fatal("unland accepted a run whose baseSHA does not precede its finalSHA")
+	}
+	if !strings.Contains(uerr.Error(), "does not precede") {
+		t.Fatalf("error %q does not name the precedence failure", uerr)
+	}
+	if code != exitOperationalError {
+		t.Fatalf("exit %d, want %d", code, exitOperationalError)
+	}
+	if got := f.runDirs(); len(got) != len(beforeDirs) {
+		t.Fatalf("a refused unland created a run dir: %v -> %v", beforeDirs, got)
+	}
+}
+
+// TestUnlandRefusesAMalformedBase is finding 11: report.json's base decides which
+// ref moves and is unvalidated, so a crafted base "refs/heads/main" once ran the
+// whole fold and verify only to die in `git update-ref` on
+// "refs/heads/refs/heads/main". It is now refused up front, the same way
+// park.json's base is validated. Removing the guard makes this fail (a run dir is
+// created and the error becomes the late git-lock one).
+func TestUnlandRefusesAMalformedBase(t *testing.T) {
+	f := newUnlandFixture(t, "")
+	target := f.land("t1", map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"}, "-verify", "go build ./...")
+	// baseSHA precedes finalSHA (so the M6 guard would pass); the base itself is
+	// the malformed value under test.
+	seeded := seedRunID(t, f.runsDir, "20260725T235901Z-ffff02", runReport{
+		Base: "refs/heads/main", BaseSHA: target.BaseSHA, Integrate: integrateJSON{FinalSHA: target.Integrate.FinalSHA},
+	})
+	beforeDirs := f.runDirs()
+	_, code, uerr := f.unland(seeded, "-verify", "go build ./...")
+	if uerr == nil {
+		t.Fatal("unland accepted a base that is already a qualified ref")
+	}
+	if !strings.Contains(uerr.Error(), "usable branch name") {
+		t.Fatalf("error %q does not name the base validation failure", uerr)
+	}
+	if code != exitOperationalError {
+		t.Fatalf("exit %d, want %d", code, exitOperationalError)
+	}
+	if got := f.runDirs(); len(got) != len(beforeDirs) {
+		t.Fatalf("a refused unland built something: %v -> %v", beforeDirs, got)
+	}
+}
+
+// TestUnlandBlockReasonNamesEachRefusalCause is finding 1: the inbox row must
+// distinguish all FOUR ways an inverse fails to land — they once collapsed to
+// "failed verify" for three of them. Each arm reads differently and matches the
+// state the driver actually recorded.
+func TestUnlandBlockReasonNamesEachRefusalCause(t *testing.T) {
+	cases := []struct {
+		name string
+		rep  runReport
+		want string
+	}{
+		{"cas-refusal", runReport{LandRefused: "deadbeefcafe", Verify: verifyJSON{Ran: true, OK: true}}, "the base moved"},
+		{"conflict", runReport{Integrate: integrateJSON{Flagged: []flaggedJSON{{Branch: "unland/x", Paths: []string{"a.txt"}}}}}, "conflicts with work that landed since"},
+		{"red-verify", runReport{Verify: verifyJSON{Ran: true, OK: false}}, "failed verify"},
+		{"park-nil", runReport{Verify: verifyJSON{Ran: true, OK: true}}, "parking record could not be written"},
+	}
+	seen := map[string]string{}
+	for _, tc := range cases {
+		got := unlandBlockReason(&tc.rep)
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("%s: reason %q does not contain %q", tc.name, got, tc.want)
+		}
+		if other, dup := seen[got]; dup {
+			t.Errorf("%s and %s both read %q — the four causes must each read differently", tc.name, other, got)
+		}
+		seen[got] = tc.name
+	}
+}
+
+// TestUnlandReportsWhenTheScanStopsAtTheLimit is finding 7: a scan cut short by
+// -limit says so, instead of handing back a silently-truncated entangled list.
+func TestUnlandReportsWhenTheScanStopsAtTheLimit(t *testing.T) {
+	f := newUnlandFixture(t, "")
+	target := f.land("t1", map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"}, "-verify", "go build ./...")
+	// Two LATER runs, so a -limit of 1 cannot reach the target.
+	f.land("t2", map[string]string{"beta.go": "package main\n\nfunc beta() int { return 2 }\n"}, "-verify", "go build ./...")
+	f.land("t3", map[string]string{"gamma.go": "package main\n\nfunc gamma() int { return 3 }\n"}, "-verify", "go build ./...")
+
+	limited, _, err := f.unland(target.RunID, "-dry-run", "-limit", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !limited.ScanLimited {
+		t.Fatal("the scan stopped at -limit 1 with newer runs unread, but ScanLimited is false")
+	}
+	full, _, err := f.unland(target.RunID, "-dry-run", "-limit", "0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.ScanLimited {
+		t.Fatal("a full scan (-limit 0) reported ScanLimited")
+	}
+}
+
+// TestEntangledEndpointHonorsLimit is finding 9: GET /runs/{id}/entangled honors
+// ?limit= exactly as the flag does, so the doc claim that it and `sig unland
+// -dry-run` "can never disagree" is true for the same limit, not only the default.
+func TestEntangledEndpointHonorsLimit(t *testing.T) {
+	f := newUnlandFixture(t, "")
+	target := f.land("t1", map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"}, "-verify", "go build ./...")
+	f.land("t2", map[string]string{"beta.go": "package main\n\nfunc beta() int { return 2 }\n"}, "-verify", "go build ./...")
+	f.land("t3", map[string]string{"gamma.go": "package main\n\nfunc gamma() int { return 3 }\n"}, "-verify", "go build ./...")
+	_, ts := newTestServer(t, "", f.repo)
+
+	dry, _, err := f.unland(target.RunID, "-dry-run", "-limit", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get(ts.URL + "/runs/" + target.RunID + "/entangled?limit=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var got entangledResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.ScanLimited || got.ScanLimited != dry.ScanLimited {
+		t.Fatalf("endpoint scanLimited=%v, dry-run=%v; both must truncate at ?limit=1", got.ScanLimited, dry.ScanLimited)
+	}
+}
+
+// TestProvenanceLineRendersUnlandedByOnUnlandCommit is finding 10: the reverse
+// edge (", since unlanded by run …") is where it matters most — on the unland
+// commit itself, which can also be taken back — yet its arm never rendered it. A
+// no-op unland leaves UnlandedBy unset upstream, so the clause stays absent there.
+func TestProvenanceLineRendersUnlandedByOnUnlandCommit(t *testing.T) {
+	p := &provenance{Role: "unland-commit", SHA: "abc123def456", RunID: "20260725T101500Z-ab12cd", Unlands: "20260701T090000Z-ff01aa", Verify: "pass"}
+	if line := provenanceLine(p); strings.Contains(line, "since unlanded") {
+		t.Fatalf("an unland with no reverse edge must not render one: %q", line)
+	}
+	p.UnlandedBy = "20260726T120000Z-99ffee"
+	line := provenanceLine(p)
+	if !strings.Contains(line, "since unlanded by run 20260726T120000Z-99ffee") {
+		t.Fatalf("the unland-commit line omits unlandedBy: %q", line)
+	}
+}
+
+// TestUnlandRecordsAProvenanceNoteUnderAPolicy covers the deferred hypothesis
+// (unland writes no git note): a clone carries refs/notes/sigbound but not
+// .git/sigbound/runs, so without a note an unland is invisible to `sig log -sha`
+// there. It is attached under the same condition and shape driveRun's -notes uses
+// — a sigbound.policy present at the head.
+func TestUnlandRecordsAProvenanceNoteUnderAPolicy(t *testing.T) {
+	f := newUnlandFixture(t, "verify = go build ./...\n") // a policy file at the head flips notes on
+	target := f.land("t1", map[string]string{"alpha.go": "package main\n\nfunc alpha() int { return 1 }\n"})
+	out, code, err := f.unland(target.RunID)
+	if err != nil || code != exitOK || out.Status != unlandStatusDone {
+		t.Fatalf("unland: exit %d status %q err %v (%s)", code, out.Status, err, out.Message)
+	}
+	content, ok, nerr := f.g.NoteShow(context.Background(), "sigbound", out.LandedSHA)
+	if nerr != nil {
+		t.Fatal(nerr)
+	}
+	if !ok {
+		t.Fatal("no git note on the unland's landed commit — a clone could not see the unland via `sig log -sha`")
+	}
+	if !strings.Contains(content, `"unlands"`) || !strings.Contains(content, target.RunID) {
+		t.Fatalf("the note does not carry the unland's report (unlands %s):\n%s", target.RunID, content)
 	}
 }

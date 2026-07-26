@@ -275,7 +275,7 @@ func (pk *parkJSON) validate() error {
 			return fmt.Errorf("%s: %s %q is not a hex object name", parkFileName, f.name, f.val)
 		}
 	}
-	if pk.Base == "" || !relSafe(pk.Base) || strings.ContainsAny(pk.Base, " \t\n:?*[\\") {
+	if !usableBranchName(pk.Base) {
 		return fmt.Errorf("%s: base %q is not a usable branch name", parkFileName, pk.Base)
 	}
 	switch pk.Reason {
@@ -294,7 +294,7 @@ func (pk *parkJSON) validate() error {
 	n := 0
 	for _, g := range pk.Groups {
 		for _, b := range g.Branches {
-			if b == "" || !relSafe(b) || strings.ContainsAny(b, " \t\n:?*[\\") {
+			if !usableBranchName(b) {
 				return fmt.Errorf("%s: branch %q is not a usable branch name", parkFileName, b)
 			}
 			n++

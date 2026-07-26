@@ -284,14 +284,24 @@ func inboxEntriesFor(ctx context.Context, g *gitx.Git, cellID, dir, runID, want 
 	return out
 }
 
-// unlandBlockReason distinguishes the two ways an inverse fails to land, since
-// they demand opposite responses: a conflict needs a resolver or the entangled
-// runs unlanded first, a red verify needs the revert itself reconsidered.
+// unlandBlockReason distinguishes the FOUR ways an inverse fails to land, since
+// they demand different responses and share one run status: a base that moved
+// wants a re-run, a conflict wants a resolver or the entangled runs unlanded
+// first, a red verify wants the revert itself reconsidered, and a park record
+// that could not be written left nothing to offer for ack. Read straight from
+// the report the driver already wrote (landRefused, the flagged set, the verify
+// verdict) — this once said "failed verify" for three of the four.
 func unlandBlockReason(rep *runReport) string {
-	if len(rep.Integrate.Flagged) > 0 {
-		return "the inverse conflicts with work that landed since"
+	switch {
+	case rep.LandRefused != "":
+		return "the base moved while this unland was computing — run it again against the new head"
+	case len(rep.Integrate.Flagged) > 0:
+		return "the inverse conflicts with work that landed since — resolve those paths, or unland the entangled runs first"
+	case rep.Verify.Ran && !rep.Verify.OK:
+		return "the reverted tree failed verify — reconsider the revert"
+	default:
+		return "its parking record could not be written, so there was nothing to offer for ack"
 	}
-	return "the reverted tree failed verify"
 }
 
 // parkSummary is a parked entry's one-line human wording: why it parked, what it
