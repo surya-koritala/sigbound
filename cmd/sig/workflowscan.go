@@ -198,6 +198,13 @@ func (sc *wfScan) scanJob(path, name string, lines []string, s, e int) {
 		case "container", "services":
 			sc.note("%s:%d job %q has `%s:` — its steps run against an environment this run does not provide, so the job contributes nothing", path, i+1, name, key)
 			return
+		case "environment":
+			// A deployment environment: the job targets a named environment (often
+			// with required reviewers or secrets), which makes it a deploy step, not
+			// a merge gate. Same reasoning as container:/services: -- this run does
+			// not provide it.
+			sc.note("%s:%d job %q targets the %q environment — a deployment is not a merge gate, so the job contributes nothing", path, i+1, name, strings.Trim(strings.TrimSpace(stripInlineComment(val)), `"'`))
+			return
 		case "env":
 			sc.note("%s:%d job %q sets job-level `env:` — a verify command would not have those variables, so the job contributes nothing", path, i+1, name)
 			return
@@ -503,11 +510,11 @@ func workflowTriggers(lines []string) (map[string]bool, int) {
 			t = strings.Trim(t, `"'`)
 			switch {
 			case t == "":
-			case t == "push" && pushIsTagsOnly(lines, j, blockIndent):
+			case t == "push" && pushIsNotAMergeGate(lines, j, blockIndent):
 				// Recorded under a DIFFERENT name so the push gate below does not
 				// see it: a release workflow's steps are release steps, and copying
 				// them into a landing bar would gate every merge on publishing.
-				trig["push(tags-only)"] = true
+				trig["push(not-a-merge-gate)"] = true
 			default:
 				trig[t] = true
 			}
@@ -517,11 +524,27 @@ func workflowTriggers(lines []string) (map[string]bool, int) {
 	return trig, 0
 }
 
-// pushIsTagsOnly reports whether the `push:` trigger whose key is at lines[at]
-// (indented `indent`) filters on tags and not on branches. A tag push is a
-// release, not a merge.
-func pushIsTagsOnly(lines []string, at, indent int) bool {
+// pushIsNotAMergeGate reports whether the `push:` trigger whose key is at
+// lines[at] (indented `indent`) fires on something other than a merge to the
+// default branch. Two shapes, one meaning:
+//
+//   - tags only. A tag push is a release, not a merge.
+//   - branches that cannot include the default branch (`release/**`, `deploy`).
+//     A push filtered to a release line never fires on a merge either.
+//
+// These were one guard and one gap. `on: push: tags: ['v*']` was refused while
+// `on: push: branches: [release/**]` -- identical semantics -- was not, so a
+// release job's `echo` became the landing bar for a repo whose tests fail, with
+// the toolchain fallback that would have drafted a real battery sitting unreached.
+//
+// ponytail: the default-branch test is name matching (main/master, or any
+// wildcard that could expand to them). Reading the repo's actual default branch
+// would be exact; do that if this ever misfires. Over-refusing is the cheap
+// direction here -- a refused workflow falls back to the manifests and drafts a
+// better bar, never a worse one.
+func pushIsNotAMergeGate(lines []string, at, indent int) bool {
 	tags, branches := false, false
+	mergeable := false
 	for j := at + 1; j < len(lines); j++ {
 		if blankOrComment(lines[j]) {
 			continue
@@ -530,18 +553,74 @@ func pushIsTagsOnly(lines []string, at, indent int) bool {
 		if n <= indent {
 			break
 		}
-		key, _, _, item, ok := splitKey(lines[j])
-		if !ok || item {
+		key, val, _, item, ok := splitKey(lines[j])
+		if item {
+			// A `- main` list entry under the branches key we last saw.
+			if branches && branchCouldBeDefault(listItemValue(lines[j])) {
+				mergeable = true
+			}
+			continue
+		}
+		if !ok {
 			continue
 		}
 		switch key {
 		case "tags", "tags-ignore":
 			tags = true
-		case "branches", "branches-ignore":
+		case "branches":
 			branches = true
+			// An inline list: `branches: [main, release/**]`.
+			for _, b := range inlineListValues(val) {
+				if branchCouldBeDefault(b) {
+					mergeable = true
+				}
+			}
+		case "branches-ignore":
+			// An exclusion list still fires on everything else, including the
+			// default branch, so it does not narrow this away from a merge gate.
+			branches, mergeable = true, true
 		}
 	}
-	return tags && !branches
+	if tags && !branches {
+		return true
+	}
+	return branches && !mergeable
+}
+
+// branchCouldBeDefault reports whether a `branches:` entry could match the
+// repository's default branch. A wildcard that is not anchored to some other
+// prefix could expand to anything, so it counts.
+func branchCouldBeDefault(b string) bool {
+	b = strings.Trim(strings.TrimSpace(b), `"'`)
+	switch b {
+	case "", "main", "master", "*", "**", "'*'":
+		return b != ""
+	}
+	// `*-stable` or `re*` could still cover the default branch; `release/**`
+	// cannot, because everything before the wildcard is a fixed prefix that
+	// main/master do not start with.
+	if i := strings.IndexAny(b, "*?["); i >= 0 {
+		prefix := b[:i]
+		return strings.HasPrefix("main", prefix) || strings.HasPrefix("master", prefix)
+	}
+	return false
+}
+
+// listItemValue is the value of a `- item` line.
+func listItemValue(ln string) string {
+	s := stripInlineComment(strings.TrimSpace(ln))
+	return strings.TrimSpace(strings.TrimPrefix(s, "-"))
+}
+
+// inlineListValues splits `[a, b]` (or a bare scalar) into its entries.
+func inlineListValues(val string) []string {
+	v := strings.TrimSpace(stripInlineComment(val))
+	v = strings.TrimPrefix(v, "[")
+	v = strings.TrimSuffix(v, "]")
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	return strings.Split(v, ",")
 }
 
 // topLevelBlock locates a column-0 key and the exclusive end of its block (the

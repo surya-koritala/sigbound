@@ -276,7 +276,14 @@ func TestPolicyInitRefusesExpressions(t *testing.T) {
 func TestPolicyInitNonLandingTriggers(t *testing.T) {
 	for _, tc := range []struct{ name, on, want string }{
 		{"schedule", "on:\n  schedule:\n    - cron: '0 8 * * *'\n", "schedule"},
-		{"tags-only", "on:\n  push:\n    tags:\n      - 'v*'\n", "push(tags-only)"},
+		{"tags-only", "on:\n  push:\n    tags:\n      - 'v*'\n", "push(not-a-merge-gate)"},
+		// The sibling that was missing: a push filtered to a release line never
+		// fires on a merge to the default branch either, so its steps are release
+		// steps. Without this the workflow's `echo` became the landing bar while
+		// the manifest fallback that would have drafted a real battery went
+		// unreached.
+		{"branches release-only", "on:\n  push:\n    branches:\n      - 'release/**'\n", "push(not-a-merge-gate)"},
+		{"branches inline release-only", "on:\n  push:\n    branches: [release/**, deploy]\n", "push(not-a-merge-gate)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := initPolicyRepo(t, map[string]string{
@@ -1140,5 +1147,61 @@ func TestControlBytePredicateIsOne(t *testing.T) {
 		if refused := strings.Contains(refuse, "control character"); refused != want {
 			t.Fatalf("byte %#02x: codeownersGlobs refused=%v, isControlByte=%v (refuse=%q)", c, refused, want, refuse)
 		}
+	}
+}
+
+// TestPolicyInitOrdinaryPushStillDrafts is the over-refusal guard for the
+// branches filter. A workflow restricted to the default branch is the single
+// most common CI shape there is, and refusing it would make this command useless
+// on the majority of real repos. It must still draft.
+func TestPolicyInitOrdinaryPushStillDrafts(t *testing.T) {
+	for _, on := range []string{
+		"on: [push]\n",
+		"on:\n  push:\n",
+		"on:\n  push:\n    branches:\n      - main\n",
+		"on:\n  push:\n    branches: [main, develop]\n",
+		"on:\n  push:\n    branches:\n      - master\n",
+		// A wildcard that could still expand to the default branch counts as
+		// mergeable: refusing it would be a guess in the expensive direction.
+		"on:\n  push:\n    branches:\n      - '*'\n",
+		"on:\n  push:\n    branches:\n      - 'ma*'\n",
+		// An exclusion list still fires on everything else, the default branch
+		// included.
+		"on:\n  push:\n    branches-ignore:\n      - 'release/**'\n",
+		// Release-only push, but pull_request is unfiltered — the PR trigger is
+		// the merge gate, so the file still counts.
+		"on:\n  push:\n    branches: [release/**]\n  pull_request:\n",
+	} {
+		t.Run(strings.ReplaceAll(strings.TrimSpace(on), "\n", "|"), func(t *testing.T) {
+			repo := initPolicyRepo(t, map[string]string{
+				".github/workflows/ci.yml": on + "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test ./...\n",
+			})
+			_, _, err, draft := policyInit(t, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pol := mustParse(t, draft)
+			if len(pol.verify) != 1 || pol.verify[0] != "go test ./..." {
+				t.Fatalf("an ordinary merge-gating workflow drafted %q, want [go test ./...]\n%s", pol.verify, draft)
+			}
+		})
+	}
+}
+
+// TestPolicyInitDeploymentJobIsNotABar: a job targeting a deployment
+// environment is a deploy step, not a merge gate.
+func TestPolicyInitDeploymentJobIsNotABar(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{
+		".github/workflows/ci.yml": "on: [push]\njobs:\n  ship:\n    environment: production\n    steps:\n      - run: echo \"deploying\"\n",
+	})
+	_, _, err, draft := policyInit(t, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol := mustParse(t, draft); len(pol.verify) != 0 {
+		t.Fatalf("a deployment job drafted %q as the landing bar\n%s", pol.verify, draft)
+	}
+	if !strings.Contains(draft, "production") {
+		t.Fatalf("no note naming the environment\n%s", draft)
 	}
 }

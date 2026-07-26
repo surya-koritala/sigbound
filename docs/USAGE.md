@@ -1521,14 +1521,25 @@ Read it before you commit it. It is a starting point, and these are its limits:
   nothing), for a step with `if:`, `continue-on-error: true`,
   `working-directory:`, its own `env:`, or a non-`sh`/`bash` `shell:` (this holds
   whether the `run:` is a single line or a `|` block), and for a whole job with
-  `container:`, `services:`, its own `env:`, its own `defaults:`, its own `if:`,
+  `container:`, `services:`, an `environment:` (a deployment is not a merge
+  gate), its own `env:`, its own `defaults:`, its own `if:`,
   `continue-on-error: true`, or a `runs-on:` that
   is not a linux/ubuntu runner (a windows- or macos-only job's steps would not
   run where verify does). The job-level `if:` and `continue-on-error:` cases are
   the step-level ones one scope up, and they matter more there: a workflow that
   fires on both `push` and a schedule passes the trigger check, but a job inside
   it gated on `github.event_name == 'schedule'` gates no merge at all, and a job
-  allowed to fail is not a gate by definition. A `run: |` block of simple commands is joined with
+  allowed to fail is not a gate by definition.
+  The same reasoning covers the trigger itself: `on: push:` filtered to
+  branches that cannot include the default branch (`release/**`, `deploy`) is a
+  release trigger, exactly like `on: push: tags:`, and is refused the same way.
+  A filter that could still match the default branch — `main`, `master`, a bare
+  `*`, or `branches-ignore:` — is not, because refusing an ordinary
+  merge-gating workflow would be the expensive mistake. **Known ceiling:**
+  `paths:`/`paths-ignore:` are NOT read, so a job that only runs when certain
+  files change is drafted as though it always runs. That is usually over-strict
+  rather than vacuous, but it is a guess this command has not been taught to
+  make; check such a member before you rely on it. A `run: |` block of simple commands is joined with
   ` && ` (the step shell is `bash -e`, so that is the same all-must-pass
   meaning); a block with a heredoc, a line continuation, a trailing operator, a
   trailing `#` comment (which would otherwise comment out every member joined
