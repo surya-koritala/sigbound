@@ -702,6 +702,52 @@ func (g *Git) TreeSize(ctx context.Context, rev string) (int64, error) {
 	return parseLsTreeSizesZ(out)
 }
 
+// LsTreeSizes lists every blob in rev's tree as a path -> raw content size (in
+// bytes) map, via `git ls-tree -r -l -z` — LsTree plus the size field, in the
+// same one call. A caller that means to read a subset of blobs can skip an
+// oversized one before it reads it into memory, so a size cap binds before
+// allocation rather than after. Submodule entries (git reports their size as
+// "-", their content living in another object store) are omitted, same as they
+// contribute 0 to TreeSize.
+func (g *Git) LsTreeSizes(ctx context.Context, rev string) (map[string]int64, error) {
+	out, err := g.run(ctx, "ls-tree", "-r", "-l", "-z", rev)
+	if err != nil {
+		return nil, err
+	}
+	return parseLsTreeSizesMapZ(out)
+}
+
+// parseLsTreeSizesMapZ decodes `git ls-tree -r -l -z` into a path -> size map.
+// It parses the same record shape as parseLsTreeSizesZ ("<mode> SP <type> SP
+// <oid> SP <size>\t<path>\0") but keyed by path rather than summed; kept a
+// sibling rather than sharing a primitive so the fuzzed disk-preflight summer
+// stays untouched. Pure function of untrusted git output; must never panic.
+func parseLsTreeSizesMapZ(out string) (map[string]int64, error) {
+	sizes := map[string]int64{}
+	for _, rec := range strings.Split(out, "\x00") {
+		if rec == "" { // trailing empty after final NUL
+			continue
+		}
+		tab := strings.IndexByte(rec, '\t')
+		if tab < 0 {
+			return nil, fmt.Errorf("ls-tree -l: malformed record %q", rec)
+		}
+		fields := strings.Fields(rec[:tab])
+		if len(fields) < 4 {
+			return nil, fmt.Errorf("ls-tree -l: malformed record %q", rec)
+		}
+		if fields[3] == "-" { // submodule: no size in this object store
+			continue
+		}
+		n, err := strconv.ParseInt(fields[3], 10, 64)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("ls-tree -l: bad size in record %q", rec)
+		}
+		sizes[rec[tab+1:]] = n
+	}
+	return sizes, nil
+}
+
 // parseLsTreeSizesZ sums the blob sizes from `git ls-tree -r -l -z` output.
 // Each record is "<mode> SP <type> SP <oid> SP <size>\t<path>\0" — the size
 // field is space-padded for column alignment in git's own formatting, hence

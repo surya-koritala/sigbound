@@ -1513,13 +1513,16 @@ Read it before you commit it. It is a starting point, and these are its limits:
   an `# unmapped:` line. It emits nothing for a step that interpolates `${{ }}`
   (an empty substitution can leave a command that exits 0 — a bar that gates
   nothing), for a step with `if:`, `continue-on-error: true`,
-  `working-directory:`, its own `env:`, or a non-`sh`/`bash` `shell:`, and for a
-  whole job with `container:`, `services:`, job-level `env:`, or `defaults:`. A
-  `run: |` block of simple commands is joined with ` && ` (the step shell is
-  `bash -e`, so that is the same all-must-pass meaning); a block with a heredoc,
-  a line continuation, a trailing operator, or a leading shell keyword is a
-  program rather than a list, so it is refused whole and quoted in the draft for
-  you to fold by hand.
+  `working-directory:`, its own `env:`, or a non-`sh`/`bash` `shell:` (this holds
+  whether the `run:` is a single line or a `|` block), and for a whole job with
+  `container:`, `services:`, job-level `env:`, `defaults:`, or a `runs-on:` that
+  is not a linux/ubuntu runner (a windows- or macos-only job's steps would not
+  run where verify does). A `run: |` block of simple commands is joined with
+  ` && ` (the step shell is `bash -e`, so that is the same all-must-pass
+  meaning); a block with a heredoc, a line continuation, a trailing operator, a
+  trailing `#` comment (which would otherwise comment out every member joined
+  after it), or a leading shell keyword is a program rather than a list, so it is
+  refused whole and quoted in the draft for you to fold by hand.
 - **A workflow that does not gate a merge contributes nothing** — a
   `schedule:` workflow, or a `push:` filtered to `tags:` only (that is a
   release, and its steps are release steps).
@@ -1533,7 +1536,11 @@ Read it before you commit it. It is a starting point, and these are its limits:
   containing `,`, a `!` negation, or a `[...]` class emits no glob at all. A
   pattern whose only slash is trailing (`docs/`) is anchored at the repository
   root here, where the forge would also match `a/b/docs/`; the file count in
-  each glob's comment is what makes such a narrowing visible on review.
+  each glob's comment is what makes such a narrowing visible on review. A pattern
+  with no slash at all (`auth`, `.github`) matches at any depth, and whether it
+  names a file or a directory is read from the tree: a directory emits the
+  subtree glob (`**/auth/**`) so the ack covers its contents, not just a file of
+  that name.
 - **Nothing is in force until you commit it**, and committing it turns on the
   self-protection below: a later change to `sigbound.policy` itself parks.
 

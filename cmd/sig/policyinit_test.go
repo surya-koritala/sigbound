@@ -211,6 +211,9 @@ func TestPolicyInitBlockScalar(t *testing.T) {
 		{"continuation", "          go test \\\n            ./...\n", nil, "line continuation"},
 		{"keyword", "          if [ -f x ]; then\n          exit 1\n          fi\n", nil, "shell keyword `if`"},
 		{"trailing-op", "          go build ./... &&\n          go test ./...\n", nil, "continues onto the next"},
+		// A trailing `#` comment would, once &&-joined, comment out every member
+		// after it (finding CRITICAL-2): refuse the whole block, do not truncate it.
+		{"trailing-comment", "          go build ./... # compile\n          go test ./...\n", nil, "trailing `#` comment"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := initPolicyRepo(t, map[string]string{".github/workflows/ci.yml": wf(tc.body)})
@@ -384,7 +387,11 @@ func TestPolicyInitCodeowners(t *testing.T) {
 		// lib, not a lib at any depth. Testing the stripped form would emit
 		// `**/lib`, a different set.
 		{"/lib", []string{"lib/**"}, ""},
-		{"lib", []string{"**/lib"}, ""},
+		// A no-separator pattern naming a DIRECTORY present in the tree (`lib`, with
+		// lib/one.go) must emit the subtree glob `**/lib/**`, not `**/lib` — the
+		// latter matches only a FILE literally named lib and would make the ack-path
+		// never park. This is finding HIGH-3.
+		{"lib", []string{"**/lib/**"}, ""},
 		{"lib/one.go", []string{"lib/one.go"}, ""},
 		{"apps/mobile", []string{"apps/mobile", "apps/mobile/**"}, ""},
 		{"**/vendor", []string{"**/vendor", "**/vendor/**"}, ""},
@@ -418,6 +425,10 @@ func TestPolicyInitCodeowners(t *testing.T) {
 		{"**/*.js", "a.js", true}, {"**/*.js", "src/b.js", true}, {"**/*.js", "docs/x.md", false},
 		{"docs/**", "docs/x.md", true}, {"docs/**", "a.js", false},
 		{"apps/web/**", "apps/web/main.go", true}, {"apps/web/**", "lib/one.go", false},
+		// The no-slash directory glob (finding HIGH-3) matches the directory's
+		// contents at any depth; the bare-name glob it replaced would not.
+		{"**/lib/**", "lib/one.go", true}, {"**/lib", "lib/one.go", false},
+		{"**/lib/**", "a.js", false},
 	} {
 		if got := globMatch(c.glob, c.path); got != c.want {
 			t.Fatalf("globMatch(%q, %q) = %v, want %v", c.glob, c.path, got, c.want)
@@ -538,41 +549,238 @@ func TestPolicyInitJobLevelRefusals(t *testing.T) {
 }
 
 // TestPolicyInitStepLevelRefusals: a step that may not run, does not gate, or
-// runs elsewhere is skipped — the rest of the job still contributes.
+// runs elsewhere is skipped — the rest of the job still contributes. Exercised
+// over BOTH `run:` forms (single-line AND `run: |` block) for every disqualifier,
+// because the block form is where a refusal set by an EARLIER key in the step was
+// being cleared (finding CRITICAL-1): reverting that fix drafts the block step as
+// a live member here, so the "exactly one member" assertion fails on the /block
+// subtests. That is this test's job as the CRITICAL-1 negative control.
 func TestPolicyInitStepLevelRefusals(t *testing.T) {
-	repo := initPolicyRepo(t, map[string]string{
-		".github/workflows/ci.yml": `on: [push]
+	disquals := []struct{ name, keyLines, note string }{
+		{"if", "        if: github.ref == 'refs/heads/main'", "conditional (`if:`)"},
+		{"continue-on-error", "        continue-on-error: true", "continue-on-error: true"},
+		{"working-directory", "        working-directory: ./sub", "working-directory:"},
+		{"env", "        env:\n          FOO: bar", "the step sets `env:`"},
+		{"shell", "        shell: pwsh", "shell: pwsh"},
+	}
+	runForms := []struct{ name, run string }{
+		{"single-line", "        run: go build ./...\n"},
+		{"block", "        run: |\n          go build ./...\n"},
+	}
+	for _, dq := range disquals {
+		for _, rf := range runForms {
+			t.Run(dq.name+"/"+rf.name, func(t *testing.T) {
+				// The disqualifying key sits BEFORE `run:`, the shape real workflows
+				// use and the one that triggered the bug; a clean step follows it.
+				wf := "on: [push]\njobs:\n  t:\n    steps:\n" +
+					"      - name: disq\n" + dq.keyLines + "\n" + rf.run +
+					"      - run: go test ./...\n"
+				repo := initPolicyRepo(t, map[string]string{".github/workflows/ci.yml": wf})
+				_, _, err, draft := policyInit(t, repo)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pol := mustParse(t, draft)
+				if len(pol.verify) != 1 || pol.verify[0] != "go test ./..." {
+					t.Fatalf("verify = %q, want exactly [\"go test ./...\"] — the disqualified %s step must not draft a live member\n%s", pol.verify, dq.name, draft)
+				}
+				if !strings.Contains(draft, dq.note) {
+					t.Fatalf("no note naming %q\n%s", dq.note, draft)
+				}
+			})
+		}
+	}
+}
+
+// TestPolicyInitRunsOnRefusal: a job pinned to a non-linux runner is refused
+// whole (finding MEDIUM-8) — its steps would run somewhere verify does not, and
+// a windows job duplicating a linux job's command must not draft that member
+// twice. A workflow of only non-linux jobs drafts zero live members, with notes.
+func TestPolicyInitRunsOnRefusal(t *testing.T) {
+	t.Run("windows and macos only", func(t *testing.T) {
+		repo := initPolicyRepo(t, map[string]string{
+			".github/workflows/ci.yml": `on: [push]
 jobs:
-  t:
+  win:
+    runs-on: windows-latest
     steps:
-      - name: conditional
-        if: github.ref == 'refs/heads/main'
-        run: go test -tags main ./...
-      - name: soft
-        continue-on-error: true
-        run: go vet ./...
-      - name: elsewhere
-        working-directory: ./sub
-        run: go build ./...
-      - name: other shell
-        shell: pwsh
-        run: Get-ChildItem
-      - name: real
-        run: go test ./...
+      - run: go test ./...
+  mac:
+    runs-on: macos-14
+    steps:
+      - run: go test ./...
 `,
+		})
+		_, _, err, draft := policyInit(t, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pol := mustParse(t, draft); len(pol.verify) != 0 {
+			t.Fatalf("non-linux jobs drafted live members: %q\n%s", pol.verify, draft)
+		}
+		for _, want := range []string{"windows-latest", "macos-14"} {
+			if !strings.Contains(draft, want) {
+				t.Fatalf("no note naming the refused runner %q\n%s", want, draft)
+			}
+		}
 	})
+	t.Run("linux job still drafts, windows dup dropped", func(t *testing.T) {
+		repo := initPolicyRepo(t, map[string]string{
+			".github/workflows/ci.yml": `on: [push]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - run: go test ./...
+  win:
+    runs-on: windows-latest
+    steps:
+      - run: go test ./...
+`,
+		})
+		_, _, err, draft := policyInit(t, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pol := mustParse(t, draft)
+		if len(pol.verify) != 1 || pol.verify[0] != "go test ./..." {
+			t.Fatalf("verify = %q, want exactly [\"go test ./...\"]\n%s", pol.verify, draft)
+		}
+	})
+	t.Run("array with linux is allowed", func(t *testing.T) {
+		repo := initPolicyRepo(t, map[string]string{
+			".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    runs-on: [self-hosted, linux, x64]\n    steps:\n      - run: go test ./...\n",
+		})
+		_, _, err, draft := policyInit(t, repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pol := mustParse(t, draft); len(pol.verify) != 1 {
+			t.Fatalf("a self-hosted linux runner was refused: %q\n%s", pol.verify, draft)
+		}
+	})
+}
+
+// TestPolicyInitBadRevExitsBeforeWriting: an explicitly-named -rev that does not
+// resolve exits non-zero and writes NOTHING (finding MEDIUM-7), so the corrected
+// retry is not blocked by a vacuous policy (there is no -force). Then a run
+// against the same repo with a good rev succeeds.
+func TestPolicyInitBadRevExitsBeforeWriting(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{"go.mod": "module x\n"})
+	var buf bytes.Buffer
+	code, err := runPolicyInit(&buf, []string{"-repo", repo, "-rev", "v9.9.9-typo"})
+	if code == exitOK || err == nil {
+		t.Fatalf("a bad -rev exited OK: code=%d err=%v", code, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repo, policyFileName)); !os.IsNotExist(statErr) {
+		t.Fatalf("a bad -rev wrote a policy: %v", statErr)
+	}
+	// The corrected invocation now works — nothing was left behind to block it.
+	if _, _, err, draft := policyInit(t, repo); err != nil || draft == "" {
+		t.Fatalf("the good retry failed: err=%v\n%s", err, draft)
+	}
+}
+
+// TestPolicyInitNoClobberSymlink: a `sigbound.policy` that is a DANGLING symlink
+// pointing outside the repo is never followed to create that file (finding
+// MEDIUM-5, O_EXCL). This is the distinguishing case: the old ReadFile-then-
+// WriteFile refused a symlink to an existing file (ReadFile succeeded) but would
+// FOLLOW a dangling one (ReadFile fails ErrNotExist, WriteFile then creates the
+// target outside). O_CREATE|O_EXCL fails EEXIST on any symlink, so nothing is
+// written outside and the command exits non-zero.
+func TestPolicyInitNoClobberSymlink(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{"go.mod": "module x\n"})
+	outside := filepath.Join(t.TempDir(), "OUTSIDE") // deliberately does not exist
+	link := filepath.Join(repo, policyFileName)
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+	var buf bytes.Buffer
+	code, err := runPolicyInit(&buf, []string{"-repo", repo})
+	if code == exitOK || err == nil {
+		t.Fatalf("O_EXCL did not refuse a symlinked policy path: code=%d err=%v", code, err)
+	}
+	if _, statErr := os.Stat(outside); !os.IsNotExist(statErr) {
+		t.Fatalf("the write followed the symlink and created a file outside the repo: %v", statErr)
+	}
+}
+
+// TestScanWorkflowControlByteRefused: a control byte (here NUL) reaching a
+// command is refused and noted, never emitted as a verify value (finding LOW —
+// workflowscan.go guarded only \r\n before).
+func TestScanWorkflowControlByteRefused(t *testing.T) {
+	data := []byte("on: [push]\njobs:\n  t:\n    steps:\n      - run: go test ./...\x00rm -rf /\n")
+	sc := scanWorkflow(".github/workflows/ci.yml", data)
+	if len(sc.Commands) != 0 {
+		t.Fatalf("a command with a NUL was emitted: %q", sc.Commands)
+	}
+	var noted bool
+	for _, n := range sc.Notes {
+		if strings.Contains(n.Detail, "control character") {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Fatalf("the NUL byte was not noted: %+v", sc.Notes)
+	}
+}
+
+// TestPolicyInitOversizeBlobSkipped: a source file larger than wfMaxBytes is
+// skipped BEFORE it is read, and the skip is a note (finding MEDIUM-6). A
+// Makefile is used because — unlike scanWorkflow — the Makefile reader has no
+// internal size cap of its own, so this observes the PRE-READ filter specifically:
+// remove that filter and the oversize Makefile is parsed and `make build` drafted.
+func TestPolicyInitOversizeBlobSkipped(t *testing.T) {
+	big := "build:\n\tgo build ./...\n" + strings.Repeat("# pad\n", (wfMaxBytes/6)+1)
+	if len(big) <= wfMaxBytes {
+		t.Fatalf("fixture not over cap: %d <= %d", len(big), wfMaxBytes)
+	}
+	repo := initPolicyRepo(t, map[string]string{"Makefile": big})
+	_, _, err, draft := policyInit(t, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustParse(t, draft)
+	if strings.Contains(draft, "make build") {
+		t.Fatalf("the oversize Makefile was read and drafted\n%s", draft)
+	}
+	if !strings.Contains(draft, "not read") {
+		t.Fatalf("no note about the skipped oversize file\n%s", draft)
+	}
+}
+
+// TestPolicyInitProbeRunsNoRepoCode: the python probe must not execute a
+// repo-resident pytest.py (finding HIGH-4). A malicious pytest.py that drops a
+// sentinel proves it: after `sig policy init`, the sentinel must not exist.
+func TestPolicyInitProbeRunsNoRepoCode(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{
+		"requirements.txt": "pytest\n",
+		// If `python -m pytest` were used with cwd on sys.path, importing pytest
+		// would run this and create the sentinel.
+		"pytest.py": "import os\nopen(os.path.join(os.path.dirname(__file__), 'PWNED'), 'w').close()\n",
+	})
+	if _, _, err, _ := policyInit(t, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(filepath.Join(repo, "PWNED")); !os.IsNotExist(statErr) {
+		t.Fatalf("the probe executed repo-resident pytest.py: sentinel exists (%v)", statErr)
+	}
+}
+
+// TestPolicyInitGoTestTimeoutNote: a drafted `go test` member with no -timeout
+// draws one advisory note (finding LOW) — the command itself is left verbatim.
+func TestPolicyInitGoTestTimeoutNote(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{"go.mod": "module x\n"})
 	_, _, err, draft := policyInit(t, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pol := mustParse(t, draft)
-	if len(pol.verify) != 1 || pol.verify[0] != "go test ./..." {
-		t.Fatalf("verify = %q, want exactly [\"go test ./...\"]\n%s", pol.verify, draft)
+	if len(pol.verify) != 1 || pol.verify[0] != verifyPresets["go"] {
+		t.Fatalf("verify = %q, want the go preset verbatim\n%s", pol.verify, draft)
 	}
-	for _, want := range []string{"conditional (`if:`)", "continue-on-error: true", "working-directory:", "shell: pwsh"} {
-		if !strings.Contains(draft, want) {
-			t.Fatalf("no note naming %q\n%s", want, draft)
-		}
+	if !strings.Contains(draft, "no `-timeout`") {
+		t.Fatalf("no -timeout advisory for a drafted go test member\n%s", draft)
 	}
 }
 

@@ -164,11 +164,21 @@ func (sc *wfScan) scanJob(path, name string, lines []string, s, e int) {
 		if n, _ := indentOf(lines[i]); n != keyIndent {
 			continue
 		}
-		key, _, _, item, ok := splitKey(lines[i])
+		key, val, _, item, ok := splitKey(lines[i])
 		if !ok || item {
 			continue
 		}
 		switch key {
+		case "runs-on":
+			// The battery is drafted for the machine verify runs on. A job pinned to
+			// a windows- or macos-only runner (or one whose OS cannot be read here)
+			// would contribute members that do not run where verify does, so it is
+			// refused whole. A MISSING runs-on is not a disqualifier (many workflows
+			// rely on the default), so only a present value is judged.
+			if refuse := runsOnRefusal(val); refuse != "" {
+				sc.note("%s:%d job %q %s", path, i+1, name, refuse)
+				return
+			}
 		case "container", "services":
 			sc.note("%s:%d job %q has `%s:` — its steps run against an environment this run does not provide, so the job contributes nothing", path, i+1, name, key)
 			return
@@ -250,7 +260,17 @@ func (sc *wfScan) scanStep(path, job string, lines []string, s, e int) {
 				block = true
 				body := blockBody(lines, i+1, e, col)
 				quote = body
-				run, refuse = joinRunBlock(body)
+				// Tuple-assigning `run, refuse = joinRunBlock(body)` would CLEAR a
+				// refusal an earlier key in this step already set (working-directory,
+				// if, env, continue-on-error, shell all commonly precede `run:`),
+				// drafting a live member with zero notes. The block branch may set a
+				// refusal but must never erase one, and may fill `run` only when the
+				// step is otherwise clean.
+				if r, rf := joinRunBlock(body); rf != "" {
+					refuse = rf
+				} else if refuse == "" {
+					run = r
+				}
 			case strings.HasPrefix(val, ">"):
 				refuse = "a folded (`>`) block scalar joins its lines with spaces, which is not the command it looks like"
 				quote = blockBody(lines, i+1, e, col)
@@ -282,13 +302,21 @@ func (sc *wfScan) scanStep(path, job string, lines []string, s, e int) {
 	if run == "" && refuse == "" {
 		return
 	}
-	// A CR or LF surviving inside the command (a lone CR mid-line, which is not
-	// a line terminator to textLines but is to plenty of other readers) would
-	// end the `verify = ...` line early and turn the remainder into a policy key
-	// of its own. Refuse rather than strip: silently rewriting somebody's
-	// command is exactly the wrong-suggestion failure this scanner avoids.
-	if refuse == "" && strings.ContainsAny(run, "\r\n") {
-		refuse = "the command contains a carriage return or newline, which cannot be a single `verify` line"
+	// A control byte surviving inside the command would corrupt the `verify = ...`
+	// line: a CR or LF (a lone CR mid-line is not a line terminator to textLines
+	// but is to plenty of other readers) ends the line early and turns the
+	// remainder into a policy key of its own, and a NUL reaches the value and then
+	// exec. Refuse rather than strip: silently rewriting somebody's command is
+	// exactly the wrong-suggestion failure this scanner avoids. Checked per byte,
+	// so a NUL or high C0 control inside invalid UTF-8 is caught too; a tab is left
+	// alone (legitimate whitespace in a command).
+	if refuse == "" {
+		for i := 0; i < len(run); i++ {
+			if b := run[i]; b < 0x20 && b != '\t' {
+				refuse = "the command contains a control character (a NUL, carriage return, or newline), which cannot be a single `verify` line"
+				break
+			}
+		}
 	}
 	if refuse == "" && strings.Contains(run, "${{") {
 		refuse = "the command interpolates a `${{ }}` expression, which cannot be evaluated here — an empty substitution can leave a command that exits 0 and gates nothing"
@@ -315,19 +343,31 @@ func (sc *wfScan) scanStep(path, job string, lines []string, s, e int) {
 // same all-must-pass meaning as those commands ANDed — that equivalence is the
 // entire licence for joining, and it evaporates the moment the block is a shell
 // program rather than a list. A trailing operator, a line continuation, a
-// heredoc, or a leading shell keyword each mean the next line is not an
-// independent command, so the block is refused whole and quoted in the draft
-// for a human to fold by hand.
+// heredoc, a trailing `#` comment, or a leading shell keyword each mean the next
+// line is not an independent command (or would be commented out), so the block
+// is refused whole and quoted in the draft for a human to fold by hand.
 //
 // Whole-line `#` comments are DROPPED rather than joined: `a && # c && b`
 // comments out everything after it, which would silently delete members of the
-// battery.
+// battery. A TRAILING `#` cannot be dropped the same way (the text before it is
+// a real command), so a line with a whitespace-preceded `#` refuses the block.
 func joinRunBlock(body []string) (cmd, refuse string) {
 	var cmds []string
 	for _, raw := range body {
 		t := strings.TrimSpace(raw)
 		if t == "" || strings.HasPrefix(t, "#") {
 			continue
+		}
+		// A trailing `#` comment (`go build ./... # compile`) would, once joined
+		// with ` && `, comment out every member after it — the same silent-deletion
+		// failure whole-line comments are dropped to avoid, but mid-line. Detecting
+		// it exactly needs shell tokenization (a `#` inside a quoted string is not a
+		// comment), which this scanner does not do, so it takes the same posture it
+		// takes for `<<` and trailing `\`: refuse the whole block and quote it. A `#`
+		// preceded by whitespace is the shell-comment shape; one inside quotes is
+		// over-refused, which is in-spec (fewer suggestions, never a wrong one).
+		if strings.Contains(t, " #") || strings.Contains(t, "\t#") {
+			return "", "a line has a trailing `#` comment, which would swallow the rest of the &&-joined block"
 		}
 		if strings.Contains(t, "<<") {
 			return "", "the block contains a heredoc (`<<`), which cannot be joined into one line"
@@ -585,6 +625,29 @@ func splitKey(line string) (key, value string, keyCol int, item, ok bool) {
 	key = strings.Trim(strings.TrimSpace(rest[:i]), `"'`)
 	value = strings.TrimSpace(rest[i+1:])
 	return key, value, keyCol, item, key != ""
+}
+
+// runsOnRefusal reports why a job's `runs-on:` value disqualifies it, or "" when
+// it names a linux/ubuntu runner. It reads the inline scalar (`ubuntu-latest`)
+// and inline array (`[self-hosted, linux, x64]`) forms; a `${{ }}` expression, a
+// block form with no inline value, or a value naming only non-linux/self-hosted
+// labels is refused, because the OS the steps would run on is then either unknown
+// or not the one verify runs on. This is a heuristic, so it errs toward refusal.
+func runsOnRefusal(val string) string {
+	v := stripInlineComment(val)
+	if strings.Contains(v, "${{") {
+		return "has a `runs-on:` `${{ }}` expression whose runner OS cannot be determined here"
+	}
+	for _, tok := range strings.FieldsFunc(strings.Trim(v, "[]"), func(r rune) bool { return r == ',' || r == ' ' }) {
+		t := strings.ToLower(strings.Trim(tok, `"'`))
+		if strings.Contains(t, "ubuntu") || strings.Contains(t, "linux") {
+			return "" // a linux runner: draft its steps
+		}
+	}
+	if strings.TrimSpace(v) == "" {
+		return "has a `runs-on:` this scanner cannot read inline, so the runner OS is unknown"
+	}
+	return fmt.Sprintf("has `runs-on: %s`, not a linux/ubuntu runner — a verify member is drafted for the machine verify runs on", v)
 }
 
 // stripInlineComment drops a trailing ` # ...` comment from a STRUCTURAL value

@@ -98,7 +98,18 @@ func runPolicyInit(w io.Writer, argv []string) (int, error) {
 	}
 
 	ctx := context.Background()
-	d := buildPolicyDraft(ctx, gitx.New(*repo), *repo, *rev)
+	g := gitx.New(*repo)
+	// An explicitly-named -rev that does not resolve is a user mistake, not a
+	// new-repo starting point: fail BEFORE drafting or writing anything, so no
+	// vacuous policy is left behind to block the corrected retry (there is no
+	// -force). A failing default HEAD is the empty/bare-repo case and still yields
+	// a commented template below.
+	if *rev != "HEAD" {
+		if _, err := g.RevParse(ctx, *rev); err != nil {
+			return exitOperationalError, fmt.Errorf("cannot resolve -rev %q in %s: %w — nothing was written", *rev, *repo, err)
+		}
+	}
+	d := buildPolicyDraft(ctx, g, *repo, *rev)
 	draft := d.render()
 	// Self-check BEFORE anything is written or suggested. A draft that does not
 	// parse is a bug in this command, and the one output it must never produce.
@@ -108,15 +119,30 @@ func runPolicyInit(w io.Writer, argv []string) (int, error) {
 	}
 
 	out := filepath.Join(*repo, policyFileName)
-	existing, err := os.ReadFile(out)
+	// O_CREATE|O_EXCL is the never-clobber guard, the concurrent-init guard, and
+	// the write-outside-the-repo guard in ONE. It fails EEXIST on an existing file
+	// AND refuses to follow a symlink — so a committed `sigbound.policy -> ../OUT`
+	// cannot redirect the write outside the tree — and the create+write is atomic
+	// against a racing second init. The old ReadFile-then-WriteFile had a TOCTOU
+	// window between the check and the write and followed such a symlink.
+	f, err := os.OpenFile(out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	switch {
-	case err == nil:
+	case errors.Is(err, fs.ErrExist):
+		// The path is taken — an existing policy (the repo's real landing bar), or a
+		// symlink O_EXCL declined to follow. Print the diff and refuse. The ReadFile
+		// is best-effort: an unreadable/symlinked target still refuses cleanly, and
+		// only OUR drafted lines are printed, never the existing file's contents.
+		existing, _ := os.ReadFile(out)
 		printPolicySuggestion(w, out, existing, d)
 		return exitOperationalError, fmt.Errorf("%s already exists — not overwriting it; nothing was written", out)
-	case !errors.Is(err, fs.ErrNotExist):
-		return exitOperationalError, fmt.Errorf("read %s: %w", out, err)
+	case err != nil:
+		return exitOperationalError, fmt.Errorf("create %s: %w", out, err)
 	}
-	if err := os.WriteFile(out, []byte(draft), 0o644); err != nil {
+	if _, err := f.WriteString(draft); err != nil {
+		f.Close()
+		return exitOperationalError, fmt.Errorf("write %s: %w", out, err)
+	}
+	if err := f.Close(); err != nil {
 		return exitOperationalError, fmt.Errorf("write %s: %w", out, err)
 	}
 	d.printSummary(w, out)
@@ -307,7 +333,13 @@ type toolchainRule struct {
 var toolchainRules = []toolchainRule{
 	{"go", []string{"go.mod"}, "go", []string{"go", "version"}},
 	{"node", []string{"package.json"}, "node", []string{"npm", "--version"}},
-	{"python", []string{"pyproject.toml", "setup.py", "requirements.txt"}, "python", []string{"python", "-m", "pytest", "--version"}},
+	// The python probe is `pytest --version`, NOT `python -m pytest --version`:
+	// `python -m NAME` prepends the current directory to sys.path, so a
+	// repo-resident `pytest.py` / `pytest/` shadows the real module and its code
+	// runs during `sig policy init`. The console-script form resolves pytest from
+	// PATH (its sys.path[0] is the script's own dir, not the repo) and `--version`
+	// prints and exits without collection, so no repo file is imported or executed.
+	{"python", []string{"pyproject.toml", "setup.py", "requirements.txt"}, "python", []string{"pytest", "--version"}},
 	{"rust", []string{"Cargo.toml"}, "rust", []string{"cargo", "--version"}},
 }
 
@@ -328,33 +360,59 @@ func buildPolicyDraft(ctx context.Context, g *gitx.Git, repo, rev string) policy
 		return d
 	}
 	d.rev = short(sha)
-	tree, err := g.LsTree(ctx, sha)
+	// LsTreeSizes gives the path list AND each blob's size in one call, so an
+	// oversized blob is skipped BEFORE BlobsBatch reads it into memory — the cap
+	// binds before allocation, not after (a 500MB workflow must not become 500MB
+	// of RSS just to be rejected).
+	sizes, err := g.LsTreeSizes(ctx, sha)
 	if err != nil {
 		d.note("repo", fmt.Sprintf("cannot list the tree at %s: %v — no source could be read", short(sha), oneLine(err.Error())))
 		d.summary = append(d.summary, "repo: tree unreadable ("+oneLine(err.Error())+")")
 		return d
 	}
-
-	inTree := make(map[string]bool, len(tree))
-	for _, p := range tree {
+	tree := make([]string, 0, len(sizes))
+	inTree := make(map[string]bool, len(sizes))
+	for p := range sizes {
+		tree = append(tree, p)
 		inTree[p] = true
 	}
+	sort.Strings(tree)
+
+	// wantBlob adds a source file to the read set unless it exceeds wfMaxBytes, in
+	// which case the skip becomes a visible note instead of a silent read.
 	var want []string
+	wantBlob := func(source, p string) {
+		if sizes[p] > wfMaxBytes {
+			d.note(source, fmt.Sprintf("%s is %d bytes (cap %d) — not read", p, sizes[p], wfMaxBytes))
+			return
+		}
+		want = append(want, p)
+	}
 	var workflows []string
 	for _, p := range tree {
 		if strings.HasPrefix(p, ".github/workflows/") && (strings.HasSuffix(p, ".yml") || strings.HasSuffix(p, ".yaml")) &&
 			!strings.Contains(strings.TrimPrefix(p, ".github/workflows/"), "/") {
+			if sizes[p] > wfMaxBytes {
+				d.note("workflows", fmt.Sprintf("%s is %d bytes (cap %d) — not scanned", p, sizes[p], wfMaxBytes))
+				continue
+			}
 			workflows = append(workflows, p)
 			want = append(want, p)
 		}
 	}
 	sort.Strings(workflows)
-	for _, group := range [][]string{codeownersCandidates, makefileCandidates, {"package.json"}} {
-		for _, p := range group {
-			if inTree[p] {
-				want = append(want, p)
-			}
+	for _, p := range codeownersCandidates {
+		if inTree[p] {
+			wantBlob("codeowners", p)
 		}
+	}
+	for _, p := range makefileCandidates {
+		if inTree[p] {
+			wantBlob("make", p)
+		}
+	}
+	if inTree["package.json"] {
+		wantBlob("toolchain", "package.json")
 	}
 	blobs := map[string]string{}
 	if len(want) > 0 {
@@ -382,7 +440,23 @@ func buildPolicyDraft(ctx context.Context, g *gitx.Git, repo, rev string) policy
 	verified = d.addMakeVerify(ctx, blobs, verified)
 	d.addToolchainVerify(ctx, inTree, blobs, verified)
 	d.addCodeowners(inTree, blobs, tree)
+	d.noteGoTestTimeout()
 	return d
+}
+
+// noteGoTestTimeout surfaces a `go test` member that carries no -timeout. The
+// command is emitted VERBATIM — never rewritten, that is the whole scanner
+// contract — but `go test`'s 10-minute default can red-out slow-but-correct
+// tests on a loaded machine (sigbound's own committed policy documents adding a
+// -timeout for exactly this reason), so the omission is made visible rather than
+// silently reproduced. One advisory note, however many members qualify.
+func (d *policyDraft) noteGoTestTimeout() {
+	for _, ln := range d.lines {
+		if ln.live && ln.key == "verify" && strings.Contains(ln.value, "go test") && !strings.Contains(ln.value, "-timeout") {
+			d.note("verify", "a drafted `go test` member has no `-timeout`; go test's 10m default can fail slow-but-correct tests on a loaded machine — consider adding one (e.g. `-timeout 20m`). The command is left exactly as its source wrote it.")
+			return
+		}
+	}
 }
 
 // addWorkflowVerify runs the workflow scanner over every workflow file and
@@ -467,7 +541,7 @@ func (d *policyDraft) addMakeVerify(ctx context.Context, blobs map[string]string
 		return already
 	}
 	live, why := true, ""
-	if err := probeTool(ctx, []string{"make", "-v"}); err != nil {
+	if err := probeTool(ctx, d.repo, []string{"make", "-v"}); err != nil {
 		live, why = false, "; `make -v` failed here: "+oneLine(err.Error())+" — uncomment once make is available"
 	}
 	for _, t := range wanted {
@@ -516,7 +590,7 @@ func (d *policyDraft) addToolchainVerify(ctx context.Context, inTree map[string]
 			continue
 		}
 		live, why, tail := true, fmt.Sprintf("`-verify-preset %s`", r.preset), ""
-		if err := probeTool(ctx, r.probe); err != nil {
+		if err := probeTool(ctx, d.repo, r.probe); err != nil {
 			live = false
 			tail = " (commented out: probe failed)"
 			why += fmt.Sprintf("; `%s` failed here: %s — this describes THIS machine, not wherever verify runs, so the line is drafted; uncomment it once the toolchain is available",
@@ -623,21 +697,38 @@ func codeownersGlobs(pattern string, tree []string) (globs []string, refuse stri
 	// leading-slash-stripped form instead would misread the anchored `/auth` as
 	// the depth-independent `auth` and emit `**/auth`, which is a different set.
 	if !strings.Contains(strings.TrimSuffix(pattern, "/"), "/") {
-		// No separator at all: matches the name at any depth, and `**/` matches
-		// zero segments, so this also covers the root.
-		return []string{"**/" + p}, ""
+		// No separator at all: the name matches at ANY depth. `**/p` matches a FILE
+		// named p (and `**/` matches zero segments, so the repo-root file too), but
+		// NOT the contents of a DIRECTORY named p — for that the subtree needs
+		// `**/p/**`. Emitting only `**/p` (the old behaviour) made `.github @sec` an
+		// ack-path that could never park, since nothing is a file literally named
+		// `.github`. Which the pattern means is answered by the tree, exactly as the
+		// anchored branch below does it; when the tree answers neither, BOTH are
+		// emitted (an over-broad ack parks more for a human; a too-narrow one lets a
+		// sensitive change land unattended).
+		return treeDirectedGlobs("**/"+p, "**/"+p+"/**", tree), ""
 	}
 	// Anchored. Whether it names a file or a directory is answered by the tree
 	// rather than guessed; when the tree answers neither (a path that does not
 	// exist yet — exactly when an ack matters most) BOTH are emitted, because
 	// an over-broad ack-paths parks more landings for a human while a too-narrow
 	// one lets a sensitive change land unattended.
+	return treeDirectedGlobs(p, p+"/**", tree), ""
+}
+
+// treeDirectedGlobs picks between a FILE glob and a DIRECTORY-subtree glob by
+// asking the tree which the pattern actually matches: the file glob alone if it
+// matches a file and no subtree, the subtree glob alone if the reverse, and BOTH
+// when the tree answers neither (the path does not exist at this rev — where an
+// over-broad ack is the safer error). Shared by the anchored and no-separator
+// CODEOWNERS branches so both consult the tree identically.
+func treeDirectedGlobs(fileGlob, dirGlob string, tree []string) []string {
 	file, dir := false, false
 	for _, t := range tree {
-		if !file && globMatch(p, t) {
+		if !file && globMatch(fileGlob, t) {
 			file = true
 		}
-		if !dir && globMatch(p+"/**", t) {
+		if !dir && globMatch(dirGlob, t) {
 			dir = true
 		}
 		if file && dir {
@@ -646,11 +737,11 @@ func codeownersGlobs(pattern string, tree []string) (globs []string, refuse stri
 	}
 	switch {
 	case file && !dir:
-		return []string{p}, ""
+		return []string{fileGlob}
 	case dir && !file:
-		return []string{p + "/**"}, ""
+		return []string{dirGlob}
 	default:
-		return []string{p, p + "/**"}, ""
+		return []string{fileGlob, dirGlob}
 	}
 }
 
@@ -731,15 +822,21 @@ func hasNodeTestScript(content string) bool {
 	return strings.TrimSpace(pkg.Scripts["test"]) != ""
 }
 
-// probeTool runs a bounded version probe. It reports only whether the tool can
-// be invoked at all on THIS machine; it never decides what the repo's bar is.
-func probeTool(ctx context.Context, argv []string) error {
+// probeTool runs a bounded version probe in dir. It reports only whether the
+// tool can be invoked at all on THIS machine; it never decides what the repo's
+// bar is. dir is set as the working directory so the probe describes the repo
+// under -repo rather than the invoker's cwd — and so a probe run for -repo PATH
+// is not silently describing somewhere else. The probes themselves are chosen to
+// never execute a module resolved FROM the repo (see toolchainRules' python
+// note); dir only fixes which directory an already-safe probe reports on.
+func probeTool(ctx context.Context, dir string, argv []string) error {
 	if len(argv) == 0 {
 		return errors.New("no probe")
 	}
 	ctx, cancel := context.WithTimeout(ctx, toolProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = dir
 	cmd.WaitDelay = 2 * time.Second // return promptly on cancel; see runAgent
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	return cmd.Run()
