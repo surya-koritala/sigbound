@@ -23,6 +23,18 @@
 // This file owns the durable half of that (intent-fired.json, due-ness); the
 // cycle that drives it is watchIntentCycle in watch.go.
 //
+// TRUST BOUNDARY, and it moved when `schedule` became live. An intent is read
+// from the working tree, and a scheduled one is FIRED by the daemon, so whoever
+// can write a `sig serve -watch -watch-agent` daemon's working tree can schedule
+// agent execution on that machine: an UNTRACKED intents/<id>.intent with a
+// `schedule` line is fired by the next due tick, with no commit, no review and
+// nobody choosing to run it. The converse is what makes this a boundary rather
+// than a hole: LANDING an intents/*.intent changes nothing, because a landing
+// moves the base ref and never touches the working tree — a committed intent
+// goes live only when someone checks it out into the daemon's tree. Treat write
+// access to a watching daemon's working tree as execute access on that machine
+// (docs/USAGE.md, Recurring intents).
+//
 // See docs/USAGE.md's Intents section.
 package main
 
@@ -284,11 +296,25 @@ type intentFired struct {
 	Intents map[string]intentFiredEntry `json:"intents"`
 }
 
-// intentFiredEntry is one intent's last fire. FiredAt is stamped when the run
-// slot is TAKEN, before any agent runs — see watchIntentCycle for why that end
-// of the run is the one that matters.
+// intentFiredEntry is one intent's last fire. Both fields are written by the
+// SAME atomic write, when the run slot is TAKEN and before any agent runs — see
+// watchIntentCycle for why that end of the run is the one that matters.
 type intentFiredEntry struct {
 	FiredAt time.Time `json:"firedAt"`
+	// Branches are the fire branches (agent/<intent>-<stamp>) this intent has
+	// produced that still exist. It is the DURABLE half of retirement: a watch
+	// cycle over arrivals is gated by the repo policy plus -watch-verify and NOT
+	// by any intent's `acceptance`, so a fire's own branch offered back as an
+	// ordinary arrival could land exactly the work the acceptance rejected.
+	// watchCollect excludes every name here, and because the name is written
+	// BEFORE the run starts, that holds across a lost seen-set and across a crash
+	// mid-run — neither of which the seen-set, a cache, could survive.
+	//
+	// Bounded, not a log: each fire drops the names that no longer resolve, and a
+	// fire that landed cleanly deletes its own branch (see retireIntentBranch),
+	// so this holds exactly the fire branches that still EXIST — a red fire's,
+	// and any a human or an ack kept — never one entry per fire forever.
+	Branches []string `json:"branches,omitempty"`
 }
 
 // readIntentFired reads the record. Every failure — missing, unreadable,
@@ -317,6 +343,19 @@ func readIntentFired(path string) intentFired {
 		}
 	}
 	return f
+}
+
+// fireBranches is every branch the record names, across all intents: the
+// branches scheduled fires produced that no fire has yet seen disappear. This is
+// what watchCollect refuses to adopt — see intentFiredEntry.Branches.
+func (f intentFired) fireBranches() map[string]bool {
+	out := map[string]bool{}
+	for _, e := range f.Intents {
+		for _, b := range e.Branches {
+			out[b] = true
+		}
+	}
+	return out
 }
 
 // writeIntentFired publishes the record atomically through atomicWriteFile
@@ -352,6 +391,27 @@ func intentFiredPathFor(ctx context.Context, repo string) string {
 	return filepath.Join(common, "sigbound", intentFiredFileName)
 }
 
+// intentFiredSkew is how far ahead of now a recorded fire may be and still be
+// believed. Clocks step (NTP, a VM resuming, a machine that booted with a bad
+// RTC), and a stamp a few minutes ahead is that; a stamp a year ahead is not a
+// fire, and believing it would wedge the schedule for a year.
+const intentFiredSkew = time.Hour
+
+// effectiveFiredAt is the last-fire time due-ness is actually judged against. A
+// stamp in the FUTURE beyond intentFiredSkew is not a time this daemon can have
+// fired at, so it reads as NEVER fired — which is the same fail-open direction
+// the whole record degrades in (see intentFired): the cost is one extra fire,
+// never a schedule that silently stopped. It is surfaced rather than swallowed:
+// `sig intent show` flags it and the watch loop emits watch_error
+// (at: intent-fired-future) on the tick that finds it, and the fire that follows
+// overwrites the stamp with a real one.
+func effectiveFiredAt(last, now time.Time) time.Time {
+	if last.After(now.Add(intentFiredSkew)) {
+		return time.Time{}
+	}
+	return last
+}
+
 // intentDue reports whether it wants to fire at now, given the last time it did
 // (zero = never). An intent with no schedule is never due.
 //
@@ -365,23 +425,35 @@ func intentDue(it intent, last, now time.Time) bool {
 	if it.Schedule <= 0 {
 		return false
 	}
+	last = effectiveFiredAt(last, now)
 	return last.IsZero() || !now.Before(last.Add(it.Schedule))
 }
 
-// dueIntent picks the intent to fire now from intents (already ordered priority
-// desc then id asc by listIntents), or false when none is due.
+// dueIntent picks the intent to fire now: the LEAST RECENTLY FIRED of the due
+// ones (a never-fired intent is the oldest there is), with ties keeping
+// listIntents' order — priority desc, then id asc. Rotation rather than fixed
+// priority order is what stops a short-scheduled or high-priority intent from
+// owning every tick a cell has: under priority order alone, an intent due on
+// every tick meant every lower one was permanently starved.
 //
 // ONE per call, deliberately: a run carries exactly one intent id for
 // attribution, one acceptance command in its verify battery, and one lane, so
-// batching two intents into a cycle would blur all three. The rest wait for the
-// next tick, which is at most one -watch-interval away.
+// batching two intents into a cycle would blur all three. The rest wait for a
+// later tick.
 func dueIntent(intents []intent, fired intentFired, now time.Time) (intent, bool) {
+	var pick intent
+	var pickAt time.Time
+	found := false
 	for _, it := range intents {
-		if intentDue(it, fired.Intents[it.ID].FiredAt, now) {
-			return it, true
+		last := effectiveFiredAt(fired.Intents[it.ID].FiredAt, now)
+		if !intentDue(it, last, now) {
+			continue
+		}
+		if !found || last.Before(pickAt) {
+			pick, pickAt, found = it, last, true
 		}
 	}
-	return intent{}, false
+	return pick, found
 }
 
 // intentJSON is the stable machine shape of `sig intent list`/`show`, and the
@@ -404,7 +476,12 @@ type intentJSON struct {
 	LastFired string `json:"lastFired,omitempty"`
 	NextDue   string `json:"nextDue,omitempty"`
 	Due       bool   `json:"due,omitempty"`
-	Issue     int    `json:"issue,omitempty"`
+	// FiredInFuture says the recorded last fire is far enough AHEAD of now that
+	// no daemon can have made it (see effectiveFiredAt), so it is being ignored
+	// and the intent reads as never fired. Reported because the alternative is an
+	// intent that says "next due" a year out and nobody knowing why.
+	FiredInFuture bool `json:"firedInFuture,omitempty"`
+	Issue         int  `json:"issue,omitempty"`
 }
 
 // intentReport renders one intent. last is when a cycle last fired it (zero =
@@ -418,6 +495,7 @@ func intentReport(it intent, last, now time.Time) intentJSON {
 	if it.Schedule > 0 {
 		out.Schedule = it.Schedule.String()
 		out.Due = intentDue(it, last, now)
+		out.FiredInFuture = !last.IsZero() && effectiveFiredAt(last, now).IsZero()
 		if !last.IsZero() {
 			out.LastFired = last.UTC().Format(time.RFC3339)
 			out.NextDue = last.Add(it.Schedule).UTC().Format(time.RFC3339)
@@ -576,7 +654,9 @@ func runIntentShow(w io.Writer, argv []string) (int, error) {
 		} else {
 			fmt.Fprintf(w, "last fired: %s\n", last.UTC().Format(time.RFC3339))
 			next := last.Add(it.Schedule)
-			if intentDue(it, last, now) {
+			if effectiveFiredAt(last, now).IsZero() {
+				fmt.Fprintf(w, "next due:   now (last fired is in the FUTURE: no daemon can have fired then, so it is IGNORED and this intent is due)\n")
+			} else if intentDue(it, last, now) {
 				fmt.Fprintf(w, "next due:   now (was due %s)\n", next.UTC().Format(time.RFC3339))
 			} else {
 				fmt.Fprintf(w, "next due:   %s\n", next.UTC().Format(time.RFC3339))
@@ -656,8 +736,12 @@ func intentTemplatePath(repo, name string) string {
 // O_EXCL, so an instantiation never overwrites an intent — including a
 // hand-edited one that happens to share the id.
 func newIntentFromTemplate(repo, name, id string) (string, error) {
-	if !slugSafe(id) {
-		return "", fmt.Errorf("intent id %q is not a safe name (allowed: A-Za-z0-9._-, not . or ..): it becomes a task id and a branch component", id)
+	// refComponentSafe, not just slugSafe: creation is the friendly place to
+	// refuse an id git will not accept as a branch. An id like "a..b" parses,
+	// lists and shows perfectly well and then fails at worktree add — for a
+	// SCHEDULED intent, once per window, unattended (see watchIntentCycle).
+	if !refComponentSafe(id) {
+		return "", fmt.Errorf("intent id %q cannot be a git branch component (allowed: A-Za-z0-9._-, no \"..\", no leading \".\" or \"-\", no trailing \".\" or \".lock\"): it becomes the branch agent/%s", id, id)
 	}
 	if !slugSafe(name) {
 		return "", fmt.Errorf("template name %q is not a safe name (allowed: A-Za-z0-9._-, not . or ..)", name)

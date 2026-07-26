@@ -315,6 +315,26 @@ func slugSafe(s string) bool {
 	return true
 }
 
+// refComponentSafe reports whether s is safe as a git branch component, which is
+// STRICTER than slugSafe: slugSafe's alphabet keeps out everything git rejects by
+// character (space, ~, ^, :, ?, *, [, \, @{), but git also rejects a component
+// that contains "..", starts or ends with ".", or ends with ".lock" — so an id
+// like "..." or "a..b" is slug-safe and still cannot be a branch. A leading "-"
+// is refused too: it is a legal ref, but every branch name this binary passes to
+// git goes as an argv word, where a leading dash is a flag.
+//
+// It is deliberately a static check rather than a `git check-ref-format` call:
+// the rules above are the whole of what survives slugSafe's alphabet, and a
+// validator that shells out cannot be used where this is (a fire's pre-check, a
+// CLI argument check) without making both depend on a subprocess.
+func refComponentSafe(s string) bool {
+	return slugSafe(s) &&
+		!strings.Contains(s, "..") &&
+		!strings.HasPrefix(s, ".") && !strings.HasSuffix(s, ".") &&
+		!strings.HasSuffix(s, ".lock") &&
+		!strings.HasPrefix(s, "-")
+}
+
 // DefaultPlanPrompt is the conflict-avoidance prompt wrapper CommandPlanner hands
 // the model: split the goal into N INDEPENDENT tasks touching DISJOINT files so
 // the resulting agents integrate cleanly, each task naming the files it owns, and

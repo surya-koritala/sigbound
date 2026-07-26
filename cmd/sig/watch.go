@@ -24,17 +24,23 @@
 // IDEMPOTENCE. watch-seen.json (per cell, alongside the run journal) maps
 // branch -> the SHA this daemon last reached a decision about, so an unchanged
 // branch is never processed twice and a re-pushed one (new SHA) always
-// re-qualifies. It is a CACHE, not a ledger: losing or corrupting it costs a
-// re-examination, never a wrong landing.
+// re-qualifies. It is a CACHE, not a ledger: losing or corrupting it costs
+// re-examination — a reset backoff count, a landing parked a second time — and
+// never a landing under a bar that did not judge it. That holds because nothing
+// UNSAFE to re-examine is kept here: a scheduled fire's own branch, the one kind
+// of branch an ordinary cycle must never adopt, is excluded durably from
+// intent-fired.json instead (see intentFiredEntry.Branches).
 //
 // STARVATION. A branch whose cycle keeps failing to land it is retried, and
 // after -watch-max-red consecutive such cycles it is excluded and raised as a
 // red-branch inbox entry for a human. A re-push clears the count.
 //
 // SCHEDULED INTENTS (issue #113). The same tick is also the heartbeat for an
-// intent's `schedule`: before looking at arrivals, a due tick asks which of the
-// repo's intents are due and fires one as an ordinary run (see
-// watchIntentCycle). There is no second scheduler and no timer per intent.
+// intent's `schedule`: a due tick asks which of the repo's intents are due and
+// fires one as an ordinary run (see watchIntentCycle). There is no second
+// scheduler and no timer per intent. Intents get the tick FIRST but not EVERY
+// tick — a due tick that follows one that fired goes to arrivals — so neither
+// side can starve the other however short the schedules are; see watchCycle.
 package main
 
 import (
@@ -215,19 +221,24 @@ type watchArrival struct {
 // that QUALIFY for a cycle at baseSHA and the seen-set updates that classifying
 // them produced (retiring an already-landed branch, marking one stale). Those
 // updates are returned rather than applied so the caller persists exactly once.
+// The third return is every branch name that EXISTS right now, which is what
+// lets the caller drop seen-set entries for branches that are gone (nil when the
+// enumeration itself failed, so a git error prunes nothing).
 //
-// A branch qualifies when its head differs from what the seen-set decided about
-// (a first sighting, or a re-push), it is not excluded by backoff, and it can
-// actually be integrated onto baseSHA. An ancestry check that ERRORS leaves the
-// branch alone entirely — unrecorded and un-offered — so a transient git failure
-// neither retires a branch nor feeds it to a run.
-func watchCollect(ctx context.Context, g *gitx.Git, seen watchSeen, baseSHA string, queued []string, cfg watchConfig, ev *eventEmitter, cellID string) (pending []watchArrival, updates map[string]watchSeenEntry) {
+// A branch qualifies when it is not a scheduled fire's own branch, its head
+// differs from what the seen-set decided about (a first sighting, or a re-push),
+// it is not excluded by backoff, and it can actually be integrated onto baseSHA.
+// An ancestry check that ERRORS leaves the branch alone entirely — unrecorded
+// and un-offered — so a transient git failure neither retires a branch nor feeds
+// it to a run.
+func watchCollect(ctx context.Context, g *gitx.Git, seen watchSeen, baseSHA string, queued []string, cfg watchConfig, ev *eventEmitter, cellID string, fired intentFired) (pending []watchArrival, updates map[string]watchSeenEntry, live map[string]bool) {
 	updates = map[string]watchSeenEntry{}
 	refs, err := g.ForEachRefCommit(ctx, strings.Split(watchRefPrefixes, ",")...)
 	if err != nil {
 		ev.emit("watch_error", map[string]any{"cell": cellID, "at": "list-refs", "error": err.Error()})
-		return nil, updates
+		return nil, updates, nil
 	}
+	fireBranches := fired.fireBranches()
 	arrivals := make([]watchArrival, 0, len(refs)+len(queued))
 	for _, r := range refs {
 		arrivals = append(arrivals, watchArrival{Branch: r.Name, SHA: r.SHA})
@@ -250,6 +261,16 @@ func watchCollect(ctx context.Context, g *gitx.Git, seen watchSeen, baseSHA stri
 			continue
 		}
 		seenBranch[a.Branch] = true
+		if fireBranches[a.Branch] {
+			// A scheduled fire's own branch (issue #113), named durably by the fire
+			// that created it BEFORE that run started. It was judged by that
+			// intent's `acceptance`; a cycle's bar is the repo policy plus
+			// -watch-verify and does NOT include the acceptance, so adopting it
+			// here could land exactly the work the acceptance rejected. Skipped
+			// before the ancestry check, and skipped whatever the seen-set says —
+			// the seen-set is a cache, and this exclusion has to survive losing it.
+			continue
+		}
 		if e, ok := seen.Branches[a.Branch]; ok && e.SHA == a.SHA {
 			if e.Done || e.Stale || (cfg.maxRed > 0 && e.Red >= cfg.maxRed) {
 				continue
@@ -276,7 +297,7 @@ func watchCollect(ctx context.Context, g *gitx.Git, seen watchSeen, baseSHA stri
 			pending = append(pending, a)
 		}
 	}
-	return pending, updates
+	return pending, updates, seenBranch
 }
 
 // ---- the cycle ----
@@ -291,14 +312,27 @@ func watchCollect(ctx context.Context, g *gitx.Git, seen watchSeen, baseSHA stri
 func (s *server) watchCycle(ctx context.Context, rc *registeredCell, cfg watchConfig, due bool) bool {
 	cellID := rc.cell.ID()
 	g := rc.cell.Git()
-	// Scheduled intents (issue #113) get the tick FIRST. An intent has a
-	// deadline and an arrival does not: a branch that waits one more tick is
-	// merely later, while a schedule that keeps losing the cell to a busy arrival
-	// stream is a schedule that does not work. Only on a DUE tick, so the check
-	// runs once per -watch-interval however fast a batch trigger is polling —
-	// which is also the resolution a `schedule` is honored to.
-	if due && s.watchIntentCycle(ctx, rc, cfg) {
-		return true
+	// Scheduled intents (issue #113) get the tick FIRST, but not EVERY tick.
+	//
+	// First, because an intent has a deadline and an arrival does not: a branch
+	// that waits one more tick is merely later, while a schedule that keeps
+	// losing the cell to a busy arrival stream is a schedule that does not work.
+	// Only on a DUE tick, so the check runs once per -watch-interval however fast
+	// a batch trigger is polling.
+	//
+	// Not every tick, because "first" alone is starvation with extra steps in the
+	// other direction: an intent scheduled at or under the interval — or a fire
+	// that simply runs longer than one — is due again on every tick, and a cycle
+	// that returns as soon as it fires would then never classify an arrival at
+	// all. So a due tick that FOLLOWS a tick that fired goes to arrivals, which
+	// bounds each side's wait at two due ticks and makes a `schedule` honored to
+	// within two -watch-intervals rather than one.
+	if due {
+		fired := s.intentTurn(cellID) && s.watchIntentCycle(ctx, rc, cfg)
+		s.noteIntentFire(cellID, fired)
+		if fired {
+			return true
+		}
 	}
 	seenPath := rc.watchSeenPath()
 	seen := readWatchSeen(seenPath)
@@ -308,11 +342,23 @@ func (s *server) watchCycle(ctx context.Context, rc *registeredCell, cfg watchCo
 		s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "resolve-base", "base": cfg.base, "error": err.Error()})
 		return false
 	}
-	pending, updates := watchCollect(ctx, g, seen, baseSHA, s.queuedBranches(cellID), cfg, s.watchEvents, cellID)
-	if len(updates) > 0 {
-		for b, e := range updates {
-			seen.Branches[b] = e
+	pending, updates, live := watchCollect(ctx, g, seen, baseSHA, s.queuedBranches(cellID), cfg, s.watchEvents, cellID, readIntentFired(rc.intentFiredPath()))
+	changed := len(updates) > 0
+	for b, e := range updates {
+		seen.Branches[b] = e
+	}
+	// An entry for a branch that no longer exists can never match a head again,
+	// so it would sit in the file forever: every fire, every deleted branch and
+	// every retired arrival would be permanent growth. live is exactly what the
+	// enumeration above saw, and is nil when that enumeration failed — a git
+	// error must not read as "every branch is gone".
+	for b := range seen.Branches {
+		if live != nil && !live[b] {
+			delete(seen.Branches, b)
+			changed = true
 		}
+	}
+	if changed {
 		writeWatchSeen(seenPath, seen)
 	}
 	if len(pending) == 0 {
@@ -408,9 +454,18 @@ func (rc *registeredCell) intentFiredPath() string {
 // ordering is also why a crash mid-run does not re-fire on restart — the record
 // is written when the work STARTS. The limit, stated because it is real: the run
 // slot is per-PROCESS, so this holds within one daemon, exactly as the per-cell
-// busy lock does. Two daemons watching one repo is outside this design.
+// busy lock does. Two daemons watching one repo is outside this design (which is
+// why newServer refuses two cells over one git directory).
+//
+// THE SAME WRITE NAMES THE BRANCH. The stamp carries agent/<task id>, the branch
+// this fire is about to create, because that is the only moment at which the
+// name is known AND nothing has run yet: watchCollect refuses to adopt a branch
+// the record names, so a fire that crashes, or whose seen-set is later lost,
+// still cannot have its work re-judged under the cycle's bar instead of the
+// intent's acceptance.
 func (s *server) watchIntentCycle(ctx context.Context, rc *registeredCell, cfg watchConfig) bool {
 	cellID := rc.cell.ID()
+	g := rc.cell.Git()
 	// The working tree, like every other intent read (see intent.go): an intent
 	// is input, not a gate. A malformed intents/ dir is reported and skipped —
 	// the daemon is not the validator of files it does not own, and `sig intent
@@ -420,12 +475,37 @@ func (s *server) watchIntentCycle(ctx context.Context, rc *registeredCell, cfg w
 		s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "intents", "error": err.Error()})
 		return false
 	}
+	// An id that cannot be a branch component is an intent that can never fire:
+	// the stamp would be written and the worktree add would then fail, so `sig
+	// intent show` would claim it fired while nothing ever ran. Refused BEFORE
+	// anything is recorded, and taken out of the running entirely rather than
+	// merely skipped — an intent that is permanently due would otherwise starve
+	// every intent behind it (see dueIntent).
+	fireable := make([]intent, 0, len(intents))
+	for _, it := range intents {
+		if it.Schedule > 0 && !refComponentSafe(it.ID) {
+			s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "intent-id", "intent": it.ID,
+				"error": fmt.Sprintf("this intent has a schedule but its id cannot be a git branch component (a fire runs on agent/%s-<stamp>): rename %s", it.ID, intentPath(rc.cell.Repo(), it.ID))})
+			continue
+		}
+		fireable = append(fireable, it)
+	}
 	firedPath := rc.intentFiredPath()
 	fired := readIntentFired(firedPath)
 	now := time.Now()
-	it, ok := dueIntent(intents, fired, now)
+	it, ok := dueIntent(fireable, fired, now)
 	if !ok {
 		return false
+	}
+	// A last-fire in the future is not a fire (see effectiveFiredAt): it is
+	// treated as never-fired, which is the documented fail-open direction, and
+	// said out loud here because the alternative is a schedule that appears to
+	// have stopped. The fire below overwrites the stamp with a real one, so this
+	// is not a per-tick alarm.
+	if last := fired.Intents[it.ID].FiredAt; !last.IsZero() && effectiveFiredAt(last, now).IsZero() {
+		s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "intent-fired-future", "intent": it.ID,
+			"error": fmt.Sprintf("last fire recorded at %s, which is ahead of now (%s): ignoring it and firing, and this fire re-stamps the record",
+				last.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))})
 	}
 	if strings.TrimSpace(cfg.agent) == "" {
 		s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "intent-agent", "intent": it.ID,
@@ -456,48 +536,92 @@ func (s *server) watchIntentCycle(ctx context.Context, rc *registeredCell, cfg w
 		s.watchEvents.emit("watch_skip", map[string]any{"cell": cellID, "intent": it.ID, "reason": err.Error()})
 		return false
 	}
-	// Recorded the instant the slot is taken, before any agent runs. A write
-	// failure here is loud: the fire happened, and a fire this daemon could not
-	// record is one the next tick will repeat.
-	fired.Intents[it.ID] = intentFiredEntry{FiredAt: now}
+	// Recorded the instant the slot is taken, before any agent runs — the stamp
+	// AND the branch this fire will produce, in one atomic write, because the
+	// exclusion is worthless if it can be missing while the branch exists. A
+	// write failure here is loud: the fire happened, and a fire this daemon could
+	// not record is one the next tick will repeat with nothing keeping this run's
+	// branch out of an ordinary cycle.
+	branch := "agent/" + tasks[0].ID
+	fired.Intents[it.ID] = intentFiredEntry{FiredAt: now, Branches: append(liveBranches(ctx, g, fired.Intents[it.ID].Branches), branch)}
 	if werr := writeIntentFired(firedPath, fired); werr != nil {
 		s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "intent-fired", "intent": it.ID,
-			"error": fmt.Sprintf("%s: %v (this fire may repeat on the next tick)", firedPath, werr)})
+			"error": fmt.Sprintf("%s: %v (this fire may repeat on the next tick, and %s is not excluded from an ordinary cycle)", firedPath, werr, branch)})
 	}
 	s.watchEvents.emit("watch_intent", map[string]any{
 		"cell": cellID, "runId": rec.id, "intent": it.ID, "schedule": it.Schedule.String(), "task": tasks[0].ID,
 	})
 	s.execRun(rec, p, tasks, planSpec{}, false)
-	s.retireIntentBranch(ctx, rc, tasks[0].ID)
+	s.retireIntentBranch(ctx, rc, rec, branch)
 	// No backoff and no retry: a fire that failed to land is an ordinary red run,
 	// its report and inbox entry say so, and the intent tries again at its next
 	// window. The schedule IS the retry cadence.
 	return true
 }
 
-// retireIntentBranch records the branch a fire produced as DECIDED in the cell's
-// seen-set, whatever the fire decided (landed, parked, or red).
+// liveBranches drops the names that no longer resolve. It is what keeps the
+// fired record's branch list bounded rather than a log of every fire this repo
+// has ever had: a landed fire deletes its own branch (see retireIntentBranch),
+// so the next fire forgets it, and what survives is exactly the fire branches
+// still on disk — the red ones, and any a human or `sig gc` has not swept.
 //
-// This is not bookkeeping, it is the acceptance rule holding past the run: a
-// cycle over arrivals is gated by the repo policy plus -watch-verify and NOT by
-// any intent's `acceptance`, so a leftover agent/* branch offered back to an
-// ordinary cycle could land exactly the work the intent's own bar rejected.
-// Marking it decided is what keeps the intent's bar the only bar its work is
-// ever judged against.
-//
-// Nothing is deleted — the branch stays on disk for whoever wants to look at it,
-// and `sig gc` sweeps it like any other agent branch. Two limits, both stated
-// because they are real: the seen-set is a CACHE (see readWatchSeen), so losing
-// it does re-offer such a branch as an ordinary arrival, to be judged by the
-// cycle bar alone; and a branch the agent never created has nothing to record,
-// which is the RevParse failure below.
-func (s *server) retireIntentBranch(ctx context.Context, rc *registeredCell, taskID string) {
-	branch := "agent/" + taskID
-	// WithoutCancel: a shutdown that cut the fire short must still leave this
-	// record, or the drain reopens exactly the hole above on the next start.
-	sha, err := rc.cell.Git().RevParse(context.WithoutCancel(ctx), branch)
+// It prunes off ONE enumeration of the watched namespaces rather than a probe
+// per name, because the two failure directions are not equal: keeping a name
+// that is gone excludes a branch that does not exist (harmless), while dropping
+// a name that is NOT gone offers a red fire's work back to an ordinary cycle. A
+// per-name rev-parse cannot tell "no such branch" from a cancelled context or a
+// transient git failure; an enumeration that fails is one answer for all of
+// them, and that answer is "keep everything".
+func liveBranches(ctx context.Context, g *gitx.Git, branches []string) []string {
+	if len(branches) == 0 {
+		return nil
+	}
+	refs, err := g.ForEachRefCommit(ctx, strings.Split(watchRefPrefixes, ",")...)
 	if err != nil {
-		return
+		return branches
+	}
+	live := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		live[r.Name] = true
+	}
+	var out []string
+	for _, b := range branches {
+		if live[b] {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// retireIntentBranch closes out the branch a fire produced. The part that
+// MATTERS already happened before the run started — the branch is named in
+// intent-fired.json, which watchCollect refuses to adopt — so this is only the
+// two things that can be decided once the run is over:
+//
+//   - A fire that LANDED cleanly has its branch deleted, the same way the run
+//     that landed it makes it redundant: its content is the base now. That is
+//     also what bounds the fired record, since the next fire drops names that no
+//     longer resolve. A fire that did NOT land keeps its branch — work is never
+//     destroyed here, and `sig gc` is the one thing that sweeps refs.
+//   - Anything else is recorded Done in the seen-set: a cache on top of the
+//     durable exclusion, so an ordinary cycle does not spend an ancestry check
+//     per tick on a branch it will refuse anyway.
+func (s *server) retireIntentBranch(ctx context.Context, rc *registeredCell, rec *runRecord, branch string) {
+	// WithoutCancel: a shutdown that cut the fire short must still get here — the
+	// durable record already holds, but leaving the branch AND a stale seen entry
+	// behind on every drain is growth nothing later cleans up.
+	ctx = context.WithoutCancel(ctx)
+	if rep, err := readRunReport(rec.dir); err == nil && landed(rep) && hasString(rep.Integrate.Landed, branch) {
+		if err := rc.cell.DeleteBranch(ctx, branch); err == nil {
+			return
+		}
+		// A delete that failed is not an error worth failing a fire over: the
+		// branch is still excluded durably, and the seen entry below is written as
+		// if it had not been attempted.
+	}
+	sha, err := rc.cell.Git().RevParse(ctx, branch)
+	if err != nil {
+		return // the agent created no branch: nothing to record
 	}
 	seenPath := rc.watchSeenPath()
 	seen := readWatchSeen(seenPath)
@@ -650,10 +774,32 @@ func (s *server) watchLoop(ctx context.Context, rc *registeredCell, cfg watchCon
 		if ctx.Err() != nil {
 			return
 		}
-		if s.watchCycle(ctx, rc, cfg, time.Since(last) >= cfg.interval) {
-			last = time.Now()
-		}
+		last = s.watchStep(ctx, rc, cfg, last)
 	}
+}
+
+// watchStep is one poll: it decides whether this poll is DUE (a -watch-interval
+// has elapsed since the last due one), drives the cycle, and returns the time
+// the next poll measures against.
+//
+// The reset depends on DUE-NESS ALONE, never on what the cycle did. A due poll
+// that found nothing pending has still spent this interval, and treating it as
+// if the clock had never started is what made "once per -watch-interval however
+// fast a batch trigger is polling" false: after one such poll, every
+// watchPollInterval poll was due, so an intent's schedule was checked 30x more
+// often than the interval says and a red branch's backoff was counted in polls.
+// A non-due (batch-triggered) cycle deliberately does NOT reset it — an early
+// batch is extra work, not a replacement for the interval's own cycle.
+//
+// Split out of watchLoop because a cadence is exactly the thing a test must be
+// able to drive without waiting for one: the caller owns `last`.
+func (s *server) watchStep(ctx context.Context, rc *registeredCell, cfg watchConfig, last time.Time) time.Time {
+	due := time.Since(last) >= cfg.interval
+	s.watchCycle(ctx, rc, cfg, due)
+	if due {
+		return time.Now()
+	}
+	return last
 }
 
 // startWatch launches one loop per registered cell, resolving each cell's
@@ -751,6 +897,23 @@ func resolveWatchConfig(ctx context.Context, g *gitx.Git, cfg watchConfig, expli
 type queueRequest struct {
 	Cell     string   `json:"cell"`
 	Branches []string `json:"branches"`
+}
+
+// intentTurn reports whether this due tick may look at intents at all: it may
+// unless the PREVIOUS due tick fired one. noteIntentFire records the answer.
+// Together they are the whole of the bounded fairness watchCycle documents —
+// one bool per cell, so it is deterministic (no clock, no counter to skew) and a
+// test can drive it by driving ticks.
+func (s *server) intentTurn(cellID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.intentTick[cellID]
+}
+
+func (s *server) noteIntentFire(cellID string, fired bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.intentTick[cellID] = fired
 }
 
 // queuedBranches drains nothing — it returns a snapshot of what is enqueued for

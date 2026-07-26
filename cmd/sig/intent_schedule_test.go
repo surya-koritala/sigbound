@@ -132,11 +132,15 @@ func (f *watchFixture) firedRecord() intentFired {
 }
 
 // setFired backdates an intent's last fire, which is how a test reaches a state
-// that would otherwise need a real day to arrive at.
+// that would otherwise need a real day to arrive at. It touches the TIME only:
+// the branches the entry records are the fire's own bookkeeping, and a helper
+// that quietly cleared them would hide exactly what the tests below check.
 func (f *watchFixture) setFired(id string, at time.Time) {
 	f.t.Helper()
 	rec := f.firedRecord()
-	rec.Intents[id] = intentFiredEntry{FiredAt: at}
+	e := rec.Intents[id]
+	e.FiredAt = at
+	rec.Intents[id] = e
 	if err := writeIntentFired(f.rc.intentFiredPath(), rec); err != nil {
 		f.t.Fatal(err)
 	}
@@ -387,12 +391,20 @@ func TestWatchScheduledIntentAcceptanceGatesTheLanding(t *testing.T) {
 	if fired.IsZero() {
 		t.Fatal("a red fire must still be recorded, or it repeats every tick")
 	}
-	// The branch it left behind is recorded as decided, so no later tick lands it
-	// under a bar that does not include the acceptance — and the intent does not
-	// fire again inside its window either.
+	// The branch it left behind is retired, so no later tick lands it under a bar
+	// that does not include the acceptance — durably in the fired record (which is
+	// what survives losing the seen-set: see TestWatchRedFireDoesNotLandAfterSeenSetLoss)
+	// and as a cache in the seen-set. And the intent does not fire again inside its
+	// window either. The branch itself SURVIVES: its work never landed.
 	branch := "agent/" + rep.Tasks[0].ID
+	if got := f.firedRecord().Intents["deps-current"].Branches; len(got) != 1 || got[0] != branch {
+		t.Fatalf("fired record branches = %v, want [%s] recorded by the fire itself", got, branch)
+	}
 	if e := f.seen().Branches[branch]; !e.Done {
 		t.Fatalf("seen[%s] = %+v, want it decided by the fire that produced it", branch, e)
+	}
+	if _, err := f.g.RevParse(context.Background(), branch); err != nil {
+		t.Fatalf("a red fire's branch was deleted (%v): nothing here may destroy work that did not land", err)
 	}
 	for i := 0; i < 2; i++ {
 		if f.cycle() {
@@ -472,6 +484,420 @@ func TestWatchUnscheduledIntentNeverFires(t *testing.T) {
 	}
 	if n := len(f.runDirs()); n != 0 {
 		t.Fatalf("%d runs for an unscheduled intent, want 0", n)
+	}
+}
+
+// ---- fire retirement is durable, not cached ----
+
+// TestWatchRedFireDoesNotLandAfterSeenSetLoss is the safety statement the whole
+// acceptance rule rests on. A red fire's branch is adoptable work that one bar
+// REJECTED; a cycle's bar is the repo policy plus -watch-verify and does not
+// include that acceptance. So if the only thing keeping that branch out of a
+// cycle were the seen-set — a documented CACHE that degrades to empty on any
+// read failure — then deleting or corrupting one file would land exactly the
+// work the acceptance rejected. The exclusion is therefore recorded in
+// intent-fired.json by the fire itself, and this pins that losing the cache
+// changes nothing about what lands.
+func TestWatchRedFireDoesNotLandAfterSeenSetLoss(t *testing.T) {
+	requirePOSIXShell(t)
+	ctx := context.Background()
+	f := newWatchFixture(t, "true") // the CYCLE bar: green on anything
+	f.scheduleIntent("deps-current", "goal = update dependencies\nacceptance = false\nschedule = 24h\n")
+	f.cfg.agent = scheduledAgent
+	base0 := f.mainSHA()
+
+	if !f.cycle() {
+		t.Fatal("the intent did not fire")
+	}
+	rep := f.lastReport()
+	branch := "agent/" + rep.Tasks[0].ID
+	if len(rep.Integrate.Landed) == 0 {
+		t.Fatal("the agent's work never folded, so this proves nothing about the gate")
+	}
+	if f.mainSHA() != base0 {
+		t.Fatal("the base moved past a red acceptance")
+	}
+	if _, err := f.g.RevParse(ctx, branch); err != nil {
+		t.Fatalf("the red fire left no branch to re-offer (%v): the attack this guards has no target", err)
+	}
+	runsAfterFire := len(f.runDirs())
+
+	for _, loss := range []struct {
+		name  string
+		write func(path string)
+	}{
+		{"deleted", func(p string) { os.Remove(p) }},                                    //nolint:errcheck // the point is that it is gone
+		{"corrupt", func(p string) { os.WriteFile(p, []byte("\x00 not json"), 0o644) }}, //nolint:errcheck // best-effort
+		{"wrong shape", func(p string) { os.WriteFile(p, []byte(`[1,2,3]`), 0o644) }},   //nolint:errcheck // best-effort
+		{"empty object", func(p string) { os.WriteFile(p, []byte(`{}`), 0o644) }},       //nolint:errcheck // best-effort
+	} {
+		t.Run(loss.name, func(t *testing.T) {
+			loss.write(f.rc.watchSeenPath())
+			// The intent is inside its window, so this tick has no fire to make: what
+			// happens next is the ORDINARY arrival path meeting the fire's branch.
+			if f.cycle() {
+				t.Error("a cycle ran over the branch a red fire left behind")
+			}
+			if f.mainSHA() != base0 {
+				t.Fatalf("the base moved to %s: work the intent's acceptance rejected landed under the cycle's bar",
+					short(f.mainSHA()))
+			}
+			if n := len(f.runDirs()); n != runsAfterFire {
+				t.Fatalf("runs = %d, want %d: no run may be driven over a fire's own branch", n, runsAfterFire)
+			}
+		})
+	}
+}
+
+// TestWatchFireBranchExcludedAfterACrashMidRun covers the window the seen-set
+// could never have covered at all: the fire's branch exists, the run never
+// finished, so nothing was ever written about it AFTER the run. The record
+// written BEFORE the run is what holds — and the negative control (the same
+// branch, the same seen-set, the record simply not naming it) proves that record
+// is what stopped the landing rather than some other property of the branch.
+func TestWatchFireBranchExcludedAfterACrashMidRun(t *testing.T) {
+	requirePOSIXShell(t)
+	f := newWatchFixture(t, "true")
+	f.scheduleIntent("deps-current", "goal = update dependencies\nschedule = 24h\n")
+	f.cfg.agent = scheduledAgent
+
+	// Exactly what a daemon killed mid-fire leaves on disk.
+	branch := "agent/deps-current-20260726T000000Z-4f2a"
+	f.arrive(branch, "half-done.txt", "the agent got this far\n")
+	firedAt := time.Now()
+	if err := writeIntentFired(f.rc.intentFiredPath(), intentFired{Intents: map[string]intentFiredEntry{
+		"deps-current": {FiredAt: firedAt, Branches: []string{branch}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := readWatchSeen(f.rc.watchSeenPath()).Branches; len(got) != 0 {
+		t.Fatalf("seen-set = %+v, want the empty set a run that never finished leaves", got)
+	}
+	base0 := f.mainSHA()
+
+	if f.cycle() {
+		t.Error("a cycle adopted the branch of a fire that never finished")
+	}
+	if f.mainSHA() != base0 {
+		t.Fatal("the base moved: a crashed fire's work landed without its intent's acceptance ever passing")
+	}
+
+	// Negative control: drop the branch from the record and it is an ordinary
+	// arrival again, which lands. The exclusion is the only difference.
+	if err := writeIntentFired(f.rc.intentFiredPath(), intentFired{Intents: map[string]intentFiredEntry{
+		"deps-current": {FiredAt: firedAt},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if !f.cycle() {
+		t.Fatal("with the branch un-recorded it must be an ordinary arrival")
+	}
+	if f.mainSHA() == base0 {
+		t.Fatal("the control did not land, so the case above proves nothing")
+	}
+}
+
+// TestWatchLandedFireBranchIsDeleted: a fire that landed cleanly deletes its own
+// branch, which is what keeps both the fired record and the ref namespace from
+// growing by one entry per fire forever. A fire that did NOT land keeps its
+// branch and its record entry — that work exists nowhere else.
+func TestWatchLandedFireBranchIsDeleted(t *testing.T) {
+	requirePOSIXShell(t)
+	ctx := context.Background()
+	f := newWatchFixture(t, "true")
+	f.scheduleIntent("deps-current", "goal = update dependencies\nschedule = 24h\n")
+	f.cfg.agent = scheduledAgent
+
+	var branches []string
+	for i := 0; i < 10 && f.ev.countEvent("watch_intent") < 3; i++ {
+		f.setFired("deps-current", time.Now().Add(-48*time.Hour)) // due again
+		if f.cycle() {
+			branches = append(branches, "agent/"+f.lastReport().Tasks[0].ID)
+		}
+	}
+	if n := len(branches); n != 3 {
+		t.Fatalf("%d fires landed, want 3", n)
+	}
+	for _, b := range branches {
+		if _, err := f.g.RevParse(ctx, b); err == nil {
+			t.Fatalf("%s still exists: a landed fire's branch is redundant with the base and must not accumulate", b)
+		}
+	}
+	// The record names only the newest fire, and stops naming even that one as
+	// soon as a later fire notices it is gone.
+	if got := f.firedRecord().Intents["deps-current"].Branches; len(got) != 1 || got[0] != branches[2] {
+		t.Fatalf("fired record branches = %v after 3 landed fires, want only the newest (%s)", got, branches[2])
+	}
+	if got := f.seen().Branches; len(got) != 0 {
+		t.Fatalf("seen-set = %+v after 3 landed fires, want no entries for branches that no longer exist", got)
+	}
+}
+
+// ---- fairness: intents get the tick first, never every tick ----
+
+// TestWatchScheduledIntentDoesNotStarveArrivals is the bound. An intent
+// scheduled at or under the interval (or a fire that outlasts one) is due on
+// EVERY tick, so a cycle that returned as soon as it fired would never classify
+// an arrival again — the branch stream would simply stop being watched.
+func TestWatchScheduledIntentDoesNotStarveArrivals(t *testing.T) {
+	requirePOSIXShell(t)
+	f := newWatchFixture(t, "true")
+	f.scheduleIntent("always", "goal = keep the cell busy\nschedule = 1ns\n") // due on every tick
+	f.cfg.agent = scheduledAgent
+
+	if !f.cycle() {
+		t.Fatal("the due intent did not fire on the first tick")
+	}
+	// The arrival forks from the base that fire just landed, the way a real one
+	// pushed after a landing does.
+	f.arrive("agent/real", "real.txt", "arrived\n")
+
+	if !f.cycle() {
+		t.Fatal("the tick after a fire did not run a cycle over arrivals: a perpetually-due intent owns the loop")
+	}
+	rep := f.lastReport()
+	if len(rep.Integrate.Landed) != 1 || rep.Integrate.Landed[0] != "agent/real" {
+		t.Fatalf("second due tick landed %v, want the arrival", rep.Integrate.Landed)
+	}
+	if e := f.seen().Branches["agent/real"]; !e.Done {
+		t.Fatalf("seen[agent/real] = %+v: the arrival was never classified", e)
+	}
+	if n := f.ev.countEvent("watch_intent"); n != 1 {
+		t.Fatalf("watch_intent events = %d after two ticks, want 1: the arrivals tick fired an intent too", n)
+	}
+	// The alternation is not one-sided: the intent gets the tick after that.
+	if !f.cycle() {
+		t.Fatal("the intent never got another tick")
+	}
+	if n := f.ev.countEvent("watch_intent"); n != 2 {
+		t.Fatalf("watch_intent events = %d, want 2: arrivals now own the loop instead", n)
+	}
+}
+
+// TestDueIntentRotatesLeastRecentlyFiredFirst: with several intents due at once,
+// the one that has waited longest goes first. Fixed priority order starved
+// everything behind a short-scheduled leader.
+func TestDueIntentRotatesLeastRecentlyFiredFirst(t *testing.T) {
+	now := time.Now()
+	intents := []intent{ // listIntents order: priority desc, then id asc
+		{ID: "high", Goal: "g", Schedule: time.Hour, Priority: 9},
+		{ID: "low", Goal: "g", Schedule: time.Hour},
+	}
+	fired := intentFired{Intents: map[string]intentFiredEntry{
+		"high": {FiredAt: now.Add(-2 * time.Hour)},
+		"low":  {FiredAt: now.Add(-10 * time.Hour)},
+	}}
+	if got, ok := dueIntent(intents, fired, now); !ok || got.ID != "low" {
+		t.Fatalf("dueIntent = %q, %v; want the intent that has waited longest", got.ID, ok)
+	}
+	// Firing re-bases its window, so the other is now the oldest.
+	fired.Intents["low"] = intentFiredEntry{FiredAt: now}
+	if got, ok := dueIntent(intents, fired, now); !ok || got.ID != "high" {
+		t.Fatalf("dueIntent = %q, %v; want high", got.ID, ok)
+	}
+}
+
+// ---- the due gate ----
+
+// TestWatchNonDueTickNeverFiresAnIntent pins the `due` gate itself. A non-due
+// tick is what a batch trigger produces (watchPollInterval, once a second): it
+// exists to look at ARRIVALS early, and a `schedule` is honored to the interval,
+// not to the poll — without the gate every batch poll would fire intents.
+func TestWatchNonDueTickNeverFiresAnIntent(t *testing.T) {
+	requirePOSIXShell(t)
+	f := newWatchFixture(t, "true")
+	f.scheduleIntent("deps-current", "goal = update dependencies\nschedule = 24h\n")
+	f.cfg.agent = scheduledAgent
+
+	for i := 0; i < 3; i++ {
+		if f.s.watchCycle(f.ctx, f.rc, f.cfg, false) {
+			t.Fatal("a non-due tick drove a cycle")
+		}
+	}
+	if n := f.ev.countEvent("watch_intent"); n != 0 {
+		t.Fatalf("watch_intent events = %d on non-due ticks, want 0", n)
+	}
+	if len(f.firedRecord().Intents) != 0 {
+		t.Fatalf("fired record = %+v, want nothing recorded by a non-due tick", f.firedRecord().Intents)
+	}
+	if n := len(f.runDirs()); n != 0 {
+		t.Fatalf("%d run dirs from non-due ticks, want 0", n)
+	}
+	// Positive control: the same state, one due tick.
+	if !f.cycle() {
+		t.Fatal("the intent did not fire on a due tick, so the case above proves nothing")
+	}
+}
+
+// ---- a fired record from the future ----
+
+// TestWatchFutureFiredAtIsIgnoredAndReported: a stamp far ahead of now cannot be
+// a fire this daemon made (a stepped clock, a record from a machine an hour or a
+// year out), and believing it is a schedule that silently stops for that long.
+// It reads as never-fired — the same fail-open direction losing the record has —
+// and is said out loud rather than swallowed.
+func TestWatchFutureFiredAtIsIgnoredAndReported(t *testing.T) {
+	requirePOSIXShell(t)
+	f := newWatchFixture(t, "true")
+	f.scheduleIntent("deps-current", "goal = update dependencies\nschedule = 24h\n")
+	f.cfg.agent = scheduledAgent
+	f.setFired("deps-current", time.Now().Add(365*24*time.Hour))
+
+	if !f.cycle() {
+		t.Fatal("a last-fire a year in the future wedged the schedule for a year")
+	}
+	ev := f.ev.lastEvent("watch_error")
+	if ev == nil || ev["at"] != "intent-fired-future" || ev["intent"] != "deps-current" {
+		t.Fatalf("watch_error = %+v, want one naming the future stamp it ignored", ev)
+	}
+	// The fire overwrote it with a real time, so this is not a per-tick alarm and
+	// the intent is back inside an ordinary window.
+	if got := f.firedRecord().Intents["deps-current"].FiredAt; time.Until(got) > time.Minute {
+		t.Fatalf("last fired = %s: the fire must re-stamp the record with its own time", got)
+	}
+
+	// Negative control: a stamp INSIDE the skew allowance is believed. A clock a
+	// few minutes out must not turn every scheduled intent into a permanent
+	// re-fire, which is the other way to be wrong here.
+	f.setFired("deps-current", time.Now().Add(intentFiredSkew/2))
+	errors := f.ev.countEvent("watch_error")
+	f.cycle() // arrivals' turn after a fire; drive the intent turn as well
+	if f.cycle() {
+		t.Fatal("a stamp inside the skew allowance was treated as never fired")
+	}
+	if n := f.ev.countEvent("watch_error"); n != errors {
+		t.Fatalf("watch_error events %d -> %d: a believable stamp must not be reported", errors, n)
+	}
+}
+
+// TestIntentShowFlagsAFutureFiredAt: the same record, from the CLI. `sig intent
+// show` says the intent is due; without the flag, "due" next to a lastFired a
+// year out is unexplainable.
+func TestIntentShowFlagsAFutureFiredAt(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	writeIntent(t, repo, "deps-current", "goal = update dependencies\nschedule = 24h\n")
+	future := time.Now().Add(365 * 24 * time.Hour).UTC().Truncate(time.Second)
+	if err := writeIntentFired(intentFiredPathFor(context.Background(), repo),
+		intentFired{Intents: map[string]intentFiredEntry{"deps-current": {FiredAt: future}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var asJSON, text bytes.Buffer
+	if code, err := runIntent(&asJSON, []string{"show", "deps-current", "-repo", repo, "-json"}); err != nil || code != exitOK {
+		t.Fatalf("intent show -json: code=%d err=%v", code, err)
+	}
+	var one intentJSON
+	if err := json.Unmarshal(asJSON.Bytes(), &one); err != nil {
+		t.Fatalf("parse show JSON: %v\n%s", err, asJSON.String())
+	}
+	if !one.FiredInFuture || !one.Due || one.LastFired != future.Format(time.RFC3339) {
+		t.Fatalf("show = %+v, want due, flagged, and still reporting the stamp it ignored", one)
+	}
+	if code, err := runIntent(&text, []string{"show", "deps-current", "-repo", repo}); err != nil || code != exitOK {
+		t.Fatalf("intent show: code=%d err=%v", code, err)
+	}
+	if !strings.Contains(text.String(), "in the FUTURE") {
+		t.Fatalf("show text = %q, want it to say why the stamp is ignored", text.String())
+	}
+
+	// Negative control: a stamp inside the allowance is neither flagged nor due.
+	recent := time.Now().Add(intentFiredSkew / 2).UTC().Truncate(time.Second)
+	if err := writeIntentFired(intentFiredPathFor(context.Background(), repo),
+		intentFired{Intents: map[string]intentFiredEntry{"deps-current": {FiredAt: recent}}}); err != nil {
+		t.Fatal(err)
+	}
+	asJSON.Reset()
+	if code, err := runIntent(&asJSON, []string{"show", "deps-current", "-repo", repo, "-json"}); err != nil || code != exitOK {
+		t.Fatalf("intent show -json: code=%d err=%v", code, err)
+	}
+	one = intentJSON{}
+	if err := json.Unmarshal(asJSON.Bytes(), &one); err != nil {
+		t.Fatal(err)
+	}
+	if one.FiredInFuture || one.Due {
+		t.Fatalf("show = %+v, want an ordinary in-window intent", one)
+	}
+}
+
+// ---- an id that is slug-safe but cannot be a branch ----
+
+// TestWatchRefusesAnIntentIdThatCannotBeABranch: "a..b" is a legal filename and
+// a legal slug, and `agent/a..b-<stamp>` is not a legal ref. Stamping the fire
+// and THEN failing at worktree add would leave `sig intent show` claiming a fire
+// that never happened, once per window, forever.
+func TestWatchRefusesAnIntentIdThatCannotBeABranch(t *testing.T) {
+	requirePOSIXShell(t)
+	f := newWatchFixture(t, "true")
+	f.scheduleIntent("a..b", "goal = update dependencies\nschedule = 24h\n")
+	f.cfg.agent = scheduledAgent
+
+	if f.cycle() {
+		t.Fatal("an intent whose id cannot be a git branch component fired")
+	}
+	ev := f.ev.lastEvent("watch_error")
+	if ev == nil || ev["at"] != "intent-id" || ev["intent"] != "a..b" {
+		t.Fatalf("watch_error = %+v, want one naming the unusable id", ev)
+	}
+	if len(f.firedRecord().Intents) != 0 {
+		t.Fatalf("fired record = %+v: a fire that cannot happen must not be stamped", f.firedRecord().Intents)
+	}
+	if n := len(f.runDirs()); n != 0 {
+		t.Fatalf("%d run dirs, want 0", n)
+	}
+
+	// Positive control, and the starvation half: an intent that CAN fire is not
+	// held up by the one that cannot, however permanently due that one is.
+	f.scheduleIntent("ok-id", "goal = update dependencies\nschedule = 24h\n")
+	if !f.cycle() {
+		t.Fatal("a valid intent never fired while an unusable one was due")
+	}
+	if got := f.lastReport().Intent; got != "ok-id" {
+		t.Fatalf("fired intent = %q, want ok-id", got)
+	}
+}
+
+// TestIntentNewRefusesAnIdThatCannotBeABranch: creation is the friendlier place
+// to say so — in front of whoever typed it, instead of on an unattended tick.
+func TestIntentNewRefusesAnIdThatCannotBeABranch(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.MkdirAll(intentTemplateDir(repo), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(intentTemplateDir(repo), "ok"+intentFileExt), []byte("goal = g\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	// A leading "-" is deliberately NOT in this list: `sig intent new -dash` is
+	// eaten by flag parsing long before any id check, so asserting on it here
+	// would pass whether or not the check exists. refComponentSafe covers it.
+	for _, id := range []string{"a..b", "...", ".lead", "trail.", "x.lock"} {
+		out.Reset()
+		if _, err := runIntent(&out, []string{"new", id, "-repo", repo, "-template", "ok"}); err == nil {
+			t.Errorf("intent id %q was accepted; it cannot be a git branch component", id)
+		}
+		if _, err := os.Stat(intentPath(repo, id)); err == nil {
+			t.Errorf("a refused id left %s behind", intentPath(repo, id))
+		}
+	}
+	// Negative control: the ordinary shapes still work.
+	for _, id := range []string{"deps-current", "issue-113", "a.b", "_x"} {
+		out.Reset()
+		if code, err := runIntent(&out, []string{"new", id, "-repo", repo, "-template", "ok"}); err != nil || code != exitOK {
+			t.Errorf("intent id %q refused: code=%d err=%v", id, code, err)
+		}
+	}
+}
+
+func TestRefComponentSafe(t *testing.T) {
+	for _, s := range []string{"a..b", "...", ".lead", "trail.", "x.lock", "-dash", "", ".", ".."} {
+		if refComponentSafe(s) {
+			t.Errorf("refComponentSafe(%q) = true, want false", s)
+		}
+	}
+	for _, s := range []string{"deps-current", "issue-113", "a.b", "_x", "A1", "x.locked"} {
+		if !refComponentSafe(s) {
+			t.Errorf("refComponentSafe(%q) = false, want true", s)
+		}
 	}
 }
 
