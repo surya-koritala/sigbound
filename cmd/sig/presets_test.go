@@ -318,9 +318,11 @@ func TestSecurityPresetComposesAfterPolicyBattery(t *testing.T) {
 // branch, head branch and body. Duplicated from the table on purpose: these are
 // the message a user reads off a failed publish step and the request the host
 // actually receives, so the test states both independently.
-var receiptPresetCases = []struct{ preset, tool, install, subcommand, targetFlag, headFlag, bodyFlag string }{
-	{"github-receipt", "gh", "https://cli.github.com", "pr create", "--base", "--head", "--body"},
-	{"gitlab-receipt", "glab", "https://gitlab.com/gitlab-org/cli", "mr create", "--target-branch", "--source-branch", "--description"},
+var receiptPresetCases = []struct {
+	preset, tool, install, subcommand, fallback, targetFlag, headFlag, bodyFlag, token string
+}{
+	{"github-receipt", "gh", "https://cli.github.com", "pr create", "pr comment", "--base", "--head", "--body", "GH_TOKEN"},
+	{"gitlab-receipt", "glab", "https://gitlab.com/gitlab-org/cli", "mr create", "mr note", "--target-branch", "--source-branch", "--description", "GLAB_TOKEN"},
 }
 
 // receiptPathDir is a PATH containing exactly the real `git` and `awk` the
@@ -425,10 +427,19 @@ func runPublishPreset(t *testing.T, preset, dir, pathDir string, env ...string) 
 // installFakeHostCLI puts an executable named tool on the test's PATH dir,
 // standing in for gh/glab. Per invocation it records `<subcommand>` into
 // $FAKE_CALLS, every argument one per line into $FAKE_ARGS, the value that
-// followed --body/--description verbatim into $FAKE_BODY (so a test can assert
-// the receipt arrived as exactly one argument, byte for byte), and the remote's
+// followed --body/--description/--message verbatim into $FAKE_BODY and
+// $FAKE_BODY.<subcommand> (so a test can assert the receipt arrived as exactly
+// one argument, byte for byte, AND which command carried it), and the remote's
 // branch list AT CALL TIME into $FAKE_REFS — which is what proves the push
 // happened BEFORE the request was opened rather than merely alongside it.
+//
+// It is STATEFUL, because the bug this guards is a steady-state bug: $FAKE_STATE
+// stands for "a request is open for this branch". `create` fails when one
+// already is (as both real CLIs do) and opens one otherwise; `comment`/`note`
+// succeeds only when one is open. So two runs against the same fixture exercise
+// the real sequence — run 1 opens, run 2 appends — rather than a flag the test
+// flips to describe its own expectation.
+//
 // `auth status` exits $FAKE_AUTH_EXIT (default 0), which is how
 // "unauthenticated" is constructed.
 func installFakeHostCLI(t *testing.T, pathDir, tool string) {
@@ -439,10 +450,20 @@ func installFakeHostCLI(t *testing.T, pathDir, tool string) {
 		"printf '%s\\n' \"$@\" > \"$FAKE_ARGS\"\n" +
 		"prev=\n" +
 		"for a in \"$@\"; do\n" +
-		"  case $prev in --body|--description) printf '%s' \"$a\" > \"$FAKE_BODY\" ;; esac\n" +
+		"  case $prev in --body|--description|--message)\n" +
+		"    printf '%s' \"$a\" > \"$FAKE_BODY\"; printf '%s' \"$a\" > \"$FAKE_BODY.$2\" ;;\n" +
+		"  esac\n" +
 		"  prev=$a\n" +
 		"done\n" +
 		"git --git-dir=\"$FAKE_REMOTE\" for-each-ref --format='%(refname)' > \"$FAKE_REFS\"\n" +
+		"case \"$2\" in\n" +
+		"  create)\n" +
+		"    if [ -f \"$FAKE_STATE\" ]; then echo \"a request for branch $3 already exists\" >&2; exit 1; fi\n" +
+		"    : > \"$FAKE_STATE\"; exit 0 ;;\n" +
+		"  comment|note)\n" +
+		"    if [ -f \"$FAKE_STATE\" ]; then exit 0; fi\n" +
+		"    echo \"no requests found for branch\" >&2; exit 1 ;;\n" +
+		"esac\n" +
 		"exit 0\n"
 	if err := os.WriteFile(filepath.Join(pathDir, tool), []byte(script), 0o755); err != nil {
 		t.Fatalf("install fake %s: %v", tool, err)
@@ -450,13 +471,15 @@ func installFakeHostCLI(t *testing.T, pathDir, tool string) {
 }
 
 // receiptEnv is the SIGBOUND_* env plus the fake CLI's recording paths for one
-// run of an expansion, with every artifact under dir.
+// run of an expansion, with every artifact under dir. Two runs sharing a dir
+// share $FAKE_STATE, which is what makes them a sequence.
 func receiptEnv(dir, baseBranch, receipt string, remote string) []string {
 	return []string{
 		"FAKE_CALLS=" + filepath.Join(dir, "calls"),
 		"FAKE_ARGS=" + filepath.Join(dir, "args"),
 		"FAKE_BODY=" + filepath.Join(dir, "body"),
 		"FAKE_REFS=" + filepath.Join(dir, "refs"),
+		"FAKE_STATE=" + filepath.Join(dir, "request-open"),
 		"FAKE_REMOTE=" + remote,
 		"SIGBOUND_BASE_BRANCH=" + baseBranch,
 		"SIGBOUND_LANDED=agent/a",
@@ -495,6 +518,13 @@ func TestPublishReceiptPresetsFailLoudlyWhenCLIAbsent(t *testing.T) {
 // the same guarantee, and the one `sh -c` gives nothing for free: gh/glab IS on
 // PATH, it just has no usable credentials. The receipt must fail saying so and
 // naming the fix — before pushing anything and without opening a request.
+//
+// The message must name -env-publish TOKEN as well as `auth login`, because the
+// standard CI shape hits this for the SECOND reason: -env-mode scoped drops
+// GH_TOKEN/GITHUB_TOKEN/GLAB_TOKEN/SSH_AUTH_SOCK (none is in baseEnvNames), so
+// a GitHub Actions run would otherwise read a message telling it to perform an
+// interactive login it cannot perform. The message is the thing they read, so
+// the fix has to be in it.
 func TestPublishReceiptPresetsFailLoudlyWhenUnauthenticated(t *testing.T) {
 	requirePOSIXShell(t)
 	for _, c := range receiptPresetCases {
@@ -509,7 +539,7 @@ func TestPublishReceiptPresetsFailLoudlyWhenUnauthenticated(t *testing.T) {
 			if err == nil {
 				t.Fatalf("-publish-preset=%s exited 0 with %s unauthenticated\n%s", c.preset, c.tool, out)
 			}
-			for _, want := range []string{c.preset, "not authenticated", c.tool + " auth login"} {
+			for _, want := range []string{c.preset, "not authenticated", c.tool + " auth login", "-env-publish " + c.token} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("-publish-preset=%s unauthenticated output %q does not contain %q", c.preset, out, want)
 				}
@@ -585,6 +615,68 @@ func TestPublishReceiptPresetsPushThenOpenRequest(t *testing.T) {
 			}
 			if string(got) != receipt {
 				t.Fatalf("-publish-preset=%s request body %q, want %q", c.preset, got, receipt)
+			}
+		})
+	}
+}
+
+// TestPublishReceiptPresetsSteadyStateAppendsToTheOpenRequest is the case that
+// decides whether this feature works past its first run. These presets require
+// -base to be a LONG-LIVED integration branch, so run 2 onward always finds the
+// request run 1 opened. Without the fallback, `create` fails "already exists"
+// every time from then on: the run exits 6 forever, and — the part that
+// actually loses data — run N's receipt is posted NOWHERE while the request
+// body still describes run 1.
+//
+// So: run 1 opens the request, run 2 comments on it, BOTH exit 0, and what run
+// 2 posted is run 2's receipt. The fake CLI is stateful, so this is a real
+// sequence rather than a description of one.
+func TestPublishReceiptPresetsSteadyStateAppendsToTheOpenRequest(t *testing.T) {
+	requirePOSIXShell(t)
+	for _, c := range receiptPresetCases {
+		t.Run(c.preset, func(t *testing.T) {
+			repo, remote := receiptRepo(t)
+			pathDir := receiptPathDir(t)
+			installFakeHostCLI(t, pathDir, c.tool)
+			dir := t.TempDir()
+
+			first := "**sigbound receipt** — run ONE landed `aaaaaaaaaaaa`."
+			out, err := runPublishPreset(t, c.preset, repo, pathDir, receiptEnv(dir, "integration", first, remote)...)
+			if err != nil {
+				t.Fatalf("run 1 of -publish-preset=%s: %v\n%s", c.preset, err, out)
+			}
+			if body, _ := os.ReadFile(filepath.Join(dir, "body.create")); string(body) != first {
+				t.Fatalf("run 1 did not open the request carrying its receipt: %q", body)
+			}
+
+			// Run 2: another landing on the same integration branch, so the
+			// request opened by run 1 is still there.
+			cmd := exec.Command("git", "commit", "-q", "--allow-empty", "-m", "run 2")
+			cmd.Dir = repo
+			cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+			if o, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("second landing: %v\n%s", err, o)
+			}
+			second := "**sigbound receipt** — run TWO landed `bbbbbbbbbbbb`."
+			out2, err2 := runPublishPreset(t, c.preset, repo, pathDir, receiptEnv(dir, "integration", second, remote)...)
+			if err2 != nil {
+				t.Fatalf("run 2 of -publish-preset=%s exited non-zero — the steady state is permanently red and run 2's receipt went nowhere: %v\n%s", c.preset, err2, out2)
+			}
+			posted, err := os.ReadFile(filepath.Join(dir, "body."+strings.Fields(c.fallback)[1]))
+			if err != nil {
+				t.Fatalf("run 2 never commented the receipt onto the open request: %v", err)
+			}
+			if string(posted) != second {
+				t.Fatalf("run 2 posted %q, want ITS OWN receipt %q — a stale body is the same data loss as no body", posted, second)
+			}
+			calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+			if !strings.Contains(string(calls), c.fallback) {
+				t.Fatalf("run 2 never ran %q: calls=%q", c.fallback, calls)
+			}
+			// The operator must be able to tell from the recorded output why a
+			// create was skipped, rather than reading a bare CLI error.
+			if !strings.Contains(out2, "already open for integration") {
+				t.Fatalf("run 2's output does not explain the fallback in sigbound's own words:\n%s", out2)
 			}
 		})
 	}
@@ -811,28 +903,136 @@ func TestReceiptBodyReportsWhatTheReportRecorded(t *testing.T) {
 	}
 }
 
-// TestReceiptBodyIsBounded: a task prompt is arbitrary prose, and the receipt
-// becomes one environment variable (Linux caps a single one at 128 KiB) and one
-// comment body. Both the per-prompt length and the task COUNT are bounded, and
-// what was left out is stated rather than silently dropped. The prompt is cut on
-// a rune boundary — a receipt truncated into invalid UTF-8 is not a receipt.
+// TestReceiptBodyIsBounded: EVERY variable-length field in a receipt is
+// attacker-shaped in the sense that matters — a planner LLM names the tasks and
+// the plan names the branches, and nothing validates the length or the count of
+// either. The receipt becomes one environment variable (Linux caps a single one
+// at 128 KiB) and one request body (GitHub caps one at 65,536 characters), so
+// there must be no unbounded path through receiptBody at all: not the task
+// list, not a task PROMPT, not a task ID, and not the landed/flagged/held
+// branch lists. Whatever is cut is COUNTED, and cuts land on rune boundaries —
+// a receipt truncated into invalid UTF-8 is not a receipt.
 func TestReceiptBodyIsBounded(t *testing.T) {
+	long := strings.Repeat("é", receiptPromptMax+50)
 	rep := runReport{Base: "main"}
-	for i := 0; i < receiptMaxTasks+7; i++ {
-		rep.Tasks = append(rep.Tasks, taskSpec{ID: fmt.Sprintf("t%d", i), Prompt: strings.Repeat("é", receiptPromptMax+50)})
+	for i := 0; i < receiptMaxItems+7; i++ {
+		rep.Tasks = append(rep.Tasks, taskSpec{ID: fmt.Sprintf("t%d-%s", i, long), Prompt: long})
+	}
+	for i := 0; i < receiptMaxItems+9; i++ {
+		rep.Integrate.Landed = append(rep.Integrate.Landed, fmt.Sprintf("agent/%d-%s", i, long))
 	}
 	got := receiptBody("", rep)
-	if !strings.Contains(got, "… and 7 more") {
-		t.Errorf("receipt body dropped tasks without saying how many:\n%s", got)
+	if n := strings.Count(got, "… and 7 more"); n != 1 {
+		t.Errorf("receipt body dropped tasks without saying how many (want one \"… and 7 more\", got %d):\n%s", n, got)
 	}
-	if strings.Contains(got, "`t20`") {
-		t.Errorf("receipt body listed more than receiptMaxTasks tasks:\n%s", got)
+	if !strings.Contains(got, "… and 9 more") {
+		t.Errorf("receipt body did not bound the landed-branch list — a 500-branch run would blow the body cap:\n%s", got)
 	}
-	if !strings.Contains(got, strings.Repeat("é", receiptPromptMax)+"...") {
+	if strings.Contains(got, "`t20") || strings.Contains(got, "agent/20") {
+		t.Errorf("receipt body listed more than receiptMaxItems entries:\n%s", got)
+	}
+	cut := strings.Repeat("é", receiptPromptMax) + "..."
+	if !strings.Contains(got, cut) {
 		t.Errorf("receipt body did not truncate an over-long prompt on a rune boundary:\n%s", got)
+	}
+	// The id and the branch name go through the same cut as the prompt: an
+	// unbounded id is the same overflow with a different name on it.
+	if strings.Contains(got, "t0-"+long) || strings.Contains(got, "agent/0-"+long) {
+		t.Errorf("receipt body left a task id or branch name unbounded:\n%s", got)
 	}
 	if !utf8.ValidString(got) {
 		t.Error("receipt body is not valid UTF-8")
+	}
+	// The whole point of the two bounds: the result stays comfortably inside
+	// what a host will accept for one request body.
+	if n := utf8.RuneCountInString(got); n > 65536 {
+		t.Errorf("receipt body is %d characters, past GitHub's 65,536-character body cap", n)
+	}
+}
+
+// TestReceiptBodyReportsWhatDidNotLand is the finding this artifact exists for.
+// A run can land its clean groups and PARK one, and then -publish fires and the
+// receipt is the document in front of the very person whose ack the parked
+// group is waiting on. A receipt that said "2 of 2 agents succeeded" and
+// stopped would describe a run that is still holding work back, and the reader
+// would have to already know to go looking. Same for a conflict-flagged branch,
+// a bisect-dropped one, and a refused landing.
+func TestReceiptBodyReportsWhatDidNotLand(t *testing.T) {
+	rep := runReport{
+		Base: "main", BaseSHA: "1111111111111111111111111111111111111111",
+		PerAgent:  []perAgentJSON{{ID: "a", OK: true}, {ID: "b", OK: true}},
+		Integrate: integrateJSON{FinalSHA: "2222222222222222222222222222222222222222", Landed: []string{"agent/a"}},
+		Verify:    verifyJSON{Ran: true, OK: true},
+		Park: &parkJSON{
+			VerifiedSHA: "3333333333333333333333333333333333333333",
+			Reason:      "touches ack-paths",
+			Groups: []parkGroupJSON{{
+				Branches:     []string{"agent/b"},
+				MatchedPaths: map[string]string{"cmd/sig/run.go": "cmd/sig/**"},
+			}},
+		},
+	}
+	got := receiptBody("", rep)
+	for _, want := range []string{
+		"**PARKED, AWAITING ACK**",
+		"no ack timeout — it waits for a human",
+		"333333333333", // the verified-but-unlanded SHA
+		"touches ack-paths",
+		"`agent/b`",
+		"`cmd/sig/run.go`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("a PARKED run's receipt does not mention %q — the one outcome that needs this reader to act:\n%s", want, got)
+		}
+	}
+
+	flagged := runReport{
+		Base:      "main",
+		Integrate: integrateJSON{FinalSHA: "44", Landed: []string{"agent/a"}, DroppedByBisect: []string{"agent/c"}, Flagged: []flaggedJSON{{Branch: "agent/b", Paths: []string{"pkg/x.go"}}}},
+	}
+	gotFlagged := receiptBody("", flagged)
+	for _, want := range []string{"**NOT LANDED**", "`agent/b`", "`pkg/x.go`", "-verify-bisect", "`agent/c`"} {
+		if !strings.Contains(gotFlagged, want) {
+			t.Errorf("a flagged/bisect-dropped run's receipt does not mention %q:\n%s", want, gotFlagged)
+		}
+	}
+
+	refused := receiptBody("", runReport{Base: "main", BaseSHA: "1111111111111111111111111111111111111111", LandRefused: "5555555555555555555555555555555555555555"})
+	if !strings.Contains(refused, "**LANDING REFUSED**") || !strings.Contains(refused, "555555555555") {
+		t.Errorf("a refused landing is not named in the receipt:\n%s", refused)
+	}
+
+	// A clean run says none of this — these lines are outcome-driven, not
+	// boilerplate a reader learns to skip.
+	clean := receiptBody("", runReport{Base: "main", Integrate: integrateJSON{FinalSHA: "66", Landed: []string{"agent/a"}}})
+	for _, unwanted := range []string{"PARKED", "NOT LANDED", "LANDING REFUSED"} {
+		if strings.Contains(clean, unwanted) {
+			t.Errorf("a clean run's receipt claims %q:\n%s", unwanted, clean)
+		}
+	}
+}
+
+// TestReceiptBodyIsDeterministic: a park's triggering paths come out of a Go
+// map, whose iteration order is randomized per run. A provenance record that
+// renders different bytes each time it is asked is not one — and two receipts
+// on the same request that differ only by line shuffling are unreadable as a
+// history.
+func TestReceiptBodyIsDeterministic(t *testing.T) {
+	rep := runReport{
+		Base: "main",
+		Park: &parkJSON{Groups: []parkGroupJSON{{
+			Branches:     []string{"agent/b"},
+			MatchedPaths: map[string]string{"z.go": "*", "a.go": "*", "m.go": "*", "b.go": "*", "q.go": "*"},
+		}}},
+	}
+	first := receiptBody("", rep)
+	for i := 0; i < 50; i++ {
+		if got := receiptBody("", rep); got != first {
+			t.Fatalf("receipt body is not deterministic:\nfirst: %s\ngot:   %s", first, got)
+		}
+	}
+	if !strings.Contains(first, "`a.go`, `b.go`, `m.go`, `q.go`, `z.go`") {
+		t.Errorf("park paths are not sorted:\n%s", first)
 	}
 }
 

@@ -751,10 +751,12 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		"set, else empty — a path pointer only, since -manifest itself is written after the run returns; use stdin for the report's actual contents). A publish FAILURE does NOT "+
 		"unland the work or flip verify's verdict — it's reported as its own report.publish field and the run exits 6 instead of 0. See docs/USAGE.md's Publish section. Default \"\": off")
 	publishPreset := fs.String("publish-preset", "", "expand a known RECEIPT preset (github-receipt|gitlab-receipt) into -publish's sh -c command: push the landed -base branch to ${SIGBOUND_REMOTE:-origin} "+
-		"and open a pull/merge request against the remote's default branch whose BODY is SIGBOUND_RECEIPT, via gh/glab. Requires -base to be an integration branch, NOT the remote's default branch "+
-		"(no request can be opened from a branch onto itself; the preset says so and stops before pushing). Publishing happens AFTER the landing, so a receipt that fails — gh/glab missing or "+
-		"unauthenticated, a rejected push, a host outage — changes NOTHING about what landed: the reason is captured in report.publish.output (and -logdir's publish.log), and the run exits 6 "+
-		"instead of 0, exactly like any other -publish failure. An explicit -publish always overrides its preset. See docs/USAGE.md's Presets section for the exact expansion of each name")
+		"and open a pull/merge request against the remote's default branch whose BODY is SIGBOUND_RECEIPT, via gh/glab — or, when one is already open for that branch (every run after the first), "+
+		"comment this run's receipt onto it. Requires -base to be an integration branch, NOT the remote's default branch (no request can be opened from a branch onto itself; the preset says so and "+
+		"stops before pushing). Under -env-mode scoped, also pass -env-publish GH_TOKEN (or GLAB_TOKEN): the scoped base env carries neither. Publishing happens AFTER the landing, so a receipt that "+
+		"fails — gh/glab missing or unauthenticated, a rejected push, a host outage — changes NOTHING about what landed: the reason is captured in report.publish.output (and -logdir's publish.log), "+
+		"and the run exits 6 instead of 0 unless a higher-precedence condition already claimed the code (e.g. 4 when a branch was flagged). An explicit -publish always overrides its preset. "+
+		"See docs/USAGE.md's Presets section for the exact expansion of each name")
 	publishTimeout := fs.Duration("publish-timeout", 120*time.Second, "timeout for the -publish command (0 = none)")
 	envMode := fs.String("env-mode", envModeInherit, "environment given to every -agent/-resolver/-verify/-repair/-planner/-publish command: inherit (default) hands each the "+
 		"FULL parent environment plus its own SIGBOUND_* vars, today's behavior, byte-identical. scoped hands each ONLY a minimal base environment (PATH, HOME, USER, SHELL, "+

@@ -268,8 +268,10 @@ func (e *overlapError) feedback() string {
 }
 
 // sortedKeys returns the keys of m in ascending order (deterministic overlap
-// reporting for tests and re-plan feedback).
-func sortedKeys(m map[string][]string) []string {
+// reporting for tests and re-plan feedback, and a receipt that renders the same
+// bytes every time — see receiptBody). Generic in the VALUE type only: every
+// caller keys by string, and the point is the ordering, not the map.
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

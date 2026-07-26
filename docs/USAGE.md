@@ -614,6 +614,13 @@ provenance record attached to it, so what sigbound did is reviewable where the
 team already reviews instead of sitting in a manifest on the machine that ran
 it.
 
+**Run 1 opens the request; every run after it comments its receipt onto the
+same one.** Because `-base` is a long-lived integration branch, the request
+stays open across runs, so `create` would fail "already exists" from run 2
+onward — the presets fall back to a comment instead. The request then
+accumulates one receipt per run, in order, and the steady state exits `0`. Once
+that request is merged, the next run opens a fresh one.
+
 **`-base` must be an integration branch, not the remote's default branch.** The
 landed branch is the request's HEAD and the remote's default branch is its
 target, so `-base main` on a repo whose default is `main` has no request to
@@ -629,29 +636,54 @@ command only if `-env-publish SIGBOUND_REMOTE` allowlists it — unset, this
 pushes to `origin`. The push is an ordinary fast-forward and is never forced: a
 remote branch that moved underneath the run rejects it, loudly.
 
-```
-**sigbound receipt** — landed `9f0c1a2b3c4d` onto `main`.
+Verbatim output of `sig run -base integration -intent add-metrics`:
 
-- run: `r-20260726-1a2b`
+```
+**sigbound receipt** — landed `842f30ce54ef` onto `integration`.
+
 - intent: `add-metrics`
-- landed sha: `9f0c1a2b3c4d…` (base was `77aa…`)
-- verify: passed (after repair)
-- agents: 3 of 4 succeeded; landed: `agent/a`, `agent/b`, `agent/c`
+- landed sha: `842f30ce54efaf3a86e98b093087baae3fbeafd5` (base was `19fc0c2d97232d1ba64ebdec6098fc11581b511f`)
+- verify: passed
+- agents: 1 of 1 succeeded; landed: `agent/add-metrics`
 - tasks:
-  - `a`: add a request counter to the http handler
-  - `b`: add a latency histogram
+  - `add-metrics`: add a request counter to the http handler
 
-sigbound 1.0.0, run started 2026-07-26T10:00:00Z.
+sigbound 1.0.0, run started 2026-07-26T05:35:12Z.
 ```
+
+A `- run:` line appears above `- intent:` when the run came from
+[`sig serve`](#sig-serve), which is the only thing that assigns a run id;
+`- intent:` appears only for an `-intent` run.
+
+**Anything that did NOT land gets its own line**, and those are the reason the
+artifact exists:
+
+```
+- **PARKED, AWAITING ACK** (no ack timeout — it waits for a human): `9f0c1a2b3c4d` verified GREEN but was deliberately NOT landed — matched ack-paths. Held branches: `agent/b`. Triggering paths: `cmd/sig/run.go`
+- **NOT LANDED** — 1 branch(es) flagged as conflicts and withheld: `agent/c` (paths: `pkg/x.go`)
+- **NOT LANDED** — 1 branch(es) dropped by -verify-bisect (their group broke the combined tree): `agent/d`
+```
+
+A run can land its clean groups and [park](#run-parking) one: the base
+advanced, so `-publish` fires, and the receipt is then the document in front of
+the very person whose ack that group is waiting on. A receipt that reported
+"2 of 2 agents succeeded" and stopped would be describing a run that is still
+holding work back.
 
 Every field comes off the [JSON report](#json-report) this run already
 produced; nothing in a receipt is a second opinion about the landing. There is
 no run-level "goal" line because there is no run-level goal to print: `-goal`
 is planned into tasks before the run starts, and `-intent` becomes a single
 task whose prompt IS the intent's goal — the task prompts are the honest
-answer. They are bounded (first line, 200 runes, 20 tasks, then `… and N
-more`), since a prompt is arbitrary prose and this string becomes one
-environment variable and one request body.
+answer.
+
+**Nothing in a receipt is unbounded.** Every list — tasks, landed branches,
+held branches, flagged branches, triggering paths — is cut to 20 entries with
+`… and N more`, and every entry (a prompt, a task id, a branch name, a path) to
+its first line and 200 runes. All of it is text an LLM chose, and the result
+becomes one environment variable (Linux caps a single one at 128 KiB) and one
+request body (GitHub caps one at 65,536 characters); the worst case here is
+roughly 25k characters.
 
 `SIGBOUND_RECEIPT` is exported to **every** `-publish` command, not just these
 two, so a hand-written one can post it wherever it likes.
@@ -662,13 +694,13 @@ table row because every `||` in them is real `sh`, not a cell boundary:
 `-publish-preset github-receipt`:
 
 ```sh
-command -v gh >/dev/null 2>&1 || { echo "sigbound -publish-preset=github-receipt: gh is not on PATH (install: https://cli.github.com) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; gh auth status >/dev/null 2>&1 || { echo "sigbound -publish-preset=github-receipt: gh is not authenticated (run: gh auth login) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; sb_remote=${SIGBOUND_REMOTE:-origin}; sb_target=$(git ls-remote --symref "$sb_remote" HEAD | awk '$1=="ref:" && $3=="HEAD"{sub("refs/heads/","",$2); print $2; exit}'); [ -n "$sb_target" ] || { echo "sigbound -publish-preset=github-receipt: cannot read the default branch of remote $sb_remote (git ls-remote failed; set SIGBOUND_REMOTE if the remote is not named origin) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; [ "$sb_target" != "$SIGBOUND_BASE_BRANCH" ] || { echo "sigbound -publish-preset=github-receipt: -base $SIGBOUND_BASE_BRANCH IS the default branch of remote $sb_remote, and a pull request cannot be opened from a branch onto itself -- re-run with -base on an integration branch, or drop the preset and publish with -publish 'git push $sb_remote $SIGBOUND_BASE_BRANCH' -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; git push "$sb_remote" "$SIGBOUND_BASE_BRANCH" && gh pr create --base "$sb_target" --head "$SIGBOUND_BASE_BRANCH" --title "sigbound: $SIGBOUND_LANDED" --body "$SIGBOUND_RECEIPT"
+command -v gh >/dev/null 2>&1 || { echo "sigbound -publish-preset=github-receipt: gh is not on PATH (install: https://cli.github.com) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; gh auth status >/dev/null 2>&1 || { echo "sigbound -publish-preset=github-receipt: gh is not authenticated (run: gh auth login -- or, under -env-mode scoped, pass -env-publish GH_TOKEN: the scoped base env does not carry GH_TOKEN or SSH_AUTH_SOCK) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; sb_remote=${SIGBOUND_REMOTE:-origin}; sb_target=$(git ls-remote --symref "$sb_remote" HEAD | awk '$1=="ref:" && $3=="HEAD"{sub("refs/heads/","",$2); print $2; exit}'); [ -n "$sb_target" ] || { echo "sigbound -publish-preset=github-receipt: cannot read the default branch of remote $sb_remote (git ls-remote failed; set SIGBOUND_REMOTE if the remote is not named origin) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; [ "$sb_target" != "$SIGBOUND_BASE_BRANCH" ] || { echo "sigbound -publish-preset=github-receipt: -base $SIGBOUND_BASE_BRANCH IS the default branch of remote $sb_remote, and a pull request cannot be opened from a branch onto itself -- re-run with -base on an integration branch, or drop the preset and publish with -publish 'git push $sb_remote $SIGBOUND_BASE_BRANCH' -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; git push "$sb_remote" "$SIGBOUND_BASE_BRANCH" && { gh pr create --base "$sb_target" --head "$SIGBOUND_BASE_BRANCH" --title "sigbound: $SIGBOUND_LANDED" --body "$SIGBOUND_RECEIPT" || { echo "sigbound -publish-preset=github-receipt: could not open a new pull request (usually because one is already open for $SIGBOUND_BASE_BRANCH); posting this run's receipt on the existing one instead" >&2; gh pr comment "$SIGBOUND_BASE_BRANCH" --body "$SIGBOUND_RECEIPT"; }; }
 ```
 
 `-publish-preset gitlab-receipt`:
 
 ```sh
-command -v glab >/dev/null 2>&1 || { echo "sigbound -publish-preset=gitlab-receipt: glab is not on PATH (install: https://gitlab.com/gitlab-org/cli) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; glab auth status >/dev/null 2>&1 || { echo "sigbound -publish-preset=gitlab-receipt: glab is not authenticated (run: glab auth login) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; sb_remote=${SIGBOUND_REMOTE:-origin}; sb_target=$(git ls-remote --symref "$sb_remote" HEAD | awk '$1=="ref:" && $3=="HEAD"{sub("refs/heads/","",$2); print $2; exit}'); [ -n "$sb_target" ] || { echo "sigbound -publish-preset=gitlab-receipt: cannot read the default branch of remote $sb_remote (git ls-remote failed; set SIGBOUND_REMOTE if the remote is not named origin) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; [ "$sb_target" != "$SIGBOUND_BASE_BRANCH" ] || { echo "sigbound -publish-preset=gitlab-receipt: -base $SIGBOUND_BASE_BRANCH IS the default branch of remote $sb_remote, and a merge request cannot be opened from a branch onto itself -- re-run with -base on an integration branch, or drop the preset and publish with -publish 'git push $sb_remote $SIGBOUND_BASE_BRANCH' -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; git push "$sb_remote" "$SIGBOUND_BASE_BRANCH" && glab mr create --source-branch "$SIGBOUND_BASE_BRANCH" --target-branch "$sb_target" --title "sigbound: $SIGBOUND_LANDED" --description "$SIGBOUND_RECEIPT" --yes
+command -v glab >/dev/null 2>&1 || { echo "sigbound -publish-preset=gitlab-receipt: glab is not on PATH (install: https://gitlab.com/gitlab-org/cli) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; glab auth status >/dev/null 2>&1 || { echo "sigbound -publish-preset=gitlab-receipt: glab is not authenticated (run: glab auth login -- or, under -env-mode scoped, pass -env-publish GLAB_TOKEN: the scoped base env does not carry GLAB_TOKEN or SSH_AUTH_SOCK) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; sb_remote=${SIGBOUND_REMOTE:-origin}; sb_target=$(git ls-remote --symref "$sb_remote" HEAD | awk '$1=="ref:" && $3=="HEAD"{sub("refs/heads/","",$2); print $2; exit}'); [ -n "$sb_target" ] || { echo "sigbound -publish-preset=gitlab-receipt: cannot read the default branch of remote $sb_remote (git ls-remote failed; set SIGBOUND_REMOTE if the remote is not named origin) -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; [ "$sb_target" != "$SIGBOUND_BASE_BRANCH" ] || { echo "sigbound -publish-preset=gitlab-receipt: -base $SIGBOUND_BASE_BRANCH IS the default branch of remote $sb_remote, and a merge request cannot be opened from a branch onto itself -- re-run with -base on an integration branch, or drop the preset and publish with -publish 'git push $sb_remote $SIGBOUND_BASE_BRANCH' -- the landing already happened and still stands; only this receipt is missing" >&2; exit 1; }; git push "$sb_remote" "$SIGBOUND_BASE_BRANCH" && { glab mr create --source-branch "$SIGBOUND_BASE_BRANCH" --target-branch "$sb_target" --title "sigbound: $SIGBOUND_LANDED" --description "$SIGBOUND_RECEIPT" --yes || { echo "sigbound -publish-preset=gitlab-receipt: could not open a new merge request (usually because one is already open for $SIGBOUND_BASE_BRANCH); posting this run's receipt on the existing one instead" >&2; glab mr note "$SIGBOUND_BASE_BRANCH" --message "$SIGBOUND_RECEIPT"; }; }
 ```
 
 ```bash
@@ -682,9 +714,11 @@ and `-verify` was green or never set. A receipt that fails — `gh`/`glab`
 missing or unauthenticated, a rejected push, `-base` being the default branch,
 a host outage — leaves the landed tree and `verify`'s verdict exactly as they
 are. The reason lands in `publish: {ran, ok, exit, output}` (and `-logdir`'s
-`publish.log`), and the run exits `6` instead of `0`, the same as any other
-[`-publish`](#publish) failure — so read `publish.output`, not stderr, when a
-receipt goes red.
+`publish.log`), and the run exits `6` instead of `0` — unless a
+higher-precedence condition already claimed the code, e.g. `4` for a run that
+landed with a branch flagged (publish is checked last; see
+[Exit codes](#exit-codes)). Read `publish.output`, not stderr, when a receipt
+goes red.
 
 **Every check fails loudly — none of them is ever skipped.** Both expansions
 preflight four things (CLI on `PATH` with an install hint, CLI authenticated,
@@ -696,6 +730,19 @@ true on a run nobody was ever told about. So never soften one into
 `gh`/`glab auth status` checks credentials, not permissions — a token that
 cannot open a request on this repo passes the check and fails at the create,
 reported the same way.
+
+**Under [`-env-mode scoped`](#scoped-environments), pass the host token
+through.** The scoped base environment does not carry `GH_TOKEN`,
+`GITHUB_TOKEN`, `GLAB_TOKEN` or `SSH_AUTH_SOCK`, so a CI runner that
+authenticates by token — the normal GitHub Actions shape — fails the auth
+preflight unless you allowlist it:
+
+```bash
+sig run ... -publish-preset github-receipt -env-mode scoped -env-publish GH_TOKEN
+```
+
+The preflight message names `-env-publish` as well as `auth login` for exactly
+this reason: an interactive login is not a fix available to a CI job.
 
 **The checks run before the push, on purpose.** A run that cannot produce a
 receipt should not move the remote as a side effect of finding that out, so
