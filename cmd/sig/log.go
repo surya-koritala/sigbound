@@ -1,7 +1,7 @@
 // Command sig log is a READ-ONLY query layer over what runs already record —
 // the report.json manifests under .git/sigbound/runs and the landing notes
 // under refs/notes/sigbound. It adds no storage and changes nothing a run
-// writes; it only reads back the run history. Three views:
+// writes; it only reads back the run history. Four views:
 //
 //	sig log -repo P                runs newest-first: id, when, task/agent
 //	                               counts, landed/flagged/dropped, verify
@@ -17,6 +17,11 @@
 //	                               sigbound never landed => exit 1.
 //	sig log -repo P -task ID       one task across every run and resume, oldest
 //	                               -first.
+//	sig log -repo P -release A..B  that commit range as a release document:
+//	                               which runs landed it, what each landing's
+//	                               acceptance was, what parked, what bisect
+//	                               dropped, and what nothing claims. See
+//	                               release.go.
 //
 // -limit bounds the newest-first list (default 50) and the scan is LAZY: run
 // dirs are ordered by their timestamp-prefixed id (a descending sort is
@@ -88,10 +93,10 @@ type logRow struct {
 	// ACKED it is the ack's commit from park.json — the report predates the ack
 	// and cannot carry it (see ackedLandedSHA).
 	LandedSHA string `json:"landedSHA,omitempty"`
-	// PolicyHash is surfaced only if a run recorded one (issue #108). No run
-	// written so far has — runReport has no such field yet — so this reads back
-	// empty and is omitted; the reader tolerates its absence and never depends
-	// on #108.
+	// PolicyHash is the sha256 of the sigbound.policy this run resolved, read
+	// from where policyReport actually writes it (report.policy.hash — NOT a
+	// top-level policyHash key, which nothing has ever written). Empty and
+	// omitted for a run against a repo with no policy file.
 	PolicyHash string `json:"policyHash,omitempty"`
 	Error      string `json:"error,omitempty"`      // error/interrupted runs: the recorded reason
 	Incomplete bool   `json:"incomplete,omitempty"` // report expected but missing/unparseable (crash mid-write)
@@ -146,16 +151,18 @@ type taskRow struct {
 func runLog(w io.Writer, argv []string) (int, error) {
 	fs := flag.NewFlagSet("log", flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "usage: sig log -repo PATH [-limit 50] [-sha COMMIT | -task ID] [-json]")
+		fmt.Fprintln(fs.Output(), "usage: sig log -repo PATH [-limit 50] [-sha COMMIT | -task ID | -release FROM..TO] [-json] [-with-commands]")
 		fmt.Fprintln(fs.Output(), "read-only history over .git/sigbound/runs + refs/notes/sigbound; adds no storage, changes nothing runs write.")
-		fmt.Fprintln(fs.Output(), "  (no -sha/-task): runs newest-first        -sha COMMIT: which run/task/agent landed it (exit 1 if none)")
-		fmt.Fprintln(fs.Output(), "  -task ID: that task across runs/resumes")
+		fmt.Fprintln(fs.Output(), "  (no selector): runs newest-first          -sha COMMIT: which run/task/agent landed it (exit 1 if none)")
+		fmt.Fprintln(fs.Output(), "  -task ID: that task across runs/resumes   -release FROM..TO: release notes for that commit range")
 		fs.PrintDefaults()
 	}
 	repo := fs.String("repo", "", "path to the target git repository")
-	limit := fs.Int("limit", 50, "max runs in the newest-first list (0 = all); ignored with -sha/-task")
+	limit := fs.Int("limit", 50, "max runs in the newest-first list (0 = all); ignored with -sha/-task/-release")
 	sha := fs.String("sha", "", "provenance for one commit: which run landed it, from which task, by which agent")
 	task := fs.String("task", "", "follow one task id across every run and resume, oldest-first")
+	release := fs.String("release", "", "FROM..TO: assemble release notes for that commit range from the ledger and landing notes")
+	withCommands := fs.Bool("with-commands", false, "-release: include the resolved commands verbatim; they are the invoker's own and CAN contain secrets")
 	asJSON := fs.Bool("json", false, "emit JSON (stable field names, omit-empty; see docs/USAGE.md)")
 	if err := fs.Parse(argv); err != nil {
 		if err == flag.ErrHelp {
@@ -166,8 +173,8 @@ func runLog(w io.Writer, argv []string) (int, error) {
 	if strings.TrimSpace(*repo) == "" {
 		return exitOperationalError, errors.New("-repo is required")
 	}
-	if *sha != "" && *task != "" {
-		return exitOperationalError, errors.New("-sha and -task are mutually exclusive")
+	if n := boolCount(*sha != "", *task != "", *release != ""); n > 1 {
+		return exitOperationalError, errors.New("-sha, -task and -release are mutually exclusive")
 	}
 
 	c, err := cell.Open(*repo)
@@ -185,9 +192,22 @@ func runLog(w io.Writer, argv []string) (int, error) {
 		return logSHA(ctx, w, c.Git(), runsDir, *sha, *asJSON)
 	case *task != "":
 		return logTask(w, runsDir, *task, *asJSON)
+	case *release != "":
+		return logRelease(ctx, w, c.Git(), runsDir, *release, *asJSON, *withCommands)
 	default:
 		return logList(w, runsDir, *limit, *asJSON)
 	}
+}
+
+// boolCount counts the true conditions, for a mutual-exclusion check.
+func boolCount(conds ...bool) int {
+	n := 0
+	for _, c := range conds {
+		if c {
+			n++
+		}
+	}
+	return n
 }
 
 // cellRunsDir is the run-history root for a cell: <git-common-dir>/sigbound/runs
@@ -244,11 +264,10 @@ func scanRuns(runsDir string, limit int) (rows []logRow, incomplete int) {
 	return rows, incomplete
 }
 
-// readLogRow projects one run dir into a logRow. It reads report.json exactly
-// once (so a tolerant second decode can pick up a future policyHash without a
-// second file read), and NEVER crashes on a partial dir: a report that is
-// missing or won't parse yields an Incomplete row carrying whatever status.json
-// / error.json / the run-id timestamp still provide. incomplete is true only
+// readLogRow projects one run dir into a logRow. It NEVER crashes on a partial
+// dir: a report that is missing or won't parse yields an Incomplete row
+// carrying whatever status.json / error.json / the run-id timestamp still
+// provide. incomplete is true only
 // when a report was expected (a "done" run, or a torn dir with no terminal
 // marker at all) but could not be read — a clean error/interrupted run is a
 // known outcome, not corruption.
@@ -273,14 +292,6 @@ func readLogRow(runsDir, id string) (row logRow, incomplete bool) {
 					row.LandedSHA = short(sha)
 				}
 			}
-			// Tolerant second decode: a policyHash written by a future run
-			// (issue #108) surfaces here; runReport has no such field today, so
-			// this is empty for every run written so far.
-			var extra struct {
-				PolicyHash string `json:"policyHash"`
-			}
-			_ = json.Unmarshal(data, &extra)
-			row.PolicyHash = extra.PolicyHash
 			row.Goal = goalOf(dir)
 			if row.StartedAt == "" {
 				row.StartedAt = whenFromID(id)
@@ -320,6 +331,9 @@ func fillRowFromReport(row *logRow, rep *runReport) {
 	row.Flagged = len(rep.Integrate.Flagged)
 	row.Dropped = len(rep.Integrate.DroppedByBisect)
 	row.Verify = verifyVerdict(rep.Verify)
+	if rep.Policy != nil {
+		row.PolicyHash = rep.Policy.Hash
+	}
 	if landed(rep) {
 		row.LandedSHA = short(rep.Integrate.FinalSHA)
 	}

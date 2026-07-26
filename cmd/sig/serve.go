@@ -351,6 +351,7 @@ func (s *server) handler() http.Handler {
 	// the same bearer gate and read-only posture as every data route above.
 	mux.HandleFunc("GET /log", s.handleLog)
 	mux.HandleFunc("GET /log/sha/{sha}", s.handleLogSHA)
+	mux.HandleFunc("GET /log/release", s.handleLogRelease)
 	// Board + metrics (issue #114): a READ-ONLY projection of the same journal
 	// /log reads, plus the intents directory. It adds no mutating endpoint and no
 	// state of its own — see board.go.
@@ -1028,6 +1029,52 @@ func (s *server) handleLogSHA(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeErr(w, http.StatusNotFound, "not landed by sigbound", codeNotFound)
+}
+
+// handleLogRelease serves GET /log/release?from=&to=&cell=: the release document
+// for one commit range — the mirror of `sig log -release`, from the identical
+// builder, so the two surfaces cannot drift.
+//
+// A release is per-repo (unlike GET /log, which fans out over every cell), so
+// `cell` is required as soon as more than one is registered: picking one for the
+// caller would publish a document about a repo they did not name. An
+// unresolvable or malformed range is a 400 and no document; an EMPTY range is a
+// 200 with an empty document, not a 404 — an empty release is a true answer,
+// unlike /log/sha's "no run landed this commit".
+//
+// The verbatim command strings (`sig log -release -with-commands`) are
+// deliberately NOT reachable here: the CLI is where an operator opts into
+// republishing their own commands, and a daemon endpoint is exactly where that
+// choice should not be a query parameter.
+func (s *server) handleLogRelease(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	from, to := strings.TrimSpace(q.Get("from")), strings.TrimSpace(q.Get("to"))
+	if from == "" || to == "" {
+		writeErr(w, http.StatusBadRequest, "from and to are required (the FROM..TO range endpoints)", codeBadRequest)
+		return
+	}
+	rc := s.cells[0] // newServer refuses an empty -repos, so there is always one
+	if key := strings.TrimSpace(q.Get("cell")); key != "" {
+		if rc = s.resolveCell(key); rc == nil {
+			writeErr(w, http.StatusBadRequest, "unknown cell "+strconv.Quote(key)+"; registered cells: "+strings.Join(s.cellKeys(), ", "), codeBadRequest)
+			return
+		}
+	} else if len(s.cells) > 1 {
+		writeErr(w, http.StatusBadRequest, "cell is required with more than one registered cell: "+strings.Join(s.cellKeys(), ", "), codeBadRequest)
+		return
+	}
+	// parseReleaseRange's grammar check, applied to the two halves the caller
+	// already split for us, so CLI and HTTP refuse the identical revisions.
+	if _, _, err := parseReleaseRange(from + ".." + to); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error(), codeBadRequest)
+		return
+	}
+	doc, err := buildRelease(r.Context(), rc.cell.Git(), rc.runsDir, from, to, false)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error(), codeBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"cell": rc.cell.ID(), "repo": rc.cell.Repo(), "release": doc})
 }
 
 // ---- conflict-review surface (issue #62) ----

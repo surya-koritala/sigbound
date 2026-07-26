@@ -2222,19 +2222,21 @@ manifests under `.git/sigbound/runs` (both entry points write one per run; a
 changes nothing a run writes; it only reads the history back.
 
 ```
-sig log -repo PATH [-limit 50] [-sha COMMIT | -task ID] [-json]
+sig log -repo PATH [-limit 50] [-sha COMMIT | -task ID | -release FROM..TO] [-json] [-with-commands]
 ```
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-repo` | — | Target git repository (required). |
-| `-limit` | `50` | Max runs in the newest-first list (`0` = all). Ignored with `-sha`/`-task`. |
+| `-limit` | `50` | Max runs in the newest-first list (`0` = all). Ignored with `-sha`/`-task`/`-release`. |
 | `-sha COMMIT` | — | Provenance for one commit (see below). **Exits 1** if sigbound never landed it. |
 | `-task ID` | — | Follow one task id across every run and resume, oldest-first. |
+| `-release FROM..TO` | — | Assemble that commit range into release notes (see below). |
+| `-with-commands` | `false` | `-release` only: include the resolved commands verbatim. They are the invoker's own and **can contain secrets**. |
 | `-json` | `false` | Emit the stable machine shape instead of the human table. |
 
-`-sha` and `-task` are mutually exclusive; with neither, `sig log` prints the
-run list.
+`-sha`, `-task` and `-release` are mutually exclusive; with none of them,
+`sig log` prints the run list.
 
 ### The list
 
@@ -2306,6 +2308,140 @@ oldest-first — one row per run it appeared in, including every `-resume` that
 re-ran or reused it (`resumed`), with its branch, tip sha, agent exit, verify
 verdict, and whether it landed.
 
+### `-release`: a commit range as release notes
+
+`sig log -repo PATH -release FROM..TO` renders a commit range as a release
+document: which runs landed the commits in it, what acceptance each landing
+passed, what parked, what `-verify-bisect` dropped, which agent produced what,
+and whether `sigbound.policy` changed inside the range. Markdown by default —
+`###` sections and no document title, so it pastes straight under a
+Keep-a-Changelog `## [version]` heading — and `-json` for tooling.
+
+It is the same read-only reader as the rest of `sig log`: no storage, no run
+field, no write path. In particular it does **not** run the park ack-timeout
+sweep [`GET /inbox`](#the-inbox) performs — generating a document must never
+transition a run's state.
+
+```
+sig log -repo . -release v2.0.0..v2.1.0 >> notes.md
+```
+
+**Range grammar.** Exactly `FROM..TO`, both endpoints present and both
+resolvable. `..TO`, `FROM..`, a bare rev and the three-dot `FROM...TO` are
+**refused**, not guessed: an implicit endpoint would make a published document
+depend on where your `HEAD` happened to be, and a symmetric difference is not a
+release. An unresolvable endpoint **exits 1** and prints no partial document.
+
+**What it selects, and how.** Two passes, both visible in the output:
+
+- **Landings** are exact and reachability-based. `git rev-list FROM..TO` gives
+  the commit set; a run claims a commit only if it actually **landed** it — the
+  run's integration commit or a member branch tip recorded as landed. For a
+  range commit the local ledger does not claim, one `git notes --ref=sigbound
+  list` names which commits carry a landing note, and only those are read back;
+  a note counts only when it genuinely concerns that commit (the same authority
+  test [`-sha`](#-sha-commit-provenance) applies, since notes are user-writable
+  and ride in from remotes). So a range whose run history has been `sig gc`'d
+  still renders from the notes, and a forged note attributes nothing.
+- **Attention items** (parked, bisect-dropped, flagged) land no commit, so they
+  appear in no range. They are selected by the run's start time inside the
+  **committer-date window** of the two endpoints. That window is an
+  approximation — a rewritten history or a skewed committer clock shifts which
+  runs fall inside it — which is why it is printed in the document. Landings are
+  unaffected: they are reachability, not time.
+
+Commits in the range that **nothing** claims — hand-written, imported,
+cherry-picked, or landed by a run whose ledger and note are both gone — are
+counted as `unattributed` and reported in the footer. They are never silently
+dropped: the document does not claim a completeness it does not have. A run dir
+whose `report.json` crashed mid-write is counted in `incomplete`, and every
+other run still renders.
+
+An **empty range** (`TO` is an ancestor of `FROM`) exits 0 with a document that
+says it is empty, plus a note on stderr — never an empty file.
+
+There is deliberately **no** Added/Fixed/Changed classification. A run records
+what landed and how it was verified, not what kind of change it was; classifying
+would require a field nothing writes.
+
+#### What a release document does not carry
+
+A release document exists to be published, so by default it carries none of the
+recorded command strings — `agentCmd`/`verifyCmd`/`repairCmd`/`resolverCmd`/
+`plannerCmd` are the invoker's own commands, verbatim, and can embed secrets
+(see [Provenance](#provenance)). What it does carry instead:
+
+- `acceptance` is the repo's **own** `verify` lines from `sigbound.policy` at
+  the base SHA (`policy.verify` on the report — the policy's declared lines, not
+  the effective battery an invoker's `-verify` is appended to). Those bytes are
+  committed to the repo, so they are already exactly as public as the repo is. A
+  run with no policy file contributes no `acceptance` and its verify **verdict**
+  only.
+- `agent` is the **program name** of the resolved agent command — the basename
+  of its first token, never an argument, so it cannot carry a flag-embedded key.
+  `/usr/local/bin/claude -p` and `claude -p --model x` both attribute to
+  `claude`. An empty command, or a first token that is not a plain program name
+  (notably a leading `NAME=value` environment assignment), attributes as
+  `unknown` rather than being printed.
+
+`-with-commands` opts into the verbatim strings: the JSON then sets
+`withCommands: true` and adds a `commands` object per landing, and the Markdown
+carries a leading `> commands are included verbatim and may contain secrets`
+line. The [serve mirror](#serve-mirror) deliberately has no equivalent knob.
+
+#### `-release` JSON shape
+
+```json
+{
+  "from": "v2.0.0", "fromSHA": "…", "to": "v2.1.0", "toSHA": "…",
+  "commits": 412,
+  "window": { "start": "2026-07-01T09:12:44Z", "end": "2026-07-24T17:40:02Z" },
+  "landings": [
+    {
+      "runId": "20260724T170501Z-a1b2c3d4e5f6",
+      "startedAt": "2026-07-24T17:05:03Z",
+      "source": "watch",
+      "intent": "billing-rates",
+      "tasks": ["t1", "t2", "t3"],
+      "landedSHA": "1a2b3c4d5e6f",
+      "members": 3,
+      "strategy": "overlay",
+      "verify": "pass",
+      "verifyDetail": { "repaired": true },
+      "acceptance": ["go test ./...", "go vet ./..."],
+      "agent": "claude",
+      "policyHash": "9f2c…",
+      "provenanceSource": "manifest"
+    }
+  ],
+  "parked":  [ { "runId": "…", "status": "awaiting-ack", "reason": "ack-paths",
+                 "branches": ["agent/t7"], "matchedPaths": {"billing/rates.go": "billing/**"},
+                 "attempts": 1, "expiresAt": "2026-07-27T…Z" } ],
+  "dropped": [ { "runId": "…", "branches": ["agent/t4"], "attempts": 3 } ],
+  "flagged": [ { "runId": "…", "branches": ["agent/t9"] } ],
+  "agents":  [ { "agent": "claude", "runs": 31, "landed": 29 } ],
+  "policy":  { "changed": true,
+               "hashes": [ { "hash": "3ab1…", "firstRunId": "…" },
+                           { "hash": "9f2c…", "firstRunId": "…" } ] },
+  "unattributed": 5,
+  "incomplete": 0,
+  "withCommands": false
+}
+```
+
+Field names match the run list and the [run report](#json-report) where they
+overlap (`runId`, `startedAt`, `source`, `intent`, `landedSHA`, `strategy`,
+`verify`, `policyHash`). Empty sections are omitted; `commits`, `window`,
+`policy`, `unattributed`, `incomplete` and `withCommands` are always present,
+because zero is an answer a consumer needs to read. `provenanceSource` is
+`manifest` or `note`; `reason` on a parked entry is `ack-paths`,
+`policy-modified` (the [park reasons](#run-parking)), or `unreadable` with the
+error in `error` — a park that will not read back is surfaced, not dropped.
+`verifyDetail` appears only when at least one of `cached`/`flaky`/`repaired` is
+true. Landings are newest-first; `agents` is ordered by run count.
+`policy.changed` is true when more than one policy hash appears in the range,
+and each hash names the run it was first seen in.
+
 ### JSON shape (`-json`)
 
 `-json` is stable, omit-empty, and shares field names with the [run
@@ -2342,17 +2478,27 @@ agent?, branch?, strategy?, verify?, startedAt?, finalSHA?, members?, source}`.
 when only a portable note answered). `-task` emits an array of `{runId,
 startedAt?, branch?, sha?, ok, resumed?, landed, verify?}`.
 
-`policyHash` is surfaced only once a run records one (a future landing-policy
-feature); no run written so far does, so it reads back empty and is omitted —
-`sig log` tolerates its absence and never depends on it.
+`policyHash` is the sha256 of the [`sigbound.policy`](#landing-policy) the run
+resolved, read from where the report actually records it (`policy.hash`). It is
+empty and omitted for a run against a repo with no policy file.
+
+`-release` emits the [release document](#-release-json-shape) above.
 
 ### Serve mirror
 
 `sig serve` exposes the same reader over HTTP (see [`sig serve`
 endpoints](#endpoints)): `GET /log?limit=N` returns the newest-first list per
-registered cell, and `GET /log/sha/<sha>` returns the same provenance (`404` —
-the HTTP analogue of the CLI's exit 1 — for a commit no cell landed). Both call
-the identical reader the CLI uses, so the two surfaces never drift.
+registered cell, `GET /log/sha/<sha>` returns the same provenance (`404` — the
+HTTP analogue of the CLI's exit 1 — for a commit no cell landed), and
+`GET /log/release?from=&to=&cell=` returns the same release document. All call
+the identical reader the CLI uses, so the surfaces never drift.
+
+A release is per-repo, unlike `/log`, which fans out over every cell — so `cell`
+is required as soon as more than one cell is registered (`400`, naming the
+registered ids). A malformed or unresolvable range is `400`; an **empty** range
+is `200` with an empty document, not a `404`. There is no `-with-commands`
+equivalent on the endpoint: republishing your own command strings is a choice
+for the CLI, not a daemon query parameter.
 
 ---
 
@@ -2422,6 +2568,7 @@ All requests and responses are JSON (events are NDJSON).
 | `GET /ui` (and `/ui/`) | The review HTML page: conflict panes plus the Inbox and Board tabs (see [Review UI](#review-ui)). |
 | `GET /log` | `{cells:[{cell, repo, runs:[…]}]}` — the newest-first run history per cell, `?limit=N` (default 50). The HTTP mirror of [`sig log`](#sig-log). |
 | `GET /log/sha/{sha}` | `{cell, provenance:{…}}` — which run/task/agent landed `{sha}` (see [`sig log`](#sig-log)). `404` (`not_found`) for a commit no cell landed. |
+| `GET /log/release?from=&to=&cell=` | `{cell, repo, release:{…}}` — that commit range as release notes (see [`-release`](#-release-a-commit-range-as-release-notes)). `cell` is required with more than one registered cell; a malformed or unresolvable range is `400`, an empty range is `200` with an empty document. |
 | `GET /board` | `{cells:[{cell, repo, intents:[…]}], metrics:{…}}` — intents × runs × parks plus delivery metrics, `?limit=N` (default 50 runs per cell, `0` = all). Read-only and fully derived. See [Board and metrics](#board-and-metrics). |
 
 The `POST /runs` body mirrors `sig run`'s flags by name (camelCased); durations

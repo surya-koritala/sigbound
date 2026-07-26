@@ -193,6 +193,48 @@ func (g *Git) RevParse(ctx context.Context, ref string) (string, error) {
 	return g.run(ctx, "rev-parse", "--verify", ref+"^{commit}")
 }
 
+// RevList returns the commits reachable from to but NOT from from (`git rev-list
+// from..to`), in git's own newest-first order. Both arguments must ALREADY be
+// resolved object names (see RevParse) — they are joined into one `from..to`
+// argv token, so anything else is handed to git as a rev expression rather than
+// a commit. An empty range (to is an ancestor of from) is no commits and no
+// error, which is a true answer, not a failure. The trailing `--` pins the token
+// as a revision so a path of the same name can never make it ambiguous.
+func (g *Git) RevList(ctx context.Context, from, to string) ([]string, error) {
+	out, err := g.run(ctx, "rev-list", from+".."+to, "--")
+	if err != nil {
+		return nil, err
+	}
+	return splitNonEmptyLines(out), nil
+}
+
+// CommitTime returns rev's COMMITTER date (`git show -s --format=%cI`), the
+// date git itself orders history by and the one a range's time window is framed
+// on. It is repo data, so a rewritten history or a skewed committer clock moves
+// it — callers that frame anything on it owe the reader that caveat.
+func (g *Git) CommitTime(ctx context.Context, rev string) (time.Time, error) {
+	out, err := g.run(ctx, "show", "-s", "--format=%cI", rev, "--")
+	if err != nil {
+		return time.Time{}, err
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(out))
+	if err != nil {
+		return time.Time{}, fmt.Errorf("commit time of %s: %w", rev, err)
+	}
+	return t, nil
+}
+
+// splitNonEmptyLines splits git's line-oriented stdout, dropping blank lines.
+func splitNonEmptyLines(out string) []string {
+	var lines []string
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
 // TreeOID returns the OID of a commit's top-level tree. Because git trees are
 // content-addressed, two commits have equal TreeOID iff their trees are byte-for
 // -byte identical — an O(1) exact tree-equality test with no per-file reads.

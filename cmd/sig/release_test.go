@@ -1,0 +1,971 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/surya-koritala/sigbound/internal/gitx"
+)
+
+// releaseDay is the fixed committer date of the n-th fixture commit. Fixed, not
+// time.Now(), because the whole attention-item window is derived from committer
+// dates: a fixture that drifted with the wall clock would make every windowed
+// assertion below depend on when the suite ran.
+func releaseDay(n int) time.Time { return time.Date(2026, 3, 1+n, 12, 0, 0, 0, time.UTC) }
+
+// releaseRunID mints a run id with the timestamp prefix newRunID uses, so a run
+// dir can be placed INSIDE or OUTSIDE the fixture's committer-date window on
+// purpose.
+func releaseRunID(at time.Time, suffix string) string {
+	return at.UTC().Format(runIDTimeLayout) + "-" + suffix
+}
+
+// releaseCommit writes one file and commits it with a pinned committer date.
+func releaseCommit(t *testing.T, repo, file, content string, at time.Time) string {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repo, file), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"add", "-A"},
+		{"commit", "-q", "--no-gpg-sign", "-m", file},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = gcHermeticEnv(at)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	sha, err := gitx.New(repo).RevParse(context.Background(), "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sha
+}
+
+// releaseRepo builds a repo whose main branch is four commits dated day 0..3.
+// Returns the Git handle, the repo path, and the shas oldest-first, so a test
+// can name a range (shas[0]..shas[3] holds three commits) and a window
+// ([day 0, day 3]) without guessing.
+func releaseRepo(t *testing.T) (*gitx.Git, string, []string) {
+	t.Helper()
+	dir := t.TempDir()
+	g := gitx.New(dir)
+	if err := g.Init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	shas := make([]string, 0, 4)
+	for i := 0; i < 4; i++ {
+		shas = append(shas, releaseCommit(t, dir, fmt.Sprintf("f%d.txt", i), "x\n", releaseDay(i)))
+	}
+	return g, dir, shas
+}
+
+// releaseJSON runs `sig log -release <spec> -json` and decodes the document.
+func releaseJSON(t *testing.T, repo, spec string, extra ...string) (*releaseDoc, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	argv := append([]string{"-repo", repo, "-release", spec, "-json"}, extra...)
+	code, err := runLog(&buf, argv)
+	if err != nil || code != exitOK {
+		t.Fatalf("runLog -release %s: code=%d err=%v\n%s", spec, code, err, buf.String())
+	}
+	var doc releaseDoc
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatalf("decode release doc: %v\n%s", err, buf.String())
+	}
+	return &doc, buf.String()
+}
+
+// releaseMarkdown runs `sig log -release <spec>` and returns the document.
+func releaseMarkdown(t *testing.T, repo, spec string, extra ...string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	argv := append([]string{"-repo", repo, "-release", spec}, extra...)
+	code, err := runLog(&buf, argv)
+	if err != nil || code != exitOK {
+		t.Fatalf("runLog -release %s: code=%d err=%v\n%s", spec, code, err, buf.String())
+	}
+	return buf.String()
+}
+
+// --- AC #1: a repo with no ledger and no notes still renders a true document ---
+
+func TestReleaseNoRunsNoNotes(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	spec := shas[0] + ".." + shas[3]
+
+	want, err := exec.Command("git", "-C", repo, "rev-list", "--count", shas[0]+".."+shas[3]).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, _ := releaseJSON(t, repo, spec)
+	if got := fmt.Sprintf("%d\n", doc.Commits); got != string(want) {
+		t.Fatalf("commits = %s, want %s (git rev-list --count)", got, want)
+	}
+	if len(doc.Landings) != 0 {
+		t.Fatalf("landings = %+v, want none", doc.Landings)
+	}
+	if doc.Unattributed != doc.Commits {
+		t.Fatalf("unattributed = %d, want %d — every commit is unclaimed here", doc.Unattributed, doc.Commits)
+	}
+	// The window is the endpoints' committer dates, printed because it is an
+	// approximation the reader has to be able to see.
+	if doc.Window.Start != releaseDay(0).Format(time.RFC3339) || doc.Window.End != releaseDay(3).Format(time.RFC3339) {
+		t.Fatalf("window = %+v, want the endpoints' committer dates", doc.Window)
+	}
+	md := releaseMarkdown(t, repo, spec)
+	if !strings.Contains(md, "carry no sigbound landing") {
+		t.Fatalf("markdown does not disclose the unattributed commits:\n%s", md)
+	}
+	_ = g
+}
+
+// TestReleaseEmptyRangeIsAClearMessage: TO an ancestor of FROM is exit 0 and a
+// document that SAYS it is empty — never an empty file for a human to interpret.
+func TestReleaseEmptyRangeIsAClearMessage(t *testing.T) {
+	_, repo, shas := releaseRepo(t)
+	spec := shas[3] + ".." + shas[0]
+
+	doc, raw := releaseJSON(t, repo, spec)
+	if doc.Commits != 0 || len(doc.Landings) != 0 {
+		t.Fatalf("empty range rendered %d commits / %d landings", doc.Commits, len(doc.Landings))
+	}
+	if doc.FromSHA != shas[3] || doc.ToSHA != shas[0] {
+		t.Fatalf("empty range lost its endpoints: %+v", doc)
+	}
+	if strings.TrimSpace(raw) == "" {
+		t.Fatal("-json emitted nothing for an empty range")
+	}
+	md := releaseMarkdown(t, repo, spec)
+	if !strings.Contains(md, "No commits in") {
+		t.Fatalf("empty-range markdown is not a clear message:\n%q", md)
+	}
+}
+
+// --- AC #2 / #16: a ledger landing renders with the stable field names ---
+
+func TestReleaseLedgerLanding(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339),
+		Strategy: "overlay", AgentCmd: "claude -p", Source: "watch", Intent: "billing-rates",
+		Tasks:    []taskSpec{{ID: "t1"}, {ID: "t2"}},
+		PerAgent: []perAgentJSON{{ID: "t1", Branch: "agent/t1", SHA: hexSHA("a1"), OK: true}},
+		Integrate: integrateJSON{
+			Strategy: "overlay", Landed: []string{"agent/t1", "agent/t2"}, FinalSHA: shas[2],
+		},
+		Verify: verifyJSON{Ran: true, OK: true, Repaired: true},
+		Policy: &policyJSON{Hash: "9f2c" + strings.Repeat("0", 60), Verify: []string{"go test ./...", "go vet ./..."}},
+	})
+
+	doc, raw := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 1 {
+		t.Fatalf("landings = %d, want exactly 1\n%s", len(doc.Landings), raw)
+	}
+	l := doc.Landings[0]
+	if l.RunID != id || l.LandedSHA != short(shas[2]) || l.Strategy != "overlay" || l.Members != 2 || l.Verify != "pass" {
+		t.Fatalf("landing = %+v", l)
+	}
+	if l.ProvenanceSource != "manifest" || l.Source != "watch" {
+		t.Fatalf("landing source = %q/%q, want manifest/watch", l.ProvenanceSource, l.Source)
+	}
+	// An intent-sourced landing carries its intent — the handle that ties a
+	// released commit back to the work the repo asked for.
+	if l.Intent != "billing-rates" {
+		t.Fatalf("intent = %q, want billing-rates", l.Intent)
+	}
+	if !reflect.DeepEqual(l.Tasks, []string{"t1", "t2"}) {
+		t.Fatalf("tasks = %v", l.Tasks)
+	}
+	if !reflect.DeepEqual(l.Acceptance, []string{"go test ./...", "go vet ./..."}) {
+		t.Fatalf("acceptance = %v, want the policy's own verify lines", l.Acceptance)
+	}
+	if l.VerifyDetail == nil || !l.VerifyDetail.Repaired {
+		t.Fatalf("verifyDetail = %+v, want repaired", l.VerifyDetail)
+	}
+	if doc.Unattributed != doc.Commits-1 {
+		t.Fatalf("unattributed = %d with %d commits and one landing", doc.Unattributed, doc.Commits)
+	}
+
+	// Field names shared with `sig log -json` and the run report.
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"from", "fromSHA", "to", "toSHA", "commits", "window", "landings", "agents", "policy", "unattributed", "incomplete", "withCommands"} {
+		if _, ok := obj[k]; !ok {
+			t.Fatalf("top-level field %q missing from -json", k)
+		}
+	}
+	var landings []map[string]json.RawMessage
+	if err := json.Unmarshal(obj["landings"], &landings); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"runId", "startedAt", "source", "intent", "landedSHA", "members", "strategy", "verify", "acceptance", "agent", "policyHash", "provenanceSource"} {
+		if _, ok := landings[0][k]; !ok {
+			t.Fatalf("landing field %q missing from -json: %v", k, keysOf(landings[0]))
+		}
+	}
+	if _, ok := landings[0]["commands"]; ok {
+		t.Fatal("commands present without -with-commands")
+	}
+
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	for _, want := range []string{"### Landed", "### Attribution", "### Policy", short(shas[2]), "intent: billing-rates", "go test ./..."} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("markdown missing %q:\n%s", want, md)
+		}
+	}
+	if strings.Contains(md, "\n# ") {
+		t.Fatalf("markdown carries a document title; it must paste under an existing heading:\n%s", md)
+	}
+}
+
+// TestReleaseUnlandedRunIsNotALanding: a run whose member commit is in the range
+// but which never landed (verify red) attributes NOTHING — the commit reached
+// the range some other way, and claiming it would be a lie the document publishes.
+func TestReleaseUnlandedRunIsNotALanding(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "bbbb")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339),
+		Strategy: "overlay", AgentCmd: "claude -p",
+		PerAgent:  []perAgentJSON{{ID: "t1", Branch: "agent/t1", SHA: shas[2], OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[3]},
+		Verify:    verifyJSON{Ran: true, OK: false}, // red: nothing landed
+	})
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 0 {
+		t.Fatalf("a red run produced %d landing(s): %+v", len(doc.Landings), doc.Landings)
+	}
+	if doc.Unattributed != doc.Commits {
+		t.Fatalf("unattributed = %d, want %d", doc.Unattributed, doc.Commits)
+	}
+}
+
+// --- AC #3: a gc'd run still renders from its portable landing note ---
+
+func TestReleaseNoteOnlyAfterLedgerIsGone(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+	id := releaseRunID(releaseDay(2), "cccc")
+	hash := "b9b8" + strings.Repeat("0", 60)
+	rep := runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339),
+		Strategy: "overlay", AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+		Policy:    &policyJSON{Hash: hash, Verify: []string{"go test ./..."}},
+	}
+	writeLogRun(t, runsDir, id, rep)
+	data, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", shas[2], data); err != nil {
+		t.Fatal(err)
+	}
+
+	fromLedger, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(fromLedger.Landings) != 1 || fromLedger.Landings[0].ProvenanceSource != "manifest" {
+		t.Fatalf("with a run dir present the landing must come from the ledger: %+v", fromLedger.Landings)
+	}
+
+	// gc the run history: only the note survives.
+	if err := os.RemoveAll(filepath.Join(runsDir, id)); err != nil {
+		t.Fatal(err)
+	}
+	fromNote, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(fromNote.Landings) != 1 {
+		t.Fatalf("landings after gc = %d, want 1 (the note is portable)", len(fromNote.Landings))
+	}
+	l := fromNote.Landings[0]
+	if l.ProvenanceSource != "note" || l.RunID != id || l.LandedSHA != short(shas[2]) {
+		t.Fatalf("note-sourced landing = %+v", l)
+	}
+	if fromNote.Unattributed != fromLedger.Unattributed {
+		t.Fatalf("unattributed changed when the ledger was gc'd: %d -> %d", fromLedger.Unattributed, fromNote.Unattributed)
+	}
+	// A document must not contradict itself: a landing that names an agent and a
+	// policy hash has to appear in the attribution table and the policy section
+	// too, whether it came from the ledger or from a note.
+	if !reflect.DeepEqual(fromNote.Agents, fromLedger.Agents) {
+		t.Fatalf("attribution dropped the note-sourced landing: %+v, ledger had %+v", fromNote.Agents, fromLedger.Agents)
+	}
+	if len(fromNote.Policy.Hashes) != 1 || fromNote.Policy.Hashes[0].Hash != hash {
+		t.Fatalf("policy section dropped the note-sourced landing's hash: %+v", fromNote.Policy)
+	}
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	if strings.Contains(md, "No run in this range recorded") {
+		t.Fatalf("markdown says no policy was recorded while a landing names one:\n%s", md)
+	}
+}
+
+// --- AC #4: a note about some other commit is not attribution ---
+
+func TestReleaseForgedNoteIsUnattributed(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	ctx := context.Background()
+	// A note ON a range commit whose payload is about a DIFFERENT final commit,
+	// with a fabricated agent — the shape a hostile remote can push.
+	forged := runReport{
+		RunID: "20260101T000000Z-evil", BaseSHA: hexSHA("00"), Strategy: "overlay", AgentCmd: "EVIL --exfiltrate",
+		PerAgent:  []perAgentJSON{{ID: "x1", Branch: "agent/x1", SHA: hexSHA("11"), OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/x1"}, FinalSHA: hexSHA("dead")},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	}
+	data, err := json.MarshalIndent(forged, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", shas[2], data); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, raw := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 0 {
+		t.Fatalf("a forged note produced a landing: %+v", doc.Landings)
+	}
+	if doc.Unattributed != doc.Commits {
+		t.Fatalf("unattributed = %d, want %d — the forged commit must count as unclaimed", doc.Unattributed, doc.Commits)
+	}
+	if strings.Contains(raw, "EVIL") {
+		t.Fatalf("the forged note's agent reached the published document:\n%s", raw)
+	}
+}
+
+// --- AC #5: a parked run is listed, and rendering it transitions nothing ---
+
+// writeReleasePark writes a valid park.json + awaiting-ack status.json into a run
+// dir. createdAt is deliberately a parameter: a park whose ack-timeout has
+// already expired is what makes the "no lazy sweep" assertion below meaningful —
+// if buildRelease swept, THIS record is the one it would rewrite.
+func writeReleasePark(t *testing.T, dir string, createdAt time.Time) {
+	t.Helper()
+	pk := &parkJSON{
+		VerifiedSHA: hexSHA("ab"), VerifiedTree: hexSHA("cd"), BaseSHA: hexSHA("ef"), ForkSHA: hexSHA("12"),
+		Base: "main", Reason: parkReasonAckPaths, CreatedAt: createdAt.UTC().Format(time.RFC3339),
+		AckTimeout: "1h", AckTimeoutAction: parkActionReject,
+		Groups: []parkGroupJSON{{
+			Branches:     []string{"agent/t7"},
+			MatchedPaths: map[string]string{"billing/rates.go": "billing/**"},
+			Reason:       parkReasonAckPaths,
+		}},
+		Attempts: []parkAttemptJSON{{N: 1, At: createdAt.UTC().Format(time.RFC3339), VerifyOK: true}},
+	}
+	if err := writePark(dir, pk); err != nil {
+		t.Fatal(err)
+	}
+	writeRunStatus(dir, statusAwaitingAck, "parked for ack")
+}
+
+func TestReleaseParkedListedAndNotSwept(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "dddd")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339),
+		Strategy: "overlay", AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay"},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+	dir := filepath.Join(runsDir, id)
+	writeReleasePark(t, dir, time.Now().Add(-2*time.Hour)) // already past its 1h deadline
+
+	before := readFileOrFail(t, filepath.Join(dir, parkFileName))
+	statusBefore := readFileOrFail(t, filepath.Join(dir, "status.json"))
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Parked) != 1 {
+		t.Fatalf("parked = %+v, want the one awaiting-ack run", doc.Parked)
+	}
+	p := doc.Parked[0]
+	if p.RunID != id || p.Status != statusAwaitingAck || p.Reason != parkReasonAckPaths {
+		t.Fatalf("parked entry = %+v", p)
+	}
+	if !reflect.DeepEqual(p.Branches, []string{"agent/t7"}) {
+		t.Fatalf("parked branches = %v", p.Branches)
+	}
+	if p.MatchedPaths["billing/rates.go"] != "billing/**" {
+		t.Fatalf("matched paths = %v", p.MatchedPaths)
+	}
+	if p.ExpiresAt == "" || p.Attempts != 1 {
+		t.Fatalf("parked entry lost its deadline/attempts: %+v", p)
+	}
+
+	// The read-only claim, at the one place it is easiest to break: generating a
+	// document must never transition a run's state, so the EXPIRED park must
+	// still be awaiting-ack with byte-identical records.
+	if got := readFileOrFail(t, filepath.Join(dir, parkFileName)); !bytes.Equal(got, before) {
+		t.Fatalf("park.json changed:\nbefore %s\nafter  %s", before, got)
+	}
+	if got := readFileOrFail(t, filepath.Join(dir, "status.json")); !bytes.Equal(got, statusBefore) {
+		t.Fatalf("status.json changed: the ack-timeout sweep ran during a read-only render\n%s", got)
+	}
+	if st, _ := diskRunStatus(dir); st != statusAwaitingAck {
+		t.Fatalf("run status = %q after rendering, want %s", st, statusAwaitingAck)
+	}
+
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	if !strings.Contains(md, "### Needed a human") || !strings.Contains(md, "billing/rates.go") {
+		t.Fatalf("markdown does not surface the park:\n%s", md)
+	}
+}
+
+// TestReleaseUnreadableParkIsListed: a park.json that will not validate is still
+// something a human is owed — it is listed as unreadable, never dropped.
+func TestReleaseUnreadableParkIsListed(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "eeee")
+	writeLogRun(t, runsDir, id, runReport{RunID: id, BaseSHA: shas[1], Integrate: integrateJSON{}})
+	dir := filepath.Join(runsDir, id)
+	if err := os.WriteFile(filepath.Join(dir, parkFileName), []byte("{ truncated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeRunStatus(dir, statusAwaitingAck, "parked")
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Parked) != 1 || doc.Parked[0].Reason != "unreadable" || doc.Parked[0].Error == "" {
+		t.Fatalf("parked = %+v, want one unreadable entry carrying the error", doc.Parked)
+	}
+}
+
+// --- AC #6: a bisect run appears in landings once AND in dropped ---
+
+func TestReleaseBisectDroppedAndSalvaged(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "ffff")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339),
+		Strategy: "overlay", AgentCmd: "aider",
+		PerAgent: []perAgentJSON{
+			{ID: "keep", Branch: "agent/keep", SHA: shas[3], OK: true},
+			{ID: "drop", Branch: "agent/drop", SHA: hexSHA("c2"), OK: true},
+		},
+		Integrate: integrateJSON{
+			Strategy: "overlay", Landed: []string{"agent/keep"},
+			DroppedByBisect: []string{"agent/drop"}, FinalSHA: shas[2],
+		},
+		Verify: verifyJSON{Ran: true, OK: true, Bisect: &bisectJSON{Ran: true, Attempts: 3}},
+	})
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 1 {
+		t.Fatalf("landings = %d, want the salvaged subset exactly once: %+v", len(doc.Landings), doc.Landings)
+	}
+	if len(doc.Dropped) != 1 || doc.Dropped[0].RunID != id || doc.Dropped[0].Attempts != 3 {
+		t.Fatalf("dropped = %+v", doc.Dropped)
+	}
+	if !reflect.DeepEqual(doc.Dropped[0].Branches, []string{"agent/drop"}) {
+		t.Fatalf("dropped branches = %v", doc.Dropped[0].Branches)
+	}
+	// Both the integration commit and the landed member are in the range; the run
+	// still contributes ONE landing row.
+	if doc.Unattributed != doc.Commits-2 {
+		t.Fatalf("unattributed = %d with %d commits; both claimed commits must be attributed", doc.Unattributed, doc.Commits)
+	}
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	if !strings.Contains(md, "### Dropped by bisect") {
+		t.Fatalf("markdown missing the bisect section:\n%s", md)
+	}
+}
+
+// --- AC #7: commands are absent by default, opt-in and flagged with -with-commands ---
+
+func TestReleaseRedactsCommandsByDefault(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "9999")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339),
+		Strategy: "overlay", AgentCmd: "/usr/local/bin/claude -p",
+		VerifyCmd: "API_KEY=SECRET-TOKEN go test ./...", RepairCmd: "fix --key SECRET-TOKEN",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+	spec := shas[0] + ".." + shas[3]
+
+	for _, out := range []string{releaseMarkdown(t, repo, spec), mustReleaseRaw(t, repo, spec)} {
+		if strings.Contains(out, "SECRET-TOKEN") {
+			t.Fatalf("a recorded command reached the default output:\n%s", out)
+		}
+	}
+	doc, _ := releaseJSON(t, repo, spec)
+	if doc.WithCommands || doc.Landings[0].Commands != nil {
+		t.Fatalf("commands present by default: %+v", doc.Landings[0])
+	}
+	if doc.Landings[0].Agent != "claude" {
+		t.Fatalf("agent = %q, want the program name", doc.Landings[0].Agent)
+	}
+
+	withMD := releaseMarkdown(t, repo, spec, "-with-commands")
+	if !strings.Contains(withMD, "SECRET-TOKEN") {
+		t.Fatalf("-with-commands did not include the verbatim command:\n%s", withMD)
+	}
+	if !strings.Contains(withMD, "> commands are included verbatim and may contain secrets") {
+		t.Fatalf("-with-commands markdown carries no warning line:\n%s", withMD)
+	}
+	withDoc, withRaw := releaseJSON(t, repo, spec, "-with-commands")
+	if !withDoc.WithCommands || withDoc.Landings[0].Commands == nil {
+		t.Fatalf("-with-commands JSON did not set withCommands/commands: %+v", withDoc.Landings[0])
+	}
+	if !strings.Contains(withRaw, "SECRET-TOKEN") {
+		t.Fatalf("-with-commands JSON dropped the command:\n%s", withRaw)
+	}
+}
+
+// mustReleaseRaw returns the raw -json bytes (for a substring check that must
+// not depend on decoding).
+func mustReleaseRaw(t *testing.T, repo, spec string) string {
+	t.Helper()
+	_, raw := releaseJSON(t, repo, spec)
+	return raw
+}
+
+// TestAgentNameCollapsesToProgram is agentName's own contract: a program name,
+// never an argument, and never an env assignment that could carry a key.
+func TestAgentNameCollapsesToProgram(t *testing.T) {
+	cases := map[string]string{
+		"/usr/local/bin/claude -p":    "claude",
+		"claude -p --model x":         "claude",
+		`C:\tools\codex.exe exec`:     "codex.exe",
+		"":                            "unknown",
+		"   ":                         "unknown",
+		"API_KEY=sk-secret claude -p": "unknown",
+		"aider":                       "aider",
+	}
+	for cmd, want := range cases {
+		if got := agentName(cmd); got != want {
+			t.Fatalf("agentName(%q) = %q, want %q", cmd, got, want)
+		}
+	}
+}
+
+// --- AC #8: attribution collapses to one row per agent program ---
+
+func TestReleaseAgentsCollapseByProgram(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	writeLogRun(t, runsDir, releaseRunID(releaseDay(1), "aa"), runReport{
+		BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339), AgentCmd: "/usr/local/bin/claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[1]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+	writeLogRun(t, runsDir, releaseRunID(releaseDay(2), "bb"), runReport{
+		BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude -p --model x",
+		Integrate: integrateJSON{Strategy: "overlay"}, // ran in the window, landed nothing
+		Verify:    verifyJSON{Ran: true, OK: false},
+	})
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Agents) != 1 {
+		t.Fatalf("agents = %+v, want one row", doc.Agents)
+	}
+	if doc.Agents[0] != (releaseAgent{Agent: "claude", Runs: 2, Landed: 1}) {
+		t.Fatalf("agent row = %+v, want {claude 2 1}", doc.Agents[0])
+	}
+}
+
+// --- AC #9: the policy section answers "did the landing bar move" ---
+
+func TestReleasePolicyChangeInsideRange(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	first, second := releaseRunID(releaseDay(1), "aa"), releaseRunID(releaseDay(2), "bb")
+	hashA, hashB := "3ab1"+strings.Repeat("0", 60), "9f2c"+strings.Repeat("0", 60)
+	writeLogRun(t, runsDir, first, runReport{
+		BaseSHA: shas[0], StartedAt: releaseDay(1).Format(time.RFC3339), AgentCmd: "claude",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"a"}, FinalSHA: shas[1]},
+		Verify:    verifyJSON{Ran: true, OK: true}, Policy: &policyJSON{Hash: hashA},
+	})
+	writeLogRun(t, runsDir, second, runReport{
+		BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"a"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true}, Policy: &policyJSON{Hash: hashB},
+	})
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if !doc.Policy.Changed || len(doc.Policy.Hashes) != 2 {
+		t.Fatalf("policy = %+v, want changed with both hashes", doc.Policy)
+	}
+	if doc.Policy.Hashes[0].Hash != hashA || doc.Policy.Hashes[0].FirstRunID != first {
+		t.Fatalf("first hash = %+v, want %s from %s", doc.Policy.Hashes[0], hashA, first)
+	}
+	if doc.Policy.Hashes[1].FirstRunID != second {
+		t.Fatalf("second hash = %+v, want first seen in %s", doc.Policy.Hashes[1], second)
+	}
+	if !strings.Contains(releaseMarkdown(t, repo, shas[0]+".."+shas[3]), "CHANGED inside this range") {
+		t.Fatal("markdown does not report the policy change")
+	}
+
+	// The same hash twice is not a change.
+	writeLogRun(t, runsDir, second, runReport{
+		BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"a"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true}, Policy: &policyJSON{Hash: hashA},
+	})
+	same, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if same.Policy.Changed || len(same.Policy.Hashes) != 1 {
+		t.Fatalf("policy = %+v, want unchanged with one hash", same.Policy)
+	}
+}
+
+// TestReleasePolicyHashReachesSigLog is the one-line fix this change carries:
+// `sig log`'s policyHash column read a TOP-LEVEL policyHash key that nothing has
+// ever written (policyReport writes policy.hash), so it was permanently empty.
+func TestReleasePolicyHashReachesSigLog(t *testing.T) {
+	g, repo, _ := newGCRepo(t)
+	runsDir := logRunsDir(t, g)
+	hash := "3ab1" + strings.Repeat("0", 60)
+	writeLogRun(t, runsDir, "20260301T000000Z-aaaa", runReport{
+		BaseSHA: hexSHA("00"), Integrate: integrateJSON{Strategy: "overlay"},
+		Policy: &policyJSON{Hash: hash, Verify: []string{"go test ./..."}},
+	})
+	rows, _ := scanRuns(runsDir, 0)
+	if len(rows) != 1 || rows[0].PolicyHash != hash {
+		t.Fatalf("logRow.PolicyHash = %q, want %q", rows[0].PolicyHash, hash)
+	}
+	var buf bytes.Buffer
+	if code, err := runLog(&buf, []string{"-repo", repo, "-json"}); err != nil || code != exitOK {
+		t.Fatalf("runLog: code=%d err=%v", code, err)
+	}
+	if !strings.Contains(buf.String(), hash) {
+		t.Fatalf("policyHash absent from `sig log -json`:\n%s", buf.String())
+	}
+}
+
+// --- AC #10 / #11: the selector is exclusive and the grammar is refused, not guessed ---
+
+func TestReleaseSelectorsMutuallyExclusive(t *testing.T) {
+	_, repo, shas := releaseRepo(t)
+	for _, argv := range [][]string{
+		{"-repo", repo, "-release", shas[0] + ".." + shas[3], "-sha", hexSHA("a1")},
+		{"-repo", repo, "-release", shas[0] + ".." + shas[3], "-task", "t1"},
+	} {
+		var buf bytes.Buffer
+		code, err := runLog(&buf, argv)
+		if err == nil || code != exitOperationalError {
+			t.Fatalf("%v: code=%d err=%v, want a mutual-exclusion error", argv, code, err)
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("%v wrote to stdout on a usage error: %q", argv, buf.String())
+		}
+	}
+}
+
+func TestReleaseMalformedRangeRefused(t *testing.T) {
+	_, repo, shas := releaseRepo(t)
+	for _, spec := range []string{
+		shas[0],                   // a bare rev
+		".." + shas[3],            // implicit FROM
+		shas[0] + "..",            // implicit TO
+		shas[0] + "..." + shas[3], // symmetric difference
+		shas[0] + ".." + shas[1] + ".." + shas[3], // three endpoints
+		"..",
+		"-HEAD..HEAD", // an option-shaped revision
+	} {
+		var buf bytes.Buffer
+		code, err := runLog(&buf, []string{"-repo", repo, "-release", spec})
+		if err == nil || code != exitOperationalError {
+			t.Fatalf("-release %q: code=%d err=%v, want exit 1", spec, code, err)
+		}
+		if !strings.Contains(err.Error(), "FROM..TO") {
+			t.Fatalf("-release %q error %q does not name the expected form", spec, err)
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("-release %q wrote a partial document: %q", spec, buf.String())
+		}
+	}
+}
+
+func TestReleaseUnresolvableEndpointIsRefused(t *testing.T) {
+	_, repo, shas := releaseRepo(t)
+	var buf bytes.Buffer
+	code, err := runLog(&buf, []string{"-repo", repo, "-release", "v9.9.9-nope.." + shas[3]})
+	if err == nil || code != exitOperationalError {
+		t.Fatalf("code=%d err=%v, want exit 1 for an unresolvable endpoint", code, err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("a half-rendered document reached stdout: %q", buf.String())
+	}
+}
+
+// --- AC #12: the serve mirror is the same builder ---
+
+func TestReleaseServeMatchesCLI(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339),
+		Strategy: "overlay", AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+	cliDoc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+
+	_, ts := newTestServer(t, "", repo)
+	var srv struct {
+		Cell    string      `json:"cell"`
+		Repo    string      `json:"repo"`
+		Release *releaseDoc `json:"release"`
+	}
+	url := ts.URL + "/log/release?from=" + shas[0] + "&to=" + shas[3]
+	if code := doJSON(t, "GET", url, "", nil, &srv); code != http.StatusOK {
+		t.Fatalf("GET /log/release status %d", code)
+	}
+	if !reflect.DeepEqual(srv.Release, cliDoc) {
+		t.Fatalf("serve document != CLI\nserve: %+v\ncli:   %+v", srv.Release, cliDoc)
+	}
+	// Byte-identical, not merely equal after decoding.
+	cliBytes, err := json.Marshal(cliDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvBytes, err := json.Marshal(srv.Release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cliBytes, srvBytes) {
+		t.Fatalf("serve/CLI JSON differ:\n%s\n%s", srvBytes, cliBytes)
+	}
+
+	// An empty range is a 200 with an empty document, not a 404.
+	var empty struct {
+		Release *releaseDoc `json:"release"`
+	}
+	if code := doJSON(t, "GET", ts.URL+"/log/release?from="+shas[3]+"&to="+shas[0], "", nil, &empty); code != http.StatusOK {
+		t.Fatalf("empty range status %d, want 200", code)
+	}
+	if empty.Release == nil || empty.Release.Commits != 0 {
+		t.Fatalf("empty range document = %+v", empty.Release)
+	}
+	// An unresolvable rev, a malformed rev and a missing endpoint are 400s.
+	for _, q := range []string{
+		"?from=v9.9.9-nope&to=" + shas[3],
+		"?from=-HEAD&to=" + shas[3],
+		"?to=" + shas[3],
+		"?from=" + shas[0],
+	} {
+		if code := doJSON(t, "GET", ts.URL+"/log/release"+q, "", nil, nil); code != http.StatusBadRequest {
+			t.Fatalf("GET /log/release%s = %d, want 400", q, code)
+		}
+	}
+}
+
+func TestReleaseServeRequiresCellWithTwoCells(t *testing.T) {
+	_, repoA, shasA := releaseRepo(t)
+	_, repoB, _ := releaseRepo(t)
+	s, ts := newTestServer(t, "", repoA, repoB)
+
+	if code := doJSON(t, "GET", ts.URL+"/log/release?from="+shasA[0]+"&to="+shasA[3], "", nil, nil); code != http.StatusBadRequest {
+		t.Fatalf("omitting cell with two cells = %d, want 400", code)
+	}
+	var out struct {
+		Cell    string      `json:"cell"`
+		Release *releaseDoc `json:"release"`
+	}
+	url := ts.URL + "/log/release?cell=" + s.cells[0].cell.ID() + "&from=" + shasA[0] + "&to=" + shasA[3]
+	if code := doJSON(t, "GET", url, "", nil, &out); code != http.StatusOK {
+		t.Fatalf("naming the cell = %d, want 200", code)
+	}
+	if out.Cell != s.cells[0].cell.ID() || out.Release.Commits != 3 {
+		t.Fatalf("cell-scoped document = %+v", out)
+	}
+	if code := doJSON(t, "GET", ts.URL+"/log/release?cell=nope&from="+shasA[0]+"&to="+shasA[3], "", nil, nil); code != http.StatusBadRequest {
+		t.Fatalf("unknown cell = %d, want 400", code)
+	}
+}
+
+// --- AC #13: a torn run dir is counted, and everything else still renders ---
+
+func TestReleaseIncompleteRunCounted(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	good := releaseRunID(releaseDay(2), "aaaa")
+	writeLogRun(t, runsDir, good, runReport{
+		RunID: good, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+	torn := filepath.Join(runsDir, releaseRunID(releaseDay(2), "bbbb"))
+	if err := os.MkdirAll(torn, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(torn, "report.json"), []byte("{ half-written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if doc.Incomplete != 1 {
+		t.Fatalf("incomplete = %d, want 1", doc.Incomplete)
+	}
+	if len(doc.Landings) != 1 || doc.Landings[0].RunID != good {
+		t.Fatalf("the readable run stopped rendering: %+v", doc.Landings)
+	}
+	if !strings.Contains(releaseMarkdown(t, repo, shas[0]+".."+shas[3]), "unreadable") {
+		t.Fatal("markdown footer does not disclose the unreadable run dir")
+	}
+}
+
+// --- AC #14: the read-only claim, asserted mechanically ---
+
+func TestReleaseWritesNothing(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+	id := releaseRunID(releaseDay(2), "aaaa")
+	rep := runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	}
+	writeLogRun(t, runsDir, id, rep)
+	data, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", shas[3], data); err != nil {
+		t.Fatal(err)
+	}
+	writeReleasePark(t, filepath.Join(runsDir, id), time.Now().Add(-2*time.Hour))
+
+	refsBefore := allRefs(t, repo)
+	runsBefore := treeSnapshot(t, runsDir)
+
+	if _, raw := releaseJSON(t, repo, shas[0]+".."+shas[3]); raw == "" {
+		t.Fatal("no document rendered")
+	}
+
+	if after := allRefs(t, repo); !reflect.DeepEqual(after, refsBefore) {
+		t.Fatalf("refs changed across a read-only render:\nbefore %v\nafter  %v", refsBefore, after)
+	}
+	if after := treeSnapshot(t, runsDir); !reflect.DeepEqual(after, runsBefore) {
+		t.Fatalf("run dir changed across a read-only render:\nbefore %v\nafter  %v", runsBefore, after)
+	}
+}
+
+// allRefs maps every ref (including refs/notes/sigbound) to its OID.
+func allRefs(t *testing.T, repo string) map[string]string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", repo, "for-each-ref", "--format=%(refname) %(objectname)").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if name, oid, ok := strings.Cut(line, " "); ok {
+			refs[name] = oid
+		}
+	}
+	return refs
+}
+
+// treeSnapshot maps every file under root to its size and modification time —
+// enough to catch a rewrite, a truncation, or a new file appearing.
+func treeSnapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snap := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		snap[path] = fmt.Sprintf("%d@%s", info.Size(), info.ModTime().UTC().Format(time.RFC3339Nano))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
+}
+
+func readFileOrFail(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// --- selection frame: attention items are windowed, landings are not ---
+
+// TestReleaseAttentionItemsAreWindowed pins the documented approximation: a
+// parked run OUTSIDE the endpoints' committer-date window is not an attention
+// item of this range, while a landing is selected by reachability and is
+// unaffected by where its run dir's timestamp falls.
+func TestReleaseAttentionItemsAreWindowed(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	// A flagged run a year after the range's last commit.
+	outside := releaseRunID(releaseDay(400), "zzzz")
+	writeLogRun(t, runsDir, outside, runReport{
+		RunID: outside, BaseSHA: shas[1], StartedAt: releaseDay(400).Format(time.RFC3339), AgentCmd: "claude",
+		Integrate: integrateJSON{Strategy: "overlay", Flagged: []flaggedJSON{{Branch: "agent/late"}}},
+	})
+	// A landing whose run dir is ALSO outside the window — reachability decides.
+	late := releaseRunID(releaseDay(401), "yyyy")
+	writeLogRun(t, runsDir, late, runReport{
+		RunID: late, BaseSHA: shas[1], StartedAt: releaseDay(401).Format(time.RFC3339), AgentCmd: "claude",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Flagged) != 0 {
+		t.Fatalf("a run outside the window became an attention item: %+v", doc.Flagged)
+	}
+	if len(doc.Landings) != 1 || doc.Landings[0].RunID != late {
+		t.Fatalf("a landing was dropped for being outside the time window: %+v", doc.Landings)
+	}
+}
+
+// TestReleaseMixedHandAndSigboundCommits is the whole point of the document:
+// over a range that mixes sigbound landings with hand commits, both are
+// represented — the landings attributed, the rest counted, never silently
+// dropped to make the ledger look complete.
+func TestReleaseMixedHandAndSigboundCommits(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	runsDir := logRunsDir(t, g)
+	id := releaseRunID(releaseDay(2), "aaaa")
+	writeLogRun(t, runsDir, id, runReport{
+		RunID: id, BaseSHA: shas[1], StartedAt: releaseDay(2).Format(time.RFC3339), AgentCmd: "claude -p",
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/t1"}, FinalSHA: shas[2]},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+
+	doc, _ := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if doc.Commits != 3 || len(doc.Landings) != 1 || doc.Unattributed != 2 {
+		t.Fatalf("commits=%d landings=%d unattributed=%d, want 3/1/2", doc.Commits, len(doc.Landings), doc.Unattributed)
+	}
+	md := releaseMarkdown(t, repo, shas[0]+".."+shas[3])
+	if !strings.Contains(md, "2 commits in this range carry no sigbound landing") {
+		t.Fatalf("markdown does not count the hand commits:\n%s", md)
+	}
+}
