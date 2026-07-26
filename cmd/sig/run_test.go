@@ -37,11 +37,12 @@ func requirePOSIXShell(t *testing.T) {
 }
 
 // requireUnixProcessSemantics skips a test that depends on the unix process
-// primitives `sig serve`'s crash recovery uses: pidAlive probes a pid with
-// signal 0 (unsupported on Windows, where Process.Signal always errors, so it
-// reports every pid — even a live one — as not alive), and some recovery tests
-// spawn a throwaway `true` process. `sig serve`'s startup recovery is therefore
-// not validated on Windows; see pidAlive's note and issue #94.
+// primitives crash recovery uses: pidAlive probes a pid with signal 0
+// (unsupported on Windows, where Process.Signal always errors, so it reports
+// every pid — even a live one — as not alive), and some recovery tests spawn a
+// throwaway `true` process. Recovery is therefore not validated on Windows —
+// and since issue #137 that covers `sig run`'s own startup sweep, not just `sig
+// serve`'s. See pidAlive's note and issue #94.
 func requireUnixProcessSemantics(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS == "windows" {

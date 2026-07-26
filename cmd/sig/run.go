@@ -226,6 +226,13 @@ type publishJSON struct {
 // simply this same report persisted, so a `sig replay` fed a -manifest file or
 // a `-json` report has identical fields to work from.
 type runReport struct {
+	// RunID is the durable run directory this run's journal lives in
+	// (<git-common-dir>/sigbound/runs/<id>/). Both entry points set it, so it is
+	// also the RUN_ID a `sig ack`/`sig reject` takes — the machine-readable
+	// handle a -json consumer needs to release a park it just read out of the
+	// Park field below. Empty (and omitted) only for an in-process driveRun
+	// caller that made no run dir, which has no park to release either.
+	RunID    string `json:"runId,omitempty"`
 	Repo     string `json:"repo"`
 	Base     string `json:"base"`
 	BaseSHA  string `json:"baseSHA"`
@@ -312,15 +319,16 @@ type runReport struct {
 	// candidate group triggered the policy's ack-paths / self-protection rule
 	// AND that group's own integrated tree passed verify: the landing is
 	// complete and VERIFIED but the ref was deliberately not advanced, pending a
-	// human ack. nil (and omitted from JSON) on every other run. `sig serve`
-	// persists it as the run dir's park.json and flips the run to
-	// awaiting-ack; see park.go.
+	// human ack. nil (and omitted from JSON) on every other run. Both entry
+	// points persist it as the run dir's park.json and flip the run to
+	// awaiting-ack (see finishRunDir); see park.go.
 	Park *parkJSON `json:"park,omitempty"`
 	// Audit marks a CLEAN landing (nothing parked, nothing flagged, nothing
 	// bisect-dropped) that the policy's audit-sample rate selected for a
 	// non-blocking spot audit — see auditSelected. Never a gate: it changes
 	// nothing about the landing, it only raises an `audit` inbox entry. Always
-	// false (and omitted) without a run id to sample on, i.e. outside `sig serve`.
+	// false (and omitted) without a run id to sample on, i.e. for an in-process
+	// driveRun caller that made no run dir.
 	Audit bool `json:"audit,omitempty"`
 	// LandRefused names the commit the base was actually at when the landing
 	// swap was refused: somebody else advanced it while this run was computing
@@ -529,11 +537,13 @@ type runParams struct {
 	// baked into Tasks and VerifyCmd by the time driveRun sees it, so this
 	// string never changes what runs or lands. Empty for every other task source.
 	Intent string
-	// RunID is `sig serve`'s durable run id for this run (see newRunID), the
-	// key the spot-audit sample is drawn on (auditSelected) — deterministic and
-	// replayable precisely because it is that recorded id, not a fresh random
-	// draw. Empty for `sig run`, which has no run id at all: such a run is never
-	// audit-sampled. Never affects what lands.
+	// RunID is this run's durable run id (see newRunID) — the directory its
+	// journal, report and parking record live in, and the key the spot-audit
+	// sample is drawn on (auditSelected), deterministic and replayable precisely
+	// because it is that recorded id rather than a fresh random draw. Set by
+	// `sig serve`'s acquireRun and by `sig run`'s startRunDir alike (issue #137);
+	// empty only for an in-process driveRun caller that made no run dir, which is
+	// then never audit-sampled. Never affects what lands.
 	RunID string
 	// PolicyExplicit names the policy-governed dimensions (lanes/semantic/assert)
 	// the invoker set DELIBERATELY, so resolvePolicy can tell a deliberate
@@ -998,7 +1008,22 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		return exitOK, nil
 	}
 
+	// The durable run directory (issue #137). A `sig run` can PARK — record a
+	// verified landing it deliberately did not land — and every path that could
+	// later release one resolves the run through this directory: `sig ack`, `sig
+	// reject`, the ack-timeout sweep, `sig gc`'s unconditional protection, a
+	// daemon's inbox. Without it a CLI park is reachable only from -manifest and
+	// has no supported completion path. Created here, alongside the -logdir and
+	// -manifest preflights above and for the same reason: a .git that cannot take
+	// it must fail the run BEFORE any agent spend, not after.
+	ctx := context.Background()
+	runDir, runID, err := startRunDir(ctx, gitx.New(*repo))
+	if err != nil {
+		return exitOperationalError, err
+	}
+
 	p := runParams{
+		RunID:           runID,
 		Repo:            *repo,
 		Base:            *base,
 		Strategy:        *strategy,
@@ -1050,31 +1075,59 @@ func runRun(w io.Writer, argv []string) (int, error) {
 			Assert:   explicitFlags["assert"],
 		},
 	}
-	rep, err := driveRun(context.Background(), p, tasks)
+	rep, err := driveRun(ctx, p, tasks)
 	if err != nil {
 		// A mid-run failure (e.g. integrate) can still leave real work behind: every
 		// agent that finished has a committed agent/<id> branch, and rep already
 		// names them. Emit what driveRun assembled before surfacing the error, so
 		// the operator can recover it instead of losing it to a discarded report
-		// (this is also the precondition for -resume to find prior branches). A
-		// report with no agents (e.g. the base ref itself never resolved) has
-		// nothing worth printing, so stays silent, same as before. Any write error
-		// here is swallowed on purpose: err is the operational failure that matters
-		// and must reach stderr unchanged.
+		// (this is also the precondition for -resume to find prior branches). The
+		// run dir gets the same partial report for the same reason — it is what
+		// keeps `sig gc` off those branches. A report with no agents (e.g. the base
+		// ref itself never resolved) has nothing worth printing, so stays silent,
+		// same as before. Any write error here is swallowed on purpose: err is the
+		// operational failure that matters and must reach stderr unchanged.
 		if len(rep.PerAgent) > 0 {
+			writeRunReport(runDir, rep)
 			_ = emitReport(w, rep, *asJSON)
 			if manifestPath != "" {
 				writeManifest(manifestPath, rep)
 			}
 		}
+		// The reason rides in the status note rather than a separate error.json:
+		// `sig log` and GET /runs/{id} both fall back to it, and a CLI run has no
+		// cell registration for error.json's other field to describe.
+		writeRunStatus(runDir, "error", err.Error())
 		return exitOperationalError, err
 	}
 	code := runExitCode(rep)
-	if err := emitReport(w, rep, *asJSON); err != nil {
-		return exitOperationalError, err
-	}
+	writeRunReport(runDir, rep)
+	// finishRunDir is where a park becomes durable, and it is the one write in
+	// this function that must be LOUD: the report below carries the park record
+	// too, but only the run dir's copy is what `sig ack` can act on. The report
+	// is still emitted (and the manifest still written) first — a failure here
+	// means the operator needs both, not neither.
+	_, parkErr := finishRunDir(runDir, rep)
+	// The report and the manifest are written whatever happened, and parkErr
+	// outranks a stdout failure when both go wrong: a broken pipe costs the
+	// operator a printout they can regenerate from the manifest, while a lost
+	// parking record is the one write here that strands a verified landing.
+	// Returning on the emit error first would discard parkErr and skip the
+	// manifest, hiding the worse failure behind the lesser one.
+	emitErr := emitReport(w, rep, *asJSON)
 	if manifestPath != "" {
 		writeManifest(manifestPath, rep)
+	}
+	if parkErr != nil {
+		// Mark the dir too. Every other failure in this function records a
+		// phase, and this process is about to exit -- left saying "running" the
+		// run reads as live forever, until some later invocation's recovery
+		// sweep heals it to the vaguer "interrupted".
+		writeRunStatus(runDir, "error", parkErr.Error())
+		return exitOperationalError, fmt.Errorf("write the parking record for run %s (the landing verified, but nothing can release it until this record exists; the branches are kept): %w", runID, parkErr)
+	}
+	if emitErr != nil {
+		return exitOperationalError, emitErr
 	}
 	return code, nil
 }
@@ -1442,7 +1495,8 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		parallelAgents = max(1, runtime.GOMAXPROCS(0))
 	}
 	rep = runReport{
-		Repo: p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks, LogDir: p.LogDir,
+		RunID: p.RunID,
+		Repo:  p.Repo, Base: p.Base, BaseSHA: baseSHA, LaneMode: p.LaneMode, Tasks: tasks, LogDir: p.LogDir,
 		Strategy:       p.Strategy,
 		AgentCmd:       p.AgentCmd,
 		ResolverCmd:    p.ResolverCmd,
@@ -3192,6 +3246,18 @@ func writeRunSummary(w io.Writer, r runReport) error {
 			for _, grp := range b.DroppedGroups {
 				fmt.Fprintf(w, "    dropped group: %v\n", grp)
 			}
+		}
+	}
+	// A park is a landing that is FINISHED and deliberately not landed, so the
+	// summary must name the two commands that finish it — and the run id they
+	// take, which is otherwise only in the JSON report. Without this the human
+	// output of a parked run is indistinguishable from an ordinary flagged one
+	// (issue #137).
+	if r.Park != nil {
+		fmt.Fprintf(w, "parked: %s verified on %s, awaiting ack (%s): %v\n",
+			short(r.Park.VerifiedSHA), short(r.Park.BaseSHA), r.Park.Reason, r.Park.branches())
+		if r.RunID != "" {
+			fmt.Fprintf(w, "  release: sig ack %s -repo %s   (or: sig reject %s -repo %s)\n", r.RunID, r.Repo, r.RunID, r.Repo)
 		}
 	}
 	return nil

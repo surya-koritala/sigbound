@@ -4,7 +4,9 @@
 // integrated and VERIFIED like any other landing and then PARKED: the exact
 // verified commit is recorded in the run dir's park.json, the base ref is left
 // alone, the branches are kept, and the run sits in `awaiting-ack` until a human
-// acks or rejects it.
+// acks or rejects it. Both entry points park into the same run dir (`sig run`
+// creates one in startRunDir since issue #137), so which door a run came in
+// changes nothing about how its park is resolved.
 //
 // THE POINT OF THE WHOLE FILE: an ack is an INPUT to the existing landing gate,
 // never a second landing path. On an ack whose base has not moved, what lands is
@@ -738,11 +740,14 @@ func parkHeldGroups(ctx context.Context, c *cell.Cell, p runParams, pol policy, 
 	return pk
 }
 
-// parkRefKey names a park's keep-alive ref. `sig serve`'s run id is the natural
-// key — one park per run, and the release is unambiguous. `sig run` has no run
-// id, so its park keys on the verified commit itself, which is equally unique
-// and equally releasable (the chosen name is recorded in the record either way,
-// so nothing downstream depends on which branch was taken).
+// parkRefKey names a park's keep-alive ref. The run id is the key: one park per
+// run, an unambiguous release, and — load-bearing — the name `sig gc` resolves
+// back to a run dir to decide whether the ref still pins an OPEN park or is
+// crash debris (see strandedParkRefs). Both entry points have one since issue
+// #137, so the sha fallback below is reached only by an in-process driveRun
+// caller that made no run dir; that ref is unattributable by construction, and
+// gc reclaims it once past the age cutoff, exactly as it would any other ref
+// with no park behind it.
 func parkRefKey(runID, sha string) string {
 	if runID != "" {
 		return runID
@@ -852,7 +857,9 @@ func integrateVerifyPark(ctx context.Context, c *cell.Cell, p runParams, forkSHA
 // percentage: sha256(runId) mod 100 < pct. Deterministic and replayable by
 // construction — the same id selects the same way in every process, on every
 // machine, forever — which is the whole reason there is no RNG here. A run with
-// no id (i.e. `sig run`, which has none) is never selected.
+// no id is never selected; since issue #137 that is only an in-process driveRun
+// caller, so `sig run` samples exactly as `sig serve` does — the sample is a
+// property of the landing and its policy, not of which door it came in.
 func auditSelected(runID string, pct int) bool {
 	if pct <= 0 || runID == "" {
 		return false

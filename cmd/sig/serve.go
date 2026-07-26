@@ -672,20 +672,14 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 	writeRunReport(rec.dir, rep)
 	writeRunUsage(rec.dir, computeUsage(&rep, time.Since(rec.startedAt).Milliseconds(), reportFileSize(rec.dir)))
 	// Parking (issue #109): a run that verified a landing but deliberately did
-	// not advance the ref is NOT done — it is awaiting a human. park.json is
-	// written BEFORE the status flips, so a crash in between leaves a parked run
-	// looking merely interrupted rather than an awaiting-ack run with no record
-	// of what it would land. A park.json that cannot be written is therefore a
-	// hard failure for the run, not a best-effort miss like the report.
-	status := "done"
-	if rep.Park != nil {
-		if err := writePark(rec.dir, rep.Park); err != nil {
-			s.failRun(rec, "write parking record: "+err.Error())
-			return
-		}
-		status = statusAwaitingAck
+	// not advance the ref is NOT done — it is awaiting a human. finishRunDir owns
+	// the record-before-marker ordering that makes that durable, shared with `sig
+	// run` so a park is journaled identically whichever entry point produced it.
+	status, err := finishRunDir(rec.dir, rep)
+	if err != nil {
+		s.failRun(rec, "write parking record: "+err.Error())
+		return
 	}
-	writeRunStatus(rec.dir, status, "")
 	s.mu.Lock()
 	rec.status = status
 	rec.finalSHA = rep.Integrate.FinalSHA
@@ -1567,6 +1561,60 @@ func parseDur(s string, def time.Duration) (time.Duration, error) {
 
 // ---- durable run storage (.git/sigbound/runs/<id>/) ----
 
+// startRunDir creates and journals one `sig run` invocation's durable run
+// directory — the same layout acquireRun creates for a served run, because
+// EVERYTHING that can release a park is keyed on that directory (issue #137):
+// `sig ack`/`sig reject` resolve a run id to it, the ack-timeout sweep and `sig
+// gc`'s unconditional branch protection scan it for park.json, and a park's
+// keep-alive ref is named after the run id so gc can tell an open park's ref
+// from a stranded one. A CLI run with no directory parks into a record only its
+// own -manifest can see, and nothing supported can then land the verified tree.
+//
+// The startup crash-recovery sweep runs here too. It is `sig serve`'s at
+// newServer, but a repo that never runs a daemon has no other moment to heal a
+// dir a Ctrl-C left saying "running". Recovery only rewrites a run whose pid
+// the liveness probe reports gone (see recoverStaleRuns) -- which on unix
+// leaves a live daemon's runs alone, and on Windows leaves nothing alone,
+// because pidAlive has no implementation there and calls every pid dead (see
+// issue #94, and the recovery section in docs/USAGE.md for what that costs).
+func startRunDir(ctx context.Context, g *gitx.Git) (dir, runID string, err error) {
+	common, err := g.GitCommonDir(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	runsDir := filepath.Join(common, "sigbound", "runs")
+	recoverStaleRuns(runsDir, os.Getpid())
+	runID = newRunID()
+	dir = filepath.Join(runsDir, runID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", "", fmt.Errorf("create run dir: %w", err)
+	}
+	writeRunStatus(dir, "running", "")
+	return dir, runID, nil
+}
+
+// finishRunDir records a completed run's outcome in its run dir and reports the
+// status it wrote. Both entry points end here — `sig serve`'s execRun and `sig
+// run`'s runRun — because the ORDERING is the contract, not a convenience: an
+// unresolved park.json OUTRANKS the phase marker (see diskRunStatus), so the
+// record must be on disk before the marker flips. A crash in the reverse gap
+// leaves a run marked done with a park nothing knows about; a crash in this one
+// leaves it marked running, which recovery and every reader then heal to
+// awaiting-ack. A park.json that cannot be written is consequently a HARD
+// failure for the run — it is the only record of a landing that has not landed
+// — unlike the best-effort report and status writes around it.
+func finishRunDir(dir string, rep runReport) (string, error) {
+	status := "done"
+	if rep.Park != nil {
+		if err := writePark(dir, rep.Park); err != nil {
+			return "", err
+		}
+		status = statusAwaitingAck
+	}
+	writeRunStatus(dir, status, "")
+	return status, nil
+}
+
 // runErrorFile is error.json's shape: the marker written when a run fails
 // operationally, so a restart can report status=error with the reason instead of
 // mistaking the dir for an interrupted run.
@@ -1798,12 +1846,18 @@ func recoverStaleRuns(runsDir string, ourPID int) {
 // is the standard, side-effect-free way to actually probe existence.
 //
 // Windows note: Process.Signal rejects signal 0 ("not supported by windows"),
-// so this returns false for every pid there, live or dead. `sig serve`'s
-// startup recovery consequently over-reaches on Windows (it would mark even a
-// live sibling run "interrupted") and is not validated on that platform — the
-// primary Windows path is the `sig run` CLI, not the serve daemon. See issue
-// #94; a correct Windows probe (OpenProcess + GetExitCodeProcess) is left as a
-// follow-up rather than pulled into the CI-enablement change.
+// so this returns false for every pid there, live or dead. recoverStaleRuns
+// consequently over-reaches on Windows — with no liveness test it would mark
+// even a live sibling run "interrupted" — and since issue #137 that is NOT
+// confined to the serve daemon: startRunDir runs the same sweep, so the `sig
+// run` CLI, the primary Windows path, has it too. Neither is validated on that
+// platform. What the over-reach does and does not cost is stated in
+// docs/USAGE.md's "Crash recovery" section; the short version is a misreported
+// phase, never lost work, because a live run rewrites its own marker and an
+// unresolved park.json outranks the marker regardless. Issue #94 settled the
+// Windows posture (ship the binary, state the limits) and is closed; a correct
+// probe (OpenProcess + GetExitCodeProcess) was left out of it and remains
+// follow-up work.
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
