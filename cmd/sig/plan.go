@@ -268,9 +268,10 @@ func (e *overlapError) feedback() string {
 }
 
 // sortedKeys returns the keys of m in ascending order (deterministic overlap
-// reporting for tests and re-plan feedback, and a receipt that renders the same
-// bytes every time — see receiptBody). Generic in the VALUE type only: every
-// caller keys by string, and the point is the ordering, not the map.
+// reporting for tests and re-plan feedback, a receipt that renders the same
+// bytes every time — see receiptBody — and a deterministic path list wherever a
+// report field is built from a path-keyed map). Generic in the VALUE type only:
+// every caller keys by string, and the point is the ordering, not the map.
 func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -298,6 +299,16 @@ func relSafe(p string) bool {
 		}
 	}
 	return true
+}
+
+// usableBranchName reports whether s is a branch name this binary could safely
+// hand to git after prepending "refs/heads/": a safe relative path with none of
+// the ref-glob/whitespace metacharacters git forbids. It is the one predicate
+// parkJSON.validate and planUnland both gate a recorded base on, so the two
+// cannot drift. It does NOT reject an already-qualified "refs/…" name — a caller
+// that prepends "refs/heads/" must guard that separately (see planUnland).
+func usableBranchName(s string) bool {
+	return s != "" && relSafe(s) && !strings.ContainsAny(s, " \t\n:?*[\\")
 }
 
 // slugSafe reports whether s is safe to use as a git branch component and a

@@ -94,9 +94,12 @@ var parkCASDelay func()
 const parkRefPrefix = "refs/sigbound/park/"
 
 // Park reasons — the machine-readable discriminant on a park record and on each
-// parked group. policy-modified outranks ack-paths when a group triggers both.
+// parked group. Precedence when several apply: policy-modified > unland-paths >
+// ack-paths. unland-paths is only ever reachable from an unland's inverse (see
+// branchHoldReason), never from an ordinary landing.
 const (
 	parkReasonAckPaths       = "ack-paths"
+	parkReasonUnlandPaths    = "unland-paths"
 	parkReasonPolicyModified = "policy-modified"
 )
 
@@ -200,6 +203,15 @@ type parkJSON struct {
 	VerifyRetries int    `json:"verifyRetries,omitempty"`
 	Resolver      string `json:"resolver,omitempty"`
 
+	// UnlandsRun and Entangled are set only when this park holds an UNLAND's
+	// inverse (see unland.go): the run whose contribution the parked landing
+	// takes back, and the later landed runs whose write-sets overlap it. They
+	// change nothing about how the park resolves — ack and reject are identical —
+	// but the inbox row and the human reading it need to know that acking this
+	// removes somebody's work, and whose. Empty on every ordinary park.
+	UnlandsRun string         `json:"unlandsRun,omitempty"`
+	Entangled  []entangledRun `json:"entangled,omitempty"`
+
 	// Outcome, written once the park is resolved.
 	LandedSHA    string `json:"landedSHA,omitempty"`
 	ResolvedAt   string `json:"resolvedAt,omitempty"`
@@ -263,11 +275,18 @@ func (pk *parkJSON) validate() error {
 			return fmt.Errorf("%s: %s %q is not a hex object name", parkFileName, f.name, f.val)
 		}
 	}
-	if pk.Base == "" || !relSafe(pk.Base) || strings.ContainsAny(pk.Base, " \t\n:?*[\\") {
+	if !usableBranchName(pk.Base) {
 		return fmt.Errorf("%s: base %q is not a usable branch name", parkFileName, pk.Base)
 	}
-	if pk.Reason != parkReasonAckPaths && pk.Reason != parkReasonPolicyModified {
+	switch pk.Reason {
+	case parkReasonAckPaths, parkReasonUnlandPaths, parkReasonPolicyModified:
+	default:
 		return fmt.Errorf("%s: unknown reason %q", parkFileName, pk.Reason)
+	}
+	// unlandsRun is joined onto a runs dir by every reader that follows it, so it
+	// gets the same single-safe-component guard a run id from a URL does.
+	if pk.UnlandsRun != "" && !validRunID(pk.UnlandsRun) {
+		return fmt.Errorf("%s: unlandsRun %q is not a run id", parkFileName, pk.UnlandsRun)
 	}
 	if len(pk.Groups) == 0 {
 		return fmt.Errorf("%s: no parked groups", parkFileName)
@@ -275,7 +294,7 @@ func (pk *parkJSON) validate() error {
 	n := 0
 	for _, g := range pk.Groups {
 		for _, b := range g.Branches {
-			if b == "" || !relSafe(b) || strings.ContainsAny(b, " \t\n:?*[\\") {
+			if !usableBranchName(b) {
 				return fmt.Errorf("%s: branch %q is not a usable branch name", parkFileName, b)
 			}
 			n++
@@ -713,16 +732,38 @@ func parkHeldGroups(ctx context.Context, c *cell.Cell, p runParams, pol policy, 
 		})
 		return nil
 	}
+	return parkRecord(ctx, c, p, pol, forkSHA, landSHA, rawVerify, groups, finalSHA, v, emit)
+}
+
+// parkRecord is parkHeldGroups' second half: turn an ALREADY-VERIFIED
+// integration result into the durable park record. Split out because `sig
+// unland` reaches the same state by a different route — it runs
+// integrateVerifyPark itself, since it must report a red inverse as blocked
+// rather than swallow it into park_failed — and a park it produced must be
+// byte-identical in shape to one a run produced, not a second implementation
+// that can drift. finalSHA/v MUST be a green result from integrateVerifyPark
+// over exactly these groups' branches; callers check that first.
+//
+// It returns nil — no park — when the verified commit cannot be pinned, which
+// is the same fail-closed direction parkHeldGroups takes: no park at all beats a
+// record naming a commit git may reclaim.
+func parkRecord(ctx context.Context, c *cell.Cell, p runParams, pol policy, forkSHA, landSHA, rawVerify string, groups []parkGroupJSON, finalSHA string, v verifyJSON, emit *eventEmitter) *parkJSON {
+	branches := make([]string, 0, len(groups))
+	for _, g := range groups {
+		branches = append(branches, g.Branches...)
+	}
 	tree, err := c.Git().TreeOID(ctx, finalSHA)
 	if err != nil {
 		emit.emit("park_failed", map[string]any{"branches": branches, "error": errText(err)})
 		return nil
 	}
+	// The record's reason is the strongest any parked group carries — the same
+	// policy-modified > unland-paths > ack-paths precedence branchHoldReason
+	// applies within one branch.
 	reason := parkReasonAckPaths
 	for _, g := range groups {
-		if g.Reason == parkReasonPolicyModified {
-			reason = parkReasonPolicyModified
-			break
+		if parkReasonRank(g.Reason) > parkReasonRank(reason) {
+			reason = g.Reason
 		}
 	}
 	// Pin the verified commit BEFORE recording it: until this ref exists the
@@ -774,6 +815,21 @@ func parkHeldGroups(ctx context.Context, c *cell.Cell, p runParams, pol policy, 
 		"matchedPaths": pk.matchedPaths(),
 	})
 	return pk
+}
+
+// parkReasonRank orders the park reasons by precedence so the strongest one a
+// record carries wins: policy-modified > unland-paths > ack-paths. An unknown
+// value ranks lowest, which is the same treatment ack-paths gets — this decides
+// only which of several true reasons is DISPLAYED, never whether a park happens.
+func parkReasonRank(r string) int {
+	switch r {
+	case parkReasonPolicyModified:
+		return 3
+	case parkReasonUnlandPaths:
+		return 2
+	default:
+		return 1
+	}
 }
 
 // parkRefKey names a park's keep-alive ref. The run id is the key: one park per
