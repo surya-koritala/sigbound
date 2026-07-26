@@ -81,10 +81,12 @@ type logRow struct {
 	Flagged  int    `json:"flagged"` // len(integrate.flagged) — real conflicts set aside for a human
 	Dropped  int    `json:"dropped"` // len(integrate.droppedByBisect) — clean branches a failing group cost
 	Verify   string `json:"verify,omitempty"`
-	// LandedSHA is integrate.finalSHA, shown ONLY when the run actually
-	// advanced the base ref (see landed): finalSHA is populated with the
+	// LandedSHA is the commit this run put on the base ref, shown ONLY when the
+	// ref actually advanced (see landed): finalSHA is populated with the
 	// integrated tree even on a verify failure that lands nothing, so a bare
-	// finalSHA is not proof of a landing.
+	// finalSHA is not proof of a landing. For a run that parked and was later
+	// ACKED it is the ack's commit from park.json — the report predates the ack
+	// and cannot carry it (see ackedLandedSHA).
 	LandedSHA string `json:"landedSHA,omitempty"`
 	// PolicyHash is surfaced only if a run recorded one (issue #108). No run
 	// written so far has — runReport has no such field yet — so this reads back
@@ -261,6 +263,16 @@ func readLogRow(runsDir, id string) (row logRow, incomplete bool) {
 		var rep runReport
 		if jerr := json.Unmarshal(data, &rep); jerr == nil {
 			fillRowFromReport(&row, &rep)
+			// An ACK lands after this report was written and records the commit
+			// in park.json instead (see ackedLandedSHA), so a run that parked
+			// every group shows a landing here only if we go and look. The
+			// report wins when it has one: that is the run's own landing, and an
+			// ack on top of it lands a different, later commit.
+			if row.LandedSHA == "" {
+				if sha := ackedLandedSHA(dir); sha != "" {
+					row.LandedSHA = short(sha)
+				}
+			}
 			// Tolerant second decode: a policyHash written by a future run
 			// (issue #108) surfaces here; runReport has no such field today, so
 			// this is empty for every run written so far.

@@ -16,6 +16,10 @@
 //	SIGBOUND_REPO      the target repo path
 //	SIGBOUND_BRANCH    the branch the agent must commit to (agent/<id>)
 //
+// `sig serve` exports one more, SIGBOUND_USAGE_FILE: a path the agent MAY write
+// a token/cost JSON to, ingested into that run's usage.json. Purely optional —
+// unset outside serve, and an agent that ignores it is the normal case.
+//
 // The agent is expected to edit files AND commit in that worktree; the driver
 // reads the resulting branch head, never the main working tree.
 package main
@@ -88,6 +92,12 @@ type perAgentJSON struct {
 	// event. 0 (and omitted) for a -resume-reused branch, which set up no
 	// worktree at all.
 	SetupMs int64 `json:"setupMs,omitempty"`
+	// WallMs is this agent's full wall time — worktree setup, every retry, and
+	// the agent command itself — the same number the agent_done event carries.
+	// 0 (and omitted) for an ADOPTED or -resume-reused branch, which ran no
+	// agent at all. `sig serve`'s metering sums these into usage.json's
+	// agentWallMs; see usage.go.
+	WallMs int64 `json:"wallMs,omitempty"`
 	// Resumed is true iff -resume reused this task's agent/<id> branch
 	// outright instead of running its agent again (see runParams.Resume /
 	// resumeAgent): the branch already differed from the recorded baseSHA, so
@@ -545,6 +555,13 @@ type runParams struct {
 	// empty only for an in-process driveRun caller that made no run dir, which is
 	// then never audit-sampled. Never affects what lands.
 	RunID string
+	// AgentUsageDir is the directory each agent's OPTIONAL token/cost file is
+	// pointed at via SIGBOUND_USAGE_FILE (see runAgent and ingestAgentUsage).
+	// `sig serve` sets it to the run's own durable directory; it is empty for
+	// `sig run`, which has no such directory, and an empty value means the
+	// variable is not exported at all. Nothing in the driver reads these files —
+	// serve's metering does, after the run — so this never affects what lands.
+	AgentUsageDir string
 	// PolicyExplicit names the policy-governed dimensions (lanes/semantic/assert)
 	// the invoker set DELIBERATELY, so resolvePolicy can tell a deliberate
 	// weaker choice (a loud error) from an unset default silently tightened to
@@ -1614,8 +1631,9 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 			emit.emit("agent_start", map[string]any{"id": tasks[i].ID, "branch": branch})
 			agentStart := time.Now()
 			agents[i] = runAgentWithRetries(ctx, c, wtRoot, baseSHA, p, tasks[i])
+			agents[i].WallMs = time.Since(agentStart).Milliseconds()
 			a := agents[i]
-			emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "setupMs": a.SetupMs, "wallMs": time.Since(agentStart).Milliseconds()})
+			emit.emit("agent_done", map[string]any{"id": a.ID, "ok": a.OK, "exit": a.Exit, "attempts": a.Attempts, "files": a.Files, "inLane": a.InLane, "setupMs": a.SetupMs, "wallMs": a.WallMs})
 		}(i)
 	}
 	wg.Wait()
@@ -2766,12 +2784,27 @@ func runAgent(ctx context.Context, c *cell.Cell, wtRoot, baseSHA string, p runPa
 	// agent (or one that leaked a background process holding our stderr) can't
 	// block the whole run. See cell.CommandResolver.Resolve for the mechanism.
 	cmd.WaitDelay = 2 * time.Second
-	cmd.Env = slotEnv(p.EnvMode, p.EnvAgent, []string{
+	agentVars := []string{
 		"SIGBOUND_TASK=" + t.Prompt,
 		"SIGBOUND_TASK_ID=" + t.ID,
 		"SIGBOUND_REPO=" + p.Repo,
 		"SIGBOUND_BRANCH=" + branch,
-	})
+	}
+	// Optional cost seam: a path this agent MAY write a token/cost JSON to.
+	// Nothing requires it and nothing here creates the file — an absent file is
+	// the normal case (see ingestAgentUsage). It is deliberately OUTSIDE the
+	// worktree, so writing it can never show up as a stray file in the agent's
+	// write-set or trip -lanes strict.
+	//
+	// ponytail: one file per sanitized task id; two ids differing only in
+	// characters sanitizeID folds to '-' would share a file and the last writer
+	// would win, exactly as they already share a -logdir log. Key it on the
+	// agent's index if that collision ever matters.
+	if p.AgentUsageDir != "" {
+		agentVars = append(agentVars, "SIGBOUND_USAGE_FILE="+
+			filepath.Join(p.AgentUsageDir, agentUsagePrefix+sanitizeID(t.ID)+".json"))
+	}
+	cmd.Env = slotEnv(p.EnvMode, p.EnvAgent, agentVars)
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	// stdout is discarded; the agent signals its work through commits + exit code.

@@ -477,6 +477,42 @@ func readPark(dir string) (*parkJSON, error) {
 	return pk, err
 }
 
+// ackedLandedSHA is the commit an ACK landed for this run, or "" if none did.
+//
+// It exists because an acked landing is the one landing a run's OWN records
+// cannot show. A run whose every group parked writes report.json and usage.json
+// with finalSHA == baseSHA and landed=false, which is the truth about what the
+// RUN did; the ref is advanced later, by ackRun, and recorded where the ack
+// happens — here, in park.json. Neither file is rewritten afterwards, on purpose:
+// a report is the run's historical record, and back-dating it would make the run
+// claim it did something it did not do.
+//
+// So every reader that asks "did this land" ORs this over the run's own record
+// (see landed, readLogRow, foldMetrics), and the answer is DERIVED on read rather
+// than stored twice. Empty for a park that is unresolved, rejected, expired, or
+// whose record will not read back: only a recorded landing counts as one.
+//
+// The status gate is what makes that last sentence true. ackRun and ackReverify
+// write resolvedAt and landedSHA BEFORE they move the ref, and only ErrRefMoved
+// routes to refuseAck to rewind them -- every other landRef failure (a stale
+// refs/heads/X.lock left by a crashed git, a reference-transaction hook refusing
+// it, ENOSPC) returns with the record still claiming a landing that did not
+// happen. Reading resolvedAt alone would therefore report landed for a ref that
+// provably never moved, which is worse than the report's own conservative
+// answer. writeRunStatus(dir, "done", "") runs only AFTER landRef succeeds, so
+// the status is the on-disk fact that means the ref moved; anything short of it
+// -- an error return or a crash between the two writes -- keeps this fail-closed.
+func ackedLandedSHA(dir string) string {
+	if st, _ := diskRunStatus(dir); st != "done" {
+		return ""
+	}
+	pk, err := readPark(dir)
+	if err != nil || pk.ResolvedAt == "" {
+		return ""
+	}
+	return pk.LandedSHA
+}
+
 // readParkAt is readPark plus the EXACT bytes it parsed. Those bytes are the
 // compare-and-swap token: a writer that read the record, spent minutes
 // re-verifying, and then wants to update it must first prove the record on disk

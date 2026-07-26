@@ -97,6 +97,25 @@
   .actions button.ack { border-color: var(--accent); }
   .actions button.rej { border-color: var(--flag); }
   .result { margin-top: 6px; font-size: 12px; }
+  /* Board tab: derived columns, never draggable — a card is a fact. */
+  #boardView { padding: 12px 16px; overflow: auto; }
+  .metrics { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .metric { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; min-width: 150px; }
+  .metric .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .metric .v { font-size: 16px; font-weight: 600; }
+  .metric .d { color: var(--muted); font-size: 11px; }
+  .cellname { font-size: 12px; color: var(--muted); margin: 10px 0 6px; word-break: break-all; }
+  .board { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+  @media (max-width: 1100px) { .board { grid-template-columns: 1fr; } }
+  .bcol { border: 1px solid var(--line); border-radius: 6px; padding: 8px; min-width: 0; }
+  .bcol > h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
+  .card { border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-bottom: 6px; background: var(--panel); }
+  .card.awaiting-ack { border-color: var(--flag); }
+  .card .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 600; word-break: break-all; }
+  .card .goal { color: var(--muted); font-size: 12px; margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
+  .card .run { font-size: 12px; margin-top: 4px; word-break: break-all; }
+  table.presets { border-collapse: collapse; font-size: 12px; margin-bottom: 12px; }
+  table.presets th, table.presets td { border: 1px solid var(--line); padding: 3px 8px; text-align: left; }
 </style>
 </head>
 <body>
@@ -111,7 +130,14 @@
 <nav class="tabs">
   <button id="tabConflicts" class="on">Conflicts</button>
   <button id="tabInbox">Inbox</button>
+  <button id="tabBoard">Board</button>
 </nav>
+<section id="boardView" hidden>
+  <div class="note">Derived from the run journal and <code>intents/</code>, recomputed on every load —
+  nothing here is draggable, because a card is a fact: an intent's column is where its runs actually
+  are. Read-only, like everything outside the Inbox's parked entries.</div>
+  <div id="board"></div>
+</section>
 <section id="inboxView" hidden>
   <div class="note">Everything across every cell waiting on a human. Only <strong>parked</strong> entries are
   actionable: <strong>Ack</strong> releases a landing that already passed verify, <strong>Reject</strong> keeps the
@@ -294,12 +320,18 @@ function showTab(which) {
   tab = which;
   $("conflictsView").hidden = which !== "conflicts";
   $("inboxView").hidden = which !== "inbox";
+  $("boardView").hidden = which !== "board";
   $("tabConflicts").classList.toggle("on", which === "conflicts");
   $("tabInbox").classList.toggle("on", which === "inbox");
+  $("tabBoard").classList.toggle("on", which === "board");
   reloadCurrent();
 }
 
-function reloadCurrent() { return tab === "inbox" ? loadInbox() : loadRuns(); }
+function reloadCurrent() {
+  if (tab === "inbox") return loadInbox();
+  if (tab === "board") return loadBoard();
+  return loadRuns();
+}
 
 // renderEntry builds one inbox row. Every string that reaches the DOM here —
 // summaries, run ids, branch names, repo paths, glob patterns — goes through
@@ -391,6 +423,134 @@ async function selectRunById(runId) {
   }
 }
 
+// ---- Board ----
+
+// The five columns, in order. They mirror board.go's derived column names
+// exactly; the page never computes or changes a column, it only groups by the
+// one the server derived from the journal.
+const COLUMNS = [
+  ["open", "Open"],
+  ["running", "Running"],
+  ["awaiting-ack", "Awaiting ack"],
+  ["landed", "Landed"],
+  ["attention", "Needs attention"],
+];
+
+function pct(n, d) { return d > 0 ? Math.round((100 * n) / d) + "%" : "—"; }
+
+function n(count, noun) { return count + " " + noun + (count === 1 ? "" : "s"); }
+
+// dur renders a mean of ms as a short human duration. n/d are kept separate so
+// an empty denominator reads as "—" instead of NaN.
+function dur(ms, d) {
+  if (!(d > 0)) return "—";
+  const s = ms / d / 1000;
+  if (s < 90) return s.toFixed(1) + "s";
+  if (s < 5400) return (s / 60).toFixed(1) + "m";
+  return (s / 3600).toFixed(1) + "h";
+}
+
+function metric(box, key, value, detail) {
+  const m = el("div", "metric");
+  m.appendChild(el("div", "k", key));
+  m.appendChild(el("div", "v", value));
+  if (detail) m.appendChild(el("div", "d", detail));
+  box.appendChild(m);
+}
+
+function renderMetrics(box, m) {
+  const strip = el("div", "metrics");
+  metric(strip, "landed", pct(m.landed, m.runs), m.landed + " of " + n(m.runs, "run"));
+  metric(strip, "verify pass", pct(m.verifyPassed, m.verifyRan), m.verifyPassed + " of " + n(m.verifyRan, "verified run"));
+  metric(strip, "bisect salvage", pct(m.bisectSalvaged, m.bisectRan), m.bisectSalvaged + " of " + n(m.bisectRan, "bisected run"));
+  metric(strip, "flag rate", pct(m.flaggedRuns, m.runs), m.flaggedRuns + " of " + n(m.runs, "run"));
+  metric(strip, "mean time to land", dur(m.landedWallMs, m.landedWallRuns), "over " + n(m.landedWallRuns, "metered landed run"));
+  metric(strip, "agent time / landed", dur(m.agentWallMs, m.agentWallLanded), "over " + n(m.agentWallLanded, "landed run") + " that recorded it");
+  // Cost appears only when agents actually wrote a SIGBOUND_USAGE_FILE. No file
+  // is the normal case, and an absent seam shows nothing rather than "$0.00".
+  if (m.costRuns > 0) {
+    const per = m.costLanded > 0 ? "$" + (m.costUsd / m.costLanded).toFixed(4) : "—";
+    metric(strip, "cost / landed", per, n(m.costRuns, "run") + " reported " + m.inputTokens + " in / " + m.outputTokens + " out");
+  }
+  box.appendChild(strip);
+  if (m.presets && m.presets.length) {
+    const t = el("table", "presets");
+    const head = el("tr");
+    for (const h of ["agent preset", "landed", "runs", "rate"]) head.appendChild(el("th", null, h));
+    t.appendChild(head);
+    for (const p of m.presets) {
+      const tr = el("tr");
+      tr.appendChild(el("td", null, p.preset));
+      tr.appendChild(el("td", null, String(p.landed)));
+      tr.appendChild(el("td", null, String(p.runs)));
+      tr.appendChild(el("td", null, pct(p.landed, p.runs)));
+      t.appendChild(tr);
+    }
+    box.appendChild(t);
+  }
+}
+
+// renderCard builds one intent card. Every string here — intent id, goal, run
+// id, status, landed sha, recorded error text — is agent- or issue-authored and
+// reaches the DOM only through el()'s textContent, so it renders as inert data.
+function renderCard(it) {
+  const card = el("div", "card " + it.column);
+  card.appendChild(el("div", "id", it.id || "(no intent)"));
+  if (it.missing) card.appendChild(el("div", "meta", "no intents/" + it.id + ".intent on disk — the journal still has its runs"));
+  if (it.goal) card.appendChild(el("div", "goal", it.goal));
+  const bits = [];
+  if (it.priority) bits.push("prio " + it.priority);
+  if (it.issue) bits.push("issue #" + it.issue);
+  if (it.schedule) bits.push("every " + it.schedule);
+  if (bits.length) card.appendChild(el("div", "meta", bits.join("  ·  ")));
+  for (const r of (it.runs || [])) {
+    const row = el("div", "run");
+    row.appendChild(el("span", "status-" + (r.status === "done" ? "done" : r.status === "error" ? "error" : "running"), r.status || "?"));
+    row.appendChild(document.createTextNode("  " + r.id));
+    const extra = [];
+    if (r.landedSHA) extra.push("landed " + r.landedSHA);
+    if (r.flagged) extra.push(r.flagged + " flagged");
+    if (r.dropped) extra.push(r.dropped + " dropped");
+    if (r.verify && r.verify !== "none") extra.push("verify " + r.verify);
+    if (extra.length) row.appendChild(el("div", "meta", extra.join("  ·  ")));
+    if (r.error) row.appendChild(el("div", "meta", r.error));
+    card.appendChild(row);
+  }
+  return card;
+}
+
+async function loadBoard() {
+  const box = $("board");
+  clear(box);
+  box.appendChild(el("div", "empty", "Loading…"));
+  try {
+    const data = await api("/board");
+    clear(box);
+    renderMetrics(box, data.metrics || {});
+    for (const c of (data.cells || [])) {
+      const name = el("div", "cellname");
+      name.appendChild(el("span", "mono", c.cell));
+      name.appendChild(document.createTextNode("  ·  " + c.repo));
+      box.appendChild(name);
+      if (c.intentsError) box.appendChild(el("div", "err", "intents: " + c.intentsError));
+      const grid = el("div", "board");
+      for (const [key, label] of COLUMNS) {
+        const col = el("div", "bcol");
+        const cards = (c.intents || []).filter((it) => it.column === key);
+        col.appendChild(el("h3", null, label + " (" + cards.length + ")"));
+        if (!cards.length) col.appendChild(el("div", "empty", "—"));
+        for (const it of cards) col.appendChild(renderCard(it));
+        grid.appendChild(col);
+      }
+      box.appendChild(grid);
+    }
+    if (!data.cells || !data.cells.length) box.appendChild(el("div", "empty", "No cells registered."));
+  } catch (e) {
+    clear(box);
+    box.appendChild(el("div", "err", String(e.message || e)));
+  }
+}
+
 $("saveTok").addEventListener("click", () => {
   const v = $("token").value.trim();
   if (v) sessionStorage.setItem(TOKKEY, v); else sessionStorage.removeItem(TOKKEY);
@@ -399,6 +559,7 @@ $("saveTok").addEventListener("click", () => {
 $("reload").addEventListener("click", reloadCurrent);
 $("tabConflicts").addEventListener("click", () => showTab("conflicts"));
 $("tabInbox").addEventListener("click", () => showTab("inbox"));
+$("tabBoard").addEventListener("click", () => showTab("board"));
 $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") $("saveTok").click(); });
 
 $("token").value = getToken();

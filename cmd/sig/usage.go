@@ -11,8 +11,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // UsageJSON is one run's metering record, always computed for every run that
@@ -45,14 +48,33 @@ type UsageJSON struct {
 	// ReportBytes is the size of report.json on disk, one crude proxy for
 	// how much this run cost to store/transfer.
 	ReportBytes int64 `json:"reportBytes"`
+	// AgentWallMs is the summed wall time of this run's agent invocations
+	// (report.perAgent[].wallMs). Agents run CONCURRENTLY, so this is machine
+	// time spent on agents, not elapsed time — it can exceed TotalWallMs. An
+	// adopted or -resume-reused branch ran no agent and contributes 0. Written
+	// from v2.1 on: a run recorded by an older binary has no per-agent wallMs
+	// and so reads back 0 here.
+	AgentWallMs int64 `json:"agentWallMs,omitempty"`
+	// InputTokens/OutputTokens/CostUSD are INGESTED, not measured: they are the
+	// sum of whatever the run's agents wrote to SIGBOUND_USAGE_FILE (see
+	// ingestAgentUsage). Sigbound never sees a token or a price itself — this is
+	// an optional seam, and every field here is 0 (and omitted) for the normal
+	// case where no agent wrote anything. CostAgents is how many agents actually
+	// reported, so a reader can tell a genuine zero from partial coverage.
+	InputTokens  int64   `json:"inputTokens,omitempty"`
+	OutputTokens int64   `json:"outputTokens,omitempty"`
+	CostUSD      float64 `json:"costUsd,omitempty"`
+	CostAgents   int     `json:"costAgents,omitempty"`
 }
 
-// computeUsage derives a run's usage record from its finished report and the
-// wall-clock total the caller measured around the whole run (see execRun).
-// landed can only be told apart from "verify failed, nothing written to the
-// ref" by combining BaseSHA/Integrate.FinalSHA with Verify.Ran/Verify.OK, per
-// Landed's doc comment above.
-func computeUsage(rep *runReport, totalWallMs, reportBytes int64) UsageJSON {
+// computeUsage derives a run's usage record from its finished report, the
+// wall-clock total the caller measured around the whole run (see execRun), and
+// the run's own directory — which is where report.json's size and the optional
+// per-agent cost files both come from. landed can only be told apart from
+// "verify failed, nothing written to the ref" by combining
+// BaseSHA/Integrate.FinalSHA with Verify.Ran/Verify.OK, per Landed's doc comment
+// above.
+func computeUsage(dir string, rep *runReport, totalWallMs int64) UsageJSON {
 	u := UsageJSON{
 		AgentsTotal:     len(rep.PerAgent),
 		IntegrateWallMs: rep.Integrate.WallMs,
@@ -61,7 +83,7 @@ func computeUsage(rep *runReport, totalWallMs, reportBytes int64) UsageJSON {
 		VerifyWallMs:    rep.Verify.WallMs,
 		TotalWallMs:     totalWallMs,
 		Landed:          rep.Integrate.FinalSHA != rep.BaseSHA && (!rep.Verify.Ran || rep.Verify.OK),
-		ReportBytes:     reportBytes,
+		ReportBytes:     reportFileSize(dir),
 	}
 	for _, a := range rep.PerAgent {
 		if a.OK {
@@ -69,8 +91,122 @@ func computeUsage(rep *runReport, totalWallMs, reportBytes int64) UsageJSON {
 		} else {
 			u.AgentsFailed++
 		}
+		u.AgentWallMs = addSat(u.AgentWallMs, a.WallMs)
 	}
+	ingestAgentUsage(dir, &u)
 	return u
+}
+
+// agentUsagePrefix names the per-agent cost files an agent MAY write via
+// SIGBOUND_USAGE_FILE. They live directly in the run directory (one per agent,
+// so concurrent agents never share a file) rather than in a subdirectory, so no
+// directory has to exist before an agent runs and the filename is always a plain
+// name under the run dir whatever the task id contains. See runAgent.
+const agentUsagePrefix = "agent-usage-"
+
+// agentUsageJSON is the OPTIONAL token/cost record an agent may write to the
+// path in SIGBOUND_USAGE_FILE. Every field is optional and unknown fields are
+// IGNORED, not rejected: an agent will usually be dumping its own vendor's usage
+// blob, and a seam that only accepted an exact schema would go unused.
+type agentUsageJSON struct {
+	InputTokens  int64   `json:"inputTokens"`
+	OutputTokens int64   `json:"outputTokens"`
+	CostUSD      float64 `json:"costUsd"`
+}
+
+// agentUsageMaxBytes bounds how much of one agent-written usage file is read
+// into the daemon. The record is a handful of numbers; the ceiling is set at a
+// vendor blob's worth of slack rather than the minimum that would fit, because
+// the seam's whole point is accepting a blob nobody here has seen. What it buys
+// is that the SIZE of a daemon allocation stops being the agent's choice: a 1 GiB
+// agent-usage-*.json costs 64 KiB and a line on stderr.
+const agentUsageMaxBytes = 64 << 10
+
+// ingestAgentUsage sums every agent-usage-*.json in dir into u. It is silent by
+// construction: no file (the normal case), an unreadable file, one that is not
+// JSON, or one carrying a negative number is skipped without a word, because
+// this is a best-effort seam that must never affect a run or its report. A
+// skipped file is simply absent from CostAgents, which is what makes partial
+// coverage visible instead of pretending to a total.
+//
+// The ONE loud case is a file over agentUsageMaxBytes: silence there would hide
+// the reason a run's cost went missing behind a file the writer believed was
+// fine, and unlike malformed JSON it is not a shape the seam ever promised to
+// tolerate.
+//
+// The listing is a ReadDir + prefix/suffix match, NOT filepath.Glob: dir is a
+// repo-derived path, and a repo whose path contains a '[' makes a glob pattern
+// that matches nothing at all — silently dropping every cost file in the cell.
+func ingestAgentUsage(dir string, u *UsageJSON) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		name := e.Name()
+		if !e.Type().IsRegular() || !strings.HasPrefix(name, agentUsagePrefix) || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		p := filepath.Join(dir, name)
+		// Bounded by the READ, not by a stat: the entry type above is a snapshot
+		// the agent can invalidate before this open (swap the file for a symlink
+		// to something enormous), and a stat would then be sizing a different file
+		// than the one read. A LimitReader cannot be raced. One byte over the cap
+		// is enough to tell there is more.
+		f, err := os.Open(p)
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(f, agentUsageMaxBytes+1))
+		f.Close()
+		if err != nil {
+			continue
+		}
+		if len(data) > agentUsageMaxBytes {
+			fmt.Fprintf(os.Stderr, "sig: ignoring agent usage file over %d bytes: %s\n", agentUsageMaxBytes, p)
+			continue
+		}
+		var a agentUsageJSON
+		if json.Unmarshal(data, &a) != nil {
+			continue
+		}
+		if a.InputTokens < 0 || a.OutputTokens < 0 || a.CostUSD < 0 || math.IsNaN(a.CostUSD) || math.IsInf(a.CostUSD, 0) {
+			continue
+		}
+		// Per-file values are finite and non-negative by the check above; their
+		// SUM is not bounded by anything — two finite 1e308 costs make +Inf, which
+		// no JSON encoder can write, so usage.json would fail to encode and the
+		// board would 200 with an empty body. Saturate instead: a huge finite
+		// number is wrong in the same direction the input was, and still renders.
+		u.InputTokens = addSat(u.InputTokens, a.InputTokens)
+		u.OutputTokens = addSat(u.OutputTokens, a.OutputTokens)
+		u.CostUSD = addFinite(u.CostUSD, a.CostUSD)
+		u.CostAgents++
+	}
+}
+
+// addSat adds two counters, saturating at the int64 limits instead of wrapping.
+// Wrapping a token count turns a huge number into a negative one, which is worse
+// than useless in a metric: it is a plausible-looking lie.
+func addSat(a, b int64) int64 {
+	switch {
+	case b > 0 && a > math.MaxInt64-b:
+		return math.MaxInt64
+	case b < 0 && a < math.MinInt64-b:
+		return math.MinInt64
+	}
+	return a + b
+}
+
+// addFinite adds two costs, collapsing an overflow to the largest finite float64
+// rather than returning ±Inf/NaN — neither of which encoding/json can write, and
+// a value that cannot be encoded takes the whole response down with it.
+func addFinite(a, b float64) float64 {
+	s := a + b
+	if math.IsInf(s, 0) || math.IsNaN(s) {
+		return math.MaxFloat64
+	}
+	return s
 }
 
 // reportFileSize returns report.json's on-disk size for dir, 0 if it isn't
@@ -83,13 +219,16 @@ func reportFileSize(dir string) int64 {
 	return fi.Size()
 }
 
+// writeRunUsage publishes the metering record atomically, for the same reason
+// writeRunReport does: /board reads this file on every request, and a torn read
+// silently costs the run its wall-clock and cost numbers for that response.
 func writeRunUsage(dir string, u UsageJSON) {
 	data, err := json.MarshalIndent(u, "", "  ")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sig serve: encode usage for %s: %v\n", dir, err)
 		return
 	}
-	if err := os.WriteFile(filepath.Join(dir, "usage.json"), data, 0o644); err != nil {
+	if err := atomicWriteFile(dir, "usage.json", data, 0o644); err != nil {
 		fmt.Fprintf(os.Stderr, "sig serve: write usage %s: %v\n", dir, err)
 	}
 }
