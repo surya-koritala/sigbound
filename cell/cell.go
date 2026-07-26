@@ -300,6 +300,7 @@ func (c *Cell) Integrate(ctx context.Context, base string, changes []BranchChang
 // A refusal names the branch and the rebase that fixes it: a stale branch is an
 // operator-fixable condition, not a defect in the engine.
 func (c *Cell) requireContainsBase(ctx context.Context, base string, changes []BranchChange) error {
+	b := shortSHA(base)
 	for _, bc := range changes {
 		head, err := c.git.RevParse(ctx, bc.Branch)
 		if err != nil {
@@ -308,7 +309,6 @@ func (c *Cell) requireContainsBase(ctx context.Context, base string, changes []B
 		if head == base {
 			continue // IS the base: contains it trivially, empty contribution
 		}
-		b := shortSHA(base)
 		switch contains, err := c.git.IsAncestor(ctx, base, head); {
 		case err != nil:
 			return fmt.Errorf("branch %q: cannot determine whether it contains base %s; refusing to integrate: %w", bc.Branch, b, err)

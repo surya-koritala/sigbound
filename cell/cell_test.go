@@ -237,6 +237,13 @@ func TestConcurrentCellsIntegrateDifferentRepos(t *testing.T) {
 // the DELETION of everything the base gained, so the guard must refuse, move
 // no ref, and leave that content in the tree.
 //
+// The batch is MIXED and the stale branch is deliberately NOT first: a healthy
+// branch leads, the stale one sits behind it. That is what pins the "one refused
+// branch refuses the WHOLE batch" half of the contract. A guard that inspected
+// only changes[0] passes an all-stale batch and a batch of one — the two shapes
+// every other #130 test has — and then lands the stale branch, deleting landed
+// work exactly as #130 did.
+//
 // The landed.txt assertion is what makes this a real check: with the guard
 // removed the integrate succeeds, the CAS finds main exactly where it left it,
 // and main advances to a tree that no longer has the file. Asserting only the
@@ -244,9 +251,9 @@ func TestConcurrentCellsIntegrateDifferentRepos(t *testing.T) {
 func TestIntegrateRefusesBranchNotContainingBase(t *testing.T) {
 	ctx := context.Background()
 	g, pool, base := scenario(t, 2)
-	changes := spawnAgents(t, pool, base, 1, nil)
+	stale := spawnAgents(t, pool, base, 1, nil) // forked from the base as it stands now
 
-	// The base moves past the branch's fork point.
+	// The base moves past the stale branch's fork point.
 	if err := os.WriteFile(filepath.Join(g.Dir(), "landed.txt"), []byte("landed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -258,6 +265,15 @@ func TestIntegrateRefusesBranchNotContainingBase(t *testing.T) {
 		t.Fatal("base did not move; scenario not established")
 	}
 
+	// A healthy branch off the MOVED base, ahead of the stale one in the batch.
+	// spawnAgents names an agent's private file by its index, so ask for two and
+	// take the second: index 0 would write the same agent_000.txt the stale branch
+	// carries, and the "good branch did not land either" check below has to name a
+	// path only the good branch can produce.
+	fresh := spawnAgents(t, pool, moved, 2, nil)[1]
+	const freshFile = "agent_001.txt"
+	changes := []BranchChange{fresh, stale[0]}
+
 	c, err := Open(g.Dir())
 	if err != nil {
 		t.Fatal(err)
@@ -265,9 +281,9 @@ func TestIntegrateRefusesBranchNotContainingBase(t *testing.T) {
 	landMain := func(in *Integrator) { in.WithLandRef("refs/heads/main") }
 	_, err = c.Integrate(ctx, moved, changes, StrategyOverlay, landMain)
 	if err == nil {
-		t.Fatal("Integrate accepted a branch that does not contain the base; want refusal")
+		t.Fatal("Integrate accepted a batch whose second branch does not contain the base; want refusal")
 	}
-	if !strings.Contains(err.Error(), changes[0].Branch) || !strings.Contains(err.Error(), "does not contain base") {
+	if !strings.Contains(err.Error(), stale[0].Branch) || !strings.Contains(err.Error(), "does not contain base") {
 		t.Fatalf("refusal must name the offending branch and why, got: %v", err)
 	}
 
@@ -284,6 +300,11 @@ func TestIntegrateRefusesBranchNotContainingBase(t *testing.T) {
 	}
 	if !slices.Contains(files, "landed.txt") {
 		t.Fatalf("refused integrate deleted landed.txt from the base tree: %v", files)
+	}
+	// Whole batch, not just the offender: the healthy branch ahead of it in the
+	// batch did not land either.
+	if slices.Contains(files, freshFile) {
+		t.Fatalf("branch %q landed despite another branch in the batch being refused: %v", fresh.Branch, files)
 	}
 
 	// Fails CLOSED: an ancestry that cannot be read at all (here, a base that is

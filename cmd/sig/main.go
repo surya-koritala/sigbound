@@ -194,12 +194,14 @@ func usage(w *os.File) {
 //
 // Contract: every branch must contain baseSHA (or BE it). A branch that
 // doesn't refuses the whole batch and nothing lands — but that guard is
-// cell.Integrate's now (issue #163), so it protects every importer of the
-// package and not just this driver; see cell.requireContainsBase for WHY such
-// a branch would silently delete landed work. It is deliberately NOT repeated
-// here: one refusal kills the batch either way, a second pass would only add
-// two git spawns per branch, and everything this function does ahead of the
-// call is read-only, so a refusal still means nothing but a diff has run.
+// cell.Integrate's now (issue #163), so it protects every caller of
+// cell.Integrate and not just this driver; see cell.requireContainsBase for WHY
+// such a branch would silently delete landed work — and for the limit of that
+// protection: the raw Integrator entry points a package importer can also reach
+// are unguarded. It is deliberately NOT repeated here: one refusal kills the
+// batch either way, a second pass would only add two git spawns per branch, and
+// everything this function does ahead of the call is read-only, so a refusal
+// still means nothing but a diff has run.
 func integrateBranches(ctx context.Context, c *cell.Cell, baseRef, baseSHA string, branches []string, writeSets map[string][]string, strategy, resolverCmd string, resolverTimeout time.Duration, assert, land bool, resolverEnv []string, semanticEdges [][2]string) (cell.IntegrationResult, error) {
 	var need []string
 	for _, b := range branches {
