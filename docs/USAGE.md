@@ -1477,6 +1477,12 @@ sig policy init [-repo PATH] [-rev REV]
 | `-repo` | `.` | The repository to read, and where `sigbound.policy` is written. |
 | `-rev` | `HEAD` | The COMMITTED tree the sources are read from — the same posture a run's policy load uses. An uncommitted workflow is invisible to it. |
 
+A `-rev` you NAME must resolve: if it does not, the command exits non-zero
+before reading a source or writing anything, so a typo cannot leave a vacuous
+policy behind that then blocks the corrected retry (there is no `-force`). The
+default `HEAD` is the exception — an empty repository with no commit yet is the
+new-repo case, so it still writes the commented template and exits 0.
+
 It writes `<repo>/sigbound.policy` and nothing else: no run starts, no ref
 moves, nothing appears under `.git/sigbound/`. Every emitted key is preceded by
 a comment naming the file and line it came from, and every input that has no
@@ -1515,17 +1521,26 @@ Read it before you commit it. It is a starting point, and these are its limits:
   nothing), for a step with `if:`, `continue-on-error: true`,
   `working-directory:`, its own `env:`, or a non-`sh`/`bash` `shell:` (this holds
   whether the `run:` is a single line or a `|` block), and for a whole job with
-  `container:`, `services:`, job-level `env:`, `defaults:`, or a `runs-on:` that
+  `container:`, `services:`, its own `env:`, its own `defaults:`, or a `runs-on:` that
   is not a linux/ubuntu runner (a windows- or macos-only job's steps would not
   run where verify does). A `run: |` block of simple commands is joined with
   ` && ` (the step shell is `bash -e`, so that is the same all-must-pass
   meaning); a block with a heredoc, a line continuation, a trailing operator, a
   trailing `#` comment (which would otherwise comment out every member joined
   after it), or a leading shell keyword is a program rather than a list, so it is
-  refused whole and quoted in the draft for you to fold by hand.
+  refused whole and quoted in the draft for you to fold by hand. And it emits
+  nothing for a WHOLE FILE carrying a workflow-level (column-0) `defaults:` or
+  `env:`: GitHub applies those to every step in every job, so
+  `defaults.run.working-directory` — the usual idiom for a monorepo whose code
+  lives in a subdirectory — silently relocates every command, and drafting one
+  would give you a bar that passes at the repository root while your real CI
+  fails in the subdirectory.
 - **A workflow that does not gate a merge contributes nothing** — a
   `schedule:` workflow, or a `push:` filtered to `tags:` only (that is a
   release, and its steps are release steps).
+- **Each source file is read only up to 512 KB.** A larger workflow, `Makefile`
+  or `CODEOWNERS` is skipped without being read (the cap is checked against the
+  blob's size in the tree, before the read) and named in an `# unmapped:` line.
 - **The toolchain line is probed, not assumed.** `sig policy init` runs the
   tool's version probe (`go version`, `npm --version`, …) and emits the line
   COMMENTED OUT when it fails, with the reason. That probe describes the machine

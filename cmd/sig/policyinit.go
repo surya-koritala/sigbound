@@ -129,10 +129,23 @@ func runPolicyInit(w io.Writer, argv []string) (int, error) {
 	switch {
 	case errors.Is(err, fs.ErrExist):
 		// The path is taken — an existing policy (the repo's real landing bar), or a
-		// symlink O_EXCL declined to follow. Print the diff and refuse. The ReadFile
-		// is best-effort: an unreadable/symlinked target still refuses cleanly, and
-		// only OUR drafted lines are printed, never the existing file's contents.
-		existing, _ := os.ReadFile(out)
+		// symlink O_EXCL declined to follow. Print the diff and refuse.
+		//
+		// The file is read ONLY when Lstat says it is not a symlink. O_EXCL closed
+		// the WRITE half of the symlink hole; this closes the READ half. A repo can
+		// commit `sigbound.policy` as a symlink to any path the invoking user can
+		// read (~/.netrc, ~/.aws/credentials, .git-credentials), and
+		// printPolicySuggestion surfaces parseConfigFile's error, which quotes the
+		// offending line verbatim — one line of that file, straight into stdout, and
+		// from there into whatever captures this command's output. Two of those three
+		// files carry live credential material. Not reading it is the fix; the parse
+		// error stays genuinely useful for a real file.
+		var existing []byte
+		if fi, lerr := os.Lstat(out); lerr == nil && fi.Mode()&fs.ModeSymlink != 0 {
+			fmt.Fprintf(w, "%s is a symlink; it was not read (a symlinked policy could point at any file this user can read).\n", out)
+		} else {
+			existing, _ = os.ReadFile(out)
+		}
 		printPolicySuggestion(w, out, existing, d)
 		return exitOperationalError, fmt.Errorf("%s already exists — not overwriting it; nothing was written", out)
 	case err != nil:
@@ -302,6 +315,16 @@ func (d *policyDraft) printSummary(w io.Writer, path string) {
 }
 
 // emitComment appends s as `#` comment lines.
+// Control bytes are replaced with '?' on the way out. A refused command is
+// QUOTED into the notes verbatim, so a NUL in a workflow (or in a job name or
+// file path interpolated into an attribution comment) would otherwise land in
+// the file and make git call it binary — "Binary files differ", "0 insertions(+),
+// 0 deletions(-)". That defeats the reviewable diff this file exists to be, and
+// it matters most to the human acking a parked change to sigbound.policy itself
+// under policy self-protection: they cannot read what they are approving. This is
+// the chokepoint every comment byte routes through — detail, quote, attribution,
+// and commented-out key lines alike. \r and \n keep their existing meaning (they
+// split the text into further comment lines); a tab is legitimate whitespace.
 func emitComment(b *strings.Builder, s string) {
 	for _, ln := range strings.Split(strings.ReplaceAll(s, "\r", ""), "\n") {
 		if ln == "" {
@@ -309,9 +332,25 @@ func emitComment(b *strings.Builder, s string) {
 			continue
 		}
 		b.WriteString("# ")
-		b.WriteString(ln)
+		b.WriteString(scrubControl(ln))
 		b.WriteByte('\n')
 	}
+}
+
+// scrubControl replaces C0 control bytes (except tab) with '?'. Operates on
+// bytes, not runes, so a control byte inside invalid UTF-8 is caught too.
+func scrubControl(s string) string {
+	if strings.IndexFunc(s, func(r rune) bool { return r < 0x20 && r != '\t' }) < 0 &&
+		!strings.ContainsRune(s, 0x7f) {
+		return s // the overwhelmingly common case: nothing to do
+	}
+	out := []byte(s)
+	for i, c := range out {
+		if (c < 0x20 && c != '\t') || c == 0x7f {
+			out[i] = '?'
+		}
+	}
+	return string(out)
 }
 
 // codeownersCandidates is the forge's own resolution order for CODEOWNERS.
@@ -680,6 +719,13 @@ func codeownersGlobs(pattern string, tree []string) (globs []string, refuse stri
 		return nil, "a negation cannot be expressed — ack-paths only adds paths that need an ack"
 	case strings.Contains(pattern, `\`):
 		return nil, "globMatch has no backslash escape, so the pattern cannot be translated faithfully"
+	case strings.IndexFunc(pattern, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0:
+		// A control byte here would reach a LIVE `ack-paths` value (strings.Fields
+		// does not split on NUL, so `auth\x00x` is one pattern), putting a NUL in
+		// the drafted file — git then calls it binary and the diff is unreviewable.
+		// Comments are scrubbed by emitComment; a value is refused instead, because
+		// silently rewriting a pattern would change which paths it matches.
+		return nil, "the pattern contains a control character, which cannot be part of an ack-paths value"
 	}
 	p := strings.TrimPrefix(pattern, "/")
 	switch p {

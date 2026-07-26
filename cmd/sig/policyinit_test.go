@@ -661,6 +661,109 @@ jobs:
 	})
 }
 
+// TestPolicyInitWorkflowLevelRefusals: `defaults:` and `env:` disqualify a
+// workflow at BOTH scopes. GitHub applies the COLUMN-0 forms to every step in
+// every job, so a top-level `defaults.run.working-directory` relocates every
+// command — the canonical monorepo idiom — and drafting a step's text under it
+// yields a bar that passes at the repository root while real CI fails in the
+// subdirectory. Same failure as the job-level twin, one scope up.
+func TestPolicyInitWorkflowLevelRefusals(t *testing.T) {
+	for _, tc := range []struct{ name, head, want string }{
+		{"workflow defaults working-directory",
+			"on: [push]\ndefaults:\n  run:\n    working-directory: services/api\n",
+			"workflow-level `defaults:`"},
+		{"workflow defaults shell",
+			"on: [push]\ndefaults:\n  run:\n    shell: pwsh\n",
+			"workflow-level `defaults:`"},
+		{"workflow env",
+			"on: [push]\nenv:\n  CGO_ENABLED: '0'\n",
+			"workflow-level `env:`"},
+		// The job-level twins keep working — this guard is additive, not a move.
+		{"job defaults",
+			"on: [push]\n",
+			"`defaults:`"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := "jobs:\n  api:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          go vet ./...\n          go test ./...\n"
+			if tc.name == "job defaults" {
+				job = "jobs:\n  api:\n    runs-on: ubuntu-latest\n    defaults:\n      run:\n        working-directory: ./sub\n    steps:\n      - run: go test ./...\n"
+			}
+			repo := initPolicyRepo(t, map[string]string{".github/workflows/ci.yml": tc.head + job})
+			_, _, err, draft := policyInit(t, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pol := mustParse(t, draft); len(pol.verify) != 0 {
+				t.Fatalf("a relocated/re-environed workflow drafted live member(s): %q\n%s", pol.verify, draft)
+			}
+			if !strings.Contains(draft, tc.want) {
+				t.Fatalf("no note naming %q\n%s", tc.want, draft)
+			}
+		})
+	}
+}
+
+// TestPolicyInitSymlinkedPolicyNotRead: a `sigbound.policy` symlink is never
+// READ. O_EXCL closed the write half of the symlink hole; this is the read half —
+// printPolicySuggestion surfaces parseConfigFile's error, which quotes the
+// offending line verbatim, so reading a symlink to ~/.netrc or .git-credentials
+// would print a live credential to stdout.
+func TestPolicyInitSymlinkedPolicyNotRead(t *testing.T) {
+	const secret = "machine github.com login alice password ghp_TESTONLY_NOT_A_REAL_TOKEN"
+	repo := initPolicyRepo(t, map[string]string{"go.mod": "module x\n"})
+	target := filepath.Join(t.TempDir(), "netrc")
+	if err := os.WriteFile(target, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(repo, policyFileName)); err != nil {
+		t.Skipf("symlinks unsupported here: %v", err)
+	}
+	var buf bytes.Buffer
+	code, err := runPolicyInit(&buf, []string{"-repo", repo})
+	if code == exitOK || err == nil {
+		t.Fatalf("a symlinked policy did not refuse: code=%d err=%v", code, err)
+	}
+	// Neither stdout nor the returned error may carry any of the file's content.
+	for what, s := range map[string]string{"stdout": buf.String(), "error": err.Error()} {
+		if strings.Contains(s, "ghp_TESTONLY") || strings.Contains(s, secret) {
+			t.Fatalf("the symlink target's content leaked into %s:\n%s", what, s)
+		}
+	}
+	if !strings.Contains(buf.String(), "is a symlink") {
+		t.Fatalf("stdout does not say the file was not read:\n%s", buf.String())
+	}
+}
+
+// TestPolicyInitDraftHasNoControlBytes: the drafted file must stay a reviewable
+// text diff. A NUL reaching it (quoted into a note from a refused command, or
+// carried into an ack-paths value by a CODEOWNERS pattern) makes git report
+// "Binary files differ" and "0 insertions(+), 0 deletions(-)" — unreadable to the
+// human acking a parked sigbound.policy change under policy self-protection.
+func TestPolicyInitDraftHasNoControlBytes(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{
+		// Refused for the NUL, then QUOTED into the note verbatim.
+		".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    steps:\n      - run: echo \x00nul\n",
+		// strings.Fields does not split on NUL, so this is ONE pattern that would
+		// otherwise reach a live ack-paths value.
+		"CODEOWNERS": "auth\x00x @acme/sec\n",
+		"x.go":       "package x\n",
+	})
+	_, _, err, draft := policyInit(t, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustParse(t, draft)
+	for i := 0; i < len(draft); i++ {
+		if c := draft[i]; (c < 0x20 && c != '\n' && c != '\t') || c == 0x7f {
+			t.Fatalf("control byte %#x at offset %d of the drafted policy — git will call this file binary:\n%q", c, i, draft)
+		}
+	}
+	// The refused input is still reported, just scrubbed rather than raw.
+	if len(unmappedLines(draft)) == 0 {
+		t.Fatalf("the control-byte input was dropped silently\n%s", draft)
+	}
+}
+
 // TestPolicyInitBadRevExitsBeforeWriting: an explicitly-named -rev that does not
 // resolve exits non-zero and writes NOTHING (finding MEDIUM-7), so the corrected
 // retry is not blocked by a vacuous policy (there is no -force). Then a run
@@ -866,6 +969,21 @@ func TestPolicySubcommandDispatch(t *testing.T) {
 	}
 }
 
+// assertRenderIsText fails if a rendered draft carries a control byte. The file
+// exists to be a diff a human reads — most consequentially the human acking a
+// parked change to sigbound.policy itself — and one NUL anywhere makes git call
+// the whole file binary and print no diff at all. Asserted over arbitrary input
+// by both fuzz targets, since a control byte can arrive from a workflow (quoted
+// into a note) or from a CODEOWNERS pattern (carried into an ack-paths value).
+func assertRenderIsText(t *testing.T, draft string) {
+	t.Helper()
+	for i := 0; i < len(draft); i++ {
+		if c := draft[i]; (c < 0x20 && c != '\n' && c != '\t') || c == 0x7f {
+			t.Fatalf("control byte %#x at offset %d — git would call this file binary:\n%q", c, i, draft)
+		}
+	}
+}
+
 // unmappedLines returns the draft's `# unmapped:` entries.
 func unmappedLines(draft string) []string {
 	var out []string
@@ -891,6 +1009,10 @@ func FuzzScanWorkflow(f *testing.F) {
 	// Regression: a lone CR mid-value is not a line terminator to textLines but
 	// is to plenty of other readers, and it used to reach a `verify =` value.
 	f.Add([]byte("on: push\njobs:\n 0:\n  steps: \n   - run: 0\r0"))
+	// Regression: DEL (0x7f) is a control byte the C0-only guard missed, so it
+	// reached a live `verify =` value. Found by this fuzzer once the rendered
+	// draft was asserted to be text (assertRenderIsText).
+	f.Add([]byte("on: push\njobs:\n 0:\n  steps:\n   - run: \x7f"))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		sc := scanWorkflow(".github/workflows/f.yml", data)
 		d := policyDraft{repo: "r", rev: "deadbeef"}
@@ -909,6 +1031,7 @@ func FuzzScanWorkflow(f *testing.F) {
 		if _, err := parsePolicy([]byte(d.render())); err != nil {
 			t.Fatalf("drafted policy does not parse: %v\n%s", err, d.render())
 		}
+		assertRenderIsText(t, d.render())
 	})
 }
 
@@ -927,8 +1050,9 @@ func FuzzCodeownersDraft(f *testing.F) {
 		if err != nil {
 			t.Fatalf("drafted policy does not parse: %v\n%s", err, d.render())
 		}
+		assertRenderIsText(t, d.render())
 		for _, glob := range pol.ackPaths {
-			if glob == "" || strings.ContainsAny(glob, ",\n\r") {
+			if glob == "" || strings.ContainsAny(glob, ",\n\r\x00") {
 				t.Fatalf("emitted glob %q is empty or would be re-split", glob)
 			}
 			globMatch(glob, "apps/web/main.go") // must not panic on any emitted glob

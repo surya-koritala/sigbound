@@ -110,6 +110,22 @@ func scanWorkflow(path string, data []byte) wfScan {
 		return sc
 	}
 
+	// WORKFLOW-level `defaults:` and `env:` are the same hazard as their job-level
+	// twins (scanJob refuses those), one scope up: GitHub applies them to every
+	// step in every job, so `defaults.run.working-directory` silently relocates
+	// every command — the canonical Actions idiom for a monorepo whose code lives
+	// in a subdirectory — and a top-level `env:` supplies variables a verify
+	// command would not have. Emitting a step's text under either would emit a
+	// command that runs somewhere else, or without its environment: a bar that
+	// passes at the repository root while the real CI fails in the subdirectory.
+	// The whole file is refused, because the relocation applies to all of it.
+	for _, k := range []string{"defaults", "env"} {
+		if at, _ := topLevelBlock(lines, k); at >= 0 {
+			sc.note("%s:%d workflow-level `%s:` applies to every step in every job — it can relocate the working directory or supply variables a verify command would not have, so the file contributes nothing", path, at+1, k)
+			return sc
+		}
+	}
+
 	jobsAt, jobsEnd := topLevelBlock(lines, "jobs")
 	if jobsAt < 0 {
 		sc.note("%s has no top-level `jobs:` key — nothing to read run steps from", path)
@@ -309,11 +325,13 @@ func (sc *wfScan) scanStep(path, job string, lines []string, s, e int) {
 	// exec. Refuse rather than strip: silently rewriting somebody's command is
 	// exactly the wrong-suggestion failure this scanner avoids. Checked per byte,
 	// so a NUL or high C0 control inside invalid UTF-8 is caught too; a tab is left
-	// alone (legitimate whitespace in a command).
+	// alone (legitimate whitespace in a command). DEL (0x7f) counts as a control
+	// byte here for the same reason emitComment's scrubber treats it as one — one
+	// definition of "control byte" across this command, not two.
 	if refuse == "" {
 		for i := 0; i < len(run); i++ {
-			if b := run[i]; b < 0x20 && b != '\t' {
-				refuse = "the command contains a control character (a NUL, carriage return, or newline), which cannot be a single `verify` line"
+			if b := run[i]; (b < 0x20 && b != '\t') || b == 0x7f {
+				refuse = "the command contains a control character (a NUL, DEL, carriage return, or newline), which cannot be a single `verify` line"
 				break
 			}
 		}
