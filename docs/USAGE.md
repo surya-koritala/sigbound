@@ -927,6 +927,8 @@ intent under `intents/`, and `sig run -intent ID` turns one into a run.
 intents/
   cache-honesty.intent
   issue-42.intent          # written by `sig intent import-github`
+  templates/
+    deps-current.intent    # a skeleton for `sig intent new -template`
 ```
 
 The file is a flat `KEY = VALUE` file, the SAME format as
@@ -958,7 +960,7 @@ a README can live alongside them.
 | `acceptance = <cmd>` | A verify command for runs started from this intent. APPENDED to the run's verify battery — see below. |
 | `files = <path>[, <path>…]` | REPEATABLE and/or comma-separated. The intent's lane: the exact repo-relative paths a run from it may create or modify, enforced by [`-lanes`](#file-lanes) like any task's declared files. |
 | `priority = N` | Integer, default `0`. Orders `sig intent list`, highest first. Nothing else reads it — it is a hint for whoever picks the next intent, not a queue the driver services. |
-| `schedule = <duration>` | How often this intent wants to run, e.g. `24h`. Parsed, validated and recorded; **acted on by nothing today** — there is no recurring runtime yet. |
+| `schedule = <duration>` | How often this intent wants to run, e.g. `24h`. Acted on by ONE thing: a [`sig serve -watch`](#watch-mode) cycle fires a due intent as an ordinary run — see [Recurring intents](#recurring-intents-schedule). `sig run -intent` ignores it (an explicit ask is always allowed). |
 | `issue = N` | The GitHub issue this intent came from, recorded by `sig intent import-github` so a `-publish` command can close it. `sig` never closes an issue itself. |
 
 An UNKNOWN key, a malformed value, or a duplicate scalar key is a hard error
@@ -1026,6 +1028,157 @@ line of each goal. `show` prints one intent AS PARSED — what `sig run -intent`
 would actually run. Both fail loudly on a malformed file rather than skipping
 it; a list that quietly dropped the one file it could not read would
 under-report what the repo is asking for.
+
+For an intent with a `schedule`, both also report where it stands in its cycle —
+`show` in full, `list` as a `!` on the schedule column when it is due:
+
+```
+sig intent show deps-current -repo /work/api
+# intent deps-current  (/work/api/intents/deps-current.intent)
+# acceptance: go build ./... && go test ./... && govulncheck ./...
+# schedule:   168h0m0s (fired by `sig serve -watch`)
+# last fired: 2026-07-18T09:14:02Z
+# next due:   2026-07-25T09:14:02Z
+```
+
+`-json` carries the same three as `lastFired`, `nextDue` and `due`. All three are
+absent for an intent with no schedule, and an intent that has never fired reports
+`due` with no timestamps — never fired is due now. The state is read from the
+watch daemon's own record (below); a repo `git` cannot answer for reads as never
+fired rather than failing a command that is only reporting.
+
+### `sig intent new` (templates)
+
+A template is an intent file under `intents/templates/`, in the same dialect.
+`sig intent new` instantiates one:
+
+```
+sig intent new weekly-deps -repo /work/api -template deps-current
+# -> wrote /work/api/intents/weekly-deps.intent from template deps-current
+```
+
+It is a **copy**: no substitution, no includes, no expansion. A template that
+grew a language of its own would be a second dialect to learn, a second parser to
+trust, and a second place a landing bar could be described — so the instantiated
+file is byte-for-byte the template, and editing it afterwards is the point.
+
+Two guards, the same ones `import-github` applies. The bytes must parse as a
+valid intent UNDER THE NEW ID before anything is written, so a broken template
+leaves no file behind; and the create is `O_EXCL`, so an instantiation never
+overwrites an existing intent — including a hand-edited one that shares the id.
+An unknown `-template` names the ones that do exist.
+
+`intents/templates/` is a subdirectory, which is what keeps its files out of the
+repo's actual asks: `sig intent list` never recurses, so a template is not an
+intent, is not runnable by id, and never fires on a schedule.
+
+### Recurring intents (`schedule`)
+
+An intent with a `schedule` line wants to run on a cadence. The thing that fires
+it is [`sig serve -watch`](#watch-mode)'s existing cycle — there is no scheduler
+daemon and no timer per intent. Each tick asks which intents are due and fires
+one, as an ordinary run:
+
+```sh
+sig serve -repos /work/api -watch -watch-interval 30s \
+          -watch-agent 'claude -p "$SIGBOUND_TASK"'
+```
+
+`-watch-agent` is the agent command a fired intent runs with. A cycle over
+arriving branches runs no agent at all, so the flag is only needed for scheduled
+intents; without it a due intent fires nothing and says so on the event stream
+(`watch_error`, `at: intent-agent`) every tick it stays due.
+
+**A fire is an ordinary run.** Same run slot, same journal, same policy
+resolution at the current base, same verify gate, same parking, same usage
+record, `"source": "watch"` on its manifest — plus the two things `sig run
+-intent` gives an intent run: the goal is the task prompt with `files` as its
+lane, and `acceptance` is APPENDED to the verify battery (tighten-only, exactly
+as [above](#acceptance-may-only-tighten)). The manifest records the intent id, so
+`sig log` attributes the landing to it like any other intent run.
+
+**One intent per tick, checked once per interval.** A tick fires at most one due
+intent — a run carries one intent id, one acceptance and one lane, so batching
+two would blur all three — and the check runs once per `-watch-interval` even
+when a batch trigger is polling faster. A `schedule` is therefore honored to
+within one interval, and a second due intent waits for the next tick. Scheduled
+intents are checked BEFORE arrivals: an intent has a deadline and a branch does
+not.
+
+**Due-ness is durable.** Each cell keeps `.git/sigbound/intent-fired.json`,
+mapping intent id → the time it last fired, written atomically and stamped the
+instant the run slot is taken — before any agent runs. That ordering is what
+makes the guarantees hold:
+
+- **A restart does not re-fire.** The record is on disk, so a fresh daemon over
+  the same repo sees an intent inside its window and leaves it alone. A run that
+  crashed mid-flight is not retried before its next window either — the fire is
+  recorded when the work STARTS.
+- **Two ticks cannot double-fire one intent.** The record is stamped before the
+  run begins, so a second tick sees it inside its window; and in the narrow
+  window before that, the cell's single run slot refuses the second tick outright
+  (`watch_skip`), recording nothing, so the intent is still due when the slot
+  frees. Both hold within one daemon — the run slot is per-process, exactly like
+  the [one-run-per-cell](#one-run-per-cell) rule. Two daemons watching one repo
+  is outside this design.
+- **A missed window fires ONCE on return, not once per window missed.** Due-ness
+  compares against the last fire, and firing re-bases it on the moment it fired,
+  so a daemon that was down for a week returns and runs a `24h` intent one time,
+  not seven. There is no backlog to catch up on.
+- **A never-fired intent is due immediately**, which is what makes adding a
+  `schedule` take effect without seeding a timestamp.
+
+Losing that file is the one degradation, and it is the opposite of the
+[seen-set](#the-seen-set)'s: an unknown last-fire reads as never fired, so each
+scheduled intent fires one EXTRA time. That direction is deliberate — a fire is
+a policy- and verify-gated run, so an extra one wastes a cycle, while failing
+closed would be a schedule that silently stopped.
+
+**A red fire waits for its window.** A fire that fails verify lands nothing, like
+any red run, and is not retried before its next window — the schedule IS the
+retry cadence. The branch it produced is recorded as DECIDED in the seen-set, so
+no later cycle re-judges it: a cycle's bar is the repo policy plus
+`-watch-verify` and does NOT include this intent's `acceptance`, so adopting that
+branch would land exactly the work the acceptance rejected. Nothing is deleted —
+the branch stays for whoever wants to look at it, and [`sig gc`](#sig-gc) sweeps
+it. The limit worth knowing: the seen-set is a cache, so losing it does re-offer
+such a branch as an ordinary arrival, judged by the cycle bar alone.
+
+Each fire runs under its own task id — the intent id plus a timestamp — because
+a task id becomes the branch `agent/<id>`, and a run refuses to reuse an existing
+branch. Every fire therefore gets its own branch; the intent id itself rides on
+the manifest, which is what `sig log` reads.
+
+#### Worked example: a maintenance intent
+
+Keep dependencies current, weekly, with the bar that matters written down:
+
+```
+# intents/templates/deps-current.intent — a maintenance skeleton.
+goal = Update this repository's dependencies to their latest compatible versions.
+goal =
+goal = Update the lockfile, keep the module graph tidy, and change nothing else.
+acceptance = go build ./... && go test ./... && govulncheck ./...
+schedule = 168h
+files = go.mod, go.sum
+priority = 1
+```
+
+```sh
+sig intent new deps-current -repo /work/api -template deps-current
+sig serve -repos /work/api -watch -watch-agent 'claude -p "$SIGBOUND_TASK"'
+```
+
+Every seven days the next tick fires it: an agent gets the goal as its prompt and
+`go.mod`/`go.sum` as its lane, and the result lands only if build, tests and the
+vulnerability scan are all green ON THE INTEGRATED TREE — the acceptance command
+composes with whatever `sigbound.policy` already requires, so it can only add
+ways to fail. A red week lands nothing and waits for the next one:
+
+```sh
+sig intent show deps-current -repo /work/api      # where it stands
+sig log -repo /work/api -json | jq 'select(.intent=="deps-current")'
+```
 
 ### `sig intent import-github`
 
@@ -2532,6 +2685,7 @@ under `GET /runs/{id}/events` is unchanged):
 | Event | When |
 |-------|------|
 | `watch_tick` | A cycle started a run: its cell, run id, base SHA, batch, and how many branches it deferred. |
+| `watch_intent` | A tick fired a due [scheduled intent](#recurring-intents-schedule): its cell, run id, intent id, schedule, and the stamped task id the fire runs under. |
 | `watch_skip` | The tick found the cell busy with a manual run or an ack; the batch stays pending for the next tick. |
 | `watch_backoff` | A branch finished a cycle without landing: its consecutive red count and the limit. |
 | `watch_stale` | A branch cannot be integrated onto the base and needs a rebase (once per pushed SHA). |

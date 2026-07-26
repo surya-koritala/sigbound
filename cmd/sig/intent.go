@@ -15,6 +15,14 @@
 // runRun's -intent branch and resolvePolicy). An intent can therefore only make
 // a run's landing bar stricter, never weaker, however it arrived on disk.
 //
+// Two things live on top of that base (issue #113). TEMPLATES: files under
+// intents/templates/ in the same dialect, copied to intents/<id>.intent by `sig
+// intent new` — a copy, with no substitution and no expansion. RECURRING: an
+// intent's `schedule` is made live by `sig serve -watch`, whose existing cycle
+// asks once per tick which intents are due and fires one as an ordinary run.
+// This file owns the durable half of that (intent-fired.json, due-ness); the
+// cycle that drives it is watchIntentCycle in watch.go.
+//
 // See docs/USAGE.md's Intents section.
 package main
 
@@ -33,6 +41,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/surya-koritala/sigbound/internal/gitx"
 )
 
 const (
@@ -42,6 +52,12 @@ const (
 	// ignored, so the directory can hold more than intents.
 	intentDirName = "intents"
 	intentFileExt = ".intent"
+	// intentTemplateDirName is the SUBDIRECTORY of intents/ holding the
+	// skeletons `sig intent new -template` instantiates. A subdirectory is what
+	// keeps a template out of the repo's actual asks: listIntents never recurses
+	// and skips directories, so a file in here is invisible to `sig intent list`,
+	// to `sig run -intent`, and to the recurring runtime.
+	intentTemplateDirName = "templates"
 )
 
 // intent is one parsed, validated intent file. Every field but ID and Goal is
@@ -70,9 +86,10 @@ type intent struct {
 	// reads it. It is a hint for whoever picks the next intent to run, not a
 	// queue the driver services.
 	Priority int
-	// Schedule is how often this intent wants to run. It is PARSED, validated
-	// and recorded here, and acted on by NOTHING today: the recurring runtime is
-	// issue #113. Zero when unset.
+	// Schedule is how often this intent wants to run. Zero when unset. It is
+	// acted on by ONE thing: a `sig serve -watch` cycle, which fires a due intent
+	// as an ordinary run (see watchIntentCycle). Nothing else — a `sig run
+	// -intent` is always an explicit ask and ignores the schedule entirely.
 	Schedule time.Duration
 	// Issue is the GitHub issue number this intent was imported from (0 when it
 	// was not), recorded by `sig intent import-github` so a later publish
@@ -245,6 +262,128 @@ func parseIntent(data []byte, id string) (intent, error) {
 	return it, nil
 }
 
+// ---- the recurring runtime's durable state (issue #113) ----
+
+// intentFiredFileName records when each scheduled intent last FIRED, per repo,
+// beside the run journal under <git-common-dir>/sigbound/ — the same place
+// watch-seen.json lives, and for the same reason: it is a daemon's state about
+// the repo, never content of it, so a scheduled run must not dirty the working
+// tree it is about to hand an agent.
+const intentFiredFileName = "intent-fired.json"
+
+// intentFired is intent-fired.json's shape: intent id -> its last fire.
+//
+// It is a LEDGER, and that is the one place it differs from watch-seen.json,
+// which is a cache. Losing this file costs one EXTRA fire per scheduled intent
+// (an unknown last-fire reads as never fired, and never fired is due), where
+// losing the seen-set costs only a re-examination. That direction is chosen
+// deliberately: a fire is an ordinary policy- and verify-gated run, so an extra
+// one wastes a cycle, while failing closed on an unreadable record would be a
+// schedule that silently stopped.
+type intentFired struct {
+	Intents map[string]intentFiredEntry `json:"intents"`
+}
+
+// intentFiredEntry is one intent's last fire. FiredAt is stamped when the run
+// slot is TAKEN, before any agent runs — see watchIntentCycle for why that end
+// of the run is the one that matters.
+type intentFiredEntry struct {
+	FiredAt time.Time `json:"firedAt"`
+}
+
+// readIntentFired reads the record. Every failure — missing, unreadable,
+// truncated, malformed, wrong shape, and the empty path `sig intent show` passes
+// for a repo git cannot answer for — yields an EMPTY record rather than an
+// error: see intentFired's doc comment for what an empty record costs.
+func readIntentFired(path string) intentFired {
+	empty := intentFired{Intents: map[string]intentFiredEntry{}}
+	if path == "" {
+		return empty
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return empty
+	}
+	var f intentFired
+	if err := json.Unmarshal(data, &f); err != nil || f.Intents == nil {
+		return empty
+	}
+	for id, e := range f.Intents {
+		// An entry with no id or no time can never mean anything but "never
+		// fired", which is what its absence already means; drop it rather than
+		// carry it forward forever.
+		if id == "" || e.FiredAt.IsZero() {
+			delete(f.Intents, id)
+		}
+	}
+	return f
+}
+
+// writeIntentFired publishes the record atomically through atomicWriteFile
+// (unique temp + rename, hardened against Windows' contended-destination
+// failure), so a daemon killed mid-write leaves either the whole old record or
+// the whole new one.
+//
+// Unlike writeWatchSeen this is NOT best-effort: it returns its error. A fire
+// that is not recorded is a fire that happens again on the next tick, so the
+// caller has to be able to say so out loud (see watchIntentCycle).
+func writeIntentFired(path string, f intentFired) error {
+	data, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return atomicWriteFile(dir, filepath.Base(path), data, 0o644)
+}
+
+// intentFiredPathFor resolves a repo's fired record for the CLI, which has no
+// server to have resolved it already. A repo git cannot answer for (not a
+// repository, git missing from PATH) yields "", which readIntentFired reports as
+// an empty record — `sig intent list`/`show` only REPORT the schedule, and must
+// not fail over state that only a watch daemon writes.
+func intentFiredPathFor(ctx context.Context, repo string) string {
+	common, err := gitx.New(repo).GitCommonDir(ctx)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(common, "sigbound", intentFiredFileName)
+}
+
+// intentDue reports whether it wants to fire at now, given the last time it did
+// (zero = never). An intent with no schedule is never due.
+//
+// A missed window fires ONCE on return, not once per window missed: due-ness is
+// a comparison against the LAST fire, and firing re-bases it on the moment it
+// fired, so a daemon that was down for a week returns and runs a 24h intent one
+// time, not seven. A never-fired scheduled intent is due immediately — the first
+// tick that sees it runs it, which is also what makes adding a schedule to an
+// intent take effect without anyone having to seed a timestamp.
+func intentDue(it intent, last, now time.Time) bool {
+	if it.Schedule <= 0 {
+		return false
+	}
+	return last.IsZero() || !now.Before(last.Add(it.Schedule))
+}
+
+// dueIntent picks the intent to fire now from intents (already ordered priority
+// desc then id asc by listIntents), or false when none is due.
+//
+// ONE per call, deliberately: a run carries exactly one intent id for
+// attribution, one acceptance command in its verify battery, and one lane, so
+// batching two intents into a cycle would blur all three. The rest wait for the
+// next tick, which is at most one -watch-interval away.
+func dueIntent(intents []intent, fired intentFired, now time.Time) (intent, bool) {
+	for _, it := range intents {
+		if intentDue(it, fired.Intents[it.ID].FiredAt, now) {
+			return it, true
+		}
+	}
+	return intent{}, false
+}
+
 // intentJSON is the stable machine shape of `sig intent list`/`show`, and the
 // only place an intent is rendered for a consumer. Schedule renders as its
 // duration string, and every optional field is omitempty, so a minimal intent
@@ -257,16 +396,32 @@ type intentJSON struct {
 	Files      []string `json:"files,omitempty"`
 	Priority   int      `json:"priority,omitempty"`
 	Schedule   string   `json:"schedule,omitempty"`
-	Issue      int      `json:"issue,omitempty"`
+	// LastFired, NextDue and Due describe the recurring runtime and appear only
+	// for an intent that HAS a schedule. LastFired/NextDue stay absent until a
+	// cycle has fired it once; Due is the verdict the next `sig serve -watch`
+	// tick would reach, so a never-fired scheduled intent reports due with no
+	// next-due timestamp — it is due now.
+	LastFired string `json:"lastFired,omitempty"`
+	NextDue   string `json:"nextDue,omitempty"`
+	Due       bool   `json:"due,omitempty"`
+	Issue     int    `json:"issue,omitempty"`
 }
 
-func intentReport(it intent) intentJSON {
+// intentReport renders one intent. last is when a cycle last fired it (zero =
+// never) and now is the instant due-ness is judged at, both passed in so a
+// listing judges every row against one clock.
+func intentReport(it intent, last, now time.Time) intentJSON {
 	out := intentJSON{
 		ID: it.ID, Path: it.Path, Goal: it.Goal, Acceptance: it.Acceptance,
 		Files: it.Files, Priority: it.Priority, Issue: it.Issue,
 	}
 	if it.Schedule > 0 {
 		out.Schedule = it.Schedule.String()
+		out.Due = intentDue(it, last, now)
+		if !last.IsZero() {
+			out.LastFired = last.UTC().Format(time.RFC3339)
+			out.NextDue = last.Add(it.Schedule).UTC().Format(time.RFC3339)
+		}
 	}
 	return out
 }
@@ -281,6 +436,8 @@ func runIntent(w io.Writer, argv []string) (int, error) {
 		return runIntentList(w, argv[1:])
 	case "show":
 		return runIntentShow(w, argv[1:])
+	case "new":
+		return runIntentNew(w, argv[1:])
 	case "import-github":
 		return runIntentImportGitHub(w, argv[1:])
 	case "-h", "--help", "help":
@@ -296,6 +453,7 @@ func intentUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  sig intent list          -repo PATH [-json]")
 	fmt.Fprintln(w, "  sig intent show ID       -repo PATH [-json]")
+	fmt.Fprintln(w, "  sig intent new ID        -repo PATH -template NAME")
 	fmt.Fprintln(w, "  sig intent import-github -repo PATH [-label sigbound] [-limit 100] [-json]")
 	fmt.Fprintln(w, "intents live in <repo>/intents/*.intent; run one with `sig run -intent ID`.")
 }
@@ -322,10 +480,14 @@ func runIntentList(w io.Writer, argv []string) (int, error) {
 	if err != nil {
 		return exitOperationalError, err
 	}
+	// One read of the fired record and one clock for the whole listing, so two
+	// rows can never disagree about what "due" meant.
+	fired := readIntentFired(intentFiredPathFor(context.Background(), *repo))
+	now := time.Now()
 	if *asJSON {
 		rows := make([]intentJSON, 0, len(intents))
 		for _, it := range intents {
-			rows = append(rows, intentReport(it))
+			rows = append(rows, intentReport(it, fired.Intents[it.ID].FiredAt, now))
 		}
 		return exitOK, writeJSONIndent(w, rows)
 	}
@@ -333,11 +495,24 @@ func runIntentList(w io.Writer, argv []string) (int, error) {
 		fmt.Fprintf(w, "no intents in %s\n", intentDir(*repo))
 		return exitOK, nil
 	}
-	fmt.Fprintf(w, "%-24s %4s  %s\n", "INTENT", "PRIO", "GOAL")
+	scheduled := false
+	fmt.Fprintf(w, "%-24s %4s %-10s  %s\n", "INTENT", "PRIO", "SCHEDULE", "GOAL")
 	for _, it := range intents {
-		fmt.Fprintf(w, "%-24s %4d  %s\n", it.ID, it.Priority, firstLine(it.Goal))
+		sched := "-"
+		if it.Schedule > 0 {
+			scheduled = true
+			sched = it.Schedule.String()
+			if intentDue(it, fired.Intents[it.ID].FiredAt, now) {
+				sched += "!" // due at the next `sig serve -watch` tick
+			}
+		}
+		fmt.Fprintf(w, "%-24s %4d %-10s  %s\n", it.ID, it.Priority, sched, firstLine(it.Goal))
 	}
-	fmt.Fprintf(w, "\n%d intent(s) in %s\n", len(intents), intentDir(*repo))
+	legend := ""
+	if scheduled {
+		legend = " (schedule! = due at the next `sig serve -watch` tick)"
+	}
+	fmt.Fprintf(w, "\n%d intent(s) in %s%s\n", len(intents), intentDir(*repo), legend)
 	return exitOK, nil
 }
 
@@ -376,8 +551,10 @@ func runIntentShow(w io.Writer, argv []string) (int, error) {
 	if err != nil {
 		return exitOperationalError, err
 	}
+	last := readIntentFired(intentFiredPathFor(context.Background(), *repo)).Intents[it.ID].FiredAt
+	now := time.Now()
 	if *asJSON {
-		return exitOK, writeJSONIndent(w, intentReport(it))
+		return exitOK, writeJSONIndent(w, intentReport(it, last, now))
 	}
 	fmt.Fprintf(w, "intent %s  (%s)\n", it.ID, it.Path)
 	if it.Priority != 0 {
@@ -393,10 +570,150 @@ func runIntentShow(w io.Writer, argv []string) (int, error) {
 		fmt.Fprintf(w, "acceptance: %s\n", it.Acceptance)
 	}
 	if it.Schedule > 0 {
-		fmt.Fprintf(w, "schedule:   %s (recorded; no recurring runtime yet — issue #113)\n", it.Schedule)
+		fmt.Fprintf(w, "schedule:   %s (fired by `sig serve -watch`)\n", it.Schedule)
+		if last.IsZero() {
+			fmt.Fprintf(w, "next due:   now (never fired)\n")
+		} else {
+			fmt.Fprintf(w, "last fired: %s\n", last.UTC().Format(time.RFC3339))
+			next := last.Add(it.Schedule)
+			if intentDue(it, last, now) {
+				fmt.Fprintf(w, "next due:   now (was due %s)\n", next.UTC().Format(time.RFC3339))
+			} else {
+				fmt.Fprintf(w, "next due:   %s\n", next.UTC().Format(time.RFC3339))
+			}
+		}
 	}
 	fmt.Fprintf(w, "goal:\n%s\n", indentLines(it.Goal, "  "))
 	return exitOK, nil
+}
+
+// runIntentNew instantiates intents/<ID>.intent from a template.
+func runIntentNew(w io.Writer, argv []string) (int, error) {
+	fs := flag.NewFlagSet("intent new", flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintln(fs.Output(), "usage: sig intent new ID -repo PATH -template NAME")
+		fmt.Fprintln(fs.Output(), "copy intents/templates/NAME.intent to intents/ID.intent. It is a COPY: no substitution,")
+		fmt.Fprintln(fs.Output(), "no expansion — a template is an intent file like any other. An existing intent is never overwritten.")
+		fs.PrintDefaults()
+	}
+	repo := fs.String("repo", "", "path to the target git repository")
+	template := fs.String("template", "", "name of the skeleton under intents/templates/ to instantiate, without the .intent extension")
+	// ID is positional and documented FIRST, which stdlib flag cannot parse on
+	// its own; same leading-positional pull `sig intent show` does, so both
+	// orders work.
+	var id string
+	if len(argv) > 0 && !strings.HasPrefix(argv[0], "-") {
+		id, argv = argv[0], argv[1:]
+	}
+	if err := fs.Parse(argv); err != nil {
+		if err == flag.ErrHelp {
+			return exitOK, nil
+		}
+		return exitOperationalError, err
+	}
+	if id == "" && fs.NArg() == 1 {
+		id = fs.Arg(0)
+	} else if id == "" || fs.NArg() > 0 {
+		return exitOperationalError, errors.New("exactly one intent ID is required")
+	}
+	if strings.TrimSpace(*repo) == "" {
+		return exitOperationalError, errors.New("-repo is required")
+	}
+	if strings.TrimSpace(*template) == "" {
+		return exitOperationalError, fmt.Errorf("-template is required: name a file under %s%s", intentTemplateDir(*repo), templateHint(*repo))
+	}
+	path, err := newIntentFromTemplate(*repo, strings.TrimSpace(*template), id)
+	if err != nil {
+		return exitOperationalError, err
+	}
+	fmt.Fprintf(w, "wrote %s from template %s\n", path, *template)
+	fmt.Fprintf(w, "edit it, then run it with `sig run -repo %s -intent %s`\n", *repo, id)
+	return exitOK, nil
+}
+
+// intentTemplateDir / intentTemplatePath locate the skeletons `sig intent new`
+// copies from.
+func intentTemplateDir(repo string) string {
+	return filepath.Join(intentDir(repo), intentTemplateDirName)
+}
+
+func intentTemplatePath(repo, name string) string {
+	return filepath.Join(intentTemplateDir(repo), name+intentFileExt)
+}
+
+// newIntentFromTemplate writes intents/<id>.intent from
+// intents/templates/<name>.intent and returns the path it wrote.
+//
+// It is a COPY, deliberately and permanently: a template is written in the
+// intent dialect and instantiating it substitutes nothing, includes nothing and
+// expands nothing. A template mechanism that grew its own language would be a
+// second dialect to learn, a second parser to trust, and a second place a
+// landing bar could be described.
+//
+// Two guards, both the ones `sig intent import-github` already applies: the
+// bytes must parse as a valid intent UNDER THE NEW ID before anything is written
+// (a file this binary cannot read back is never left behind), and the create is
+// O_EXCL, so an instantiation never overwrites an intent — including a
+// hand-edited one that happens to share the id.
+func newIntentFromTemplate(repo, name, id string) (string, error) {
+	if !slugSafe(id) {
+		return "", fmt.Errorf("intent id %q is not a safe name (allowed: A-Za-z0-9._-, not . or ..): it becomes a task id and a branch component", id)
+	}
+	if !slugSafe(name) {
+		return "", fmt.Errorf("template name %q is not a safe name (allowed: A-Za-z0-9._-, not . or ..)", name)
+	}
+	tpl := intentTemplatePath(repo, name)
+	data, err := os.ReadFile(tpl)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("no template %q: %s does not exist%s", name, tpl, templateHint(repo))
+		}
+		return "", fmt.Errorf("read template %q: %w", name, err)
+	}
+	if _, err := parseIntent(data, id); err != nil {
+		return "", fmt.Errorf("%s would not render a valid intent: %w", tpl, err)
+	}
+	if err := os.MkdirAll(intentDir(repo), 0o755); err != nil {
+		return "", fmt.Errorf("create %s: %w", intentDir(repo), err)
+	}
+	path := intentPath(repo, id)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	switch {
+	case errors.Is(err, fs.ErrExist):
+		return "", fmt.Errorf("intent %q already exists at %s: an instantiation never overwrites — delete it, or choose another id", id, path)
+	case err != nil:
+		return "", fmt.Errorf("write %s: %w", path, err)
+	}
+	_, werr := f.Write(data)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return "", fmt.Errorf("write %s: %w", path, werr)
+	}
+	return path, nil
+}
+
+// templateHint names the templates that DO exist, for the error raised when the
+// named one does not. Templates have no listing command of their own, so this is
+// the only place the set is discoverable; an unreadable directory contributes
+// nothing rather than a second error about a hint.
+func templateHint(repo string) string {
+	entries, err := os.ReadDir(intentTemplateDir(repo))
+	if err != nil {
+		return ""
+	}
+	var names []string
+	for _, de := range entries {
+		if !de.IsDir() && strings.HasSuffix(de.Name(), intentFileExt) {
+			names = append(names, strings.TrimSuffix(de.Name(), intentFileExt))
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	return " (available: " + strings.Join(names, ", ") + ")"
 }
 
 // ghIssue is the subset of `gh issue list --json number,title,body` this reads.

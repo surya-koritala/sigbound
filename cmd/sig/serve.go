@@ -2019,6 +2019,8 @@ func runServe(w io.Writer, argv []string) (int, error) {
 	watchVerify := fs.String("watch-verify", "", "-watch: the verify command every cycle must pass before it lands, composed with the cell policy's own verify battery. "+
 		"Required unless the cell's sigbound.policy declares a verify line; pass `true` to accept landing every cycle unverified")
 	watchMaxRed := fs.Int("watch-max-red", 3, "-watch: exclude a branch after this many consecutive cycles that failed to land it, raising a red-branch inbox entry. Re-pushing the branch clears the count")
+	watchAgent := fs.String("watch-agent", "", "-watch: the agent command a due SCHEDULED intent's run invokes (an intents/*.intent file with a `schedule` line; see docs/USAGE.md's Intents section). "+
+		"Unset means scheduled intents never fire — a cycle over arriving branches runs no agent and does not need this")
 	// Event push (issue #117): mirror the NDJSON event stream to an HTTP
 	// receiver. Delivery is fail-open — see eventpush.go and docs/USAGE.md's
 	// "Event push" section.
@@ -2120,6 +2122,7 @@ func runServe(w io.Writer, argv []string) (int, error) {
 			batch:    *watchBatch,
 			maxRed:   *watchMaxRed,
 			verify:   *watchVerify,
+			agent:    *watchAgent,
 		}, explicitFlags); err != nil {
 			return exitOperationalError, err
 		}

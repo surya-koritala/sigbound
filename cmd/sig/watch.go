@@ -30,6 +30,11 @@
 // STARVATION. A branch whose cycle keeps failing to land it is retried, and
 // after -watch-max-red consecutive such cycles it is excluded and raised as a
 // red-branch inbox entry for a human. A re-push clears the count.
+//
+// SCHEDULED INTENTS (issue #113). The same tick is also the heartbeat for an
+// intent's `schedule`: before looking at arrivals, a due tick asks which of the
+// repo's intents are due and fires one as an ordinary run (see
+// watchIntentCycle). There is no second scheduler and no timer per intent.
 package main
 
 import (
@@ -84,6 +89,14 @@ type watchConfig struct {
 	// resolveWatchConfig). `-watch-verify true` is the explicit way to say that
 	// landing unverified is what you meant.
 	verify string
+	// agent is -watch-agent: the agent command a due SCHEDULED INTENT's run
+	// invokes (issue #113). Empty is the ordinary case and costs nothing — a
+	// branch cycle runs no agent at all (see watchParams) — so only a cell whose
+	// intents declare a schedule needs it, and a due intent with no agent is
+	// reported per occurrence rather than refused at startup: intents live in the
+	// WORKING TREE and change under a running daemon, so startup is the wrong
+	// place to decide whether this cell will ever need one.
+	agent string
 	// tick replaces the internal ticker when non-nil: each receive is one poll.
 	// Tests drive cycles through it so a cadence test never depends on a sleep
 	// producing the interleaving it hoped for. With interval 0 every poll is
@@ -278,6 +291,15 @@ func watchCollect(ctx context.Context, g *gitx.Git, seen watchSeen, baseSHA stri
 func (s *server) watchCycle(ctx context.Context, rc *registeredCell, cfg watchConfig, due bool) bool {
 	cellID := rc.cell.ID()
 	g := rc.cell.Git()
+	// Scheduled intents (issue #113) get the tick FIRST. An intent has a
+	// deadline and an arrival does not: a branch that waits one more tick is
+	// merely later, while a schedule that keeps losing the cell to a busy arrival
+	// stream is a schedule that does not work. Only on a DUE tick, so the check
+	// runs once per -watch-interval however fast a batch trigger is polling —
+	// which is also the resolution a `schedule` is honored to.
+	if due && s.watchIntentCycle(ctx, rc, cfg) {
+		return true
+	}
 	seenPath := rc.watchSeenPath()
 	seen := readWatchSeen(seenPath)
 
@@ -351,6 +373,136 @@ func (s *server) watchCycle(ctx context.Context, rc *registeredCell, cfg watchCo
 
 	s.watchSettle(ctx, rc, cfg, rec, pending, seenPath)
 	return true
+}
+
+// ---- scheduled intents (issue #113) ----
+
+// intentFiredPath is this cell's last-fired record, beside its seen-set.
+func (rc *registeredCell) intentFiredPath() string {
+	return filepath.Join(filepath.Dir(rc.runsDir), intentFiredFileName)
+}
+
+// watchIntentCycle fires at most ONE due scheduled intent as an ordinary run,
+// and reports whether it did. It is the whole recurring runtime: there is no
+// second scheduler, no timer per intent and no queue — the watch tick is the
+// heartbeat, and every tick simply asks which intents are due.
+//
+// A fire is an ordinary run in every way a cycle over arrivals is (same
+// acquireRun slot, same journal, same policy resolution, same verify gate, same
+// parking) plus the two things `sig run -intent` gives an intent run: the goal
+// as the task prompt with the intent's files as its lane, and the intent's
+// acceptance APPENDED to the verify battery — tighten-only, never replacing a
+// policy member.
+//
+// WHY THE TASK ID IS STAMPED. A task id becomes the branch agent/<id>, and a
+// worktree add refuses to reuse an existing branch (loudly, by design — see
+// runAgent). A recurring intent runs under the same id forever, so a plain
+// intent id would collide with the branch its own previous fire left behind and
+// every fire after the first would die at worktree add. The stamp is newRunID's
+// UTC-timestamp-plus-random, so each fire gets its own branch and the intent id
+// still reaches `sig log` where it belongs: runParams.Intent.
+//
+// EXACTLY-ONCE, AND ITS LIMIT. Two concurrent ticks cannot both fire one intent:
+// acquireRun takes the cell's single run slot, so the loser is refused before it
+// records anything, and the winner stamps the fired record BEFORE execRun. That
+// ordering is also why a crash mid-run does not re-fire on restart — the record
+// is written when the work STARTS. The limit, stated because it is real: the run
+// slot is per-PROCESS, so this holds within one daemon, exactly as the per-cell
+// busy lock does. Two daemons watching one repo is outside this design.
+func (s *server) watchIntentCycle(ctx context.Context, rc *registeredCell, cfg watchConfig) bool {
+	cellID := rc.cell.ID()
+	// The working tree, like every other intent read (see intent.go): an intent
+	// is input, not a gate. A malformed intents/ dir is reported and skipped —
+	// the daemon is not the validator of files it does not own, and `sig intent
+	// list` is where that error belongs.
+	intents, err := listIntents(rc.cell.Repo())
+	if err != nil {
+		s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "intents", "error": err.Error()})
+		return false
+	}
+	firedPath := rc.intentFiredPath()
+	fired := readIntentFired(firedPath)
+	now := time.Now()
+	it, ok := dueIntent(intents, fired, now)
+	if !ok {
+		return false
+	}
+	if strings.TrimSpace(cfg.agent) == "" {
+		s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "intent-agent", "intent": it.ID,
+			"error": "this intent has a schedule but the daemon has no agent to run it with: start `sig serve -watch` with -watch-agent"})
+		return false
+	}
+
+	p := s.watchParams(rc, cfg, nil)
+	p.AgentCmd = cfg.agent
+	p.Intent = it.ID
+	// Same composition `sig run -intent` performs, for the same reason: the
+	// acceptance command is a member of the battery, not a replacement for one.
+	// resolvePolicy then composes the repo's own battery over this inside
+	// driveRun, where policy is resolved for every run.
+	if acc := strings.TrimSpace(it.Acceptance); acc != "" {
+		battery := []string{acc}
+		if strings.TrimSpace(p.VerifyCmd) != "" {
+			battery = append(battery, p.VerifyCmd)
+		}
+		p.VerifyCmd = joinVerifyBattery(battery)
+	}
+	tasks := []taskSpec{{ID: it.ID + "-" + newRunID(), Prompt: it.Goal, Files: it.Files}}
+	req := runRequest{Cell: cellID, Base: cfg.base, Tasks: tasks}
+	rec, err := s.acquireRun(rc, req, &p)
+	if err != nil {
+		// A manual POST /runs (or an ack) holds the cell, or a quota is full.
+		// Nothing is recorded, so the intent stays due and the next tick fires it.
+		s.watchEvents.emit("watch_skip", map[string]any{"cell": cellID, "intent": it.ID, "reason": err.Error()})
+		return false
+	}
+	// Recorded the instant the slot is taken, before any agent runs. A write
+	// failure here is loud: the fire happened, and a fire this daemon could not
+	// record is one the next tick will repeat.
+	fired.Intents[it.ID] = intentFiredEntry{FiredAt: now}
+	if werr := writeIntentFired(firedPath, fired); werr != nil {
+		s.watchEvents.emit("watch_error", map[string]any{"cell": cellID, "at": "intent-fired", "intent": it.ID,
+			"error": fmt.Sprintf("%s: %v (this fire may repeat on the next tick)", firedPath, werr)})
+	}
+	s.watchEvents.emit("watch_intent", map[string]any{
+		"cell": cellID, "runId": rec.id, "intent": it.ID, "schedule": it.Schedule.String(), "task": tasks[0].ID,
+	})
+	s.execRun(rec, p, tasks, planSpec{}, false)
+	s.retireIntentBranch(ctx, rc, tasks[0].ID)
+	// No backoff and no retry: a fire that failed to land is an ordinary red run,
+	// its report and inbox entry say so, and the intent tries again at its next
+	// window. The schedule IS the retry cadence.
+	return true
+}
+
+// retireIntentBranch records the branch a fire produced as DECIDED in the cell's
+// seen-set, whatever the fire decided (landed, parked, or red).
+//
+// This is not bookkeeping, it is the acceptance rule holding past the run: a
+// cycle over arrivals is gated by the repo policy plus -watch-verify and NOT by
+// any intent's `acceptance`, so a leftover agent/* branch offered back to an
+// ordinary cycle could land exactly the work the intent's own bar rejected.
+// Marking it decided is what keeps the intent's bar the only bar its work is
+// ever judged against.
+//
+// Nothing is deleted — the branch stays on disk for whoever wants to look at it,
+// and `sig gc` sweeps it like any other agent branch. Two limits, both stated
+// because they are real: the seen-set is a CACHE (see readWatchSeen), so losing
+// it does re-offer such a branch as an ordinary arrival, to be judged by the
+// cycle bar alone; and a branch the agent never created has nothing to record,
+// which is the RevParse failure below.
+func (s *server) retireIntentBranch(ctx context.Context, rc *registeredCell, taskID string) {
+	branch := "agent/" + taskID
+	// WithoutCancel: a shutdown that cut the fire short must still leave this
+	// record, or the drain reopens exactly the hole above on the next start.
+	sha, err := rc.cell.Git().RevParse(context.WithoutCancel(ctx), branch)
+	if err != nil {
+		return
+	}
+	seenPath := rc.watchSeenPath()
+	seen := readWatchSeen(seenPath)
+	seen.Branches[branch] = watchSeenEntry{SHA: sha, Done: true}
+	writeWatchSeen(seenPath, seen)
 }
 
 // watchSettle records what the finished cycle decided about each branch it took.
