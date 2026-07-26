@@ -3045,11 +3045,12 @@ directory.
 within one boot of one pid namespace. `pidScope` records where the pid came from
 — on Linux the kernel's `boot_id` plus the hostname, elsewhere the hostname
 alone — and **both** the scope and the pid must match before a run is treated as
-owned by a live process. A record from another host, another container, or a
-previous boot of this host reads as **not alive**, so it is reclaimed rather than
-trusted: under one process (or container) per run over a shared clone, a
-stranger's pid number resolves here perfectly well, and believing it would wedge
-the cell in `running` forever with nothing behind it.
+owned by a live process. A record from another host, another container, or — on
+Linux, where there is a `boot_id` to fold in — a previous boot of this host reads
+as **not alive**, so it is reclaimed rather than trusted: under one process (or
+container) per run over a shared clone, a stranger's pid number resolves here
+perfectly well, and believing it would wedge the cell in `running` forever with
+nothing behind it.
 
 A `status.json` written before `pidScope` existed has no identity recorded, and
 is likewise treated as **not ours**. That is deliberate, and it is a behaviour
@@ -3066,6 +3067,12 @@ alone rather than recovered. Off Linux there is no `boot_id` to fold in, so the
 scope is the hostname alone and a pid reused after a reboot of the same host
 still reads alive. Both are narrow, best-effort windows, consistent with this
 feature's posture elsewhere, not correctness guarantees.
+
+The scope errs the other way too, and on macOS that is not exotic: the `.local`
+hostname changes on ordinary network events, so a run started under the old name
+no longer matches, and the next sweep (every `sig run` does one) marks it
+`interrupted` while it is still running. Same cost as the Windows over-reach
+below — a wrong phase, never the run.
 
 `sig serve` does **not** auto-resume an interrupted run — that would mean
 guessing what to do with partial work, which cuts against the fail-safe

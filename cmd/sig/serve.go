@@ -2017,16 +2017,19 @@ func writeRunRequest(dir string, req runRequest) {
 
 // recoverStaleRuns is newServer's startup recovery pass over one cell's runs
 // dir: a run whose status.json still says queued/running belongs to a dead
-// owner if its recorded PID no longer resolves to a live process. A dead
-// owner's entry gets rewritten to "interrupted" here, before the server
-// accepts its first request -- that's what keeps GET from reporting
-// "running" forever after a kill -9. A LIVE recorded PID is left alone
-// unconditionally, whether it's our own PID (a run this same process is
-// still doing -- restart recovery doesn't run mid-process, but the test
-// suite plants this case directly) or a sibling daemon's (multiple `sig
-// serve` processes can share a runs dir; recovery must never stomp another
-// daemon's in-flight run just because it isn't ours). ourPID is accepted as
-// a parameter (not read via os.Getpid() inside) purely so a test can name a
+// owner unless the owner it records -- the pid AND the scope that pid is a
+// name in -- is a process still running HERE. A dead owner's entry gets rewritten
+// to "interrupted" here, before the server accepts its first request -- that's
+// what keeps GET from reporting "running" forever after a kill -9. A live
+// owner is left alone whether it's our own pid (a run this same process is
+// still doing -- restart recovery doesn't run mid-process, but the test suite
+// plants this case directly) or a sibling daemon's (multiple `sig serve`
+// processes can share a runs dir; recovery must never stomp another daemon's
+// in-flight run just because it isn't ours). A live recorded pid does NOT on
+// its own earn that: a record naming another host or boot, or naming none at
+// all, is reclaimed even when its number resolves to a running process here,
+// because here that number is somebody else's. ourPID is accepted as a
+// parameter (not read via os.Getpid() inside) purely so a test can name a
 // specific "this process" pid without actually running as it; the recovery
 // decision itself no longer depends on it.
 //
@@ -2099,17 +2102,36 @@ func recoverStaleRuns(runsDir string, ourPID int) {
 // and docs/USAGE.md's "Crash recovery"). This narrows "alive", it does not
 // prove ownership.
 //
+// The hostname MOVING is the same ceiling from the other side, and it needs no
+// reboot and no container to reach: on macOS the `.local` name changes on
+// ordinary network events, so a run started under the old name stops matching,
+// and the next sweep -- every `sig run` does one, via startRunDir -- reclaims a
+// marker whose process is still running. The bare-pid check this replaces held
+// that case; this deliberately does not. The cost is the same misreported phase
+// (see ownedByLiveProcess), which the issue's fail-toward-reclaim direction
+// accepts on purpose.
+//
 // Computed once: the answer must not change under a process while its own
 // records are on disk, or it would reclaim itself.
 var ownerScope = sync.OnceValue(func() string {
 	host, _ := os.Hostname() // "" on failure; see the ceiling above
-	if runtime.GOOS == "linux" {
-		if b, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
+	return ownerScopeFrom(runtime.GOOS, host, "/proc/sys/kernel/random/boot_id")
+})
+
+// ownerScopeFrom is ownerScope's body with its three inputs named. Split out
+// only so the fold-in can be tested: an end-to-end assertion on ownerScope()
+// can require non-empty and stable, and the hostname ALONE satisfies both on
+// every platform -- so the boot_id half, the half that closes issue #162's
+// named "pid reuse after a reboot" residual, would be silently deletable. See
+// TestOwnerScopeFrom.
+func ownerScopeFrom(goos, host, bootIDPath string) string {
+	if goos == "linux" {
+		if b, err := os.ReadFile(bootIDPath); err == nil {
 			return strings.TrimSpace(string(b)) + "/" + host
 		}
 	}
 	return host
-})
+}
 
 // ownedByLiveProcess reports whether sf's recorded owner is a process still
 // running HERE. BOTH halves must hold — the pid scope must be ours, and the pid

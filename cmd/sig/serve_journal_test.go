@@ -286,6 +286,13 @@ func TestServeRecoveryFlipsDeadForeignPid(t *testing.T) {
 	if sf.Status != "interrupted" {
 		t.Fatalf("status = %q, want interrupted (recorded pid is dead)", sf.Status)
 	}
+	// Matching scope + dead pid is the ordinary crash, and the only one of
+	// staleOwnerReason's three arms that may say the process is gone. Nothing
+	// else pins that arm, and printing it for a foreign-scope record would send
+	// an operator hunting a process that is very much running.
+	if !strings.Contains(sf.Note, "is gone") {
+		t.Fatalf("note = %q, want it to say the owning process is gone", sf.Note)
+	}
 }
 
 // TestServeRecoveryLeavesTerminalRunsAlone guards against the recovery scan
@@ -329,7 +336,10 @@ func TestServeRecoveryReclaimsForeignHostRecord(t *testing.T) {
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	plantRunStatus(t, runDir, "running", os.Getpid(), "some-other-host-entirely")
+	// The scope carries a newline because it is read back off a file on disk,
+	// i.e. hand-editable input that ends up in a note `sig log` and the UI
+	// print. It must land quoted, not interpolated raw.
+	plantRunStatus(t, runDir, "running", os.Getpid(), "some-other-host\nstatus: running")
 
 	recoverStaleRuns(runsDir, os.Getpid())
 
@@ -344,6 +354,9 @@ func TestServeRecoveryReclaimsForeignHostRecord(t *testing.T) {
 	// "that process is gone" about a process that is very much running.
 	if !strings.Contains(sf.Note, "another host or boot") {
 		t.Fatalf("note = %q, want it to name the foreign host/boot rather than claiming the pid is gone", sf.Note)
+	}
+	if strings.Contains(sf.Note, "\n") {
+		t.Fatalf("note = %q: a scope read off disk reached it unquoted and forged a second line", sf.Note)
 	}
 }
 
@@ -463,6 +476,47 @@ func TestOwnerScopeIsStableAndNonEmpty(t *testing.T) {
 	}
 	if second := ownerScope(); second != first {
 		t.Fatalf("ownerScope() returned %q then %q; it must not vary within a process", first, second)
+	}
+}
+
+// TestOwnerScopeFrom pins the boot_id fold-in itself. It needs its own test
+// because nothing else can bite it: TestOwnerScopeIsStableAndNonEmpty is
+// satisfied by the hostname alone -- on Linux CI as much as on a mac -- so with
+// only that test the fold-in is deletable with the suite still green, and the
+// fold-in is the half of the scope that closes the residual issue #162 names by
+// hand ("PID reuse after a reboot gives the same false-alive"). The rows fail in
+// BOTH directions: if the fold-in is dropped, and if it is applied off Linux.
+func TestOwnerScopeFrom(t *testing.T) {
+	dir := t.TempDir()
+	bootID := filepath.Join(dir, "boot_id")
+	// Trailing newline on purpose: that is the shape the kernel's file has.
+	if err := os.WriteFile(bootID, []byte("6f0c3a1e-boot\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	absent := filepath.Join(dir, "no-such-boot-id")
+	for _, tc := range []struct {
+		name, goos, host, path, want string
+	}{
+		{"linux folds the boot id in, trimmed", "linux", "host-a", bootID, "6f0c3a1e-boot/host-a"},
+		{"unreadable boot id degrades to the hostname, not to something worse", "linux", "host-a", absent, "host-a"},
+		{"off linux the file is never consulted", "darwin", "host-a", bootID, "host-a"},
+		{"windows likewise", "windows", "host-a", bootID, "host-a"},
+		{"no hostname off linux leaves nothing for a record to match", "darwin", "", bootID, ""},
+	} {
+		if got := ownerScopeFrom(tc.goos, tc.host, tc.path); got != tc.want {
+			t.Errorf("%s: ownerScopeFrom(%q, %q, ...) = %q, want %q", tc.name, tc.goos, tc.host, got, tc.want)
+		}
+	}
+	// The point of the fold-in, stated as the property rather than as strings:
+	// two boots of one host must not read as the same owner. Unreadable boot_id
+	// degrades to the hostname (row 2 above), which is today's behaviour -- the
+	// floor -- not something worse.
+	other := filepath.Join(dir, "boot_id2")
+	if err := os.WriteFile(other, []byte("11111111-boot\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ownerScopeFrom("linux", "host-a", bootID) == ownerScopeFrom("linux", "host-a", other) {
+		t.Error("two different boot ids on one host produced the same scope; a pid reused across a reboot would read alive")
 	}
 }
 
