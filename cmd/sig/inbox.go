@@ -35,6 +35,12 @@ const (
 	// a landing awaiting release — there is nothing to ack. Re-pushing the branch
 	// clears it; the entry stays as the record that it happened.
 	inboxRedBranch = "red-branch"
+	// inboxUnlandBlocked: an unland whose inverse could not be offered as a
+	// landing (issue #149) — it conflicted with a later run, or the reverted tree
+	// verified red. Shaped like red-branch: an attention item with nothing to ack.
+	// An unland that PARKED raises the ordinary `parked` entry instead and is
+	// resolved through the existing ack/reject endpoints.
+	inboxUnlandBlocked = "unland-blocked"
 )
 
 // inboxDefaultLimit bounds GET /inbox when the caller names no ?limit. Audit
@@ -62,6 +68,15 @@ type inboxEntry struct {
 	Attempts     int               `json:"attempts,omitempty"`
 	ExpiresAt    string            `json:"expiresAt,omitempty"`
 	Branches     []string          `json:"branches,omitempty"`
+
+	// Unlands/Entangled/Paths are set on an unland-blocked entry (issue #149):
+	// the run whose landing could not be taken back, the later runs it is
+	// entangled with, and the paths that actually conflicted — which together are
+	// the operator's next move (resolve those paths, or unland those runs first).
+	// Empty on every other entry type.
+	Unlands   string   `json:"unlands,omitempty"`
+	Entangled []string `json:"entangled,omitempty"`
+	Paths     []string `json:"paths,omitempty"`
 }
 
 // handleInbox serves GET /inbox?type=&limit=. Newest run first (run ids are
@@ -79,10 +94,10 @@ func (s *server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	}
 	want := strings.TrimSpace(r.URL.Query().Get("type"))
 	switch want {
-	case "", inboxParked, inboxFlagged, inboxDropped, inboxRepairFailed, inboxAudit, inboxRedBranch:
+	case "", inboxParked, inboxFlagged, inboxDropped, inboxRepairFailed, inboxAudit, inboxRedBranch, inboxUnlandBlocked:
 	default:
 		writeErr(w, http.StatusBadRequest, "unknown type "+strconv.Quote(want)+
-			"; want parked|flagged|dropped|repair-failed|audit|red-branch", codeBadRequest)
+			"; want parked|flagged|dropped|repair-failed|audit|red-branch|unland-blocked", codeBadRequest)
 		return
 	}
 
@@ -143,11 +158,13 @@ func inboxEntriesFor(ctx context.Context, g *gitx.Git, cellID, dir, runID, want 
 	runLink := "/runs/" + runID
 
 	// parked: the only actionable entry type.
-	parkedBranches := map[string]bool{}
+	// reported tracks branches an earlier, more specific entry already named, so
+	// the generic `flagged` row below never lists one twice.
+	reported := map[string]bool{}
 	if status == statusAwaitingAck {
 		if pk, err := readPark(dir); err == nil {
 			for _, b := range pk.branches() {
-				parkedBranches[b] = true
+				reported[b] = true
 			}
 			e := inboxEntry{
 				Type:         inboxParked,
@@ -198,12 +215,35 @@ func inboxEntriesFor(ctx context.Context, g *gitx.Git, cellID, dir, runID, want 
 		return out
 	}
 
+	// unland-blocked: the inverse conflicted with a later run, or verified red, so
+	// nothing was taken back (issue #149). Nothing to ack — the inverse branch is
+	// kept, and the way out is a -resolver over these paths or unlanding the runs
+	// named here first.
+	if status == statusUnlandBlocked {
+		e := inboxEntry{
+			Type:      inboxUnlandBlocked,
+			Summary:   "unland of run " + rep.Unlands + " landed nothing: " + unlandBlockReason(rep),
+			Unlands:   rep.Unlands,
+			Entangled: entangledIDs(rep.Entangled),
+			Links:     map[string]string{"run": runLink, "events": runLink + "/events"},
+		}
+		if rep.Unlands != "" {
+			e.Links["entangled"] = "/runs/" + rep.Unlands + "/entangled"
+		}
+		for _, f := range rep.Integrate.Flagged {
+			reported[f.Branch] = true
+			e.Branches = append(e.Branches, f.Branch)
+			e.Paths = append(e.Paths, f.Paths...)
+		}
+		add(e)
+	}
+
 	// flagged: real conflicts, plus any policy hold that did NOT end up parked
-	// (a held group whose own tree failed verify). A branch that IS parked is
-	// deliberately not listed twice.
+	// (a held group whose own tree failed verify). A branch a more specific entry
+	// already named is deliberately not listed twice.
 	var conflicts []string
 	for _, f := range rep.Integrate.Flagged {
-		if !parkedBranches[f.Branch] {
+		if !reported[f.Branch] {
 			conflicts = append(conflicts, f.Branch)
 		}
 	}
@@ -242,6 +282,16 @@ func inboxEntriesFor(ctx context.Context, g *gitx.Git, cellID, dir, runID, want 
 		add(e)
 	}
 	return out
+}
+
+// unlandBlockReason distinguishes the two ways an inverse fails to land, since
+// they demand opposite responses: a conflict needs a resolver or the entangled
+// runs unlanded first, a red verify needs the revert itself reconsidered.
+func unlandBlockReason(rep *runReport) string {
+	if len(rep.Integrate.Flagged) > 0 {
+		return "the inverse conflicts with work that landed since"
+	}
+	return "the reverted tree failed verify"
 }
 
 // parkSummary is a parked entry's one-line human wording: why it parked, what it

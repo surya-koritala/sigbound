@@ -1475,6 +1475,7 @@ budget = 30m
 | `max-agents = N` | Ceiling on a run's task count; a run with more tasks is rejected before any agent runs. |
 | `budget = <duration>` | Ceiling on the run's wall-clock budget. Effective value is `min(policy, flag)`. |
 | `ack-paths = <glob>[, <glob>…]` | REPEATABLE and/or comma-separated. A landing that touches a matching path is PARKED for a human ack (see [Run parking](#run-parking)). |
+| `unland-paths = <glob>[, <glob>…]` | REPEATABLE and/or comma-separated. Same glob semantics, but it holds an UNLAND's inverse rather than a forward landing (see [Unlanding](#unlanding)) — for paths cheap to land forward and expensive to take back. `ack-paths` holds an inverse too, so this is only needed for that asymmetry. |
 | `audit-sample = N%` | `0..100`. Percentage of CLEAN landings sampled into non-blocking `audit` inbox entries (see [Spot-audit sampling](#spot-audit-sampling)). |
 | `ack-timeout = <duration>` | How long a parked landing waits before it auto-resolves. Absent (the default) parks forever. |
 | `ack-timeout-action = reject` | What an EXPIRED park becomes. `reject` is the only value; it is also the default whenever `ack-timeout` is set. |
@@ -1755,6 +1756,201 @@ A selected run gets `"audit": true` in its manifest and an `audit` inbox entry.
 
 It is **purely informational**: no state machine, no gate, nothing to close. An
 entry ages out of the inbox via `?limit`.
+
+---
+
+## Unlanding
+
+`sig unland RUN_ID` takes back exactly one landed run's contribution to the base
+branch — as a **new commit on top**, never a history rewrite and never a
+force-push:
+
+```sh
+sig unland 20260701T090000Z-ff01aa -repo /work/api -verify 'go build ./... && go test ./...'
+# -> unland 20260701T090000Z-ff01aa: unlanded run 20260701T090000Z-ff01aa: main now at 9f2c1ab
+```
+
+**It goes through the landing gate.** An unland is a landing: the reverted tree
+is built, the policy's verify battery is run against it, and the ref advances
+only if it passes — through the same `landRef` compare-and-swap every other
+landing uses. An unland that breaks the build is exactly as unacceptable as a
+landing that does, so it lands nothing.
+
+### How the inverse is built
+
+The run's ledger entry records `baseSHA` (where its branches forked) and
+`integrate.finalSHA` (what the ref advanced to). `tree(finalSHA)` is
+`tree(baseSHA)` plus exactly that run's contribution, so the inverse is one
+commit carrying the pre-run tree, parented on the landed commit:
+
+```
+inverse = commit-tree(tree(baseSHA), parents=[finalSHA])
+refs/heads/unland/<UNLAND_RUN_ID> -> inverse
+```
+
+`diff finalSHA..inverse` is that run's contribution reversed and nothing else —
+no patch application, no `-m` parent selection, and no dependence on the landing
+having been a merge commit (overlay landings are not). That branch is then an
+ordinary input to the machinery that already exists: it is folded onto the base's
+**current** head with `finalSHA` as the 3-way merge base, verified, and landed or
+parked. A path only this run touched reverts; a path a later run also touched
+conflicts.
+
+The branch is keyed on the NEW run's id, so repeated unlands of one run never
+collide. `sig gc` sweeps `refs/heads/unland/` like `refs/heads/agent/` once the
+unland has resolved and the branch is past `-older-than`; a branch an unresolved
+park still holds is protected unconditionally.
+
+### Blast radius
+
+Before anything is built, `sig unland` reports which **later landed runs'**
+write-sets overlap the target's, and on which paths. The overlap test is the same
+one that decides which branches may land in parallel, applied backwards in time.
+
+```sh
+sig unland 20260701T090000Z-ff01aa -repo /work/api -dry-run
+# -> unland 20260701T090000Z-ff01aa: would unland ... (2 paths, 1 later run entangled); nothing was built
+#      entangled: run 20260703T112000Z-4c9e (a1b2c3d) also touched cell/occ.go
+```
+
+`-dry-run` creates no branch, no run dir and no ledger entry, and moves no ref.
+
+Blast radius is **advisory, not a gate**: an overlap is what *produces* a
+conflict, and the conflict is the gate. A later run that overlaps but whose
+changes still merge cleanly lands. Reporting it up front is what makes the
+outcome predictable before the verify cost is paid. `-limit` (default `200`,
+`0` = all) bounds how many newer runs the scan reads — one manifest read plus one
+`git diff` each — so a long history pays a bound rather than a full walk.
+
+### Flags
+
+```
+sig unland RUN_ID -repo PATH [-verify CMD] [-verify-retries N] [-resolver CMD]
+                             [-reason TEXT] [-limit 200] [-dry-run] [-json]
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-repo` | *(required)* | The repository whose run history holds `RUN_ID`. |
+| `-verify` | — | Appended to the policy's verify battery, stricter-only as everywhere else. A repo with a `verify` line in `sigbound.policy` needs no flag. |
+| `-verify-retries` | `0` | As `sig run`: re-run a FAILING verify up to N more times on the same tree. |
+| `-resolver` | — | The same `sh -c` conflict resolver `sig run`/`sig integrate` take, identical `SIGBOUND_BASE`/`OURS`/`THEIRS`/`PATH` contract. The only mechanism for landing an inverse over an entangled path. |
+| `-reason` | — | Recorded verbatim in the inverse commit message and the `unland_start` event. |
+| `-limit` | `200` | How many newer runs the blast-radius scan reads (`0` = all). |
+| `-dry-run` | `false` | Print the blast radius and the preconditions verdict; build nothing. |
+| `-json` | `false` | Emit the outcome as JSON instead of the human summary. |
+
+`RUN_ID` is positional and comes first, exactly as for `sig ack`/`sig reject`;
+`sig unland -repo PATH RUN_ID` also works.
+
+There is deliberately **no `-force`**. An entangled inverse is resolved with
+`-resolver`, by unlanding the entangled runs too, or by a human — never by
+landing a half-revert.
+
+### Outcomes
+
+| `status` | What happened |
+|---|---|
+| `done` | The reverted tree verified green and the base ref advanced to it. Exit `0`. |
+| `awaiting-ack` | The inverse verified green but policy says a human must release it (see below). A `park.json` records it and `sig ack`/`sig reject` resolve it exactly as for any other park. Exit `0`. |
+| `unland-blocked` | Nothing landed: the inverse conflicted with a later run, or the reverted tree failed verify, or the base moved during the landing swap. The inverse branch is kept — and, like any other `unland/` branch, becomes a `sig gc` candidate once past `-older-than`. Exit `1`. |
+| `no-op` | The fold produced the tree the base already has — this run's contribution is already gone (most often: already unlanded). Nothing lands, and that is not an error. Exit `0`. |
+| `dry-run` | `-dry-run`: preconditions and blast radius only. Exit `0`. |
+
+A **red inverse is blocked, not parked**. A park is a *verified* landing awaiting
+a human; parking a red one would make every park record less trustworthy.
+
+### Policy applies to an inverse
+
+`ack-paths` binds an unland too — a path that needs an ack to change needs an ack
+to change back — and self-protection is unchanged: an inverse that would modify
+`sigbound.policy` parks unconditionally. `unland-paths` exists for the asymmetric
+case, paths cheap to land forward and expensive to take back:
+
+```
+unland-paths = migrations/**, go.sum
+```
+
+Park-reason precedence, extending the existing pair:
+`policy-modified` > `unland-paths` > `ack-paths`. A parked unland's `park.json`
+additionally carries `unlandsRun` and `entangled`, so the inbox row and the human
+acking it can see whose work is about to be removed.
+
+### It refuses rather than guesses
+
+Every one of these leaves the repository byte-identical — no branch, no run dir,
+no ref touched:
+
+| Condition | Behavior |
+|---|---|
+| The target run never landed (no `finalSHA`, `finalSHA == baseSHA`, or a red verify) | Refuse; exit `1` / `409 not_landed`. |
+| Its `report.json` is missing or unparseable | Refuse, naming the run dir. An unreadable ledger entry is not evidence of what landed. |
+| Its `finalSHA` is no longer in the base's history (rewritten, or already unlanded by other means) | Refuse, naming both commits. |
+| Its recorded `baseSHA` does not precede its `finalSHA` | Refuse: that pair does not describe a landing this can invert. |
+| `sigbound.policy` at the current head is invalid | Refuse before building anything, exactly as a run does. |
+
+**One limit worth stating plainly:** `sig unland` inverts what a run's *report*
+records as landed. A landing that an **ack** released is recorded in that run's
+`park.json`, not in its `integrate` block, so the report reads as "nothing
+landed" and an unland of it is refused — with that reason named. Undo an acked
+park by hand, or with a fresh run.
+
+And a partial revert is never landed: a conflicted or red inverse lands **nothing
+at all** and names the runs it is entangled with.
+
+Crash safety is the same as a run's: `landRef` is the last step, so nothing
+landed; the inverse branch survives and `sig gc` sweeps it under the `unland/`
+prefix after `-older-than`.
+
+### The ledger records both halves
+
+An unland is itself a run in the ledger, attributed to the run it reverses:
+
+```sh
+sig log -repo /work/api -json      # the unland row carries "unlands": "<target run id>"
+sig log -repo /work/api -sha <the unland's landed sha>
+# -> commit 9f2c1ab: run 20260725T101500Z-ab12cd took run 20260701T090000Z-ff01aa back out of the base, verify pass
+sig log -repo /work/api -sha <the target's finalSHA> -json   # reports "unlandedBy": "<unland run id>"
+```
+
+The newest-first list shows only the forward edge (`unlands`): it reads at most
+`-limit` manifests by design, and the reverse edge needs every newer one.
+`-sha`'s walk visits them all, so `unlandedBy` is exact there — except on the
+portable-note path, where the note carries only the run's own report and cannot
+know what a later run did to it.
+
+### Over HTTP
+
+```
+POST /runs/{id}/unland      body {"reason": "…"}   -> 200, the same outcome shape
+GET  /runs/{id}/entangled                          -> 200, the blast radius (read-only)
+```
+
+`POST` holds the cell's run slot for its whole integrate + verify + land, exactly
+as `POST /runs/{id}/ack` does and for the identical reason — it runs a real
+verify and then moves a ref — so a second one is `409 cell_busy`. It runs on the
+daemon's own context, not the request's, so a closed browser tab cannot abort a
+verify partway and record it as red. Its verify battery comes from
+`sigbound.policy` alone: a request never chooses the bar its own landing must
+clear, so there is no `-verify` equivalent on this door.
+
+`GET /runs/{id}/entangled` writes nothing and computes no verdict about landing.
+It returns the same data `-dry-run` prints:
+
+```json
+{"runId":"20260701T090000Z-ff01aa","writeSet":["cell/occ.go","cell/writeset.go"],
+ "unlandable":true,"reason":"",
+ "entangled":[{"runId":"20260703T112000Z-4c9e","startedAt":"…","finalSHA":"…","paths":["cell/occ.go"]}]}
+```
+
+A run that cannot be unlanded returns `200` with `"unlandable": false` and the
+reason — it is a report on state, not a failed request. `POST` on the same run is
+`409 not_landed`.
+
+A blocked unland raises an `unland-blocked` inbox entry naming the entangled runs
+and the conflicted paths; there is nothing to ack on it. An unland that PARKED
+raises the ordinary `parked` entry and is acked or rejected through the existing
+endpoints.
 
 ---
 
@@ -3536,6 +3732,9 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 | `ack` † | `actor`, `sha`, `reverified`, `attempt`* | Once, when an ack landed. `actor` is `cli` or `http`; `reverified` says whether the base had moved. *`attempt` only on a re-verified landing. |
 | `ack_refused` † | `actor`, `attempt`, `verifiedSHA`, `baseSHA`, `movedTo` | An ack's landing swap was refused: the base had moved to `movedTo` by the time it landed, so nothing landed. `attempt` is the re-verify round on the base-moved path, and `0` on a direct ack — which neither re-verified nor re-parked, since its recorded result was already against the current head. Either way the resolution is taken back: the run returns to `awaiting-ack` with its verified result and parking ref intact and `baseSHA` naming the head it was verified on; ack again to re-verify against current state. |
 | `reject` † | `actor`, `reason` | Once, when a park was rejected. `actor` is `cli`, `http`, or `timeout` for an expired `ack-timeout`. |
+| `unland_start` | `target`, `reason`, `writeSet`, `entangled` | Once, on an UNLAND run's own stream (see [Unlanding](#unlanding)), after every precondition passed and before the inverse branch is built. `target` is the run being taken back, `writeSet` its contribution, `entangled` the later landed runs that overlap it. |
+| `unland_done` | `status`, `landedSHA` | Once, always last on an unland run's stream. `status` is `done`, `awaiting-ack`, `unland-blocked`, `no-op`, or `error`; `landedSHA` is set only on `done`. |
+| `unlanded` † | `by`, `sha`, `actor` | Appended to the TARGET run's `events.ndjson` when an unland of it actually landed — the reverse edge, so the run that was taken back says so in its own journal. `by` is the unland run's id, `sha` what the base ref now holds, `actor` `cli` or `http`. |
 | `publish_start` | — | Once, right before the `-publish` command runs. Only emitted when `-publish` is set AND the run landed. |
 | `publish_done` | `ok`, `exit`, `wallMs` | Once, right after the `-publish` command finishes. |
 | `run_done` | `ok`, `exitCode`, `wallMs` | Once, always last — even on a mid-run operational error. |
