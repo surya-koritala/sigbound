@@ -2298,12 +2298,17 @@ This is correct for every landing shape:
   attributed as `member-dropped-by-bisect` (its task, agent, run) — reported as
   "dropped by bisect", never "unknown".
 - **[acked landings](#run-parking)** — the commit a human released with
-  `sig ack` resolves to `ack-landed-commit`, naming the run and how many parked
-  branches it released, so an audit can tell a landing somebody approved from one
-  the driver landed on its own. The ack attaches this note itself, on the commit
-  it actually put on the base ref (never on a refused or failed landing) — a
+  `sig ack` resolves to `ack-landed-commit`, naming how many parked branches it
+  released, so an audit can tell a landing somebody approved from one the driver
+  landed on its own. It names the **run** only when the local ledger answered;
+  from a note it reads `(from commit note, started …)`, like every other
+  note-sourced answer. The ack attaches this note itself, on the commit it
+  actually put on the base ref (never on a refused or failed landing) — a
   `-notes` note covers the run's own landing, which happened before the ack
-  existed. A **rejected** run lands nothing and attaches nothing.
+  existed. A run that parked its **only** group landed nothing, so it writes no
+  `-notes` note at all: its landing commit is the base commit, and a note there
+  would overwrite the provenance of whatever run really did land it. A
+  **rejected** run lands nothing and attaches nothing.
 
 A commit sigbound never landed prints `not landed by sigbound` and **exits 1**.
 
@@ -2532,10 +2537,12 @@ that crashed mid-write).
 agent?, branch?, strategy?, verify?, startedAt?, finalSHA?, members?, source}`.
 `role` is one of `landed-commit`, `ack-landed-commit`, `member-landed`,
 `member-dropped-by-bisect`, `member-flagged`, `member`; `source` is `note` or
-`manifest` (`runId` is empty when only a portable note answered, except for
-`ack-landed-commit`, whose note carries the run id the ack was taken against —
-a note's claim, naming a run dir that may not be local). `-task` emits an array
-of `{runId, startedAt?, branch?, sha?, ok, resumed?, landed, verify?}`.
+`manifest`. `runId` is the **local ledger's** run dir and is empty whenever only
+a portable note answered — for every role, including `ack-landed-commit`: a note
+is user-writable, so an answer read out of one names no run rather than lending
+a real run's identity to whatever the note claims (the human line says `(from
+commit note, started …)` in its place). `-task` emits an array of `{runId,
+startedAt?, branch?, sha?, ok, resumed?, landed, verify?}`.
 
 `policyHash` is the sha256 of the [`sigbound.policy`](#landing-policy) the run
 resolved, read from where the report actually records it (`policy.hash`). It is

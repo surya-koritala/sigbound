@@ -1878,8 +1878,14 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		emit.emit("publish_done", map[string]any{"ok": pub.OK, "exit": pub.Exit, "wallMs": time.Since(pubStart).Milliseconds()})
 	}
 	// -notes: the landing already happened above, so a note failure below must
-	// never look like the run itself failed — see attachNote's doc.
-	if p.Notes {
+	// never look like the run itself failed — see attachNote's doc. Same
+	// landSHA != baseSHA guard as -publish, and for a sharper reason: nothing
+	// landed, and `git notes add -f` would REPLACE the base commit's existing
+	// provenance with a report that says landed=false, destroying in every clone
+	// the record of whatever run did land it. A run that parked its only group
+	// takes exactly this path; the commit its ack later lands gets its own note
+	// then (attachAckNote).
+	if p.Notes && landSHA != baseSHA {
 		attachNote(ctx, g, landSHA, rep, "-notes")
 	}
 	return rep, nil

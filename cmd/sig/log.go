@@ -120,11 +120,11 @@ type provenance struct {
 	SHA    string `json:"sha"`
 	Landed bool   `json:"landed"`
 	Role   string `json:"role"`
-	// RunID is empty when only a portable note answered — except for
-	// ack-landed-commit, where the note carries the report's own runId and that
-	// id is the handle `sig ack`/`sig reject` were taken against (see
-	// matchProvenance's ack arm). It is then the NOTE's claim about which run
-	// resolved the park, and names a run dir that may not be local.
+	// RunID is the LOCAL LEDGER's run dir and nothing else: empty whenever only a
+	// portable note answered. That emptiness is load-bearing — it is what
+	// provenanceLine and release.go's releaseRunLabel render as "(from commit
+	// note)" — so no matchProvenance arm may fill it from a note's payload, and
+	// resolveProvenance clears it on the note path so none can.
 	RunID string `json:"runId,omitempty"`
 	// Intent is the intents/<id>.intent the landing run was started from
 	// (`sig run -intent`), empty for every other task source. It answers "which
@@ -373,7 +373,14 @@ func resolveProvenance(ctx context.Context, g *gitx.Git, runsDir, sha string) (*
 		var rep runReport
 		if json.Unmarshal([]byte(content), &rep) == nil {
 			if p := matchProvenance(&rep, sha); p != nil {
-				p.Source = "note" // RunID left empty: the note is portable, the run dir may not be local
+				// A note-sourced answer NAMES NO RUN. RunID is the local ledger's dir
+				// name (filled in by the walk below), and its emptiness is the signal
+				// every renderer keys "(from commit note)" on. Cleared HERE, once, at
+				// the single point where a note's payload becomes an answer, rather
+				// than trusted to each arm: an arm that promoted the payload's own
+				// runId would let a forged note both borrow a real local run's
+				// identity and pass itself off as the ledger's own record.
+				p.RunID, p.Source = "", "note"
 				return p, true
 			}
 			// The note parses but is not about THIS commit — treat it as
@@ -405,40 +412,40 @@ func resolveProvenance(ctx context.Context, g *gitx.Git, runsDir, sha string) (*
 }
 
 // matchProvenance tests one report for the commit and returns its provenance,
-// or nil. It matches the run's landed integration commit (integrate.finalSHA)
-// and every agent branch tip (perAgent[].sha) — which together cover overlay
-// landings (finalSHA is a fresh combine commit; members are the branch tips),
-// octopus/merge landings (finalSHA a merge, members its parents) and
-// bisect-salvaged runs (some members landed, others dropped). A full 40/64-hex
-// sha matches exactly; a shorter arg matches by prefix.
+// or nil. It matches the run's landed integration commit (integrate.finalSHA),
+// the commit an ack released (park.landedSHA, see the arm below) and every agent
+// branch tip (perAgent[].sha) — which together cover overlay landings (finalSHA
+// is a fresh combine commit; members are the branch tips), octopus/merge
+// landings (finalSHA a merge, members its parents) and bisect-salvaged runs
+// (some members landed, others dropped). A full 40/64-hex sha matches exactly; a
+// shorter arg matches by prefix.
 func matchProvenance(rep *runReport, sha string) *provenance {
 	match := shaMatcher(sha)
 	if match(rep.Integrate.FinalSHA) && landed(rep) {
 		return provenanceFromFinal(rep, rep.Integrate.FinalSHA)
 	}
 	// An ACKED landing (issue #160) matches on the park record's landedSHA and
-	// nothing else. The report itself cannot claim this commit: a run whose group
-	// parked recorded finalSHA == baseSHA and landed=false, which is the truth
-	// about what the RUN did, and the ref was advanced later by a human's `sig
-	// ack` (see ackedLandedSHA). A resolved landedSHA is therefore a landing this
-	// report knows about, but only for THAT commit.
+	// nothing else. The report itself can never claim this commit: it was written
+	// before the ack existed, so integrate.finalSHA is whatever the RUN landed on
+	// its own — the base commit for a run that parked its only group, a different
+	// commit for a mixed run whose clean group landed — and the acked commit
+	// reached the base ref later, by a human's `sig ack` (see ackedLandedSHA). A
+	// resolved landedSHA is therefore a landing this report knows about, but only
+	// for THAT commit.
 	//
-	// The forgery bar is exactly the finalSHA arm's, neither higher nor lower: a
-	// note lifted onto an unrelated commit carries somebody else's landedSHA, so
-	// it does not match and falls through to the ledger. It is no HIGHER because a
-	// note is user-writable and its payload is self-attesting — the documented
-	// limit of the whole notes path (see resolveProvenance), not a gap this arm
-	// opens.
+	// The spoofing bar, precisely. MATCHING is exactly the finalSHA arm's: a note
+	// lifted onto an unrelated commit carries somebody else's landedSHA, does not
+	// match, and falls through to the ledger. What a match BUYS is also exactly
+	// the other arms': the answer names no run, because resolveProvenance clears
+	// RunID on the note path — so a note cannot dress its claim in a real local
+	// run's identity, and it renders with the same "(from commit note)" marker as
+	// every other note-sourced answer. Nothing here is trusted that the finalSHA
+	// arm does not already trust.
 	if rep.Park != nil && match(rep.Park.LandedSHA) {
 		return &provenance{
-			SHA:    rep.Park.LandedSHA,
-			Landed: true,
-			Role:   roleAckLanded,
-			// The run id travels IN the note here, unlike every other arm: an ack is
-			// resolved against a run dir by id, so that id is the handle an auditor
-			// asking "who approved this" needs, and resolveProvenance's manifest walk
-			// overwrites it with the local dir name when the ledger answers instead.
-			RunID:     rep.RunID,
+			SHA:       rep.Park.LandedSHA,
+			Landed:    true,
+			Role:      roleAckLanded,
 			Intent:    rep.Intent,
 			Agent:     rep.AgentCmd,
 			Strategy:  strategyOf(rep),
@@ -696,11 +703,15 @@ func logSHA(ctx context.Context, w io.Writer, g *gitx.Git, runsDir, sha string, 
 // intent clause is appended only when the run recorded one, so a commit landed
 // by a -tasks/-goal run reads exactly as it did before intents existed.
 func provenanceLine(p *provenance) string {
-	run := p.RunID
-	if run == "" {
+	// Where the answer came from, said out loud. A note is user-writable and
+	// rides in on a fetch from wherever the commit came from, so a note-sourced
+	// line must never read like the ledger's own record. Keyed on Source, the
+	// field that actually records that (resolveProvenance sets it) — the string
+	// is unchanged, since a note-sourced answer carries no run id either, but the
+	// marker no longer hangs on one arm remembering to leave RunID empty.
+	run := "run " + p.RunID
+	if p.Source == "note" {
 		run = "(from commit note, started " + p.StartedAt + ")"
-	} else {
-		run = "run " + run
 	}
 	if p.Intent != "" {
 		run += " (intent " + p.Intent + ")"

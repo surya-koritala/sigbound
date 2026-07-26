@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -2554,37 +2553,65 @@ func TestAckedLandingCarriesAProvenanceNote(t *testing.T) {
 			if rep.RunID != f.runID {
 				t.Fatalf("note runId = %q, want %q", rep.RunID, f.runID)
 			}
+			// The premise every sha assertion below rests on: the ack's commit is
+			// NOT the run's own integration commit, so "which sha" is a real
+			// question here and reading the wrong field cannot pass by luck.
+			if rep.Integrate.FinalSHA == out.LandedSHA {
+				t.Fatalf("fixture is degenerate: the run's own finalSHA %s is the acked commit", short(out.LandedSHA))
+			}
 
 			runsDir := filepath.Dir(f.dir)
 			p, ok := resolveProvenance(ctx, f.g, runsDir, out.LandedSHA)
 			if !ok {
 				t.Fatal("the acked landing resolves to nothing — `sig log -sha` calls it not landed by sigbound")
 			}
-			if !p.Landed || p.Role != roleAckLanded || p.RunID != f.runID || p.Source != "note" {
-				t.Fatalf("provenance = %+v, want a landed %s for run %s, from the note", p, roleAckLanded, f.runID)
+			if !p.Landed || p.Role != roleAckLanded || p.Source != "note" {
+				t.Fatalf("provenance = %+v, want a landed %s from the note", p, roleAckLanded)
+			}
+			// The IDENTITY of the answer. `sig log -sha -json` emits these verbatim,
+			// so naming the run's own finalSHA here would publish the commit the ack
+			// did NOT land as the thing that landed.
+			if p.SHA != out.LandedSHA || p.FinalSHA != out.LandedSHA {
+				t.Fatalf("provenance names sha=%s finalSHA=%s, want the acked commit %s", short(p.SHA), short(p.FinalSHA), short(out.LandedSHA))
+			}
+			if p.Verify != "pass" || p.StartedAt != rep.StartedAt || p.StartedAt == "" {
+				t.Fatalf("provenance = %+v, want verify pass and the run's startedAt %q", p, rep.StartedAt)
+			}
+			// A note is user-writable, so a note-sourced answer names no run —
+			// otherwise a forged one wears a real run's id (see
+			// TestLogSHAForgedAckNoteCannotBorrowARunID) — and says where it came from.
+			if p.RunID != "" {
+				t.Fatalf("the note-sourced answer names run %q; only the local ledger may name one", p.RunID)
 			}
 
-			// GET /log/sha/{sha} is the same answer over HTTP — it serves this exact
-			// struct, so the two cannot say different things about who approved a
-			// landing.
+			// GET /log/sha/{sha} is the same answer over HTTP. Asserted field by
+			// field against the ack's own outcome, NOT against p: comparing the route
+			// to the function it calls is a tautology that moves whenever the
+			// implementation does.
 			var srv struct {
 				Provenance provenance `json:"provenance"`
 			}
 			if code := doJSON(t, "GET", f.ts.URL+"/log/sha/"+out.LandedSHA, "", nil, &srv); code != http.StatusOK {
 				t.Fatalf("GET /log/sha/%s status %d, want 200", short(out.LandedSHA), code)
 			}
-			if !reflect.DeepEqual(srv.Provenance, *p) {
-				t.Fatalf("serve provenance != CLI\nserve: %+v\ncli:   %+v", srv.Provenance, *p)
+			if sp := srv.Provenance; sp.SHA != out.LandedSHA || !sp.Landed || sp.Role != roleAckLanded ||
+				sp.Source != "note" || sp.RunID != "" || sp.Verify != "pass" {
+				t.Fatalf("GET /log/sha serves %+v, want a landed %s for %s from the note, naming no run",
+					sp, roleAckLanded, short(out.LandedSHA))
 			}
 
-			// The LEDGER answers identically with no note to read: the ack's commit
-			// lives in park.json, which the manifest walk folds in on read.
+			// The LEDGER answers with no note to read: the ack's commit lives in
+			// park.json, which the manifest walk folds in on read — and THAT answer
+			// names the run, because the dir it came out of is the run.
 			if err := f.g.DeleteRef(ctx, "refs/notes/sigbound"); err != nil {
 				t.Fatal(err)
 			}
 			pm, ok := resolveProvenance(ctx, f.g, runsDir, out.LandedSHA)
 			if !ok || !pm.Landed || pm.Role != roleAckLanded || pm.RunID != f.runID || pm.Source != "manifest" {
 				t.Fatalf("ledger provenance = %+v ok=%v, want the same ack landing from the manifest walk", pm, ok)
+			}
+			if pm.SHA != out.LandedSHA || pm.FinalSHA != out.LandedSHA {
+				t.Fatalf("ledger provenance names sha=%s finalSHA=%s, want the acked commit %s", short(pm.SHA), short(pm.FinalSHA), short(out.LandedSHA))
 			}
 
 			// And through the command an auditor actually runs.
@@ -2597,5 +2624,24 @@ func TestAckedLandingCarriesAProvenanceNote(t *testing.T) {
 				t.Fatalf("`sig log -sha` does not report that a human approved this landing:\n%s", buf.String())
 			}
 		})
+	}
+}
+
+// TestAllParkedRunPublishesNoNote is the other side of the same coin. A run that
+// parked its ONLY group landed nothing, so its landing commit IS the base
+// commit — and `-notes` (on by default whenever a policy is present, which is
+// the only way to park at all) would then write a report saying landed=false
+// over whatever provenance that commit already carries, since `git notes add -f`
+// replaces. The record destroyed is the one that travels: in a clone, the commit
+// that really did land becomes unattributable. Nothing landed, so nothing is
+// published; the ack publishes its own note later, on its own commit.
+func TestAllParkedRunPublishesNoNote(t *testing.T) {
+	f := newAllParkedFixture(t) // asserts the premise: the run's report records no landing
+	rep, err := readRunReport(f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, noted, _ := f.g.NoteShow(context.Background(), "sigbound", rep.BaseSHA); noted {
+		t.Fatalf("a run that landed nothing wrote a landing note onto the base commit %s", short(rep.BaseSHA))
 	}
 }
