@@ -577,10 +577,12 @@ type runParams struct {
 	RunID string
 	// AgentUsageDir is the directory each agent's OPTIONAL token/cost file is
 	// pointed at via SIGBOUND_USAGE_FILE (see runAgent and ingestAgentUsage).
-	// `sig serve` sets it to the run's own durable directory; it is empty for
-	// `sig run`, which has no such directory, and an empty value means the
-	// variable is not exported at all. Nothing in the driver reads these files —
-	// serve's metering does, after the run — so this never affects what lands.
+	// Both entry points set it to the run's own durable directory — serve's
+	// acquireRun and `sig run`'s startRunDir alike (issue #159) — so the cost
+	// seam is the same seam whichever door the run came in. Empty only for an
+	// in-process driveRun caller that made no run dir, and an empty value means
+	// the variable is not exported at all. Nothing in the driver reads these
+	// files — metering does, after the run — so this never affects what lands.
 	AgentUsageDir string
 	// PolicyExplicit names the policy-governed dimensions (lanes/semantic/assert)
 	// the invoker set DELIBERATELY, so resolvePolicy can tell a deliberate
@@ -969,6 +971,15 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		return exitOperationalError, errors.New("one of -tasks, -goal or -intent is required")
 	}
 
+	// The run's wall-clock bracket — the ONE number computeUsage cannot derive
+	// from the report (see UsageJSON.TotalWallMs). Stamped here, before the task
+	// source is resolved, so a -goal run's planning time is inside it: that is
+	// the same span `sig serve` measures, where acquireRun stamps startedAt the
+	// instant the request is accepted and execRun plans afterwards. Everything
+	// above this line is flag/preflight validation, which serve does before
+	// accepting too and therefore never meters.
+	startedAt := time.Now()
+
 	var tasks []taskSpec
 	var err error
 	switch {
@@ -1077,7 +1088,13 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	}
 
 	p := runParams{
-		RunID:           runID,
+		RunID: runID,
+		// Cost seam (issue #114, extended to this path by #159): each agent gets
+		// SIGBOUND_USAGE_FILE pointing into the run's own durable dir, and the
+		// computeUsage calls below sum whatever was written there. Nothing is
+		// created here — an agent that ignores the variable leaves no file, which
+		// is the normal case.
+		AgentUsageDir:   runDir,
 		Repo:            *repo,
 		Base:            *base,
 		Strategy:        *strategy,
@@ -1143,6 +1160,8 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		// operational failure that matters and must reach stderr unchanged.
 		if len(rep.PerAgent) > 0 {
 			writeRunReport(runDir, rep)
+			// After the report, never before: reportBytes is that file's size.
+			recordRunUsage(runDir, &rep, startedAt, err)
 			_ = emitReport(w, rep, *asJSON)
 			if manifestPath != "" {
 				writeManifest(manifestPath, rep)
@@ -1156,6 +1175,7 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	}
 	code := runExitCode(rep)
 	writeRunReport(runDir, rep)
+	recordRunUsage(runDir, &rep, startedAt, nil)
 	// finishRunDir is where a park becomes durable, and it is the one write in
 	// this function that must be LOUD: the report below carries the park record
 	// too, but only the run dir's copy is what `sig ack` can act on. The report

@@ -1,7 +1,8 @@
 // GET /board (issue #114): the delivery board and its metrics, both DERIVED —
 // the board from the run journal (.git/sigbound/runs) and the repo's intents
 // directory, the metrics from the same journal plus the per-run metering records
-// serve already writes (usage.json). It stores nothing and decides nothing.
+// every run already writes (usage.json, from either entry point). It stores
+// nothing and decides nothing.
 //
 // A card cannot be moved, because a card is a fact. An intent's column is
 // COMPUTED from its runs on every request (see boardColumn), so the board can
@@ -101,8 +102,9 @@ type boardMetrics struct {
 	// a real conflict. Counted per RUN, not per branch.
 	FlaggedRuns int `json:"flaggedRuns"`
 	// Mean time-to-land = LandedWallMs / LandedWallRuns. Only runs that landed
-	// AND carry a metering record contribute; a landed run from a `sig run`
-	// invocation has no usage.json and is in neither number.
+	// AND carry a metering record contribute; a `sig run` in a registered cell
+	// writes one too (issue #159), so it counts in both — a run recorded before
+	// that did not, and is in neither.
 	LandedWallMs   int64 `json:"landedWallMs"`
 	LandedWallRuns int   `json:"landedWallRuns"`
 	// Agent wall-time per landed change = AgentWallMs / AgentWallLanded, over one

@@ -3061,13 +3061,13 @@ that died mid-flight, it is a verified landing waiting on a person, and it stays
 `awaiting-ack` across any number of restarts until acked, rejected, or expired by
 its `ack-timeout`. See [Run parking](#run-parking).
 
-`sig run` journals the same way — its own `status.json`, `report.json` and (when
-it parks) `park.json` under the same `.git/sigbound/runs/<runId>/`, which is what
-makes a CLI park ackable at all. It also runs that recovery sweep itself, at the
-start of every run: a repo that never runs a daemon has no other moment to heal a
-directory a `Ctrl-C` left saying `running`. `sig run` writes no `request.json`
-(there is no request body behind it) and no `usage.json`, and it streams events
-only where `-events` points.
+`sig run` journals the same way — its own `status.json`, `report.json`,
+`usage.json` and (when it parks) `park.json` under the same
+`.git/sigbound/runs/<runId>/`, which is what makes a CLI park ackable at all. It
+also runs that recovery sweep itself, at the start of every run: a repo that
+never runs a daemon has no other moment to heal a directory a `Ctrl-C` left
+saying `running`. `sig run` writes no `request.json` (there is no request body
+behind it), and it streams events only where `-events` points.
 
 **The live-run exclusion is a unix guarantee, and it degrades on Windows.** On
 Linux and macOS, recovery — from either entry point — only ever rewrites a run
@@ -3206,7 +3206,7 @@ the sample size:
 | Verify pass rate | `verifyPassed` / `verifyRan` | Runs with no `-verify` are in neither. |
 | Salvage rate | `bisectSalvaged` / `bisectRan` | `bisectRan` only counts runs where the full tree already failed verify, so these are runs that would otherwise have landed nothing. |
 | Flag rate | `flaggedRuns` / `runs` | Per run, not per branch. |
-| Mean time to land | `landedWallMs` / `landedWallRuns` | From `usage.totalWallMs`. A `sig run` landing has no metering record and is in neither. |
+| Mean time to land | `landedWallMs` / `landedWallRuns` | From `usage.totalWallMs`. A `sig run` landing in a registered cell counts too — both entry points record one. |
 | Agent wall-time per landed change | `agentWallMs` / `agentWallLanded` | From `usage.agentWallMs`, the sum of `report.perAgent[].wallMs`. Agents run concurrently, so this is machine time, not elapsed time. **One population for both numbers**: landed runs that recorded an agent wall time. A run that did not land is in neither, and neither is a pre-v2.1 run that recorded no agent time. |
 | Per-preset landing success | `presets[].landed` / `presets[].runs` | Sigbound records the **resolved** agent command, never the preset name (see [Provenance](#provenance)), so the preset is recovered by an exact reverse match on its expansion. A hand-written or hand-edited command reads as `custom`. |
 | Cost per landed change | `costUsd` / `costLanded` | Only present when agents used the optional seam below; `costRuns` is how many runs reported anything. |
@@ -3215,8 +3215,8 @@ A run whose report cannot be read contributes **nothing** — not a zero. The sa
 rule holds per metric: a run without a metering record is absent from the
 wall-clock and cost numbers rather than counted as zero in them.
 
-**Optional cost ingestion.** Every agent `sig serve` runs gets
-`SIGBOUND_USAGE_FILE`, a path it MAY write a JSON object to:
+**Optional cost ingestion.** Every agent gets `SIGBOUND_USAGE_FILE` — under
+`sig serve` and `sig run` alike — a path it MAY write a JSON object to:
 
 ```json
 {"inputTokens": 18400, "outputTokens": 3120, "costUsd": 0.42}
@@ -3241,10 +3241,11 @@ rather than becoming `+Inf` or a negative number, either of which would take out
 the `/board` response for every cell. Sigbound still never sees a token or a
 price of its own — as with the rest of metering, **this is not a biller**.
 
-`SIGBOUND_USAGE_FILE` is set only for agents `sig serve` runs. A plain `sig run`
-leaves it **unset**, so write through `${SIGBOUND_USAGE_FILE:-/dev/null}` — a
-bare `> "$SIGBOUND_USAGE_FILE"` makes the shell fail the redirect and the agent
-exits before doing any work.
+Both drive paths set it; earlier releases set it under `sig serve` only. An agent
+command that must also work under one of those, or outside sigbound entirely,
+should still redirect through `${SIGBOUND_USAGE_FILE:-/dev/null}`: with the
+variable unset, a bare `> "$SIGBOUND_USAGE_FILE"` redirects to the empty path,
+which fails.
 
 ```sh
 # The board and its metrics over all history:
@@ -3266,9 +3267,10 @@ persisted before the process exits.
 
 ### Quotas and metering
 
-A **managed-layer** feature on `serve` only — `sig run` is untouched and stays
-uncapped. Everything here is **opt-in** via server flags; leave them all at
-their default (`0`) and behavior is byte-identical to before this existed.
+**Quotas** are a managed-layer feature on `serve` only — `sig run` is untouched
+and stays uncapped. They are **opt-in** via server flags; leave them all at their
+default (`0`) and behavior is byte-identical to before this existed. **Metering**
+is not a managed-layer feature: every run records one, `sig run` included.
 
 **Quotas** are hosted-side ceilings, enforced at `POST /runs` **before a run
 starts** (no run directory created, no cell slot held) and, for wall clock,
@@ -3288,12 +3290,15 @@ run slot.
 
 **Metering** is a per-run usage record, always on (it costs nothing — every
 measured number is derived from data `driveRun`'s report already tracks, plus
-the one wall-clock bracket only `serve` itself can measure). The three token/cost
+the one wall-clock bracket only the driver can measure). The three token/cost
 fields are the exception: they are **ingested**, summed from whatever the run's
 agents chose to write to `SIGBOUND_USAGE_FILE` (see [Board and
 metrics](#board-and-metrics)), and are absent when nobody wrote anything — which
 is the normal case. It's written as `usage.json` alongside `report.json` under
-the run's directory, so it survives a restart the same way. Fields:
+the run's directory, so it survives a restart the same way. **Both entry points
+record one**, for the same run dir and with the same fields: a `sig run` and a
+`POST /runs` over the same tasks produce equivalent records, so nothing reading
+the ledger has to know which door a run came in by. Fields:
 
 | Field | Meaning |
 |-------|---------|
@@ -3302,7 +3307,7 @@ the run's directory, so it survives a restart the same way. Fields:
 | `verifyAttempts` | Total `-verify` command invocations: the initial attempt's `-verify-retries` loop, plus one per repair round that reached a re-verify. |
 | `repairAttempts` | Repair rounds actually run (`report.verify.attempts`). |
 | `verifyWallMs` | Summed wall time of every invocation counted in `verifyAttempts`. |
-| `totalWallMs` | The run's full wall clock as `serve` saw it — `POST /runs` acceptance to the run's terminal write. For a `goal` run this includes planning time, which `driveRun`'s own report never sees. |
+| `totalWallMs` | The run's full wall clock as its driver saw it — acceptance to the run's terminal write. Acceptance is `POST /runs` for `serve` and the end of flag validation for `sig run`; everything before it is request validation on both paths. For a `goal` run this includes planning time, which `driveRun`'s own report never sees. |
 | `landed` | The base ref actually advanced **while the run was running**. **Not** the same as `report.integrate.finalSHA != report.baseSHA` — `finalSHA` is populated with the *integrated* tree even when `-verify` fails and nothing is ever written to the ref. A park **acked** later lands after this record was written, so the stored value stays `false`; the ack's commit is in `park.json`, and the landed counts on `GET /usage` and `GET /board` include it. |
 | `reportBytes` | Size of `report.json` on disk. |
 | `agentWallMs` | Summed wall time of this run's agent invocations (`report.perAgent[].wallMs`). Agents run **concurrently**, so this is machine time spent on agents and can exceed `totalWallMs`. An adopted or `-resume`-reused branch ran no agent and adds 0; a run recorded before v2.1 has no per-agent wall time and reads back `0`. Omitted when zero. |
@@ -3322,7 +3327,7 @@ those live on [`GET /board`](#board-and-metrics)'s metrics, over that endpoint's
 `?limit` window.
 
 **This is not a biller.** There is no price, currency, unit cost, or external
-metering call anywhere in `sig serve` — `usage.json` is the DATA layer a
+metering call anywhere in sigbound — `usage.json` is the DATA layer a
 hosted product would meter on (engine work: agents run, integrate/verify wall
 time, repair rounds — the honest billable unit for a BYO-model engine that
 never sees a token), not a bill itself.
@@ -3613,7 +3618,7 @@ command **you** supply, run via `sh -c`. Sigbound passes context through
 | `SIGBOUND_TASK_ID` | `-agent` | The task id. |
 | `SIGBOUND_REPO` | `-agent`, `-repair`, `-publish` | Path to the repository. cwd for `-publish` too (unlike `-agent`/`-repair`, which run in a throwaway worktree). |
 | `SIGBOUND_BRANCH` | `-agent` | The task's branch name. |
-| `SIGBOUND_USAGE_FILE` | `-agent` | **`sig serve` only, and entirely optional.** A path the agent MAY write a token/cost JSON to; it is ingested into that run's `usage.json`. Not set by `sig run`, which has no run directory — so redirect through `${SIGBOUND_USAGE_FILE:-/dev/null}` if the same agent command has to work under both. Writing nothing is the normal case. See [Board and metrics](#board-and-metrics). |
+| `SIGBOUND_USAGE_FILE` | `-agent` | **Entirely optional.** A path the agent MAY write a token/cost JSON to; it is ingested into that run's `usage.json`. Set by both `sig run` and `sig serve` — earlier releases set it under `sig serve` only, so redirect through `${SIGBOUND_USAGE_FILE:-/dev/null}` if the same agent command has to work under one of those too. Writing nothing is the normal case. See [Board and metrics](#board-and-metrics). |
 | `SIGBOUND_BASE` | `-resolver` | Path to the base (common-ancestor) version of a conflicted file. |
 | `SIGBOUND_OURS` | `-resolver` | Path to the "ours" version. |
 | `SIGBOUND_THEIRS` | `-resolver` | Path to the "theirs" version. |
@@ -3785,9 +3790,8 @@ With `-json`, `sig run` prints a full report. Top-level shape:
   command run: the initial attempt's `-verify-retries` loop, plus one more
   per repair round that reached a re-verify. Both are `0` when `-verify`
   wasn't set. `-verify-bisect`'s own probes are **not** folded in here — they
-  have their own count in `verify.bisect.attempts`. `sig serve`'s per-run
-  usage record (see [Quotas and metering](#quotas-and-metering)) is built
-  from these.
+  have their own count in `verify.bisect.attempts`. The per-run usage record
+  (see [Quotas and metering](#quotas-and-metering)) is built from these.
 - `verify.bisect` is present iff `-verify-bisect` ran (the full tree failed
   and there were ≥ 2 groups to bisect — see [Verify bisect](#verify-bisect)).
   `landedGroups`/`droppedGroups` list the branch names per group that landed
