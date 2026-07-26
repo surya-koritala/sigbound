@@ -477,6 +477,132 @@ func TestLogServeMatchesCLI(t *testing.T) {
 	}
 }
 
+// --- issue #161: GET /runs and GET /log cannot disagree about what landed ---
+
+// fixturePark writes the park.json + status marker an ack or a reject leaves
+// behind. Everything but the outcome fields and the marker is fixed, so the
+// cases below differ only in the one thing under test.
+func fixturePark(t *testing.T, dir, landedSHA, rejectReason, status string) {
+	t.Helper()
+	if err := writePark(dir, &parkJSON{
+		VerifiedSHA: hexSHA("ab"), VerifiedTree: hexSHA("cd"), BaseSHA: hexSHA("ef"), ForkSHA: hexSHA("12"),
+		Base: "main", Reason: parkReasonAckPaths, CreatedAt: "2026-01-09T00:00:00Z",
+		Groups:       []parkGroupJSON{{Branches: []string{"agent/t1"}, Reason: parkReasonAckPaths}},
+		Attempts:     []parkAttemptJSON{{N: 1, At: "2026-01-09T00:00:00Z", VerifyOK: true}},
+		LandedSHA:    landedSHA,
+		RejectReason: rejectReason,
+		ResolvedAt:   "2026-01-09T01:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeRunStatus(dir, status, "")
+}
+
+// TestRunsListAndLogAgreeOnLandedSHA builds one history holding every shape a
+// landed sha can take — a clean landing, a run whose verify went red, an acked
+// park, a rejected park, and an ack whose ref move failed — and asserts GET
+// /runs and GET /log agree across the whole set. Agreement alone would be
+// vacuous (two surfaces can be wrong the same way), so each case also pins the
+// sha that actually reached the base ref.
+func TestRunsListAndLogAgreeOnLandedSHA(t *testing.T) {
+	_, repo := makeGoRepo(t)
+	srv, ts := newTestServer(t, "", repo)
+	runsDir := srv.cells[0].runsDir
+
+	base := hexSHA("b0")
+	rep := func(finalSHA string, verifyOK bool) runReport {
+		r := runReport{
+			BaseSHA: base, StartedAt: "2026-01-09T00:00:00Z", Strategy: "overlay", AgentCmd: "claude -p",
+			PerAgent:  []perAgentJSON{{ID: "t1", Branch: "agent/t1", SHA: hexSHA("a1"), OK: true}},
+			Integrate: integrateJSON{Strategy: "overlay", FinalSHA: finalSHA},
+			Verify:    verifyJSON{Ran: true, OK: verifyOK},
+		}
+		if finalSHA != base {
+			r.Integrate.Landed = []string{"agent/t1"}
+		}
+		return r
+	}
+	const (
+		cleanID    = "20260109T000001Z-aaaa"
+		redID      = "20260109T000002Z-bbbb"
+		ackedID    = "20260109T000003Z-cccc"
+		rejectedID = "20260109T000004Z-dddd"
+		wedgedID   = "20260109T000005Z-eeee"
+	)
+	// A clean landing: verify green, the ref moved to f1.
+	fixtureRun(t, runsDir, cleanID, "done", rep(hexSHA("f1"), true), nil)
+	// Verify went RED. integrate.finalSHA holds the integrated tree the run built,
+	// but landRef was never reached and the base ref never moved.
+	fixtureRun(t, runsDir, redID, "done", rep(hexSHA("f2"), false), nil)
+	// Every group parked, so the run itself landed nothing (finalSHA == baseSHA);
+	// a human ACKED it afterwards and f3 landed, recorded only in park.json.
+	fixtureRun(t, runsDir, ackedID, "done", rep(base, true), nil)
+	fixturePark(t, filepath.Join(runsDir, ackedID), hexSHA("f3"), "", "done")
+	// Parked and REJECTED: a verified landing a human refused. Nothing moved.
+	fixtureRun(t, runsDir, rejectedID, "done", rep(base, true), nil)
+	fixturePark(t, filepath.Join(runsDir, rejectedID), "", "not this week", statusRejected)
+	// An ack that wrote its outcome and then failed to move the ref for a reason
+	// other than ErrRefMoved (a stale .lock, ENOSPC): park.json claims f5, but the
+	// "done" marker ackRun writes only AFTER landRef succeeds never appeared. Fail
+	// closed — the ref provably did not move, so this is a landing on no surface.
+	fixtureRun(t, runsDir, wedgedID, "done", rep(base, true), nil)
+	fixturePark(t, filepath.Join(runsDir, wedgedID), hexSHA("f5"), "", statusAwaitingAck)
+
+	var list struct{ Runs []runListEntry }
+	if code := doJSON(t, "GET", ts.URL+"/runs", "", nil, &list); code != http.StatusOK {
+		t.Fatalf("GET /runs: %d", code)
+	}
+	var lg struct {
+		Cells []struct {
+			Runs []logRow `json:"runs"`
+		} `json:"cells"`
+	}
+	if code := doJSON(t, "GET", ts.URL+"/log?limit=50", "", nil, &lg); code != http.StatusOK {
+		t.Fatalf("GET /log: %d", code)
+	}
+	fromRuns := map[string]string{}
+	for _, e := range list.Runs {
+		fromRuns[e.ID] = e.FinalSHA
+	}
+	fromLog := map[string]string{}
+	for _, c := range lg.Cells {
+		for _, row := range c.Runs {
+			fromLog[row.ID] = row.LandedSHA
+		}
+	}
+
+	cases := []struct{ name, id, want string }{
+		{"clean landing", cleanID, hexSHA("f1")},
+		{"red verify landed nothing", redID, ""},
+		{"acked park landed the ack commit", ackedID, hexSHA("f3")},
+		{"rejected park landed nothing", rejectedID, ""},
+		{"ack whose ref move failed landed nothing", wedgedID, ""},
+	}
+	if len(fromRuns) != len(cases) || len(fromLog) != len(cases) {
+		t.Fatalf("surfaces list different histories: /runs %d rows, /log %d rows, want %d", len(fromRuns), len(fromLog), len(cases))
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			runsSHA, ok := fromRuns[c.id]
+			if !ok {
+				t.Fatalf("%s missing from GET /runs", c.id)
+			}
+			logSHA, ok := fromLog[c.id]
+			if !ok {
+				t.Fatalf("%s missing from GET /log", c.id)
+			}
+			// /runs serves the full object name, /log the abbreviation its human
+			// column shows, so the two are compared through short().
+			if short(runsSHA) != logSHA {
+				t.Fatalf("/runs and /log disagree: /runs %q, /log %q", runsSHA, logSHA)
+			}
+			if runsSHA != c.want {
+				t.Fatalf("landed sha = %q, want %q", runsSHA, c.want)
+			}
+		})
+	}
+}
+
 // --- AC #5: the ledger is independent of refs (deleted branches still render) ---
 
 func TestLogListLedgerIndependentOfRefs(t *testing.T) {

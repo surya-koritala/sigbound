@@ -38,7 +38,7 @@
 //
 //	GET  /health           -> {ok, version, cells:[{id, repo}]}
 //	POST /runs             -> Content-Type: application/json required; 202 {runId,...}; runs ASYNC via driveRun
-//	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}
+//	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}; finalSHA is what LANDED (see landedSHA)
 //	GET  /runs/{id}        -> {status: queued|running|done|error|interrupted, report?, usage?}
 //	GET  /runs/{id}/events -> the run's events.ndjson (application/x-ndjson)
 //	GET  /runs/{id}/usage  -> that run's metering record (see usage.go)
@@ -190,7 +190,6 @@ type runRecord struct {
 	dir       string
 	status    string // queued | running | done | error
 	startedAt time.Time
-	finalSHA  string
 	errMsg    string
 }
 
@@ -707,7 +706,6 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 	}
 	s.mu.Lock()
 	rec.status = status
-	rec.finalSHA = rep.Integrate.FinalSHA
 	s.mu.Unlock()
 }
 
@@ -850,14 +848,23 @@ func (s *server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 			if rec := live[id]; rec != nil {
 				e.Status = rec.status
 				e.StartedAt = rec.startedAt.UTC().Format(time.RFC3339)
-				e.FinalSHA = rec.finalSHA
 			} else {
 				e.Status, _ = diskRunStatus(dir)
 			}
-			if e.Status == "done" && e.FinalSHA == "" {
+			// finalSHA is a LANDING, never integrate.finalSHA raw: a run whose
+			// -verify went red records the integrated commit it never landed, and
+			// an acked park landed a commit written after its report. landedSHA is
+			// the rule `sig log` and GET /log apply, read from the same disk they
+			// read, so no in-memory shortcut can make the surfaces disagree
+			// (issue #161). Disk is never staler than memory here — the report and
+			// the ack's park.json are both written before this process marks the
+			// run done.
+			if e.Status == "done" {
 				if rep, err := readRunReport(dir); err == nil {
-					e.FinalSHA = rep.Integrate.FinalSHA
-					e.StartedAt = rep.StartedAt
+					e.FinalSHA = landedSHA(rep, dir)
+					if e.StartedAt == "" {
+						e.StartedAt = rep.StartedAt
+					}
 				}
 			}
 			entries = append(entries, e)
@@ -1342,13 +1349,13 @@ func (s *server) handleAckReject(w http.ResponseWriter, r *http.Request, ack boo
 		return
 	}
 	// Keep this process's in-memory view honest for a run it started itself;
-	// the disk journal was already updated by ackRun/rejectRun.
+	// the disk journal was already updated by ackRun/rejectRun. The ack's landed
+	// commit is deliberately NOT cached here — every surface derives it from
+	// park.json (see landedSHA), and a second copy is what let GET /runs answer
+	// differently from GET /log.
 	s.mu.Lock()
 	if rec := s.runs[id]; rec != nil {
 		rec.status = out.Status
-		if out.LandedSHA != "" {
-			rec.finalSHA = out.LandedSHA
-		}
 	}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, out)

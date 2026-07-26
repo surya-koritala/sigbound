@@ -2601,7 +2601,7 @@ All requests and responses are JSON (events are NDJSON).
 |---------------|---------|
 | `GET /health` | `{ok, version, cells:[{id, repo}]}` |
 | `POST /runs` | Start a run. Returns **202** `{runId, cell, status}` immediately; the run executes asynchronously. |
-| `GET /runs` | `{runs:[{id, cell, status, startedAt, finalSHA?}]}`, newest first. |
+| `GET /runs` | `{runs:[{id, cell, status, startedAt, finalSHA?}]}`, newest first. `finalSHA` is what the run actually put on the base ref: absent when the ref never moved (a red `-verify` still records the integrated commit it never landed), and for an **acked** park it is the ack's own commit, which the report predates. Same rule as `sig log`'s `landedSHA`, in full rather than abbreviated. |
 | `GET /runs/{id}` | `{id, cell, status, startedAt, error?, report?, usage?, park?}` — `status` is `queued`, `running`, `done`, `error`, `interrupted` (see [Crash recovery](#crash-recovery)), `awaiting-ack`, or `rejected` (see [Run parking](#run-parking)); the full run report is present once the run has one, `usage` alongside it (see [Quotas and metering](#quotas-and-metering)), and `park` whenever the run has a parking record. |
 | `GET /runs/{id}/events` | The run's `events.ndjson` as written so far (`Content-Type: application/x-ndjson`) — the same lifecycle events `sig run -events` emits. |
 | `GET /runs/{id}/usage` | That run's metering record. `404` until the run has written a report. |

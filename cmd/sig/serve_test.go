@@ -551,6 +551,30 @@ func TestServeVerifyGateHolds(t *testing.T) {
 	if after != before {
 		t.Fatalf("base ref advanced despite failing verify: %s -> %s", before, after)
 	}
+
+	// Nor may the listing claim a landing. This run is still THIS process's live
+	// record — the path that used to serve integrate.finalSHA verbatim (issue
+	// #161) — and the report genuinely carries the integrated commit it never
+	// landed, so there is a wrong answer available to give.
+	if final.Report.Integrate.FinalSHA == "" {
+		t.Fatal("report recorded no integrate.finalSHA: the listing assertion below would be vacuous")
+	}
+	var list struct{ Runs []runListEntry }
+	if code := doJSON(t, "GET", ts.URL+"/runs", "", nil, &list); code != http.StatusOK {
+		t.Fatalf("GET /runs: %d", code)
+	}
+	var found *runListEntry
+	for i := range list.Runs {
+		if list.Runs[i].ID == created.RunID {
+			found = &list.Runs[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("run %s missing from GET /runs: %+v", created.RunID, list.Runs)
+	}
+	if found.FinalSHA != "" {
+		t.Fatalf("GET /runs reports finalSHA %q for a run whose verify went red and moved no ref", found.FinalSHA)
+	}
 }
 
 func TestServeStartupErrors(t *testing.T) {
