@@ -290,6 +290,89 @@ func TestLogSHAForgedNoteFallsThrough(t *testing.T) {
 	}
 }
 
+// ackNoteReport builds the payload an ack attaches: a run that parked its only
+// group (so its own report claims no landing at all — finalSHA == baseSHA) with
+// the RESOLVED parking record folded in. landedSHA is the commit the note
+// claims the ack released.
+func ackNoteReport(runID, landedSHA, agent string) runReport {
+	return runReport{
+		RunID: runID, BaseSHA: hexSHA("00"), Strategy: "overlay", AgentCmd: agent,
+		PerAgent:  []perAgentJSON{{ID: "held", Branch: "agent/held", SHA: hexSHA("a7"), OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", FinalSHA: hexSHA("00")},
+		Verify:    verifyJSON{Ran: true, OK: true},
+		Park: &parkJSON{
+			VerifiedSHA: landedSHA, VerifiedTree: hexSHA("cd"), BaseSHA: hexSHA("00"), ForkSHA: hexSHA("00"),
+			Base: "main", Reason: parkReasonAckPaths, CreatedAt: "2026-01-01T00:00:00Z",
+			Groups:    []parkGroupJSON{{Branches: []string{"agent/held"}, Reason: parkReasonAckPaths}},
+			LandedSHA: landedSHA, ResolvedAt: "2026-01-01T01:00:00Z",
+		},
+	}
+}
+
+// TestLogSHAForgedAckNoteFallsThrough is issue #160's half of the #110 lesson.
+// The ack arm of matchProvenance is a new way for a note to claim a commit, so
+// it gets the same adversarial test: a note in the ACK shape, hand-attached to
+// an unrelated commit, whose park record says some OTHER commit was the acked
+// landing. It must not be attributed — resolution falls through to the local
+// ledger, which is ground truth. A note that genuinely names the queried commit
+// as its ack's landing is still served from the fast path.
+func TestLogSHAForgedAckNoteFallsThrough(t *testing.T) {
+	g, _, base := newGCRepo(t) // base is a real commit
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+
+	// Attacker: an ack-shaped note ON base, claiming a human released some other
+	// commit entirely — a real ack note lifted onto a commit it says nothing about.
+	forged := ackNoteReport("20260101T000000Z-evil", hexSHA("dead"), "EVIL --exfiltrate")
+	fdata, err := json.MarshalIndent(forged, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", base, fdata); err != nil {
+		t.Fatal(err)
+	}
+
+	// The local ledger records the truth about base: an ordinary landed member.
+	writeLogRun(t, runsDir, "20260201T000000Z-real", runReport{
+		BaseSHA: hexSHA("00"), Strategy: "overlay", AgentCmd: "claude -p",
+		PerAgent:  []perAgentJSON{{ID: "real", Branch: "agent/real", SHA: base, OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/real"}, FinalSHA: hexSHA("f1")},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+
+	p, ok := resolveProvenance(ctx, g, runsDir, base)
+	if !ok {
+		t.Fatal("expected the manifest to answer for base")
+	}
+	if p.Source != "manifest" || p.Role == roleAckLanded {
+		t.Fatalf("provenance = %+v, want the manifest's answer — a forged ack note must not be attributed", p)
+	}
+	if p.Agent != "claude -p" || p.TaskID != "real" || p.RunID != "20260201T000000Z-real" {
+		t.Fatalf("provenance came from the forged ack note, not the ledger: %+v", p)
+	}
+
+	// Self-consistent: the note's ack really did land THIS commit. Served from the
+	// fast path, carrying the run id the ack was taken against.
+	good := ackNoteReport("20260301T000000Z-good", base, "claude -p")
+	gdata, err := json.MarshalIndent(good, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", base, gdata); err != nil { // -f overwrites the forged note
+		t.Fatal(err)
+	}
+	p2, ok := resolveProvenance(ctx, g, runsDir, base)
+	if !ok || p2.Source != "note" || p2.Role != roleAckLanded || !p2.Landed {
+		t.Fatalf("a self-consistent ack note was not served from the fast path: %+v ok=%v", p2, ok)
+	}
+	if p2.RunID != "20260301T000000Z-good" || p2.Members != 1 {
+		t.Fatalf("ack provenance = %+v, want the note's run id and its one parked branch", p2)
+	}
+	if line := provenanceLine(p2); !strings.Contains(line, "human ACK") {
+		t.Fatalf("rendered as %q — a reader cannot tell a human approved this landing", line)
+	}
+}
+
 // --- AC #2: newest-first ordering, -limit, laziness ---
 
 func TestLogListNewestFirst(t *testing.T) {

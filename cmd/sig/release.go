@@ -432,8 +432,18 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 				// authoritative ONLY if it genuinely concerns this commit and says
 				// it landed — exactly resolveProvenance's test. Anything else is
 				// ignored and the commit stays unattributed.
+				//
+				// An ACK note (issue #160) is authoritative and still claims nothing
+				// HERE, and the limit is worth naming: its commit is the park
+				// record's landedSHA, while every field of a landing row —
+				// landedSHA, members, the commits it covers via landedCommitsIn — is
+				// projected from integrate.finalSHA, which for a run that parked its
+				// only group IS the base commit. A row built from it would publish
+				// the base as the thing that landed. So an acked landing counts as
+				// unattributed in a release document, exactly as it did before it
+				// had a note at all; `sig log -sha` is where it is attributed.
 				p := matchProvenance(&rep, sha)
-				if p == nil || !p.Landed {
+				if p == nil || !p.Landed || p.Role == roleAckLanded {
 					continue
 				}
 				// One landing, one row. A hand-written or legacy note may omit

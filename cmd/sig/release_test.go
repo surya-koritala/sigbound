@@ -359,6 +359,33 @@ func TestReleaseForgedNoteIsUnattributed(t *testing.T) {
 	}
 }
 
+// TestReleaseAckNoteIsNotALanding pins the boundary issue #160 stopped at. An
+// ack note IS authoritative for its own commit (`sig log -sha` attributes it),
+// but a release landing row is projected from integrate.finalSHA — which for a
+// run that parked its only group is the BASE commit — so claiming one here would
+// publish the base as the thing that landed. The commit stays counted as
+// unattributed instead, exactly as it did before acked landings had notes.
+func TestReleaseAckNoteIsNotALanding(t *testing.T) {
+	g, repo, shas := releaseRepo(t)
+	ctx := context.Background()
+	// Self-consistent, not forged: this note genuinely says the ack landed shas[2].
+	data, err := json.MarshalIndent(ackNoteReport("20260101T000000Z-ackd", shas[2], "claude -p"), "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", shas[2], data); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, raw := releaseJSON(t, repo, shas[0]+".."+shas[3])
+	if len(doc.Landings) != 0 {
+		t.Fatalf("an ack note produced a landing row: %+v\n%s", doc.Landings, raw)
+	}
+	if doc.Unattributed != doc.Commits {
+		t.Fatalf("unattributed = %d, want %d — the acked commit must stay unclaimed here", doc.Unattributed, doc.Commits)
+	}
+}
+
 // --- AC #5: a parked run is listed, and rendering it transitions nothing ---
 
 // writeReleasePark writes a valid park.json + awaiting-ack status.json into a run

@@ -1076,6 +1076,7 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 			return ackOutcome{}, fmt.Errorf("land %s: %w", short(pk.VerifiedSHA), err)
 		}
 		writeRunStatus(dir, "done", "")
+		attachAckNote(ctx, g, dir, pk)
 		// The landed commit is now reachable from the base branch, so the
 		// keep-alive ref has nothing left to protect.
 		releaseParkRef(ctx, g, pk)
@@ -1235,12 +1236,50 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 		return ackOutcome{}, fmt.Errorf("land %s: %w", short(finalSHA), err)
 	}
 	writeRunStatus(dir, "done", "")
+	attachAckNote(ctx, c.Git(), dir, pk)
 	releaseParkRef(ctx, c.Git(), pk)
 	appendRunEvent(dir, "ack", map[string]any{"actor": actor, "sha": finalSHA, "reverified": true, "attempt": att.N})
 	return ackOutcome{
 		RunID: runID, Status: "done", LandedSHA: finalSHA, Reverified: true, Attempts: att.N,
 		Message: fmt.Sprintf("base had moved to %s; re-verified green and landed %s", short(current), short(finalSHA)),
 	}, nil
+}
+
+// attachAckNote records an ACK's landing as a git note on the commit the ack put
+// on the base ref — the refs/notes/sigbound provenance a driveRun landing gets
+// from -notes, for the landing that needs it most. An acked landing is one a
+// human was REQUIRED to approve (an ack-paths glob, or sigbound.policy itself),
+// which makes it exactly what an audit comes looking for, and park.json in the
+// run dir is otherwise the only record of it. The note is the half that travels:
+// it rides with the commit into any clone, where no run dir exists to consult.
+//
+// CALLED ONLY AFTER landRef RETURNED NIL, at both ack sites. Both of them write
+// resolvedAt and landedSHA BEFORE the swap (see ackedLandedSHA for why that
+// ordering is the survivable one), so the record alone is not evidence the ref
+// moved — a note attached on a refused or failed landRef would claim a landing on
+// a commit the base ref does not hold, and unlike the record it would then be on
+// the commit forever, in every clone that fetched it.
+//
+// The payload is the run's own report with the RESOLVED park record folded in.
+// park.landedSHA is what makes the note about THIS commit — matchProvenance's ack
+// arm is exactly that test — and the rest of the report is the same provenance a
+// -notes landing carries. Best-effort with a loud warning, the posture attachNote
+// documents: the ref has already moved, and a failure here must never read as a
+// failed ack.
+//
+// Deliberately NOT gated on -notes, whose limit is worth stating: it is a run
+// parameter, the report does not record it, and an ack is not the run. A park can
+// only happen under a landing policy, which is the same condition that turns
+// -notes on by default (issue #110) — so this diverges only for a run that
+// explicitly passed -notes=false and then parked.
+func attachAckNote(ctx context.Context, g *gitx.Git, dir string, pk *parkJSON) {
+	rep, err := readRunReport(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ack: read the run report for %s's landing note: %v\n", short(pk.LandedSHA), err)
+		return
+	}
+	rep.Park = pk
+	attachNote(ctx, g, pk.LandedSHA, *rep, "ack")
 }
 
 // refuseAck takes back a resolution that could not be landed. Both ack paths

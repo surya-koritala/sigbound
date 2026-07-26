@@ -1880,7 +1880,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	// -notes: the landing already happened above, so a note failure below must
 	// never look like the run itself failed — see attachNote's doc.
 	if p.Notes {
-		attachNote(ctx, g, landSHA, rep)
+		attachNote(ctx, g, landSHA, rep, "-notes")
 	}
 	return rep, nil
 }
@@ -1956,18 +1956,20 @@ func runPublish(ctx context.Context, p runParams, rep runReport) publishJSON {
 // attachNote records rep as a git note on the landed commit, namespaced under
 // refs/notes/sigbound (see gitx.NoteAdd — never git's default
 // refs/notes/commits, so sigbound's provenance record never collides with a
-// repo's own note usage). -notes only ever fires AFTER landing has already
-// happened (see driveRun's call site): a failure here must never look like
-// the run itself failed, so it's best-effort with a loud stderr warning, the
-// same posture as a -manifest write failure (writeManifest).
-func attachNote(ctx context.Context, g *gitx.Git, commit string, rep runReport) {
+// repo's own note usage). Both callers only ever fire AFTER landing has already
+// happened (see driveRun's call site, and attachAckNote): a failure here must
+// never look like the run — or the ack — itself failed, so it's best-effort with
+// a loud stderr warning, the same posture as a -manifest write failure
+// (writeManifest). why names what asked for the note, so the warning points at
+// the thing the operator can actually act on rather than always saying -notes.
+func attachNote(ctx context.Context, g *gitx.Git, commit string, rep runReport, why string) {
 	data, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: -notes: encode report: %v\n", err)
+		fmt.Fprintf(os.Stderr, "warning: %s: encode report: %v\n", why, err)
 		return
 	}
 	if err := g.NoteAdd(ctx, "sigbound", commit, data); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: -notes: attach note to %s: %v\n", short(commit), err)
+		fmt.Fprintf(os.Stderr, "warning: %s: attach note to %s: %v\n", why, short(commit), err)
 	}
 }
 

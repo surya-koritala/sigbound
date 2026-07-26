@@ -108,6 +108,8 @@ type logRow struct {
 // run ledger). Role classifies the commit:
 //
 //	landed-commit             the run's integrated commit that advanced the base
+//	ack-landed-commit         a parked landing a HUMAN released with `sig ack`,
+//	                          which is the only role a person had to approve
 //	member-landed             an agent branch tip that landed as part of a run
 //	member-dropped-by-bisect  an agent branch that integrated clean but whose
 //	                          group failed -verify, so bisect dropped it (never
@@ -118,7 +120,12 @@ type provenance struct {
 	SHA    string `json:"sha"`
 	Landed bool   `json:"landed"`
 	Role   string `json:"role"`
-	RunID  string `json:"runId,omitempty"` // empty when only a portable note answered
+	// RunID is empty when only a portable note answered — except for
+	// ack-landed-commit, where the note carries the report's own runId and that
+	// id is the handle `sig ack`/`sig reject` were taken against (see
+	// matchProvenance's ack arm). It is then the NOTE's claim about which run
+	// resolved the park, and names a run dir that may not be local.
+	RunID string `json:"runId,omitempty"`
 	// Intent is the intents/<id>.intent the landing run was started from
 	// (`sig run -intent`), empty for every other task source. It answers "which
 	// intent did this commit come from" — including from a portable landing
@@ -131,9 +138,15 @@ type provenance struct {
 	Verify    string `json:"verify,omitempty"`
 	StartedAt string `json:"startedAt,omitempty"`
 	FinalSHA  string `json:"finalSHA,omitempty"` // the run's landed integration commit
-	Members   int    `json:"members,omitempty"`  // branches that landed together (landed-commit only)
+	Members   int    `json:"members,omitempty"`  // branches that landed together (landed-commit / ack-landed-commit only)
 	Source    string `json:"source"`
 }
+
+// roleAckLanded is the provenance role for a landing a human released with `sig
+// ack`. Named, unlike its sibling roles, because release.go tests for it too —
+// two files agreeing on a literal by hand is the drift this costs one line to
+// rule out.
+const roleAckLanded = "ack-landed-commit"
 
 // taskRow is one appearance of a task across the run history (`sig log -task`),
 // oldest-first — a task re-run under -resume shows once per run it appeared in.
@@ -368,9 +381,19 @@ func resolveProvenance(ctx context.Context, g *gitx.Git, runsDir, sha string) (*
 		}
 	}
 	for _, id := range runDirNames(runsDir) {
-		rep, err := readRunReport(filepath.Join(runsDir, id))
+		dir := filepath.Join(runsDir, id)
+		rep, err := readRunReport(dir)
 		if err != nil {
 			continue // unreadable/partial dir: never crash a provenance query, just skip it
+		}
+		// An ACK lands after this report was written and records the commit in
+		// park.json, which is never folded back into the report (see
+		// ackedLandedSHA), so the ledger can only answer for an acked landing if we
+		// go and look — the same OR readLogRow applies, DERIVED on read rather than
+		// back-dated into the run's own historical record. Only for a run that
+		// actually parked, so an ordinary run costs no extra file reads.
+		if rep.Park != nil && rep.Park.LandedSHA == "" {
+			rep.Park.LandedSHA = ackedLandedSHA(dir)
 		}
 		if p := matchProvenance(rep, sha); p != nil {
 			p.RunID = id
@@ -392,6 +415,38 @@ func matchProvenance(rep *runReport, sha string) *provenance {
 	match := shaMatcher(sha)
 	if match(rep.Integrate.FinalSHA) && landed(rep) {
 		return provenanceFromFinal(rep, rep.Integrate.FinalSHA)
+	}
+	// An ACKED landing (issue #160) matches on the park record's landedSHA and
+	// nothing else. The report itself cannot claim this commit: a run whose group
+	// parked recorded finalSHA == baseSHA and landed=false, which is the truth
+	// about what the RUN did, and the ref was advanced later by a human's `sig
+	// ack` (see ackedLandedSHA). A resolved landedSHA is therefore a landing this
+	// report knows about, but only for THAT commit.
+	//
+	// The forgery bar is exactly the finalSHA arm's, neither higher nor lower: a
+	// note lifted onto an unrelated commit carries somebody else's landedSHA, so
+	// it does not match and falls through to the ledger. It is no HIGHER because a
+	// note is user-writable and its payload is self-attesting — the documented
+	// limit of the whole notes path (see resolveProvenance), not a gap this arm
+	// opens.
+	if rep.Park != nil && match(rep.Park.LandedSHA) {
+		return &provenance{
+			SHA:    rep.Park.LandedSHA,
+			Landed: true,
+			Role:   roleAckLanded,
+			// The run id travels IN the note here, unlike every other arm: an ack is
+			// resolved against a run dir by id, so that id is the handle an auditor
+			// asking "who approved this" needs, and resolveProvenance's manifest walk
+			// overwrites it with the local dir name when the ledger answers instead.
+			RunID:     rep.RunID,
+			Intent:    rep.Intent,
+			Agent:     rep.AgentCmd,
+			Strategy:  strategyOf(rep),
+			Verify:    verifyVerdict(rep.Verify),
+			StartedAt: rep.StartedAt,
+			FinalSHA:  rep.Park.LandedSHA,
+			Members:   len(rep.Park.branches()),
+		}
 	}
 	for _, a := range rep.PerAgent {
 		if !match(a.SHA) {
@@ -653,6 +708,9 @@ func provenanceLine(p *provenance) string {
 	switch p.Role {
 	case "landed-commit":
 		return fmt.Sprintf("commit %s: landed integration commit of %s (%s, %d branch(es)), verify %s",
+			short(p.SHA), run, p.Strategy, p.Members, p.Verify)
+	case roleAckLanded:
+		return fmt.Sprintf("commit %s: released by a human ACK of %s (%s, %d parked branch(es)), verify %s",
 			short(p.SHA), run, p.Strategy, p.Members, p.Verify)
 	case "member-landed":
 		return fmt.Sprintf("commit %s: landed by %s, task %s, agent %s (%s), verify %s",
