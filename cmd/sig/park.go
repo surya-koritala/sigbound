@@ -489,7 +489,21 @@ func readPark(dir string) (*parkJSON, error) {
 // (see landed, readLogRow, foldMetrics), and the answer is DERIVED on read rather
 // than stored twice. Empty for a park that is unresolved, rejected, expired, or
 // whose record will not read back: only a recorded landing counts as one.
+//
+// The status gate is what makes that last sentence true. ackRun and ackReverify
+// write resolvedAt and landedSHA BEFORE they move the ref, and only ErrRefMoved
+// routes to refuseAck to rewind them -- every other landRef failure (a stale
+// refs/heads/X.lock left by a crashed git, a reference-transaction hook refusing
+// it, ENOSPC) returns with the record still claiming a landing that did not
+// happen. Reading resolvedAt alone would therefore report landed for a ref that
+// provably never moved, which is worse than the report's own conservative
+// answer. writeRunStatus(dir, "done", "") runs only AFTER landRef succeeds, so
+// the status is the on-disk fact that means the ref moved; anything short of it
+// -- an error return or a crash between the two writes -- keeps this fail-closed.
 func ackedLandedSHA(dir string) string {
+	if st, _ := diskRunStatus(dir); st != "done" {
+		return ""
+	}
 	pk, err := readPark(dir)
 	if err != nil || pk.ResolvedAt == "" {
 		return ""

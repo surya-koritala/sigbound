@@ -185,6 +185,73 @@ func TestBoardCountsAnAckedLanding(t *testing.T) {
 		t.Fatalf("landedWallRuns=%d agentWallLanded=%d, want 1/1 — an acked landing is a landing in every metric",
 			after.Metrics.LandedWallRuns, after.Metrics.AgentWallLanded)
 	}
+	// GET /usage reads the same landing through its own aggregate. The two
+	// endpoints answering differently about one landing is the disagreement
+	// this whole derivation exists to prevent, so pin it here rather than
+	// trusting that the shared helper is called on both paths.
+	var agg struct {
+		Totals usageTotals `json:"totals"`
+	}
+	if code := doJSON(t, "GET", f.ts.URL+"/usage", "", nil, &agg); code != http.StatusOK {
+		t.Fatalf("GET /usage: status %d, want 200", code)
+	}
+	if agg.Totals.Landed != 1 {
+		t.Fatalf("GET /usage reports landed=%d, want 1 — /board and /usage disagree about the same acked landing", agg.Totals.Landed)
+	}
+}
+
+// TestBoardDoesNotCountAnAckWhoseRefNeverMoved is the fail-closed half of the
+// rule above. Both ack paths write resolvedAt and landedSHA BEFORE they move the
+// ref, and only ErrRefMoved rewinds them -- any other landRef failure returns
+// with the record already claiming a landing. A stale refs/heads/main.lock, the
+// thing a crashed git leaves behind, is enough to produce that state without any
+// crash of our own.
+//
+// Reading the park record alone would then report a landing for a ref that
+// provably never moved, which is worse than the run report's own conservative
+// answer. The run status is the on-disk fact that means the ref moved -- it is
+// written only after landRef succeeds -- so the derivation gates on it.
+func TestBoardDoesNotCountAnAckWhoseRefNeverMoved(t *testing.T) {
+	f := newAllParkedFixture(t)
+	head := f.head()
+
+	// Make landRef fail for a reason that is NOT ErrRefMoved.
+	lock := filepath.Join(f.repo, ".git", "refs", "heads", "main.lock")
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatalf("plant a stale ref lock: %v", err)
+	}
+	if code := doJSON(t, "POST", f.ts.URL+"/runs/"+f.runID+"/ack", "", map[string]any{}, nil); code == http.StatusOK {
+		t.Fatal("the ack succeeded with a stale ref lock in place; this test cannot prove anything")
+	}
+	if err := os.Remove(lock); err != nil {
+		t.Fatalf("remove the stale ref lock: %v", err)
+	}
+
+	// Ground truth: nothing landed.
+	if now := f.head(); now != head {
+		t.Fatalf("main moved from %s to %s despite the failed ack", short(head), short(now))
+	}
+	// The record nevertheless claims one -- that is the state under test.
+	if pk := f.reread(); pk.LandedSHA == "" {
+		t.Skip("the failed ack left no landedSHA in the park record, so the rule under test cannot fire")
+	}
+
+	board := getBoard(t, f.ts.URL, "", "limit=0")
+	if card := cardFor(t, board.Cells[0], ""); card.Column == boardLanded {
+		t.Fatalf("the card is in %q for a ref that never moved", card.Column)
+	}
+	if board.Metrics.Landed != 0 {
+		t.Fatalf("metrics.landed = %d, want 0 — the base ref is still at %s", board.Metrics.Landed, short(head))
+	}
+	var agg struct {
+		Totals usageTotals `json:"totals"`
+	}
+	if code := doJSON(t, "GET", f.ts.URL+"/usage", "", nil, &agg); code != http.StatusOK {
+		t.Fatalf("GET /usage: status %d, want 200", code)
+	}
+	if agg.Totals.Landed != 0 {
+		t.Fatalf("GET /usage reports landed=%d, want 0 — nothing landed", agg.Totals.Landed)
+	}
 }
 
 // TestBoardRejectedParkIsNotLanded drives a REAL park to a real rejection. Its
