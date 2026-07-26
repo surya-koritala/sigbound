@@ -352,10 +352,15 @@ type runReport struct {
 }
 
 // policyJSON records the resolved landing policy on the report/manifest. Verify
-// is the EFFECTIVE battery (policy lines plus any appended flag/request verify);
-// AuditSample/AckTimeout are parsed, validated, and recorded now but enforced
-// only from the v2.0 parking work (#109) — see the "Landing policy" USAGE
-// section. Every list/scalar is omitempty so a minimal policy records minimally.
+// is the POLICY'S OWN declared verify lines, in file order — what policyReport
+// assigns (pol.verify), NOT the effective battery: resolvePolicy appends the
+// invoker's -verify to the battery it composes into runParams.VerifyCmd, and
+// that composed string is never recorded here. The distinction is load-bearing:
+// these lines are committed to the repo, so `sig log -release` can publish them
+// as a landing's acceptance without republishing an invoker's command.
+// AuditSample/AckTimeout are the parking knobs (#109) — see the "Landing policy"
+// USAGE section. Every list/scalar is omitempty so a minimal policy records
+// minimally.
 type policyJSON struct {
 	Hash        string   `json:"hash"`
 	Verify      []string `json:"verify,omitempty"`

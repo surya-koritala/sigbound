@@ -551,6 +551,31 @@ func (g *Git) NoteShow(ctx context.Context, ref, commit string) (content string,
 	return out, true, nil
 }
 
+// NoteList returns the commits that carry a note under the NAMESPACED ref
+// (`git notes --ref=<ref> list`) — ONE git call for the whole namespace, which
+// is what lets a caller ask "which of these commits have notes" without a
+// NoteShow per commit. An absent or unreadable notes ref yields no commits and
+// no error, the same not-found contract NoteShow uses; err is reserved for a git
+// process that could not run at all. ref is a bare name (e.g. "sigbound"),
+// matching NoteAdd/NoteShow.
+func (g *Git) NoteList(ctx context.Context, ref string) ([]string, error) {
+	out, _, code, err := g.runWith(ctx, nil, nil, "notes", "--ref="+ref, "list")
+	if err != nil {
+		return nil, err
+	}
+	if code != 0 {
+		return nil, nil // no notes ref: an empty namespace, not an error
+	}
+	// Each line is "<noteOID> <commitOID>"; the commit is what a caller wants.
+	var commits []string
+	for _, line := range splitNonEmptyLines(out) {
+		if _, commit, ok := strings.Cut(line, " "); ok {
+			commits = append(commits, strings.TrimSpace(commit))
+		}
+	}
+	return commits, nil
+}
+
 // BlobAt returns the contents of path at tree-ish rev (`git cat-file blob
 // rev:path`). present is false when the path is absent at rev (e.g. one side of
 // an add/add or delete/modify conflict) — NOT an error; the caller treats it as
