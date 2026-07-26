@@ -72,6 +72,9 @@ func runDoctor(w io.Writer, argv []string) (int, error) {
 	// Same posture as the disk line above: a debris count that can't be
 	// formed never fails doctor (see gcInfoLine's doc comment).
 	fmt.Fprintln(w, gcInfoLine(ctx, *repo))
+	// Same posture again (see policyInfoLine): whether the repo owns a landing
+	// bar is information, never a doctor verdict.
+	fmt.Fprintln(w, policyInfoLine(ctx, *repo))
 	if !allOK {
 		return exitOperationalError, nil
 	}

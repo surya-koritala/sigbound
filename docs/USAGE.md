@@ -1463,6 +1463,135 @@ ack-paths = auth/**, billing/**
 budget = 30m
 ```
 
+### Drafting a first one: `sig policy init`
+
+You do not have to answer "what do I put in `verify =`?" from scratch. The repo
+already says what its bar is, in its CI config, and `sig policy init` reads it:
+
+```
+sig policy init [-repo PATH] [-rev REV]
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-repo` | `.` | The repository to read, and where `sigbound.policy` is written. |
+| `-rev` | `HEAD` | The COMMITTED tree the sources are read from — the same posture a run's policy load uses. An uncommitted workflow is invisible to it. |
+
+A `-rev` you NAME must resolve: if it does not, the command exits non-zero
+before reading a source or writing anything, so a typo cannot leave a vacuous
+policy behind that then blocks the corrected retry (there is no `-force`). The
+default `HEAD` is the exception — an empty repository with no commit yet is the
+new-repo case, so it still writes the commented template and exits 0.
+
+It writes `<repo>/sigbound.policy` and nothing else: no run starts, no ref
+moves, nothing appears under `.git/sigbound/`. Every emitted key is preceded by
+a comment naming the file and line it came from, and every input that has no
+policy equivalent becomes a `# unmapped:` line — `grep '^# unmapped:'
+sigbound.policy` lists everything it declined to translate and why.
+
+Sources, in the order it trusts them:
+
+| Source | Reads | Produces |
+|--------|-------|----------|
+| workflows | `.github/workflows/*.yml`/`*.yaml` whose `on:` includes `push` or `pull_request` | one `verify` member per usable `run:` step, deduplicated by command text |
+| Makefile | `GNUmakefile`/`makefile`/`Makefile` | `make check` (or `ci`/`verify`) alone if present, else `make build`/`lint`/`test` for whichever exist |
+| toolchain | `go.mod`, `package.json`, `Cargo.toml`, `pyproject.toml`/`setup.py`/`requirements.txt` | the matching [`-verify-preset`](#presets) command, verbatim |
+| CODEOWNERS | first of `.github/CODEOWNERS`, `CODEOWNERS`, `docs/CODEOWNERS` | one `ack-paths` glob per pattern, with the file count it matches at `-rev` |
+
+The battery comes from exactly ONE of the first three — the first that produces
+anything. A later source then says what it saw in an `# unmapped:` line instead
+of appending a second battery that runs the same work twice. `CODEOWNERS` is
+independent and always contributes.
+
+**It never overwrites.** An existing `sigbound.policy` is the repo's real
+landing bar, so the command prints the lines it would have added, in a diff
+shape, and exits non-zero without writing anything. There is no `-force`; merge
+what you want by hand. The draft is also parsed with the policy parser before it
+is written, and one that does not parse is never written — a present-but-invalid
+policy is a hard error at every subsequent run start.
+
+Read it before you commit it. It is a starting point, and these are its limits:
+
+- **The workflow reader is a heuristic, not a YAML parser** (sigbound has no
+  module dependencies and is keeping none). It follows the common shapes —
+  key lines, `- ` items, `|` block scalars, tracked by indentation. Anything it
+  does not recognize yields FEWER suggestions, never a wrong one, and says so in
+  an `# unmapped:` line. It emits nothing for a step that interpolates `${{ }}`
+  (an empty substitution can leave a command that exits 0 — a bar that gates
+  nothing), for a step with `if:`, `continue-on-error: true`,
+  `working-directory:`, its own `env:`, or a non-`sh`/`bash` `shell:` (this holds
+  whether the `run:` is a single line or a `|` block), and for a whole job with
+  `container:`, `services:`, an `environment:` (a deployment is not a merge
+  gate), its own `env:`, its own `defaults:`, its own `if:`,
+  `continue-on-error: true`, or a `runs-on:` that
+  is not a linux/ubuntu runner (a windows- or macos-only job's steps would not
+  run where verify does). The job-level `if:` and `continue-on-error:` cases are
+  the step-level ones one scope up, and they matter more there: a workflow that
+  fires on both `push` and a schedule passes the trigger check, but a job inside
+  it gated on `github.event_name == 'schedule'` gates no merge at all, and a job
+  allowed to fail is not a gate by definition.
+  The same reasoning covers the trigger itself: `on: push:` filtered to
+  branches that cannot include the default branch (`release/**`, `deploy`) is a
+  release trigger, exactly like `on: push: tags:`, and is refused the same way.
+  A filter that could still match it is not, because refusing an ordinary
+  merge-gating workflow would be the expensive mistake. Which branch that is
+  comes from the repository itself — `origin/HEAD`, and only that: the
+  checked-out branch is where you happen to be standing, not where merges land.
+  So a repo that merges into `develop` or `trunk` keeps its own battery, and
+  `main`/`master` are used only when the repo genuinely cannot say (no
+  `origin/HEAD`, which is the normal state after `git init` plus `git remote
+  add`, or a pointer left stale by a server-side rename). A bare `*`, a wildcard
+  whose fixed prefix could still expand to that branch, and `branches-ignore:`
+  all count as matching it. The same test applies to `on: pull_request: branches:`, which
+  filters the PR's base branch — the same question asked from the other side.
+
+  **Known ceilings**, both erring toward fewer suggestions:
+  `paths:`/`paths-ignore:` are NOT read, so a job that only runs when certain
+  files change is drafted as though it always runs — usually over-strict rather
+  than vacuous, but it is a guess this command has not been taught to make, so
+  check such a member before you rely on it. And `merge_group:` is not treated
+  as a merge gate, so a repo whose bar is enforced by a merge queue drafts from
+  its other workflows or falls back to its manifests instead. A `run: |` block of simple commands is joined with
+  ` && ` (the step shell is `bash -e`, so that is the same all-must-pass
+  meaning); a block with a heredoc, a line continuation, a trailing operator, a
+  trailing `#` comment (which would otherwise comment out every member joined
+  after it), or a leading shell keyword is a program rather than a list, so it is
+  refused whole and quoted in the draft for you to fold by hand. And it emits
+  nothing for a WHOLE FILE carrying a workflow-level (column-0) `defaults:` or
+  `env:`: GitHub applies those to every step in every job, so
+  `defaults.run.working-directory` — the usual idiom for a monorepo whose code
+  lives in a subdirectory — silently relocates every command, and drafting one
+  would give you a bar that passes at the repository root while your real CI
+  fails in the subdirectory.
+- **A workflow that does not gate a merge contributes nothing** — a
+  `schedule:` workflow, or a `push:` filtered to `tags:` only (that is a
+  release, and its steps are release steps).
+- **Each source file is read only up to 512 KB.** A larger workflow, `Makefile`
+  or `CODEOWNERS` is skipped without being read (the cap is checked against the
+  blob's size in the tree, before the read) and named in an `# unmapped:` line.
+- **The toolchain line is probed, not assumed.** `sig policy init` runs the
+  tool's version probe (`go version`, `npm --version`, …) and emits the line
+  COMMENTED OUT when it fails, with the reason. That probe describes the machine
+  you ran it on, not wherever verify will actually run, so the line is always
+  drafted — uncomment it once the toolchain is there.
+- **CODEOWNERS owners are dropped**: `ack-paths` has no owner dimension, and any
+  ack releases a parked landing whoever the file's owner is. A pattern
+  containing `,`, a `!` negation, or a `[...]` class emits no glob at all. A
+  pattern whose only slash is trailing (`docs/`) is anchored at the repository
+  root here, where the forge would also match `a/b/docs/`; the file count in
+  each glob's comment is what makes such a narrowing visible on review. A pattern
+  with no slash at all (`auth`, `.github`) matches at any depth, and whether it
+  names a file or a directory is read from the tree: a directory emits the
+  subtree glob (`**/auth/**`) so the ack covers its contents, not just a file of
+  that name.
+- **Nothing is in force until you commit it**, and committing it turns on the
+  self-protection below: a later change to `sigbound.policy` itself parks.
+
+[`sig doctor`](#sig-doctor) prints one informational line about this — the
+policy's member and glob counts at `HEAD`, or a pointer at `sig policy init`
+when there is none. Like doctor's other informational lines it never affects
+doctor's exit code.
+
 ### Keys
 
 | Key | Meaning |
@@ -2252,6 +2381,7 @@ git version >= 2.38: ok
 live probe: merge-tree + overlay plumbing: ok
 disk: repo tree ~2.1MB, free 41.2GB on /tmp (a 512-agent run needs ~1.0GB)
 gc: 1 stale worktree(s), 2 sweepable branch(es), 0 old tempdir(s) (run sig gc)
+landing policy: no sigbound.policy at HEAD (run `sig policy init` to draft one from this repo's CI config)
 ```
 
 The `disk:` line is unconditional (informational, not a pass/fail check — it
@@ -2262,8 +2392,8 @@ repo lives on a different filesystem than the temp directory (a common trap
 in CI, where `/tmp` is a small tmpfs), the line shows both readings instead:
 `free on temp: X (path) · free on repo fs: Y (path)`.
 
-The `gc:` line is the same posture: unconditional and informational, never a
-pass/fail check. It's [`sig gc`](#sig-gc)'s own dry-run plan (default
+The `gc:` and `landing policy:` lines are the same posture: unconditional and
+informational, never a pass/fail check. It's [`sig gc`](#sig-gc)'s own dry-run plan (default
 `-older-than`, never `-force`), so the counts match exactly what a bare `sig
 gc -repo ... -delete` would remove right now — run `sig gc` to see and act on
 the detail.
