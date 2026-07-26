@@ -499,7 +499,7 @@ func unlandRun(ctx context.Context, c *cell.Cell, p unlandParams) (unlandOutcome
 	// to opt out on this door.
 	if _, present, perr := g.BlobAt(ctx, plan.Head, policyFileName); perr == nil && present {
 		rep.Verify = derefVerify(out.Verify)
-		attachNote(ctx, g, finalSHA, rep)
+		attachNote(ctx, g, finalSHA, rep, "unland")
 	}
 	out.Status, out.LandedSHA = unlandStatusDone, finalSHA
 	out.Message = fmt.Sprintf("unlanded run %s: %s now at %s", p.TargetID, plan.Base, short(finalSHA))

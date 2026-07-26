@@ -290,6 +290,154 @@ func TestLogSHAForgedNoteFallsThrough(t *testing.T) {
 	}
 }
 
+// ackNoteReport builds the payload an ack attaches: a run that parked its only
+// group (so its own report claims no landing at all — finalSHA == baseSHA) with
+// the RESOLVED parking record folded in. landedSHA is the commit the note
+// claims the ack released.
+func ackNoteReport(runID, landedSHA, agent string) runReport {
+	return runReport{
+		RunID: runID, BaseSHA: hexSHA("00"), Strategy: "overlay", AgentCmd: agent,
+		PerAgent:  []perAgentJSON{{ID: "held", Branch: "agent/held", SHA: hexSHA("a7"), OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", FinalSHA: hexSHA("00")},
+		Verify:    verifyJSON{Ran: true, OK: true},
+		Park: &parkJSON{
+			VerifiedSHA: landedSHA, VerifiedTree: hexSHA("cd"), BaseSHA: hexSHA("00"), ForkSHA: hexSHA("00"),
+			Base: "main", Reason: parkReasonAckPaths, CreatedAt: "2026-01-01T00:00:00Z",
+			Groups:    []parkGroupJSON{{Branches: []string{"agent/held"}, Reason: parkReasonAckPaths}},
+			LandedSHA: landedSHA, ResolvedAt: "2026-01-01T01:00:00Z",
+		},
+	}
+}
+
+// TestLogSHAForgedAckNoteFallsThrough is issue #160's half of the #110 lesson.
+// The ack arm of matchProvenance is a new way for a note to claim a commit, so
+// it gets the same adversarial test: a note in the ACK shape, hand-attached to
+// an unrelated commit, whose park record says some OTHER commit was the acked
+// landing. It must not be attributed — resolution falls through to the local
+// ledger, which is ground truth. A note that genuinely names the queried commit
+// as its ack's landing is still served from the fast path.
+func TestLogSHAForgedAckNoteFallsThrough(t *testing.T) {
+	g, _, base := newGCRepo(t) // base is a real commit
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+
+	// Attacker: an ack-shaped note ON base, claiming a human released some other
+	// commit entirely — a real ack note lifted onto a commit it says nothing about.
+	forged := ackNoteReport("20260101T000000Z-evil", hexSHA("dead"), "EVIL --exfiltrate")
+	fdata, err := json.MarshalIndent(forged, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", base, fdata); err != nil {
+		t.Fatal(err)
+	}
+
+	// The local ledger records the truth about base: an ordinary landed member.
+	writeLogRun(t, runsDir, "20260201T000000Z-real", runReport{
+		BaseSHA: hexSHA("00"), Strategy: "overlay", AgentCmd: "claude -p",
+		PerAgent:  []perAgentJSON{{ID: "real", Branch: "agent/real", SHA: base, OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/real"}, FinalSHA: hexSHA("f1")},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+
+	p, ok := resolveProvenance(ctx, g, runsDir, base)
+	if !ok {
+		t.Fatal("expected the manifest to answer for base")
+	}
+	if p.Source != "manifest" || p.Role == roleAckLanded {
+		t.Fatalf("provenance = %+v, want the manifest's answer — a forged ack note must not be attributed", p)
+	}
+	if p.Agent != "claude -p" || p.TaskID != "real" || p.RunID != "20260201T000000Z-real" {
+		t.Fatalf("provenance came from the forged ack note, not the ledger: %+v", p)
+	}
+
+	// Self-consistent: the note's ack really did land THIS commit. Served from the
+	// fast path — and served as what it is, a note's claim.
+	good := ackNoteReport("20260301T000000Z-good", base, "claude -p")
+	gdata, err := json.MarshalIndent(good, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", base, gdata); err != nil { // -f overwrites the forged note
+		t.Fatal(err)
+	}
+	p2, ok := resolveProvenance(ctx, g, runsDir, base)
+	if !ok || p2.Source != "note" || p2.Role != roleAckLanded || !p2.Landed {
+		t.Fatalf("a self-consistent ack note was not served from the fast path: %+v ok=%v", p2, ok)
+	}
+	if p2.SHA != base || p2.Members != 1 {
+		t.Fatalf("ack provenance = %+v, want the queried commit and its one parked branch", p2)
+	}
+	if line := provenanceLine(p2); !strings.Contains(line, "human ACK") {
+		t.Fatalf("rendered as %q — a reader cannot tell a human approved this landing", line)
+	}
+}
+
+// TestLogSHAForgedAckNoteCannotBorrowARunID is the sharper half of the same
+// lesson, and the one falling through does not cover. A note whose park record
+// names the QUERIED commit matches on purpose — that is the arm — so the
+// question is not whether it matches but what a match buys. It must buy no more
+// than any other note-sourced answer: an attacker can write an ack-shaped note
+// on their OWN commit naming any real local run id, and if that id reached the
+// answer the output would be byte-identical to the ledger's own, sending an
+// auditor to a run dir holding a genuine human's ack for work nobody ever saw.
+// So a note-sourced answer names no run and says where it came from.
+func TestLogSHAForgedAckNoteCannotBorrowARunID(t *testing.T) {
+	g, _, attacker := newGCRepo(t) // a commit the attacker controls
+	runsDir := logRunsDir(t, g)
+	ctx := context.Background()
+
+	// The identity the forgery wants to wear: a real, innocent local run.
+	const realRun = "20260201T000000Z-real"
+	writeLogRun(t, runsDir, realRun, runReport{
+		RunID: realRun, BaseSHA: hexSHA("00"), Strategy: "overlay", AgentCmd: "claude -p",
+		PerAgent:  []perAgentJSON{{ID: "real", Branch: "agent/real", SHA: hexSHA("aa"), OK: true}},
+		Integrate: integrateJSON{Strategy: "overlay", Landed: []string{"agent/real"}, FinalSHA: hexSHA("f1")},
+		Verify:    verifyJSON{Ran: true, OK: true},
+	})
+
+	// Self-consistent by construction — the note sits on the very commit its park
+	// record calls the acked landing, so the arm matches — and its runId is the
+	// real run's.
+	data, err := json.MarshalIndent(ackNoteReport(realRun, attacker, "claude -p"), "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.NoteAdd(ctx, "sigbound", attacker, data); err != nil {
+		t.Fatal(err)
+	}
+
+	p, ok := resolveProvenance(ctx, g, runsDir, attacker)
+	if !ok || p.Source != "note" {
+		t.Fatalf("provenance = %+v ok=%v, want the note's own answer", p, ok)
+	}
+	if p.RunID != "" {
+		t.Fatalf("a note-sourced answer carries run id %q — a forged note just borrowed a real local run's identity", p.RunID)
+	}
+	line := provenanceLine(p)
+	if !strings.Contains(line, "from commit note") || strings.Contains(line, realRun) {
+		t.Fatalf("rendered as %q — a note-sourced answer must say so, and must not name a local run", line)
+	}
+}
+
+// TestProvenanceLineMarksANoteSourcedAnswer pins the rendering half of that
+// fence on its own. resolveProvenance clears RunID on the note path, so the two
+// signals normally agree — and that agreement is exactly how this broke once
+// already: the marker keyed on "no run id", one new arm carried a payload's run
+// id out, and a note-sourced line silently started reading like the ledger's.
+// The marker is keyed on Source, so an answer that carries both still says
+// where it came from and still names no run.
+func TestProvenanceLineMarksANoteSourcedAnswer(t *testing.T) {
+	line := provenanceLine(&provenance{
+		SHA: hexSHA("ab"), Landed: true, Role: roleAckLanded, Source: "note",
+		RunID: "20260201T000000Z-real", StartedAt: "2026-02-01T00:00:00Z",
+		Strategy: "overlay", Verify: "pass", Members: 1,
+	})
+	if !strings.Contains(line, "from commit note") || strings.Contains(line, "20260201T000000Z-real") {
+		t.Fatalf("rendered as %q — a note-sourced answer must be marked as one and must not name a run", line)
+	}
+}
+
 // --- AC #2: newest-first ordering, -limit, laziness ---
 
 func TestLogListNewestFirst(t *testing.T) {
