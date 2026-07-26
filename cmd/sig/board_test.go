@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -91,6 +92,98 @@ func TestBoardReflectsRealJournal(t *testing.T) {
 	}
 	if after.Runs[0].LandedSHA == "" {
 		t.Fatal("acked run shows no landed sha on the board")
+	}
+}
+
+// newAllParkedFixture drives a REAL run whose ONLY task touches an ack-path, so
+// EVERY group parks and the run's own report records no landing at all
+// (finalSHA == baseSHA). newParkFixture cannot stand in for this: its clean
+// group lands on its own, which moves finalSHA before anybody acks, so the
+// report already says "landed" and an ack the board cannot see stays invisible.
+func newAllParkedFixture(t *testing.T) *parkFixture {
+	t.Helper()
+	requirePOSIXShell(t)
+	g, repo := makeGoRepo(t)
+	agent := buildTestAgent(t)
+	commitPolicy(t, g, repo, parkPolicyAckPaths)
+	srv, ts := newTestServer(t, "", repo)
+	var created struct {
+		RunID string `json:"runId"`
+	}
+	if code := doJSON(t, "POST", ts.URL+"/runs", "", runRequest{
+		Cell:   repo,
+		Base:   "main",
+		Tasks:  []taskSpec{taskWrite(t, "held", map[string]string{"auth/token.go": "package auth\n\nfunc Token() string { return \"t\" }\n"})},
+		Agent:  agent,
+		Verify: "go build ./...",
+	}, &created); code != http.StatusAccepted {
+		t.Fatalf("POST /runs status %d, want 202", code)
+	}
+	pollRunStatus(t, ts, "", created.RunID, statusAwaitingAck)
+	f := &parkFixture{
+		t: t, repo: repo, g: g, cell: srv.cells[0].cell, srv: srv, ts: ts,
+		runID: created.RunID, dir: filepath.Join(srv.cells[0].runsDir, created.RunID),
+	}
+	f.park = f.reread()
+	// The premise this fixture exists for: the run itself landed NOTHING, so its
+	// report can never be what tells a reader this run landed.
+	rep, err := readRunReport(f.dir)
+	if err != nil {
+		t.Fatalf("read the parked run's report: %v", err)
+	}
+	if landed(rep) {
+		t.Fatalf("fixture is not all-parked: the report already records a landing (finalSHA %s, baseSHA %s)",
+			short(rep.Integrate.FinalSHA), short(rep.BaseSHA))
+	}
+	return f
+}
+
+// TestBoardCountsAnAckedLanding is the ALL-PARKED ack: a run that parked every
+// group lands only when a human acks it, and that landing is recorded in
+// park.json — never in the report, which was written before the ack existed. A
+// board that reads landedness out of the report alone shows this run as needing
+// attention with no landed sha, and counts landed=0, forever, for a landing that
+// happened.
+func TestBoardCountsAnAckedLanding(t *testing.T) {
+	f := newAllParkedFixture(t)
+
+	before := getBoard(t, f.ts.URL, "", "limit=0")
+	card := cardFor(t, before.Cells[0], "")
+	if card.Column != boardAwaitingAck {
+		t.Fatalf("before the ack the card is in %q, want %q", card.Column, boardAwaitingAck)
+	}
+	if before.Metrics.Landed != 0 {
+		t.Fatalf("before the ack metrics.landed = %d, want 0 — nothing has landed yet", before.Metrics.Landed)
+	}
+
+	var out ackOutcome
+	if code := doJSON(t, "POST", f.ts.URL+"/runs/"+f.runID+"/ack", "", map[string]any{}, &out); code != http.StatusOK {
+		t.Fatalf("POST ack: status %d, want 200", code)
+	}
+	if out.LandedSHA == "" {
+		t.Fatal("the ack reported no landed sha")
+	}
+	// Ground truth, independent of anything the board reads: the base ref moved.
+	if head := f.head(); head != out.LandedSHA {
+		t.Fatalf("main is at %s, the ack claims it landed %s", short(head), short(out.LandedSHA))
+	}
+
+	after := getBoard(t, f.ts.URL, "", "limit=0")
+	acked := cardFor(t, after.Cells[0], "")
+	if acked.Column != boardLanded {
+		t.Fatalf("after the ack the card is in %q, want %q", acked.Column, boardLanded)
+	}
+	if acked.Runs[0].LandedSHA != short(out.LandedSHA) {
+		t.Fatalf("the card shows landed sha %q, want the acked commit %q", acked.Runs[0].LandedSHA, short(out.LandedSHA))
+	}
+	if after.Metrics.Landed != 1 {
+		t.Fatalf("after the ack metrics.landed = %d, want 1", after.Metrics.Landed)
+	}
+	// The landed-only populations agree with that count: this run has a metering
+	// record, and it landed, so it is in both of them.
+	if after.Metrics.LandedWallRuns != 1 || after.Metrics.AgentWallLanded != 1 {
+		t.Fatalf("landedWallRuns=%d agentWallLanded=%d, want 1/1 — an acked landing is a landing in every metric",
+			after.Metrics.LandedWallRuns, after.Metrics.AgentWallLanded)
 	}
 }
 
@@ -278,8 +371,11 @@ func TestBoardMetricsReconcile(t *testing.T) {
 		FlaggedRuns: 1,
 		// Runs 1+2 landed AND carry usage; run 4 landed with no usage record.
 		LandedWallMs: 30000, LandedWallRuns: 2,
-		// Runs 1, 3 and 5 recorded agent wall time; only run 1 of those landed.
-		AgentWallMs: 5500, AgentWallLanded: 1,
+		// Runs 1, 3 and 5 recorded agent wall time, but only run 1 of those
+		// LANDED — and this is a per-landed-change mean, so 3 and 5 are in
+		// neither number. Summing all 5500ms over the single landing would
+		// report 5500ms per landed change for a run that took 4000.
+		AgentWallMs: 4000, AgentWallLanded: 1,
 		CostUSD: 1.50, CostRuns: 1, CostLanded: 1, InputTokens: 100, OutputTokens: 20,
 		Presets: []boardPreset{
 			{Preset: "claude", Runs: 2, Landed: 2},
@@ -303,8 +399,9 @@ func TestBoardMetricsReconcile(t *testing.T) {
 		}
 		if u.Landed {
 			sumTotal += u.TotalWallMs
+			// Same population as the denominator: landed runs only.
+			sumAgent += u.AgentWallMs
 		}
-		sumAgent += u.AgentWallMs
 		sumCost += u.CostUSD
 	}
 	if sumTotal != got.LandedWallMs || sumAgent != got.AgentWallMs || sumCost != got.CostUSD {
@@ -526,6 +623,78 @@ func TestAgentUsageFileIngested(t *testing.T) {
 	ingestAgentUsage(t.TempDir(), &none)
 	if none != (UsageJSON{}) {
 		t.Fatalf("no usage file at all produced %+v, want a zero record", none)
+	}
+}
+
+// TestAgentUsageSumsSaturate: the per-file guard rejects an infinite cost, but
+// two FINITE costs can still sum to +Inf — and +Inf is not encodable JSON, so
+// the sum would take out `usage.json` at the per-run layer and the whole /board
+// response (200, empty body) at the cross-run layer. Both layers must saturate.
+func TestAgentUsageSumsSaturate(t *testing.T) {
+	// Per-run layer: two files whose finite values sum past both limits.
+	dir := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		body := `{"costUsd":1e308,"inputTokens":9223372036854775807,"outputTokens":9223372036854775807}`
+		if err := os.WriteFile(filepath.Join(dir, agentUsagePrefix+name+".json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var u UsageJSON
+	ingestAgentUsage(dir, &u)
+	if u.CostAgents != 2 {
+		t.Fatalf("costAgents = %d, want 2 — both files are individually valid", u.CostAgents)
+	}
+	if math.IsInf(u.CostUSD, 0) || math.IsNaN(u.CostUSD) {
+		t.Fatalf("per-run cost sum = %v; an unencodable number must never reach usage.json", u.CostUSD)
+	}
+	if u.InputTokens != math.MaxInt64 || u.OutputTokens != math.MaxInt64 {
+		t.Fatalf("token sums = %d/%d, want saturation at %d — a wrapped counter reads as a negative token count",
+			u.InputTokens, u.OutputTokens, int64(math.MaxInt64))
+	}
+	if _, err := json.Marshal(u); err != nil {
+		t.Fatalf("the summed record does not encode: %v", err)
+	}
+
+	// Cross-run layer: two runs each carrying the clamped maximum.
+	_, repo := makeGoRepo(t)
+	srv, ts := newTestServer(t, "", repo)
+	rep := runReport{BaseSHA: "base0", AgentCmd: "x", Integrate: integrateJSON{FinalSHA: "final"}}
+	for _, id := range []string{"20260101T000001Z-a", "20260101T000002Z-b"} {
+		fixtureRun(t, srv.cells[0].runsDir, id, "done", rep,
+			&UsageJSON{Landed: true, CostUSD: math.MaxFloat64, CostAgents: 1,
+				InputTokens: math.MaxInt64, OutputTokens: math.MaxInt64, AgentWallMs: math.MaxInt64})
+	}
+	// getBoard fails the test if the body will not decode, which is exactly the
+	// symptom: the 200 header is already on the wire when Encode gives up.
+	m := getBoard(t, ts.URL, "", "limit=0").Metrics
+	if math.IsInf(m.CostUSD, 0) || math.IsNaN(m.CostUSD) || m.CostUSD <= 0 {
+		t.Fatalf("board cost = %v, want a huge but finite number", m.CostUSD)
+	}
+	if m.InputTokens < 0 || m.AgentWallMs < 0 {
+		t.Fatalf("wrapped counters reached the board: inputTokens=%d agentWallMs=%d", m.InputTokens, m.AgentWallMs)
+	}
+}
+
+// TestAgentUsageFileIsBounded: the file is written by the AGENT, so its size is
+// the agent's choice and the daemon's allocation must not be. An oversized file
+// is refused loudly — silence there hides why a run's cost vanished — and the
+// well-formed file beside it is still ingested.
+func TestAgentUsageFileIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	big := `{"costUsd":9,"pad":"` + strings.Repeat("a", agentUsageMaxBytes) + `"}`
+	if err := os.WriteFile(filepath.Join(dir, agentUsagePrefix+"big.json"), []byte(big), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, agentUsagePrefix+"ok.json"), []byte(`{"costUsd":0.25,"inputTokens":7}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var u UsageJSON
+	log := captureStderr(t, func() { ingestAgentUsage(dir, &u) })
+	if u.CostAgents != 1 || u.CostUSD != 0.25 || u.InputTokens != 7 {
+		t.Fatalf("ingested %+v, want only the small file (1 agent / 0.25 / 7 tokens)", u)
+	}
+	if !strings.Contains(log, agentUsagePrefix+"big.json") {
+		t.Fatalf("the oversized file was dropped silently; stderr said %q", log)
 	}
 }
 

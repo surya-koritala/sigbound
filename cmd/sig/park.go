@@ -475,6 +475,28 @@ func readPark(dir string) (*parkJSON, error) {
 	return pk, err
 }
 
+// ackedLandedSHA is the commit an ACK landed for this run, or "" if none did.
+//
+// It exists because an acked landing is the one landing a run's OWN records
+// cannot show. A run whose every group parked writes report.json and usage.json
+// with finalSHA == baseSHA and landed=false, which is the truth about what the
+// RUN did; the ref is advanced later, by ackRun, and recorded where the ack
+// happens — here, in park.json. Neither file is rewritten afterwards, on purpose:
+// a report is the run's historical record, and back-dating it would make the run
+// claim it did something it did not do.
+//
+// So every reader that asks "did this land" ORs this over the run's own record
+// (see landed, readLogRow, foldMetrics), and the answer is DERIVED on read rather
+// than stored twice. Empty for a park that is unresolved, rejected, expired, or
+// whose record will not read back: only a recorded landing counts as one.
+func ackedLandedSHA(dir string) string {
+	pk, err := readPark(dir)
+	if err != nil || pk.ResolvedAt == "" {
+		return ""
+	}
+	return pk.LandedSHA
+}
+
 // readParkAt is readPark plus the EXACT bytes it parsed. Those bytes are the
 // compare-and-swap token: a writer that read the record, spent minutes
 // re-verifying, and then wants to update it must first prove the record on disk

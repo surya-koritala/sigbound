@@ -105,10 +105,12 @@ type boardMetrics struct {
 	// invocation has no usage.json and is in neither number.
 	LandedWallMs   int64 `json:"landedWallMs"`
 	LandedWallRuns int   `json:"landedWallRuns"`
-	// Agent wall-time per landed change = AgentWallMs / AgentWallLanded, over
-	// runs whose metering record carries an agent wall time at all (written from
-	// v2.1 on — an older run contributes to neither number, so the mean is not
-	// silently diluted by zeros).
+	// Agent wall-time per landed change = AgentWallMs / AgentWallLanded, over one
+	// population: LANDED runs whose metering record carries an agent wall time at
+	// all (written from v2.1 on). A run that did not land, and an older run with
+	// no recorded agent time, are in NEITHER number — the numerator is not summed
+	// over a wider set than the denominator counts, and the mean is not diluted
+	// by zeros.
 	AgentWallMs     int64 `json:"agentWallMs"`
 	AgentWallLanded int   `json:"agentWallLanded"`
 	// Cost per landed change = CostUSD / CostLanded, over runs whose agents
@@ -238,6 +240,8 @@ func boardColumn(rows []logRow) string {
 	// the ref was never advanced, so a REJECTED park — whose report is a green,
 	// fully verified landing a human refused — carries a landedSHA while having
 	// landed nothing. Rejected, errored and interrupted runs are all attention.
+	// An ACKED park is "done" with the ack's own commit as its landed sha (see
+	// ackedLandedSHA), so a run that parked every group reaches this column too.
 	if rows[0].Status == "done" && rows[0].LandedSHA != "" {
 		return boardLanded
 	}
@@ -255,7 +259,12 @@ func foldMetrics(m *boardMetrics, presets map[string]*boardPreset, dir string) {
 		return
 	}
 	m.Runs++
-	didLand := landed(rep)
+	// An acked landing is invisible to the report that ran before it (see
+	// ackedLandedSHA), so it is OR-ed in rather than read out of the run's own
+	// files — which is why the same term appears again below, over the metering
+	// record's own landed flag.
+	acked := ackedLandedSHA(dir) != ""
+	didLand := landed(rep) || acked
 	if didLand {
 		m.Landed++
 	}
@@ -291,23 +300,29 @@ func foldMetrics(m *boardMetrics, presets map[string]*boardPreset, dir string) {
 	}
 	// usage.Landed is authoritative over the report heuristic: execRun forces it
 	// false for a run that errored mid-flight, where the ref provably never moved
-	// (see execRun).
-	if u.Landed {
-		m.LandedWallMs += u.TotalWallMs
+	// (see execRun). An ack is the other direction — a landing that happened after
+	// this record was written — so it is OR-ed on top rather than replacing it.
+	landedRun := u.Landed || acked
+	if landedRun {
+		m.LandedWallMs = addSat(m.LandedWallMs, u.TotalWallMs)
 		m.LandedWallRuns++
 	}
-	if u.AgentWallMs > 0 {
-		m.AgentWallMs += u.AgentWallMs
-		if u.Landed {
-			m.AgentWallLanded++
-		}
+	// ONE population for both halves of "agent time per landed change": landed
+	// runs that recorded an agent wall time. Summing every metered run over a
+	// landed-only denominator would report 10x on a cell with 10 runs and one
+	// landing, and would not be the mean the UI's label promises.
+	if landedRun && u.AgentWallMs > 0 {
+		m.AgentWallMs = addSat(m.AgentWallMs, u.AgentWallMs)
+		m.AgentWallLanded++
 	}
 	if u.CostAgents > 0 {
-		m.CostUSD += u.CostUSD
-		m.InputTokens += u.InputTokens
-		m.OutputTokens += u.OutputTokens
+		// Ingested numbers: agent-written, so the cross-run sum saturates rather
+		// than overflowing to +Inf, which json.Encode cannot write — see addFinite.
+		m.CostUSD = addFinite(m.CostUSD, u.CostUSD)
+		m.InputTokens = addSat(m.InputTokens, u.InputTokens)
+		m.OutputTokens = addSat(m.OutputTokens, u.OutputTokens)
 		m.CostRuns++
-		if u.Landed {
+		if landedRun {
 			m.CostLanded++
 		}
 	}
