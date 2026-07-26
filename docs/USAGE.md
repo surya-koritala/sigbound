@@ -2421,7 +2421,9 @@ bar move" is ledger-derived — and its agent is counted in a **separate**
 In the **Markdown** shape, every value that came from a run — a `goal` posted to
 `POST /runs`, a branch name, a task id, an agent name, a whole report read out of
 a note — is rendered onto a single line, with control characters, Unicode
-line/paragraph separators and format characters (the BOM, the bidi overrides)
+line/paragraph separators and format characters (the BOM, the bidi overrides,
+and — the one visible cost — the zero-width joiners that hold a multi-person
+emoji together, so `👨‍👩‍👧` renders as its three separate figures)
 collapsed to spaces and `|` escaped. A multi-line goal would otherwise write `###` sections of
 its own into your release notes, and an agent named `cl|aude` would add a column
 to the attribution table. The `-json` shape is structured, so it carries those
