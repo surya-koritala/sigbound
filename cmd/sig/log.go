@@ -311,16 +311,11 @@ func readLogRow(runsDir, id string) (row logRow, incomplete bool) {
 		var rep runReport
 		if jerr := json.Unmarshal(data, &rep); jerr == nil {
 			fillRowFromReport(&row, &rep)
-			// An ACK lands after this report was written and records the commit
-			// in park.json instead (see ackedLandedSHA), so a run that parked
-			// every group shows a landing here only if we go and look. The
-			// report wins when it has one: that is the run's own landing, and an
-			// ack on top of it lands a different, later commit.
-			if row.LandedSHA == "" {
-				if sha := ackedLandedSHA(dir); sha != "" {
-					row.LandedSHA = short(sha)
-				}
-			}
+			// The report alone cannot answer "what landed" — it records a commit
+			// it never landed when verify went red, and an ACK's commit lands
+			// after it was written. landedSHA owns that rule; GET /runs applies
+			// the identical one.
+			row.LandedSHA = short(landedSHA(&rep, dir))
 			row.Goal = goalOf(dir)
 			if row.StartedAt == "" {
 				row.StartedAt = whenFromID(id)
@@ -348,7 +343,9 @@ func readLogRow(runsDir, id string) (row logRow, incomplete bool) {
 	return row, incomplete
 }
 
-// fillRowFromReport copies the rendered fields out of a parsed report.
+// fillRowFromReport copies the rendered fields out of a parsed report — every
+// one except LandedSHA, which the report cannot answer on its own (see
+// landedSHA) and readLogRow fills from the run dir.
 func fillRowFromReport(row *logRow, rep *runReport) {
 	row.StartedAt = rep.StartedAt
 	row.Intent = rep.Intent
@@ -364,9 +361,6 @@ func fillRowFromReport(row *logRow, rep *runReport) {
 		row.PolicyHash = rep.Policy.Hash
 	}
 	row.Unlands = rep.Unlands
-	if landed(rep) {
-		row.LandedSHA = short(rep.Integrate.FinalSHA)
-	}
 }
 
 // resolveProvenance answers -sha for one commit against one cell. Notes first:
@@ -577,6 +571,32 @@ func landed(rep *runReport) bool {
 	return rep.Integrate.FinalSHA != "" &&
 		rep.Integrate.FinalSHA != rep.BaseSHA &&
 		(!rep.Verify.Ran || rep.Verify.OK)
+}
+
+// landedSHA is the commit this run put on the base ref, or "" if none did — the
+// ONE derivation every surface that shows a landed commit reads (`sig log`'s
+// rows, GET /log, GET /runs). The run's own landing wins when its report proves
+// one; otherwise it is the commit an ACK landed afterwards, which the report
+// predates and cannot carry (see ackedLandedSHA).
+//
+// It lives here because deriving it twice is exactly how the surfaces drifted:
+// GET /runs used to read integrate.finalSHA raw, so it showed a SHA for a run
+// whose -verify went red and never moved the ref, and showed nothing for an
+// acked park that really did land (issue #161). For the same reason no caller
+// may put a condition in FRONT of it, least of all a status gate: a run that
+// lands its clean groups and only then parks a held one (issue #109) sits at
+// awaiting-ack with the base ref already moved, so "ask this only for a done
+// run" is a second, stronger copy of the rule that drops a real landing.
+//
+// The limit: it answers from the run's OWN report, so a dir whose report.json is
+// missing or torn reports no landing. That is the same conservative answer
+// readLogRow's Incomplete row gives — "nothing recorded here", not proof that
+// nothing landed.
+func landedSHA(rep *runReport, dir string) string {
+	if landed(rep) {
+		return rep.Integrate.FinalSHA
+	}
+	return ackedLandedSHA(dir)
 }
 
 // verifyVerdict collapses the verify record to a one-word verdict for a row:

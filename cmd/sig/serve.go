@@ -39,7 +39,7 @@
 //
 //	GET  /health           -> {ok, version, cells:[{id, repo}]}
 //	POST /runs             -> Content-Type: application/json required; 202 {runId,...}; runs ASYNC via driveRun
-//	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}
+//	GET  /runs             -> {runs:[{id, cell, status, startedAt, finalSHA?}]}; finalSHA is what this run LANDED, whatever its status (see landedSHA)
 //	GET  /runs/{id}        -> {status: queued|running|done|error|interrupted, report?, usage?}
 //	GET  /runs/{id}/events -> the run's events.ndjson (application/x-ndjson)
 //	GET  /runs/{id}/usage  -> that run's metering record (see usage.go)
@@ -192,7 +192,6 @@ type runRecord struct {
 	dir       string
 	status    string // queued | running | done | error
 	startedAt time.Time
-	finalSHA  string
 	errMsg    string
 }
 
@@ -710,7 +709,6 @@ func (s *server) execRun(rec *runRecord, p runParams, tasks []taskSpec, plan pla
 	}
 	s.mu.Lock()
 	rec.status = status
-	rec.finalSHA = rep.Integrate.FinalSHA
 	s.mu.Unlock()
 }
 
@@ -799,7 +797,12 @@ func (s *server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	if status == "done" || status == statusAwaitingAck || status == statusRejected {
 		if rep, err := readRunReport(dir); err == nil {
 			resp.Report = rep
-			if resp.StartedAt == "" {
+			// The report's startedAt outranks the in-memory one on BOTH /runs
+			// surfaces (see handleListRuns): the record is stamped when POST /runs
+			// accepted the run, the report when driveRun actually began, and a
+			// -goal run runs its whole planner in between. Taking the report means
+			// this field does not change when a restart drops the record.
+			if rep.StartedAt != "" {
 				resp.StartedAt = rep.StartedAt
 			}
 		}
@@ -837,9 +840,10 @@ func (s *server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	// ponytail: list reads each done run's report.json for finalSHA; fine for a
-	// single-process daemon over a handful of repos. Add a per-cell index file
-	// if run history ever grows large enough for this scan to matter.
+	// ponytail: list reads every run's report.json for finalSHA, exactly as GET
+	// /log already does; fine for a single-process daemon over a handful of
+	// repos. Add a per-cell index file if run history ever grows large enough
+	// for this scan to matter.
 	var entries []runListEntry
 	for _, rc := range s.cells {
 		names, _ := os.ReadDir(rc.runsDir) // missing dir => no runs yet
@@ -853,13 +857,31 @@ func (s *server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 			if rec := live[id]; rec != nil {
 				e.Status = rec.status
 				e.StartedAt = rec.startedAt.UTC().Format(time.RFC3339)
-				e.FinalSHA = rec.finalSHA
 			} else {
 				e.Status, _ = diskRunStatus(dir)
 			}
-			if e.Status == "done" && e.FinalSHA == "" {
-				if rep, err := readRunReport(dir); err == nil {
-					e.FinalSHA = rep.Integrate.FinalSHA
+			// finalSHA is a LANDING, never integrate.finalSHA raw: a run whose
+			// -verify went red records the integrated commit it never landed, and
+			// an acked park landed a commit written after its report. landedSHA is
+			// the rule, and it is applied to the run dir with NOTHING layered on
+			// top: parse report.json, hand it and the dir to landedSHA, which is
+			// what readLogRow does and all it does (issue #161). In particular
+			// there is no status gate here — a run that lands its clean
+			// groups and only THEN parks a held one is awaiting-ack with the base
+			// ref genuinely moved (issue #109), so gating on "done" would be a
+			// second, stronger copy of "did this land" and would erase a landing
+			// GET /log reports. Disk is never staler than memory — the report and
+			// the ack's park.json are both written before this process marks the
+			// run done — and a run with no report yet simply has no landing to
+			// show.
+			if rep, err := readRunReport(dir); err == nil {
+				e.FinalSHA = landedSHA(rep, dir)
+				// The report's startedAt is when the run actually began (driveRun's
+				// entry); rec.startedAt is when POST /runs accepted it, and on a
+				// -goal run the whole planner call sits between the two. Preferring
+				// the report is what makes this field the same before and after a
+				// daemon restart drops the record from memory.
+				if rep.StartedAt != "" {
 					e.StartedAt = rep.StartedAt
 				}
 			}
@@ -1345,13 +1367,13 @@ func (s *server) handleAckReject(w http.ResponseWriter, r *http.Request, ack boo
 		return
 	}
 	// Keep this process's in-memory view honest for a run it started itself;
-	// the disk journal was already updated by ackRun/rejectRun.
+	// the disk journal was already updated by ackRun/rejectRun. The ack's landed
+	// commit is deliberately NOT cached here — every surface derives it from
+	// park.json (see landedSHA), and a second copy is what let GET /runs answer
+	// differently from GET /log.
 	s.mu.Lock()
 	if rec := s.runs[id]; rec != nil {
 		rec.status = out.Status
-		if out.LandedSHA != "" {
-			rec.finalSHA = out.LandedSHA
-		}
 	}
 	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, out)
