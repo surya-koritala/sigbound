@@ -1542,11 +1542,16 @@ Read it before you commit it. It is a starting point, and these are its limits:
   `origin/HEAD`, which is the normal state after `git init` plus `git remote
   add`, or a pointer left stale by a server-side rename). A bare `*`, a wildcard
   whose fixed prefix could still expand to that branch, and `branches-ignore:`
-  all count as matching it. **Known ceiling:**
+  all count as matching it. The same test applies to `on: pull_request: branches:`, which
+  filters the PR's base branch — the same question asked from the other side.
+
+  **Known ceilings**, both erring toward fewer suggestions:
   `paths:`/`paths-ignore:` are NOT read, so a job that only runs when certain
-  files change is drafted as though it always runs. That is usually over-strict
-  rather than vacuous, but it is a guess this command has not been taught to
-  make; check such a member before you rely on it. A `run: |` block of simple commands is joined with
+  files change is drafted as though it always runs — usually over-strict rather
+  than vacuous, but it is a guess this command has not been taught to make, so
+  check such a member before you rely on it. And `merge_group:` is not treated
+  as a merge gate, so a repo whose bar is enforced by a merge queue drafts from
+  its other workflows or falls back to its manifests instead. A `run: |` block of simple commands is joined with
   ` && ` (the step shell is `bash -e`, so that is the same all-must-pass
   meaning); a block with a heredoc, a line continuation, a trailing operator, a
   trailing `#` comment (which would otherwise comment out every member joined

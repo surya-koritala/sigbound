@@ -284,6 +284,13 @@ func TestPolicyInitNonLandingTriggers(t *testing.T) {
 		// unreached.
 		{"branches release-only", "on:\n  push:\n    branches:\n      - 'release/**'\n", "push(not-a-merge-gate)"},
 		{"branches inline release-only", "on:\n  push:\n    branches: [release/**, deploy]\n", "push(not-a-merge-gate)"},
+		// pull_request: branches: filters the PR's BASE branch, which asks the
+		// same question from the other side -- a PR into a release line does not
+		// gate a merge to the default branch either. The note keeps the trigger
+		// it came from, so a refused pull_request does not report itself as a
+		// push.
+		{"pull_request release-only", "on:\n  pull_request:\n    branches:\n      - 'release/**'\n", "pull_request(not-a-merge-gate)"},
+		{"pull_request inline release-only", "on:\n  pull_request:\n    branches: [release/**]\n", "pull_request(not-a-merge-gate)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := initPolicyRepo(t, map[string]string{
@@ -1171,6 +1178,11 @@ func TestPolicyInitOrdinaryPushStillDrafts(t *testing.T) {
 		// Release-only push, but pull_request is unfiltered — the PR trigger is
 		// the merge gate, so the file still counts.
 		"on:\n  push:\n    branches: [release/**]\n  pull_request:\n",
+		// And the converse: a pull_request filtered TO the default branch is the
+		// single most common CI shape after a bare trigger. The guard must not
+		// swallow it.
+		"on:\n  pull_request:\n    branches: [main]\n",
+		"on:\n  pull_request:\n",
 	} {
 		t.Run(strings.ReplaceAll(strings.TrimSpace(on), "\n", "|"), func(t *testing.T) {
 			repo := initPolicyRepo(t, map[string]string{

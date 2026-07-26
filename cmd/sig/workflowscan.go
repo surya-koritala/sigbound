@@ -510,11 +510,13 @@ func workflowTriggers(lines []string, defaultBranch string) (map[string]bool, in
 			t = strings.Trim(t, `"'`)
 			switch {
 			case t == "":
-			case t == "push" && pushIsNotAMergeGate(lines, j, blockIndent, defaultBranch):
-				// Recorded under a DIFFERENT name so the push gate below does not
-				// see it: a release workflow's steps are release steps, and copying
-				// them into a landing bar would gate every merge on publishing.
-				trig["push(not-a-merge-gate)"] = true
+			case (t == "push" || t == "pull_request") && triggerIsNotAMergeGate(lines, j, blockIndent, defaultBranch):
+				// Recorded under a DIFFERENT name so the merge-gate test below does
+				// not see it: a release workflow's steps are release steps, and
+				// copying them into a landing bar would gate every merge on
+				// publishing. The name keeps the trigger it came from, so the note
+				// says pull_request when that is what was refused.
+				trig[t+"(not-a-merge-gate)"] = true
 			default:
 				trig[t] = true
 			}
@@ -524,13 +526,17 @@ func workflowTriggers(lines []string, defaultBranch string) (map[string]bool, in
 	return trig, 0
 }
 
-// pushIsNotAMergeGate reports whether the `push:` trigger whose key is at
-// lines[at] (indented `indent`) fires on something other than a merge to the
-// default branch. Two shapes, one meaning:
+// triggerIsNotAMergeGate reports whether the `push:` or `pull_request:` trigger
+// whose key is at lines[at] (indented `indent`) fires on something other than a
+// merge to the default branch. Two shapes, one meaning:
 //
 //   - tags only. A tag push is a release, not a merge.
 //   - branches that cannot include the default branch (`release/**`, `deploy`).
-//     A push filtered to a release line never fires on a merge either.
+//     A push filtered to a release line never fires on a merge either. For
+//     `pull_request:` the same key filters the PR's BASE branch, which is the
+//     same question asked from the other side: a PR into `release/**` does not
+//     gate a merge to the default branch. The tags leg is simply inert there --
+//     `pull_request:` has no tags key -- so one helper answers for both.
 //
 // These were one guard and one gap. `on: push: tags: ['v*']` was refused while
 // `on: push: branches: [release/**]` -- identical semantics -- was not, so a
@@ -542,7 +548,7 @@ func workflowTriggers(lines []string, defaultBranch string) (map[string]bool, in
 // would be exact; do that if this ever misfires. Over-refusing is the cheap
 // direction here -- a refused workflow falls back to the manifests and drafts a
 // better bar, never a worse one.
-func pushIsNotAMergeGate(lines []string, at, indent int, defaultBranch string) bool {
+func triggerIsNotAMergeGate(lines []string, at, indent int, defaultBranch string) bool {
 	tags, branches := false, false
 	mergeable := false
 	lastKey := "" // the key any following `- ` items belong to
