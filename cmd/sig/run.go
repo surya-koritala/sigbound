@@ -254,6 +254,16 @@ type publishJSON struct {
 // simply this same report persisted, so a `sig replay` fed a -manifest file or
 // a `-json` report has identical fields to work from.
 type runReport struct {
+	// NoteFormat is the version of the PROVENANCE NOTE shape, set only when this
+	// report is being written as a note (attachNote) and omitted everywhere else
+	// — so -json output and the on-disk manifest stay byte-identical to before it
+	// existed. It is first in the struct so it is the first key a reader meets.
+	//
+	// It versions the NOTE, not the product: this number moves on its own
+	// schedule and has nothing to do with the release version. See
+	// docs/USAGE.md's "Note format" section for the compatibility rule and the
+	// field set it covers.
+	NoteFormat int `json:"noteFormat,omitempty"`
 	// RunID is the durable run directory this run's journal lives in
 	// (<git-common-dir>/sigbound/runs/<id>/). Both entry points set it, so it is
 	// also the RUN_ID a `sig ack`/`sig reject` takes — the machine-readable
@@ -2022,6 +2032,10 @@ func runPublish(ctx context.Context, p runParams, rep runReport) publishJSON {
 // (writeManifest). why names what asked for the note, so the warning points at
 // the thing the operator can actually act on rather than always saying -notes.
 func attachNote(ctx context.Context, g *gitx.Git, commit string, rep runReport, why string) {
+	// Stamp the note format HERE, at the one place a report becomes a note, so
+	// the field can never leak into -json output or a manifest (both marshal the
+	// same struct with it left at zero, where omitempty drops it).
+	rep.NoteFormat = noteFormatCurrent
 	data, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: %s: encode report: %v\n", why, err)

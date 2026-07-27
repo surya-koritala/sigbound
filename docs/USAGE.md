@@ -942,6 +942,67 @@ See [`sig replay`](#sig-replay) below for what a `-manifest` file (or a
 `-notes` note, since the shape is identical) is actually *for*: feeding it
 back in to deterministically reproduce the integration it recorded.
 
+### Note format
+
+The note is deliberately the half of the record that **travels**. It rides on the
+commit, survives `gc`, and is readable from a clone that never had the run
+directory — which means anything outside this repository that wants to answer
+*which run landed this commit* has to parse it. So its shape is a promise, not an
+implementation detail.
+
+Every note carries **`noteFormat`**, an integer, as its first key:
+
+```json
+{
+  "noteFormat": 1,
+  "repo": "/path/to/repo",
+  "base": "main",
+  ...
+}
+```
+
+It versions the **note payload only**. It is not the release version and moves on
+its own schedule.
+
+**Stable fields.** These are the ones an outside reader may depend on within a
+format version. Everything else in the payload is internal and may change without
+a bump.
+
+| Field | Meaning |
+| --- | --- |
+| `noteFormat` | This format version. Absent on notes written before v2.2. |
+| `runId` | The run directory this run's journal lives in. Empty for an in-process caller that made no run dir. |
+| `repo` | The cell the run ran against. |
+| `base` | The base branch the landing advanced. |
+| `baseSHA` | The commit the run computed against. |
+| `strategy` | The integration strategy actually applied. |
+| `integrate` | The integration result. `integrate.finalSHA` is the landed commit, `integrate.landed[]` the branches that landed together. |
+| `verify` | The verify verdict, including `ok`, `flaky`, `cached`, and `repaired`. |
+| `park` | Present only for a parked run. `park.landedSHA` is the commit a later `sig ack` landed. |
+| `unlands` | The run id this run took back, for an unland. |
+
+**The compatibility rule:**
+
+- Adding a field does **not** bump `noteFormat`. A reader must ignore fields it
+  does not recognise.
+- Within a version, an existing field never changes meaning.
+- Removing a documented field, or changing what one means, **does** bump it.
+
+**Reading an unknown version.** A note whose `noteFormat` is higher than the
+reading binary understands is **refused, not guessed at**: `sig log -sha` and
+`sig log -release` both ignore it and fall through to the local run ledger, which
+is ground truth. Refusing is silent and non-fatal — an unreadable note never
+crashes a query, and never attributes a landing it cannot actually parse. A note
+with **no** `noteFormat` is read exactly as it is today, so existing repositories
+keep their history.
+
+**A version is a statement about shape, never about authenticity.** A note is
+user-writable and arrives from whatever remote sent the commit. `noteFormat`
+tells a reader how to read the bytes and buys the payload no trust at all: a note
+is still authoritative only if it genuinely concerns the queried commit, and a
+note-sourced answer still names no run and still renders as `(from commit note)`.
+See [`sig log -sha`](#-sha-commit-provenance).
+
 ### Resume
 
 `runAgent` deliberately never cleans up an `agent/<id>` branch — it tears

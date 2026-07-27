@@ -45,7 +45,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -424,8 +423,8 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 				if !ok {
 					continue
 				}
-				var rep runReport
-				if json.Unmarshal([]byte(content), &rep) != nil {
+				rep, ok := parseNote(content)
+				if !ok {
 					continue
 				}
 				// Notes are user-writable and ride in from remotes, so a note is
@@ -442,7 +441,7 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 				// the base as the thing that landed. So an acked landing counts as
 				// unattributed in a release document, exactly as it did before it
 				// had a note at all; `sig log -sha` is where it is attributed.
-				p := matchProvenance(&rep, sha)
+				p := matchProvenance(rep, sha)
 				if p == nil || !p.Landed || p.Role == roleAckLanded {
 					continue
 				}
@@ -471,10 +470,10 @@ func buildRelease(ctx context.Context, g *gitx.Git, runsDir, from, to string, wi
 					}
 					continue
 				}
-				claimedRuns[key] = landedCommitsIn(&rep, inRange)
+				claimedRuns[key] = landedCommitsIn(rep, inRange)
 				delete(unclaimed, sha)
-				cover(&rep, rep.RunID, true)
-				doc.Landings = append(doc.Landings, landingOf(&rep, rep.RunID, "", "note", withCommands))
+				cover(rep, rep.RunID, true)
+				doc.Landings = append(doc.Landings, landingOf(rep, rep.RunID, "", "note", withCommands))
 			}
 		}
 	}
