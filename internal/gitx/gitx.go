@@ -87,9 +87,32 @@ func (g *Git) Init(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// gc.auto=0 keeps background repacks from perturbing benchmark timings.
-	_, err = g.run(ctx, "config", "gc.auto", "0")
-	return err
+	// Disable BOTH of git's automatic background-maintenance mechanisms. They are
+	// separate switches and each is enabled by default:
+	//
+	//   gc.auto          gates `git gc --auto`, which many porcelain commands
+	//                    trigger on their own.
+	//   maintenance.auto gates `git maintenance run --auto`, the newer path,
+	//                    which gc.auto does NOT cover.
+	//
+	// Two reasons, and the second is the one that bites.
+	//
+	// Benchmarks: a background repack lands in the middle of a timed run and the
+	// number means nothing.
+	//
+	// Correctness of teardown: both daemonize and OUTLIVE the command that
+	// triggered them. A process still writing into .git after the foreground
+	// command returned is what turns a passing test red in cleanup — RemoveAll
+	// enumerates .git, deletes the contents, and then rmdir fails with "directory
+	// not empty" because something created a file in between (issue #166).
+	// Nothing here is load-bearing for the engine: a repo sigbound made is one it
+	// maintains explicitly, never in the background.
+	for _, kv := range [][2]string{{"gc.auto", "0"}, {"maintenance.auto", "false"}} {
+		if _, err = g.run(ctx, "config", kv[0], kv[1]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // AddAll stages every change in the working tree (`git add -A`). This scans the
