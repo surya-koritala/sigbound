@@ -375,6 +375,18 @@ func receiptRepo(t *testing.T) (repo, remote string) {
 	// the thing under test instead of inheriting it from a git default.
 	git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
 	git(root, "init", "-q", repo)
+	// These two repos are made by `git init` directly rather than through
+	// gitx.Init, because the fixture needs a bare remote and an explicit HEAD
+	// symref that Init does not offer. They therefore do NOT inherit Init's
+	// background-maintenance switches, and both of git's daemonize and outlive
+	// the command that triggers them — which is how a passing test fails in
+	// t.TempDir cleanup with ".git: directory not empty" (issue #166). Set them
+	// here so every repo this package creates has the same posture, whichever
+	// door made it.
+	for _, dir := range []string{remote, repo} {
+		git(dir, "config", "gc.auto", "0")
+		git(dir, "config", "maintenance.auto", "false")
+	}
 	git(repo, "checkout", "-q", "-B", "main")
 	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("base\n"), 0o644); err != nil {
 		t.Fatal(err)
