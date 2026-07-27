@@ -173,6 +173,7 @@ func (sc *wfScan) scanJob(path, name string, lines []string, s, e int) {
 		return
 	}
 	stepsAt := -1
+	linuxConfirmed := false
 	for i := s; i < e; i++ {
 		if blankOrComment(lines[i]) {
 			continue
@@ -184,48 +185,33 @@ func (sc *wfScan) scanJob(path, name string, lines []string, s, e int) {
 		if !ok || item {
 			continue
 		}
+		// AFFIRMATIVE CONFIRMATION, not enumerated refusal (issue #158). Every key
+		// a job may carry has to be one this scanner has actually reasoned about;
+		// anything else disqualifies the job.
+		//
+		// The old shape was the inverse — draft from every job, then refuse the
+		// constructs known to break it — and it needed four rounds of additions at
+		// four different scopes, each found the same way: a construct nobody had
+		// enumerated produced a live `verify` member that exits 0 on broken code.
+		// That sequence has no end, because it is a list of everything GitHub
+		// Actions will ever add.
+		//
+		// The asymmetry is what makes inverting cheap. A refused workflow falls
+		// through to the Makefile and manifest sources, which draft a real battery
+		// — so OVER-refusing costs a less specific draft, while UNDER-refusing
+		// costs a landing bar that reports green on failing code.
 		switch key {
 		case "runs-on":
-			// The battery is drafted for the machine verify runs on. A job pinned to
-			// a windows- or macos-only runner (or one whose OS cannot be read here)
-			// would contribute members that do not run where verify does, so it is
-			// refused whole. A MISSING runs-on is not a disqualifier (many workflows
-			// rely on the default), so only a present value is judged.
+			// The battery is drafted for the machine verify runs on, so linux must
+			// be CONFIRMED rather than merely not-contradicted. A missing runs-on
+			// used to be accepted on the grounds that many workflows rely on a
+			// default; under inversion that is exactly the unrecognized input this
+			// change exists to stop trusting.
 			if refuse := runsOnRefusal(val); refuse != "" {
 				sc.note("%s:%d job %q %s", path, i+1, name, refuse)
 				return
 			}
-		case "container", "services":
-			sc.note("%s:%d job %q has `%s:` — its steps run against an environment this run does not provide, so the job contributes nothing", path, i+1, name, key)
-			return
-		case "environment":
-			// A deployment environment: the job targets a named environment (often
-			// with required reviewers or secrets), which makes it a deploy step, not
-			// a merge gate. Same reasoning as container:/services: -- this run does
-			// not provide it.
-			sc.note("%s:%d job %q targets the %q environment — a deployment is not a merge gate, so the job contributes nothing", path, i+1, name, strings.Trim(strings.TrimSpace(stripInlineComment(val)), `"'`))
-			return
-		case "env":
-			sc.note("%s:%d job %q sets job-level `env:` — a verify command would not have those variables, so the job contributes nothing", path, i+1, name)
-			return
-		case "defaults":
-			sc.note("%s:%d job %q has `defaults:` — it can redirect the shell or working directory of every step, so the job contributes nothing", path, i+1, name)
-			return
-		case "if":
-			// The step-scope twin of this guard refuses a conditional STEP. A
-			// conditional JOB is strictly broader -- the condition decides whether
-			// any of its steps run at all -- so a schedule-only job in a workflow
-			// that also fires on push would otherwise contribute a bar that gates
-			// nothing in CI. Same reasoning as the tags-only trigger refusal.
-			sc.note("%s:%d job %q is conditional (`if:`) — the whole job may not run, so it contributes nothing", path, i+1, name)
-			return
-		case "continue-on-error":
-			// Also the step-scope twin: a job whose failure does not fail the
-			// workflow is not a gate, so its steps are not a landing bar.
-			if strings.TrimSpace(stripInlineComment(val)) == "true" {
-				sc.note("%s:%d job %q has `continue-on-error: true` — its failure does not fail CI, so it is not a gate and contributes nothing", path, i+1, name)
-				return
-			}
+			linuxConfirmed = true
 		case "strategy":
 			// A matrix runs the SAME step text N times over different values.
 			// Emitting that text once is faithful; a step that interpolates a
@@ -233,9 +219,25 @@ func (sc *wfScan) scanJob(path, name string, lines []string, s, e int) {
 			sc.note("%s:%d job %q has `strategy:` — a matrix leg is not represented; its steps are emitted once", path, i+1, name)
 		case "steps":
 			stepsAt = i
+		case "name", "needs", "timeout-minutes", "permissions", "outputs", "concurrency":
+			// Reasoned about and harmless to a drafted battery: none of them changes
+			// WHETHER the steps run, WHERE they run, or what environment they see.
+			// `needs` only orders jobs — a job that runs after a dependency
+			// succeeded still gates the merge. `permissions` scopes the workflow
+			// token, which a build-and-test command does not use.
+		default:
+			// Includes every key the old deny-list enumerated (container, services,
+			// environment, env, defaults, if, continue-on-error) and, far more
+			// importantly, every key nobody has thought about yet.
+			sc.note("%s:%d job %q has `%s:`, which this scanner has not confirmed is safe for a landing bar — the job contributes nothing", path, i+1, name, key)
+			return
 		}
 	}
 	if stepsAt < 0 {
+		return
+	}
+	if !linuxConfirmed {
+		sc.note("%s job %q does not say `runs-on:` — the runner OS is unconfirmed, and a battery drafted for the wrong machine is a bar that does not run where verify does, so the job contributes nothing", path, name)
 		return
 	}
 	stepsEnd := e
