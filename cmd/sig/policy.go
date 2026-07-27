@@ -54,7 +54,7 @@ type policy struct {
 	// answer for an agent doing requested work and the wrong one for an
 	// automatic fixer nobody asked for. A repo that wants its tests off-limits
 	// to the fixer but still writable by ordinary agents can only say so here.
-	repairDeny []string
+	repairDeny  []string
 	auditSample int // 0..100, or -1 when unset: the spot-audit sampling rate (see auditSelected)
 	ackTimeout  time.Duration
 	// ackTimeoutAction is what an EXPIRED park auto-transitions to (see
