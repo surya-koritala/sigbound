@@ -362,7 +362,7 @@ func unlandRun(ctx context.Context, c *cell.Cell, p unlandParams) (unlandOutcome
 		return out, err
 	}
 
-	dir, runID, err := startRunDir(ctx, g)
+	dir, runID, err := startRunDir(ctx, g, "")
 	if err != nil {
 		return out, err
 	}

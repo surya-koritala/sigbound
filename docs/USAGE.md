@@ -852,9 +852,43 @@ on it instead of parsing stdout:
 | `4` | One or more branches flagged as conflicts (the rest landed). |
 | `5` | No agent succeeded. |
 | `6` | Landed (and verified), but `-publish` failed — see `publish` in the [JSON report](#json-report). |
+| `7` | Interrupted by a signal (`SIGINT`/`SIGTERM`) — see [Signals](#signals). Distinct from `1` on purpose: the orchestrator was told to stop, which is usually worth re-running, rather than the run failing, which usually is not. `-budget` exhaustion is NOT this — that is the run doing what it was configured to do. |
 
 When a run matches more than one of these, the most severe wins, in this
-order: `1` > `3` > `5` > `4` > `6`.
+order: `1` > `3` > `5` > `4` > `6`. A signal outranks all of them: an
+interrupted run reports `7` whatever its partial report would otherwise imply,
+because "we were told to stop" is the true fact about it.
+
+### Signals
+
+`sig run` handles `SIGINT` and `SIGTERM`. Without that a stop would kill the
+process outright and throw away everything the run had already paid for —
+including agent work that had finished — and leave the caller unable to tell an
+interrupted run from a crashed one.
+
+On the first signal it stops cleanly:
+
+- **Running commands are killed, not orphaned.** Every agent, verify, repair and
+  publish child runs under the run's context, so cancelling it terminates them.
+- **The record is written for whatever completed** — the report, the park record
+  if one had already been decided, and `usage.json` for the work that did happen.
+- **The run directory is marked `interrupted`**, the same status the
+  crash-recovery sweep heals a killed run to. The difference is that this run
+  wrote its own record instead of being reconstructed from outside.
+- **Exit code `7`.**
+
+A **second** signal exits immediately. The handler unregisters itself on the
+first one, restoring the default disposition, so a shutdown that is itself stuck
+can never be un-killable.
+
+Two honest limits:
+
+- **`exec.CommandContext` kills the direct child.** An agent command is run
+  through `sh -c`, so a fixer that spawns its own background children may leave
+  them behind. Sigbound does not create a process group for them.
+- **Windows gets `Ctrl-C` and nothing else.** `os.Interrupt` is the portable
+  half. `SIGTERM` is accepted but never delivered there, so a Windows service
+  stop is not covered. `SIGKILL` cannot be handled on any platform.
 
 With `-verify-bisect`, a run that lands a nonempty green subset counts as
 "landed and verified" and exits `0` — the dropped groups appear in the report
@@ -4019,7 +4053,7 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 
 | Event | Fields | When |
 |-------|--------|------|
-| `run_start` | `repo`, `base`, `baseSHA`, `tasks`, `parallelAgents` | Once, right after the base ref resolves. `parallelAgents` is the RESOLVED fan-out cap actually applied (see [Parallelism](#parallelism)) — `-parallel-agents`'s own value when set, else the `GOMAXPROCS`-derived default; always a concrete number here even when `-parallel-agents` wasn't passed. |
+| `run_start` | `runId`, `repo`, `base`, `baseSHA`, `tasks`, `parallelAgents` | Once, right after the base ref resolves. `parallelAgents` is the RESOLVED fan-out cap actually applied (see [Parallelism](#parallelism)) — `-parallel-agents`'s own value when set, else the `GOMAXPROCS`-derived default; always a concrete number here even when `-parallel-agents` wasn't passed. `runId` is this run's id — the one `-run-id` set, or the generated one — so a caller streaming this file sees its own handle in line one. |
 | `agent_start` | `id`, `branch` | Once per task, right before that agent's worktree/command starts. |
 | `agent_done` | `id`, `ok`, `exit`, `attempts`, `files`, `inLane`, `setupMs`, `wallMs`, `resumed`* | Once per task, after all of that task's attempts (including `-agent-retries`) finish. `setupMs` is that task's worktree-setup wall (the locked `--no-checkout` add plus its parallel `reset --hard` populate) for the attempt that ended the loop. *`resumed` is present (`true`) only for a task `-resume` reused outright — see [Resume](#resume) — with `wallMs=0`/`setupMs=0` since no agent command ran and no worktree was set up; absent for every ordinary task. |
 | `worktree_setup` | `count`, `totalMs`, `maxMs` | Once, right after the agent fan-out finishes. The run-level rollup of per-agent worktree setup — `count` worktrees set up, `totalMs` the summed setup work, `maxMs` the single long pole — so the setup phase's cost is visible at any scale without a per-agent line. Only fresh (non-`-resume`) agents are counted; omitted when every task was resumed. |
