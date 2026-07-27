@@ -270,44 +270,56 @@ func blastRadius(ctx context.Context, g *gitx.Git, runsDir, targetID string, wri
 		if rerr != nil {
 			continue
 		}
-		base, final := rep.BaseSHA, rep.Integrate.FinalSHA
-		if !landed(rep) {
-			// An ACK released this landing: its SHA lives in park.json, not the
-			// report's integrate block — the same asymmetry notLandedReason reads
-			// for the target run. Without this, an acked landing that overwrote a
-			// shared path is invisible to the scan, and the block message would tell
-			// the operator to "unland those runs first" while naming none.
-			//
-			// ackedLandedSHA is the ONE definition of "did this ack actually land"
-			// (shared with landed/readLogRow/foldMetrics): it gates on the run
-			// status as well as resolvedAt, so a park whose landRef failed for any
-			// reason other than ErrRefMoved is never counted. The park is then read
-			// for its baseSHA — the fork point this landing's contribution is
-			// measured from, which the SHA alone does not carry.
-			sha := ackedLandedSHA(dir)
-			if sha == "" {
+		// ONE RUN CAN CONTRIBUTE MORE THAN ONE LANDING (issue #164), and the two
+		// are recorded in different places. The report's integrate block carries
+		// what the run landed on its own; an ACK-released landing's SHA lives in
+		// park.json instead — the same asymmetry notLandedReason reads for the
+		// target run — because the report was written before the ack existed.
+		//
+		// A multi-task run under ack-paths produces BOTH: its clean groups land
+		// immediately, so landed(rep) is already true, and the gated group parks.
+		// When a human later acks that park the run has landed twice, from two
+		// different fork points. Reading the park only when the report shows
+		// nothing landed sees the first contribution and never the second, and the
+		// block message then tells the operator to "unland those runs first" while
+		// naming none of them.
+		//
+		// ackedLandedSHA is the ONE definition of "did this ack actually land"
+		// (shared with landed/readLogRow/foldMetrics): it gates on the run status
+		// as well as resolvedAt, so a park whose landRef failed for any reason
+		// other than ErrRefMoved is never counted. The park is then read for its
+		// baseSHA — the fork point that contribution is measured from, which the
+		// SHA alone does not carry.
+		type landing struct{ base, final string }
+		var landings []landing
+		if landed(rep) {
+			landings = append(landings, landing{rep.BaseSHA, rep.Integrate.FinalSHA})
+		}
+		if sha := ackedLandedSHA(dir); sha != "" {
+			if pk, perr := readPark(dir); perr == nil {
+				landings = append(landings, landing{pk.BaseSHA, sha})
+			}
+		}
+		// One entry PER LANDING, not per run: each names the commit it is about,
+		// and a run that landed twice has two commits an operator may need to look
+		// at. The display concern — a run id appearing twice in "unland these
+		// first" — is deduplicated by entangledIDs, where it belongs.
+		for _, l := range landings {
+			paths, derr := g.DiffNameOnly(ctx, l.base, l.final)
+			if derr != nil {
 				continue
 			}
-			pk, perr := readPark(dir)
-			if perr != nil {
+			if !ws.Overlaps(cell.NewWriteSet(paths...)) {
 				continue
 			}
-			base, final = pk.BaseSHA, sha
-		}
-		paths, derr := g.DiffNameOnly(ctx, base, final)
-		if derr != nil {
-			continue
-		}
-		if !ws.Overlaps(cell.NewWriteSet(paths...)) {
-			continue
-		}
-		shared := make([]string, 0, 1)
-		for _, p := range paths {
-			if ws.Contains(p) {
-				shared = append(shared, p)
+			shared := make([]string, 0, 1)
+			for _, p := range paths {
+				if ws.Contains(p) {
+					shared = append(shared, p)
+				}
 			}
+			out = append(out, entangledRun{RunID: id, StartedAt: rep.StartedAt, FinalSHA: l.final, Paths: shared})
 		}
-		out = append(out, entangledRun{RunID: id, StartedAt: rep.StartedAt, FinalSHA: final, Paths: shared})
 	}
 	return out, truncated, nil
 }
@@ -553,9 +565,19 @@ func blockedMessage(target string, plan *unlandPlan, flagged []flaggedJSON, v ve
 	}
 }
 
+// entangledIDs is the run-id list the inbox and the block message render.
+// DEDUPLICATED, in first-seen order: blastRadius emits one entry per LANDING and
+// a single run can have contributed two (issue #164), but "unland run X, then
+// unland run X" is not an instruction anyone can follow — unlanding a run takes
+// back everything it contributed, once.
 func entangledIDs(ent []entangledRun) []string {
 	out := make([]string, 0, len(ent))
+	seen := make(map[string]bool, len(ent))
 	for _, e := range ent {
+		if seen[e.RunID] {
+			continue
+		}
+		seen[e.RunID] = true
 		out = append(out, e.RunID)
 	}
 	return out
