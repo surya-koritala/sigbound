@@ -363,6 +363,52 @@ func fillRowFromReport(row *logRow, rep *runReport) {
 	row.Unlands = rep.Unlands
 }
 
+// noteFormatCurrent is the version stamped into every note this binary writes
+// (runReport.NoteFormat, set in attachNote). It versions the NOTE PAYLOAD and
+// nothing else — it is not tied to the release version and moves on its own
+// schedule.
+//
+// The compatibility rule, also stated in docs/USAGE.md so an outside reader can
+// rely on it: ADDING a field does not bump this, and existing fields do not
+// change meaning within a version. Anything that would make a reader written
+// against version N wrong — removing a documented field, or changing what one
+// means — bumps it.
+const noteFormatCurrent = 1
+
+// parseNote decodes one note payload, and is the single gate BOTH note readers
+// go through (resolveProvenance here, and the release-notes reader in
+// release.go) so a version bump is one edit rather than two that can drift.
+//
+// Three cases, and the middle one is the reason this exists:
+//
+//   - Unparseable: not a note this binary can use. Not authoritative.
+//   - noteFormat ABSENT (zero): a note written before the format carried a
+//     version. Its shape is exactly the one this binary already reads, so it
+//     stays readable. Existing repositories must not lose their history because
+//     a version stamp arrived late.
+//   - noteFormat GREATER than this binary knows: written by a newer sigbound,
+//     in a shape whose fields may no longer mean what this binary thinks. It is
+//     refused rather than guessed at — the caller falls through to the local
+//     manifest ledger, which is ground truth. Refusing is deliberately silent
+//     and non-fatal: an unreadable note must never crash a provenance query, and
+//     must never attribute a landing it cannot actually parse.
+//
+// This is a statement about SHAPE, never about authenticity. A note is
+// user-writable and rides in from untrusted remotes; a version field is a hint
+// about how to read the bytes and buys the payload no trust whatsoever. The
+// caller still has to prove the note concerns the queried commit
+// (matchProvenance), exactly as before.
+func parseNote(content string) (*runReport, bool) {
+	var rep runReport
+	if json.Unmarshal([]byte(content), &rep) != nil {
+		return nil, false
+	}
+	if rep.NoteFormat > noteFormatCurrent {
+		return nil, false
+	}
+	return &rep, true
+}
+
 // resolveProvenance answers -sha for one commit against one cell. Notes first:
 // a landing note is the whole report keyed by the landed commit and rides with
 // that commit to any clone, so this answers even when the local ledger has no
@@ -381,9 +427,8 @@ func fillRowFromReport(row *logRow, rep *runReport) {
 // manifest ledger, which is ground truth.
 func resolveProvenance(ctx context.Context, g *gitx.Git, runsDir, sha string) (*provenance, bool) {
 	if content, ok, _ := g.NoteShow(ctx, "sigbound", sha); ok {
-		var rep runReport
-		if json.Unmarshal([]byte(content), &rep) == nil {
-			if p := matchProvenance(&rep, sha); p != nil {
+		if rep, ok := parseNote(content); ok {
+			if p := matchProvenance(rep, sha); p != nil {
 				// A note-sourced answer NAMES NO RUN. RunID is the local ledger's dir
 				// name (filled in by the walk below), and its emptiness is the signal
 				// every renderer keys "(from commit note)" on. Cleared HERE, once, at
