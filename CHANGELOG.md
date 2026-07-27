@@ -8,6 +8,248 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-07-27
+
+The trustworthiness milestone. 2.1 made the loop something you could point at a
+codebase and leave running; 2.2 is about whether you can believe what it tells
+you afterwards.
+
+The headline is a hole in the middle of this product's central claim. `-repair`
+could edit the tests that had just failed it, and whatever made the tree green
+landed carrying a green verify. That is fixed, and the rest of the release is
+the same theme from other angles: a landing's evidence now travels with it
+atomically instead of being left behind, the note that carries that evidence is
+versioned so a reader can tell what it is looking at, an interrupted run leaves a
+record instead of vanishing, an ack can say who approved it, and the rules a
+landing is judged by are published as a library so a second implementation of
+them can never disagree with the first.
+
+Nothing about what lands changed. The verify gate still decides, the tree that
+lands is still byte-for-byte the tree that passed, and every path that moves a
+ref still does it with a compare-and-swap.
+
+### Fixed
+
+- **The `-repair` fixer can no longer edit what judged it.** This is the one
+  place the product's central claim was false. The fixer is the only agent in a
+  run with no brief — it is handed a failure and rewarded for making it stop,
+  which makes weakening whatever judged it the shortest path from red to green —
+  and nothing stopped it. Lane enforcement runs on the agent path only, and the
+  landing holdback is decided from the **agents'** write-sets before the fixer
+  has run at all, so the fixer was the single code path that walked straight
+  through the ack bar. A fixer that deleted a failing assertion had its edit
+  auto-committed, re-verified against a suite with nothing left in it, and landed.
+
+  The fixer's write-set is now checked before its commit is handed back, and a
+  match **refuses** the attempt: the commit stays in the throwaway worktree and is
+  never referenced, the base does not move, and the repair loop stops — a fixer
+  that reached for the bar will reach for it again. Four rules, most to least
+  specific: `sigbound.policy` itself, the new `repair-deny` globs, the repo's
+  existing `ack-paths`, and an unreadable diff (the write-set is the only thing
+  the rules can reason about, so an unknowable one fails closed). The refusal is
+  recorded on the attempt as `refused` / `refusedPaths` and emitted as
+  `repair_refused`.
+
+  Two asymmetries with the landing rules are deliberate. `sigbound.policy` is
+  barred **unconditionally**, including creating one where none existed and
+  including repos with no policy at all — a landing may create a first policy
+  because that can only raise the bar, but a fixer writing a governance file is
+  not fixing a verify failure under any reading. And an `ack-paths` match is
+  **refused, not parked**: a park exists to put work in front of a person, and a
+  repair is work nobody asked for, so there is nothing to hold.
+
+- **A landing pushed to a remote now arrives with its evidence.** The provenance
+  note was not pushed at all, and `-notes` ran *after* `-publish`, so at push time
+  there was no note to send. That mattered more than it sounds: "did this run
+  already land?" is answered by fetching the base and looking for that run's note,
+  so a caller recovering from an interrupted run read *no*, re-ran work that had
+  already landed, and paid for it twice — reachable through a plain network
+  failure. The order is reversed and the receipt presets now push the branch and
+  `refs/notes/sigbound` in one `git push --atomic` transaction: either both refs
+  move or neither does. The notes ref is included only when one exists locally,
+  `--porcelain` makes the per-ref outcome machine-readable so a refusal names
+  *which* ref was refused, and a server without `--atomic` support fails loudly
+  rather than degrading into two pushes and silently reopening the window. What
+  the note gives up is the publish outcome, which was never its job — whether we
+  reached a remote is a fact about the machine and stays in the run report.
+
+- **`sig unland`'s entanglement scan sees both landings of a run that landed and
+  parked.** A multi-task run under `ack-paths` lands its clean groups immediately
+  and parks the gated one; acking that park makes the run contribute a *second*
+  landing from a different fork point. The scan consulted the parking record only
+  when the report showed nothing landed, so it saw the first and never the second.
+  Safety was never at risk — the conflict gate refused either way — but the
+  operator was told to "unland those runs first" while the list named none of
+  them. Landings are now collected rather than chosen between, one entry per
+  landing, with the run id deduplicated where it is displayed.
+
+- **A CI flake that turned passing tests red in cleanup.** `t.TempDir` removal
+  failed with `.git: directory not empty` — something creating a file inside
+  `.git` after the foreground git command returned. The suspect was auto-gc, and
+  it was not: repos made through `gitx.Init` have had `gc.auto=0` since it was
+  written. The unhandled mechanism was **`maintenance.auto`**, a separate switch,
+  enabled by default, gating `git maintenance run --auto`, which `gc.auto` does
+  nothing about and which daemonizes the same way. Both are now set on every repo
+  sigbound makes. **Honest limit:** this eliminates a mechanism, it does not prove
+  the flake gone — it appeared in one of two runs on an identical commit and
+  cannot be reproduced on demand, so nothing here can assert its absence.
+
+### Added
+
+- **`sig run -run-id ID` — the caller names the run.** `sig run` minted its own
+  id, so anything queueing work had to start the run and *then* discover what it
+  chose; a run that died before printing left no id at all and no way to find the
+  directory it had already made. `-run-id` sets the **existing** id — the run
+  directory, the events, the report, and the handle `sig ack` / `sig reject` /
+  `sig log` take — rather than adding a second identity the ledger would carry
+  alongside. The id becomes both a path component and a git branch component, so
+  both are checked, and checked *above* the `-logdir` / `-manifest` preflights,
+  because those create directories and the promise is "before any directory is
+  created". Reusing an existing id is refused rather than merged into. The
+  `run_start` event now carries `runId`, so a caller streaming `-events` sees its
+  own handle in line one.
+
+- **`sig run` handles `SIGINT` and `SIGTERM`, and exits `7` when interrupted.**
+  There was no handler at all: a stop killed the process outright and the run lost
+  everything it had already paid for — no report, no park record, no usage — and
+  the caller could not tell an interrupted run from a crashed one. Cancelling the
+  run's context does the work, since every agent, verify, repair and publish child
+  runs under it, so they are killed rather than orphaned and the existing error
+  path salvages the partial record. The run directory is marked `interrupted`, the
+  same status the crash-recovery sweep heals a killed run to; the difference is
+  that this run wrote its own record instead of being reconstructed from outside.
+  A **second** signal exits immediately — the handler unregisters itself on the
+  first, so a stuck shutdown can never be un-killable.
+
+  The classification runs on **both** paths out of the driver, which is the part
+  worth knowing: cancelling kills the agents, and a run whose every agent was
+  killed completes perfectly normally and would otherwise exit "no agent
+  succeeded" — a code that is a lie about what happened. It is asked of the
+  *signal* context specifically, never a phase's own, so `-budget` exhaustion and
+  `-agent-timeout` keep their own codes. Two limits stated rather than left to be
+  discovered: an agent's own background children are not put in a process group,
+  and Windows gets `Ctrl-C` only — `SIGTERM` is accepted there but never
+  delivered, and `SIGKILL` cannot be handled anywhere.
+
+- **`sig ack -by WHO` / `sig reject -by WHO` — who approved this landing.**
+  Parking exists because some changes need a person to decide, and the ledger
+  could not say which person. Anything driving `sig` from outside knows the
+  identity and had nowhere to put it; an approval recorded only in that system
+  does not travel with the commit and cannot be checked from a clone. `-by` is
+  written into the parking record and, through the record the ack note carries,
+  onto the released commit — so `sig log -sha <commit>` answers from a clone that
+  has only `refs/notes/sigbound` and no run directory. Also accepted on both HTTP
+  verbs as `{"by": "…"}`.
+
+  **It is not authentication.** Sigbound has no user model and is not getting one:
+  the string is opaque, uninterpreted, and trusted exactly as far as whoever
+  passed it — a daemon's token says a caller *may* act, never *who they are*. A
+  value read back from a note is a claim, so it renders as "recorded as approved
+  by" and rides inside the ledger-versus-note marking every other provenance
+  answer carries. Sanitized once on the way in: control bytes dropped (a newline
+  in a note is how a payload forges structure around itself) and the length
+  bounded, with dropping before the bound so an all-newline value cannot fill the
+  budget and push real characters out.
+
+- **`repair-deny` policy key.** Globs the `-repair` fixer may never write —
+  typically a repo's tests and CI config. A separate key from `ack-paths` because
+  the two answer different questions: `ack-paths` says *a human must approve this
+  change*, which is right for an agent doing requested work and wrong for an
+  automatic fixer. A repo that wants its tests off-limits to the fixer while
+  ordinary agents keep writing them can only say so here.
+
+- **`noteFormat` — the provenance note is versioned, and its stable fields are
+  documented.** The note is deliberately the half of the record that travels: it
+  rides on the commit, survives `gc`, and is readable from a clone that never had
+  the run directory. Anything outside this repository answering "which run landed
+  this commit" has to parse it — and it was a struct that could change shape in
+  any release, with no way to tell which shape you were looking at, so a reader
+  written against it silently got worse answers after a change instead of failing
+  loudly.
+
+  Every note now carries `noteFormat` as its first key, `docs/USAGE.md` documents
+  the stable field set and the compatibility rule (adding a field does not bump
+  it; removing one or changing what one means does), and a note from a **newer**
+  sigbound is **refused rather than guessed at** — the reader falls through to the
+  local run ledger, silently and non-fatally. A note with **no** version reads
+  exactly as before, so existing repositories keep their history. The version
+  belongs to the note, not the product, and never appears in `-json` output or the
+  on-disk manifest. It is a statement about **shape, never authenticity**: a note
+  is user-writable, and `noteFormat` buys its payload no trust at all.
+
+- **`pkg/policy` and `pkg/attest` — the rules, as an importable library.** The
+  landing rules lived in `package main`, which no other module can import, so
+  anything enforcing the same bar elsewhere had to reimplement them — and two
+  implementations of a gate eventually disagree about the same bytes. `pkg/policy`
+  owns the `sigbound.policy` type, parser and evaluators (`HoldReason`,
+  `RepairRefusal`, `GlobMatch`); `pkg/attest` reads the provenance note (`Parse`,
+  `Landed`, `LandedSHA`, `Concerns`).
+
+  **Neither does any I/O** — no file read, no git, no subprocess, no network — so
+  a caller holding only the bytes of a push can use them. `cmd/sig` consumes them
+  rather than keeping a copy: its `policy` type is an alias, its helpers are
+  re-exports, and the note version gate *is* `pkg/attest`'s, so the whole engine
+  suite exercises the published library on every run.
+
+  `pkg/attest` exposes only the documented stable fields, and carries the two
+  things a caller gets wrong on its own. `Landed()` exists because
+  `integrate.finalSHA` is populated with the integrated tree **even when verify
+  went red** and nothing reached the base ref — reading it and concluding "landed"
+  accepts a tree that failed — and because an ack-released landing lives in
+  `park.landedSHA`, since the report predates the ack. `Concerns(sha)` exists
+  because a note is user-writable and arrives with the commit: parsing says what
+  the bytes *say*, and a note lifted onto an unrelated commit parses perfectly and
+  concerns nothing.
+
+  Still zero dependencies; `go.sum` stays empty.
+
+### Changed
+
+- **`sig policy init` drafts only from a job it can affirmatively confirm gates a
+  merge.** It used to draft from every workflow job and then refuse the constructs
+  known to break one — a default that needed four rounds of additions at four
+  different scopes, each found the same way: a construct nobody had enumerated
+  produced a live `verify` member that exits 0 on broken code. The enumeration was
+  the problem, because a deny-list of things that break a landing bar is a list of
+  everything GitHub Actions will ever add.
+
+  Job scope is now an allow-list: every key a job carries must be one the scanner
+  has reasoned about, and anything else refuses the job and is noted by name. That
+  covers `container`, `services`, `environment`, `env`, `defaults`, `if` and
+  `continue-on-error` — the four rounds' worth — and every key nobody has thought
+  about yet. `runs-on` became an affirmative requirement rather than a
+  not-contradicted one; a missing value used to be accepted on the grounds that
+  workflows rely on a default, and that is precisely the unrecognized input this
+  stops trusting, since the battery is drafted *for* the machine verify runs on.
+  It costs nothing real — Actions requires `runs-on` for every job.
+
+  The asymmetry is what makes over-refusing cheap: a refused workflow falls
+  through to the Makefile and manifest sources, which draft a real battery. Over-
+  refusing costs a less specific draft; under-refusing costs a landing bar that
+  reports green on failing code. **Scope:** trigger-level checks are still a
+  deny-list — job scope is where all four rounds of churn happened.
+
+- **`-notes` now runs before `-publish`.** A consequence of the atomic-push fix
+  above: the note no longer records the publish outcome, because it has not
+  happened yet. That outcome is still in the run report (`publish`).
+
+- **`refs/notes/sigbound` should be pushed with `--atomic`, not separately.**
+  `docs/USAGE.md`'s guidance changed from `git push origin refs/notes/sigbound` to
+  `git push --atomic origin main refs/notes/sigbound`, with the token-permission
+  trap named: one that can move branches but not `refs/notes/*` now fails the
+  whole publish rather than landing a branch without its evidence.
+
+### Internal
+
+- **`ackedLandedSHA`'s two guards are now pinned by tests.** Either could be
+  deleted with the whole suite staying green. The status gate is the one that
+  matters: both ack paths write `resolvedAt` and `landedSHA` *before* moving the
+  ref and only a moved-base refusal rewinds them, so every other landing failure —
+  a stale `refs/heads/X.lock`, a rejecting `reference-transaction` hook, ENOSPC —
+  leaves a record claiming a landing that never happened. The helper has four
+  consumers, and in the entanglement scan that false positive names an innocent
+  run as blocking a revert.
+
 ## [2.1.0] - 2026-07-26
 
 The agent-operation milestone. 2.0 gave a repository a landing bar and a way to
@@ -593,7 +835,8 @@ Initial public release.
 - **`sig version`** — reports the version, and the git commit and build date
   when built from a checkout.
 
-[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/surya-koritala/sigbound/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/surya-koritala/sigbound/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/surya-koritala/sigbound/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/surya-koritala/sigbound/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/surya-koritala/sigbound/compare/v1.0.0...v1.1.0
