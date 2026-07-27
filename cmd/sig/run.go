@@ -220,6 +220,23 @@ type repairAttemptJSON struct {
 	N            int      `json:"n"`
 	FilesTouched []string `json:"filesTouched"`
 	VerifyOK     bool     `json:"verifyOk"`
+	// Refused/RefusedPaths are set when the fixer's edits were declined on
+	// their write-set alone and never verified (see repairRefusalReason):
+	// Refused is the machine-readable rule that fired, RefusedPaths the sorted
+	// paths that triggered it. Both empty on an attempt allowed to proceed, so
+	// a run whose repairs were all allowed serializes exactly as before.
+	Refused      string   `json:"refused,omitempty"`
+	RefusedPaths []string `json:"refusedPaths,omitempty"`
+}
+
+// repairRefusal is runRepair's answer when the fixer wrote something it may
+// not write. Kind is the machine-readable rule (repairRefused*), Reason its
+// human wording, Paths the sorted files that triggered it (empty when the rule
+// is not path-driven).
+type repairRefusal struct {
+	Kind   string
+	Reason string
+	Paths  []string
 }
 
 // publishJSON records the outcome of the -publish command (see runPublish).
@@ -1823,7 +1840,7 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	// the head via a repair; FinalSHA reports whatever we computed either way.
 	landSHA := res.FinalSHA
 	if strings.TrimSpace(p.VerifyCmd) != "" {
-		rep.Verify, landSHA = verifyWithRepair(ctx, g, p, res.FinalSHA, changedFiles, emit)
+		rep.Verify, landSHA = verifyWithRepair(ctx, g, pol, p, res.FinalSHA, changedFiles, emit)
 		rep.Integrate.FinalSHA = landSHA
 		if !rep.Verify.OK {
 			// A -budget expiry can kill -verify mid-run (its command context is a
@@ -2090,7 +2107,7 @@ func budgetAwareErr(p runParams, ctx context.Context, op string, err error) erro
 // non-Go file falls back to full just like any other doubt) — a repair
 // changes the tree, so re-deciding scope from scratch, not memoizing the
 // first decision, is what keeps the fallback honest.
-func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string, changedFiles []string, emit *eventEmitter) (verifyJSON, string) {
+func verifyWithRepair(ctx context.Context, g *gitx.Git, pol policy, p runParams, head string, changedFiles []string, emit *eventEmitter) (verifyJSON, string) {
 	dir, err := os.MkdirTemp("", "sig-verify-*")
 	if err != nil {
 		return verifyJSON{Ran: true, OK: false, Output: err.Error()}, head
@@ -2128,9 +2145,23 @@ func verifyWithRepair(ctx context.Context, g *gitx.Git, p runParams, head string
 	for attempt := 1; attempt <= p.RepairMax; attempt++ {
 		emit.emit("repair_start", map[string]any{"attempt": attempt})
 		rStart := time.Now()
-		newHead, touched, rerr := runRepair(ctx, g, p, head, lastOutput, attempt)
+		newHead, touched, refusal, rerr := runRepair(ctx, g, pol, p, head, lastOutput, attempt)
 		repairWallMs := time.Since(rStart).Milliseconds()
 		rec := repairAttemptJSON{N: attempt, FilesTouched: touched, VerifyOK: false}
+		if refusal != nil {
+			// The fixer wrote something it may not write. Its commit is discarded
+			// with the throwaway worktree, head does not move, and the loop stops:
+			// a fixer that reached for the bar will reach for it again, so further
+			// attempts only burn budget. The refusal rides into the verify output
+			// so the run's failure explains itself without needing the JSON.
+			rec.Refused, rec.RefusedPaths = refusal.Kind, refusal.Paths
+			lastOutput = tail(lastOutput+"\n[repair attempt "+fmt.Sprintf("%d", attempt)+" refused] "+refusal.Reason, 2000)
+			repairs = append(repairs, rec)
+			emit.emit("repair_refused", map[string]any{
+				"attempt": attempt, "rule": refusal.Kind, "paths": refusal.Paths, "wallMs": repairWallMs,
+			})
+			break
+		}
 		if rerr != nil || newHead == head {
 			// Fixer failed to spawn/commit, or produced no change: record the
 			// dead attempt and stop — re-verifying an unchanged tree is pointless.
@@ -2648,16 +2679,25 @@ func runVerifyRetry(ctx context.Context, g *gitx.Git, wtPath string, p runParams
 // files that commit touched vs. head. The main working tree is never touched.
 // attempt is this repair round's 1-based number (see verifyWithRepair's loop),
 // used only to name the -logdir log file (repair-<attempt>.log).
-func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure string, attempt int) (string, []string, error) {
+//
+// The fixer's write-set is checked against the repo's policy BEFORE the commit
+// is handed back (repairRefusalReason). On a refusal the returned head is the
+// UNCHANGED input head — the fixer's commit exists only in the throwaway
+// worktree, which this function removes, leaving it unreferenced and eligible
+// for gc — and refusal explains which rule fired. This is the enforcement an
+// ordinary agent gets from applyLaneEnforcement and policyHoldback, neither of
+// which is on this path: repair runs AFTER the holdback decision, from a
+// worktree no lane was ever computed for.
+func runRepair(ctx context.Context, g *gitx.Git, pol policy, p runParams, head, failure string, attempt int) (newHead string, touched []string, refusal *repairRefusal, err error) {
 	dir, err := os.MkdirTemp("", "sig-repair-*")
 	if err != nil {
-		return head, nil, err
+		return head, nil, nil, err
 	}
 	defer os.RemoveAll(dir)
 
 	wtPath := filepath.Join(dir, "wt")
 	if err := g.WorktreeAddDetached(ctx, wtPath, head); err != nil {
-		return head, nil, fmt.Errorf("repair worktree at %s: %w", short(head), err)
+		return head, nil, nil, fmt.Errorf("repair worktree at %s: %w", short(head), err)
 	}
 	defer func() { _ = g.WorktreeRemove(ctx, wtPath) }()
 
@@ -2685,13 +2725,13 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 		cmd.Stderr = io.MultiWriter(&errBuf, blog)
 	}
 	if runErr := cmd.Run(); runErr != nil {
-		return head, nil, fmt.Errorf("repair command: %w: %s", runErr, tail(errBuf.String(), 400))
+		return head, nil, nil, fmt.Errorf("repair command: %w: %s", runErr, tail(errBuf.String(), 400))
 	}
 
 	wt := g.At(wtPath)
 	newHead, herr := wt.HeadSHA(ctx)
 	if herr != nil {
-		return head, nil, herr
+		return head, nil, nil, herr
 	}
 	// Auto-commit the fixer's edits: a bring-your-own fixer that only edits (no
 	// git) leaves work uncommitted, so the head never advances. If it committed
@@ -2700,19 +2740,28 @@ func runRepair(ctx context.Context, g *gitx.Git, p runParams, head, failure stri
 		if dirty, derr := wt.HasUncommittedChanges(ctx); derr == nil && dirty {
 			sha, cerr := wt.CommitAll(ctx, "repair: fix verify failure")
 			if cerr != nil {
-				return head, nil, fmt.Errorf("repair commit: %w", cerr)
+				return head, nil, nil, fmt.Errorf("repair commit: %w", cerr)
 			}
 			newHead = sha
 		}
 	}
 	if newHead == head {
-		return head, nil, nil // fixer made no change
+		return head, nil, nil, nil // fixer made no change
 	}
 	files, ferr := g.DiffNameOnly(ctx, head, newHead)
 	if ferr != nil {
-		files = nil
+		// The write-set is the only thing the refusal check can reason about, so
+		// failing to compute it is not a reason to wave the repair through. Treat
+		// an unreadable diff as a refusal: fail closed, name the cause.
+		return head, nil, &repairRefusal{
+			Kind:   repairRefusedUnknownWriteSet,
+			Reason: "repair write-set unreadable, refusing: " + ferr.Error(),
+		}, nil
 	}
-	return newHead, files, nil
+	if kind, reason, refused := repairRefusalReason(files, pol); kind != "" {
+		return head, files, &repairRefusal{Kind: kind, Reason: reason, Paths: refused}, nil
+	}
+	return newHead, files, nil, nil
 }
 
 // runAgentWithRetries wraps runAgent with -agent-retries: on a FAILED attempt
