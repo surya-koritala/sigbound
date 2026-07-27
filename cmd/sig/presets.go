@@ -232,7 +232,32 @@ func receiptPublish(preset, tool, install, pr, token, create, comment string) st
 		`sb_target=$(git ls-remote --symref "$sb_remote" HEAD | awk '$1=="ref:" && $3=="HEAD"{sub("refs/heads/","",$2); print $2; exit}'); `+
 		`[ -n "$sb_target" ] || { echo "sigbound -publish-preset=%[1]s: cannot read the default branch of remote $sb_remote (git ls-remote failed; set SIGBOUND_REMOTE if the remote is not named origin)`+receiptStands+`" >&2; exit 1; }; `+
 		`[ "$sb_target" != "$SIGBOUND_BASE_BRANCH" ] || { echo "sigbound -publish-preset=%[1]s: -base $SIGBOUND_BASE_BRANCH IS the default branch of remote $sb_remote, and a %[4]s cannot be opened from a branch onto itself -- re-run with -base on an integration branch, or drop the preset and publish with -publish 'git push $sb_remote $SIGBOUND_BASE_BRANCH'`+receiptStands+`" >&2; exit 1; }; `+
-		`git push "$sb_remote" "$SIGBOUND_BASE_BRANCH" && { %[6]s || { echo "sigbound -publish-preset=%[1]s: could not open a new %[4]s (usually because one is already open for $SIGBOUND_BASE_BRANCH); posting this run's receipt on the existing one instead" >&2; %[7]s; }; }`,
+		// The branch and its provenance note go in ONE --atomic transaction, so
+		// the remote ends up with the landing AND its evidence, or with neither.
+		// Pushing them separately leaves a window where the branch has moved and
+		// the note has not — and "did this run already land?" is answered by
+		// fetching the base and looking for that run's note, so a caller
+		// recovering from an interrupted run reads "no" and re-runs work that
+		// already landed, paying for it twice. A plain network failure between two
+		// pushes is enough to reach it.
+		//
+		// The notes ref is only included when it exists locally: -notes can be off,
+		// and naming a missing ref would fail every publish for a repo that never
+		// wrote one. --porcelain makes the failure machine-readable — git prints
+		// one status line per ref, so "which ref was refused" is read off git's own
+		// output rather than guessed at from prose. That matters for the trap this
+		// creates: a token allowed to move the branch but not refs/notes/* turns a
+		// working landing into a failing publish, and the error has to say which
+		// ref it was.
+		//
+		// --atomic needs support on BOTH ends. An ancient server that lacks it
+		// fails loudly here rather than silently degrading into two pushes and
+		// reintroducing the window the flag exists to close.
+		`sb_refs="$SIGBOUND_BASE_BRANCH"; `+
+		`git show-ref --verify --quiet refs/notes/sigbound && sb_refs="$sb_refs refs/notes/sigbound"; `+
+		`git push --atomic --porcelain "$sb_remote" $sb_refs || { echo "sigbound -publish-preset=%[1]s: atomic push of [$sb_refs] to $sb_remote failed -- NOTHING was pushed (--atomic moves every ref or none). `+
+		`A rejected refs/notes/sigbound usually means the token can write branches but not refs/notes/*; a rejected branch usually means it moved underneath this run, so re-run against the new head`+receiptStands+`" >&2; exit 1; }; `+
+		`{ %[6]s || { echo "sigbound -publish-preset=%[1]s: could not open a new %[4]s (usually because one is already open for $SIGBOUND_BASE_BRANCH); posting this run's receipt on the existing one instead" >&2; %[7]s; }; }`,
 		preset, tool, install, pr, token, create, comment)
 }
 

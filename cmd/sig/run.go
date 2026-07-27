@@ -2042,6 +2042,35 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		rep.Audit = true
 		emit.emit("audit_selected", map[string]any{"runId": p.RunID, "sample": pol.auditSample, "sha": landSHA})
 	}
+	// -notes runs BEFORE -publish (issue #177). It used to be the other way
+	// round, so a note could also capture the publish outcome — which read as the
+	// richer choice and was the wrong one.
+	//
+	// The note is the EVIDENCE that a landing happened, and the only record that
+	// survives on a remote when the machine that ran the work is gone. Anything
+	// recovering from an interrupted run asks one question — did this run already
+	// land? — and answers it by fetching the base and looking for that run's
+	// note. Writing the note after the push made that unanswerable: at push time
+	// there was no note to send, so the branch moved and its evidence did not,
+	// and the recovering caller re-ran work that had already landed and paid for
+	// it twice.
+	//
+	// What the note gives up is the publish outcome, which was never its job.
+	// Whether we managed to reach a remote is a fact about this machine's network
+	// and belongs in the run report, where it still is (rep.Publish). What the
+	// note carries is what LANDED, which is what a reader on the far end needs.
+	//
+	// The landing already happened above, so a note failure must never look like
+	// the run itself failed — see attachNote's doc. The landSHA != baseSHA guard
+	// is the same one -publish has and for a sharper reason: with nothing landed,
+	// `git notes add -f` would REPLACE the base commit's existing provenance with
+	// a report that says landed=false, destroying in every clone the record of
+	// whatever run did land it. A run that parked its only group takes exactly
+	// this path; the commit its ack later lands gets its own note then
+	// (attachAckNote).
+	if p.Notes && landSHA != baseSHA {
+		attachNote(ctx, g, landSHA, rep, "-notes")
+	}
 	// -publish: the run has now LANDED (base ref advanced past baseSHA;
 	// -verify green or unset — a verify failure already returned above, before
 	// ever reaching the landing swap). landSHA == baseSHA here means nothing
@@ -2050,25 +2079,13 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	// "the ref moved", nothing more to check. A publish FAILURE never
 	// unlands the work or touches rep.Verify; it's recorded in its own
 	// rep.Publish field and only changes the process exit code (see
-	// runExitCode). Runs before -notes so a note (if also requested) still
-	// captures the publish outcome.
+	// runExitCode).
 	if strings.TrimSpace(p.PublishCmd) != "" && landSHA != baseSHA {
 		emit.emit("publish_start", map[string]any{})
 		pubStart := time.Now()
 		pub := runPublish(ctx, p, rep)
 		rep.Publish = &pub
 		emit.emit("publish_done", map[string]any{"ok": pub.OK, "exit": pub.Exit, "wallMs": time.Since(pubStart).Milliseconds()})
-	}
-	// -notes: the landing already happened above, so a note failure below must
-	// never look like the run itself failed — see attachNote's doc. Same
-	// landSHA != baseSHA guard as -publish, and for a sharper reason: nothing
-	// landed, and `git notes add -f` would REPLACE the base commit's existing
-	// provenance with a report that says landed=false, destroying in every clone
-	// the record of whatever run did land it. A run that parked its only group
-	// takes exactly this path; the commit its ack later lands gets its own note
-	// then (attachAckNote).
-	if p.Notes && landSHA != baseSHA {
-		attachNote(ctx, g, landSHA, rep, "-notes")
 	}
 	return rep, nil
 }
