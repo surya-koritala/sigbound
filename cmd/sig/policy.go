@@ -47,6 +47,14 @@ type policy struct {
 	// needs an ack to change back — so this key exists only for the asymmetric
 	// case: paths cheap to land forward and expensive to take back.
 	unlandPaths []string
+	// repairDeny are globs the -repair fixer may never write, on top of the
+	// unconditional floor every repair gets (see repairRefusalReason). It is a
+	// separate key from ackPaths because the two ask different questions:
+	// ack-paths is "a human must approve this change", which is the right
+	// answer for an agent doing requested work and the wrong one for an
+	// automatic fixer nobody asked for. A repo that wants its tests off-limits
+	// to the fixer but still writable by ordinary agents can only say so here.
+	repairDeny  []string
 	auditSample int // 0..100, or -1 when unset: the spot-audit sampling rate (see auditSelected)
 	ackTimeout  time.Duration
 	// ackTimeoutAction is what an EXPIRED park auto-transitions to (see
@@ -144,6 +152,12 @@ func parsePolicy(data []byte) (policy, error) {
 				return policy{}, fmt.Errorf("line %d: unland-paths requires at least one glob", e.Line)
 			}
 			pol.unlandPaths = append(pol.unlandPaths, globs...)
+		case "repair-deny":
+			globs := splitCSV(e.Value)
+			if len(globs) == 0 {
+				return policy{}, fmt.Errorf("line %d: repair-deny requires at least one glob", e.Line)
+			}
+			pol.repairDeny = append(pol.repairDeny, globs...)
 		case "lanes":
 			if err := scalar(e); err != nil {
 				return policy{}, err
@@ -575,6 +589,74 @@ func globHold(paths, globs []string, kind, wording string) (string, string, map[
 		return "", "", nil
 	}
 	return kind, wording + first, matched
+}
+
+// The rule that refused a repair attempt, most to least specific. Machine
+// readable, recorded on the attempt and emitted with repair_refused.
+const (
+	repairRefusedPolicyFile = "policy-file"
+	repairRefusedDeny       = "repair-deny"
+	repairRefusedAckPaths   = "ack-paths"
+	// repairRefusedUnknownWriteSet is the fail-closed case: the diff that would
+	// have been checked could not be read, so nothing about the fixer's edits is
+	// known. Refusing an unknowable write-set is the only safe direction.
+	repairRefusedUnknownWriteSet = "unknown-write-set"
+)
+
+// repairRefusalReason reports why a -repair attempt's write-set must be
+// REFUSED — kind empty when the fixer may keep what it wrote. paths is the
+// sorted set of files that triggered the rule.
+//
+// The fixer is the one agent in the system with no brief: it is handed a
+// failure and rewarded for making it stop. That makes weakening whatever
+// judged it the shortest path to success, so unlike an ordinary agent it is
+// barred from three sets rather than merely held for review:
+//
+//   - policyFileName itself, unconditionally — with or without a policy file
+//     at the base. A fixer has no business writing the file that decides
+//     whether its own work lands, and there is no repo state in which it does.
+//   - repairDeny globs — what this repo says the fixer may never write,
+//     typically its tests and CI config. Ordinary agents stay unaffected.
+//   - ackPaths globs — a path a human must approve cannot be changed by a
+//     machine no human is going to look at. This leg matters most: the landing
+//     holdback (policyHoldback) is decided from the AGENTS' write-sets, before
+//     repair has run at all, so without this check the fixer is the single
+//     code path that walks straight through the ack bar.
+//
+// Refusal is deliberately harsher than the park an equivalent agent change
+// earns. A park exists to put work in front of a person; a repair is work
+// nobody asked for, so there is nothing to hold — declining it simply leaves
+// the tree that honestly failed.
+func repairRefusalReason(paths []string, pol policy) (kind, reason string, refused []string) {
+	for _, p := range paths {
+		if p == policyFileName {
+			return repairRefusedPolicyFile, "repair may not modify " + policyFileName, []string{policyFileName}
+		}
+	}
+	for _, r := range []struct {
+		kind    string
+		globs   []string
+		wording string
+	}{
+		{repairRefusedDeny, pol.repairDeny, "repair-deny: repair may not modify "},
+		{repairRefusedAckPaths, pol.ackPaths, "ack-paths: repair may not modify a path needing a human ack, "},
+	} {
+		if _, reason, matched := globHold(paths, r.globs, r.kind, r.wording); reason != "" {
+			return r.kind, reason, sortedPaths(matched)
+		}
+	}
+	return "", "", nil
+}
+
+// sortedPaths returns globHold's path -> glob map as its sorted key set, the
+// stable order the report and the repair_refused event need.
+func sortedPaths(matched map[string]string) []string {
+	out := make([]string, 0, len(matched))
+	for p := range matched {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // globMatch reports whether pattern matches name, both slash-separated

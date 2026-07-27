@@ -1605,6 +1605,7 @@ doctor's exit code.
 | `budget = <duration>` | Ceiling on the run's wall-clock budget. Effective value is `min(policy, flag)`. |
 | `ack-paths = <glob>[, <glob>…]` | REPEATABLE and/or comma-separated. A landing that touches a matching path is PARKED for a human ack (see [Run parking](#run-parking)). |
 | `unland-paths = <glob>[, <glob>…]` | REPEATABLE and/or comma-separated. Same glob semantics, but it holds an UNLAND's inverse rather than a forward landing (see [Unlanding](#unlanding)) — for paths cheap to land forward and expensive to take back. `ack-paths` holds an inverse too, so this is only needed for that asymmetry. |
+| `repair-deny = <glob>[, <glob>…]` | REPEATABLE and/or comma-separated. Paths the `-repair` fixer may never write; ordinary agents are unaffected (see [What the fixer may not touch](#what-the-fixer-may-not-touch)). Typically a repo's tests and CI config. |
 | `audit-sample = N%` | `0..100`. Percentage of CLEAN landings sampled into non-blocking `audit` inbox entries (see [Spot-audit sampling](#spot-audit-sampling)). |
 | `ack-timeout = <duration>` | How long a parked landing waits before it auto-resolves. Absent (the default) parks forever. |
 | `ack-timeout-action = reject` | What an EXPIRED park becomes. `reject` is the only value; it is also the default whenever `ack-timeout` is set. |
@@ -1699,6 +1700,54 @@ matches one character except `/`; `*` matches any run of characters except `/`
 (stays within a path segment); `**` matches any run INCLUDING `/` (crosses
 segments), and a `**/` prefix also matches zero leading segments, so
 `**/secrets.yaml` matches both `secrets.yaml` and `deploy/prod/secrets.yaml`.
+
+### What the fixer may not touch
+
+The `-repair` fixer is the only agent in a run with no brief. It is handed a
+failure and rewarded for making it stop, which makes weakening whatever judged
+it the shortest path to success — delete the failing assertion and the tree goes
+green.
+
+The holdback above cannot catch that, because it is decided from the **agents'**
+write-sets, before the fixer has run at all. So the fixer's own write-set is
+checked separately, and a match **refuses** the attempt: its commit is discarded
+without ever being verified, the base does not move, and the repair loop stops
+(a fixer that reached for the bar will reach for it again). The run then fails
+with the honest failure it started with, and the refusal is recorded on the
+attempt as `refused` / `refusedPaths` and emitted as `repair_refused`.
+
+Three rules, most to least specific:
+
+| Rule | What it bars |
+| --- | --- |
+| `policy-file` | `sigbound.policy` itself. |
+| `repair-deny` | The repo's `repair-deny` globs — typically its tests and CI config. |
+| `ack-paths` | The repo's `ack-paths` globs. |
+
+```
+repair-deny = **/*_test.go, .github/workflows/**
+```
+
+Two ways this is deliberately stricter than the landing rules above:
+
+- **`sigbound.policy` is barred unconditionally**, including CREATING one where
+  none existed, and including repos with no policy file at all. A landing may
+  create a first policy because doing so can only raise the bar; a fixer writing
+  a governance file is not fixing a verify failure under any reading, so there is
+  no case to allow.
+- **An `ack-paths` match is refused, not parked.** A park exists to put work in
+  front of a person. A repair is work nobody asked for, so there is nothing to
+  hold for review — declining it leaves exactly the tree that honestly failed.
+
+`repair-deny` is a separate key from `ack-paths` because the two answer different
+questions. `ack-paths` says *a human must approve this change*, which is right for
+an agent doing requested work and wrong for an automatic fixer. A repo that wants
+its tests off-limits to the fixer while ordinary agents keep writing them can only
+say so with `repair-deny`.
+
+A fourth rule, `unknown-write-set`, fires when the fixer's diff could not be read
+at all. The write-set is the only thing these rules can reason about, so an
+unreadable one is refused rather than waved through.
 
 ---
 
@@ -3920,6 +3969,7 @@ FILE that can't be opened at all fails the run before any agent runs, same as
 | `verify_done` | `ok`, `flaky`, `cached`, `attempt`, `wallMs` | After each `-verify` invocation (including `-verify-retries`). `cached` is `true` on a `-verify-cache` hit, and `wallMs` is near-zero since the command never ran. |
 | `repair_start` | `attempt` | Before each `-repair` fixer invocation. |
 | `repair_done` | `attempt`, `verifyOk`, `wallMs` | After that round's fixer AND its follow-up `-verify` both finish; `wallMs` covers the fixer only. |
+| `repair_refused` | `attempt`, `rule`, `paths`, `wallMs` | That round's fixer wrote a path it may not write, so its commit was discarded unverified and the repair loop stopped (see [What the fixer may not touch](#what-the-fixer-may-not-touch)). `rule` is `policy-file`, `repair-deny`, `ack-paths`, or `unknown-write-set`. Replaces that round's `repair_done`. |
 | `bisect_start` | `groups` | Once, when `-verify-bisect` starts (the full tree failed and there are ≥ 2 groups). `groups` is the group count being bisected. |
 | `bisect_attempt` | `groups`, `ok` | After each candidate-subset verify. `groups` is the branch names per group in that candidate; `ok` is its verdict. |
 | `bisect_done` | `landed`, `dropped` | Once, when bisect finishes. `landed`/`dropped` are the branch names per group that landed vs. were dropped (`landed` empty when nothing was salvaged). |
