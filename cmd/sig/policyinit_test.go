@@ -198,7 +198,7 @@ func TestPolicyInitRefusesToClobber(t *testing.T) {
 // quoted, because joining it would produce a different program.
 func TestPolicyInitBlockScalar(t *testing.T) {
 	wf := func(body string) string {
-		return "on: [push]\njobs:\n  t:\n    steps:\n      - run: |\n" + body
+		return "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n" + body
 	}
 	for _, tc := range []struct {
 		name   string
@@ -255,7 +255,7 @@ func TestPolicyInitBlockScalar(t *testing.T) {
 // nothing. Nothing is emitted, the raw text is carried in the note.
 func TestPolicyInitRefusesExpressions(t *testing.T) {
 	repo := initPolicyRepo(t, map[string]string{
-		".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    steps:\n      - run: go test -run ${{ matrix.go }} ./...\n",
+		".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test -run ${{ matrix.go }} ./...\n",
 	})
 	_, _, err, draft := policyInit(t, repo)
 	if err != nil {
@@ -294,7 +294,7 @@ func TestPolicyInitNonLandingTriggers(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := initPolicyRepo(t, map[string]string{
-				".github/workflows/w.yml": tc.on + "jobs:\n  t:\n    steps:\n      - run: goreleaser release --clean\n",
+				".github/workflows/w.yml": tc.on + "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: goreleaser release --clean\n",
 			})
 			_, _, err, draft := policyInit(t, repo)
 			if err != nil {
@@ -514,7 +514,7 @@ func TestPolicyInitDeterministic(t *testing.T) {
 	files := map[string]string{
 		"go.mod":                   "module x\n",
 		".github/workflows/ci.yml": ciWorkflow,
-		".github/workflows/b.yml":  "on: [pull_request]\njobs:\n  a:\n    steps:\n      - run: echo a\n  b:\n    steps:\n      - run: echo b\n",
+		".github/workflows/b.yml":  "on: [pull_request]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo a\n  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo b\n",
 		"CODEOWNERS":               "*.go @acme/core\nsrc/ @acme/src\n",
 	}
 	repo := initPolicyRepo(t, files)
@@ -534,26 +534,69 @@ func TestPolicyInitDeterministic(t *testing.T) {
 	}
 }
 
-// TestPolicyInitJobLevelRefusals: constructs that change what a step MEANS
-// refuse the job, so the drafted battery never contains a command that would
-// actually run somewhere else.
+// TestPolicyInitRequiresAConfirmedRunner: a job that does not say `runs-on:`
+// contributes nothing (issue #158).
+//
+// The old rule accepted a missing runs-on on the grounds that many workflows
+// rely on a default. Under affirmative confirmation that is precisely the
+// unrecognized input this change exists to stop trusting: the battery is drafted
+// FOR the machine verify runs on, and a bar drafted for an unknown machine is a
+// bar that may not run where verify does.
+//
+// It costs nothing real. GitHub Actions requires runs-on for every job, so a
+// workflow this refuses would not run on GitHub either — and a refused workflow
+// falls through to the Makefile and manifest sources, which draft a real battery.
+func TestPolicyInitRequiresAConfirmedRunner(t *testing.T) {
+	repo := initPolicyRepo(t, map[string]string{
+		".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    steps:\n      - run: go test ./...\n",
+	})
+	_, _, err, draft := policyInit(t, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pol := mustParse(t, draft); len(pol.verify) != 0 {
+		t.Fatalf("a job with no runs-on drafted %q as the landing bar; the runner OS was never confirmed\n%s", pol.verify, draft)
+	}
+	if !strings.Contains(draft, "runs-on") {
+		t.Fatalf("no note explaining that the runner is unconfirmed\n%s", draft)
+	}
+}
+
+// TestPolicyInitJobLevelRefusals: a job carrying any key this scanner has not
+// affirmatively confirmed is safe contributes NOTHING (issue #158).
+//
+// The `unknown` cases are the point. Every other row here was found the hard
+// way — a construct nobody had enumerated produced a live `verify` member that
+// exits 0 on broken code — across four rounds of additions. Under an
+// allow-list, a key nobody has thought about is refused because nobody has
+// thought about it, so there is no fifth round to have.
+//
+// Each case asserts the outcome (no drafted member) AND that the note names the
+// key, so an operator can see which construct cost them the draft. It
+// deliberately does not assert per-construct prose: pinning the wording is what
+// made this table read like a list of special cases rather than one rule.
 func TestPolicyInitJobLevelRefusals(t *testing.T) {
 	for _, tc := range []struct{ name, job, want string }{
-		{"services", "    services:\n      db:\n        image: postgres\n", "environment this run does not provide"},
-		{"container", "    container: golang:1.22\n", "environment this run does not provide"},
-		{"job env", "    env:\n        CGO_ENABLED: '0'\n", "job-level `env:`"},
-		{"defaults", "    defaults:\n      run:\n        working-directory: ./sub\n", "`defaults:`"},
+		{"services", "    services:\n      db:\n        image: postgres\n", "services"},
+		{"container", "    container: golang:1.22\n", "container"},
+		{"job env", "    env:\n        CGO_ENABLED: '0'\n", "env"},
+		{"defaults", "    defaults:\n      run:\n        working-directory: ./sub\n", "defaults"},
 		// The step-scope twins, mirrored down. A conditional JOB is strictly
 		// broader than a conditional step -- its condition decides whether any of
 		// its steps run at all -- and a job whose failure does not fail the
-		// workflow is not a gate. Both were unguarded at this scope while being
-		// refused one level down.
-		{"job if", "    if: github.event_name == 'schedule'\n", "conditional (`if:`)"},
-		{"job continue-on-error", "    continue-on-error: true\n", "does not fail CI"},
+		// workflow is not a gate.
+		{"job if", "    if: github.event_name == 'schedule'\n", "if"},
+		{"job continue-on-error", "    continue-on-error: true\n", "continue-on-error"},
+		// Keys this scanner has never seen. Under the old deny-list every one of
+		// these drafted a live member; under the allow-list they are refused for
+		// the only honest reason there is -- nobody has confirmed them.
+		{"unknown key", "    snapshot: true\n", "snapshot"},
+		{"unknown future key", "    runtime-isolation: gvisor\n", "runtime-isolation"},
+		{"a key that only LOOKS harmless", "    uses: some/reusable-workflow@v1\n", "uses"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := initPolicyRepo(t, map[string]string{
-				".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n" + tc.job + "    steps:\n      - run: go test ./...\n",
+				".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n" + tc.job + "    steps:\n      - run: go test ./...\n",
 			})
 			_, _, err, draft := policyInit(t, repo)
 			if err != nil {
@@ -593,7 +636,7 @@ func TestPolicyInitStepLevelRefusals(t *testing.T) {
 			t.Run(dq.name+"/"+rf.name, func(t *testing.T) {
 				// The disqualifying key sits BEFORE `run:`, the shape real workflows
 				// use and the one that triggered the bug; a clean step follows it.
-				wf := "on: [push]\njobs:\n  t:\n    steps:\n" +
+				wf := "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n" +
 					"      - name: disq\n" + dq.keyLines + "\n" + rf.run +
 					"      - run: go test ./...\n"
 				repo := initPolicyRepo(t, map[string]string{".github/workflows/ci.yml": wf})
@@ -763,7 +806,7 @@ func TestPolicyInitSymlinkedPolicyNotRead(t *testing.T) {
 func TestPolicyInitDraftHasNoControlBytes(t *testing.T) {
 	repo := initPolicyRepo(t, map[string]string{
 		// Refused for the NUL, then QUOTED into the note verbatim.
-		".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    steps:\n      - run: echo \x00nul\n",
+		".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \x00nul\n",
 		// strings.Fields does not split on NUL, so this is ONE pattern that would
 		// otherwise reach a live ack-paths value.
 		"CODEOWNERS": "auth\x00x @acme/sec\n",
@@ -833,7 +876,7 @@ func TestPolicyInitNoClobberSymlink(t *testing.T) {
 // command is refused and noted, never emitted as a verify value (finding LOW —
 // workflowscan.go guarded only \r\n before).
 func TestScanWorkflowControlByteRefused(t *testing.T) {
-	data := []byte("on: [push]\njobs:\n  t:\n    steps:\n      - run: go test ./...\x00rm -rf /\n")
+	data := []byte("on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test ./...\x00rm -rf /\n")
 	sc := scanWorkflow(".github/workflows/ci.yml", data, "main")
 	if len(sc.Commands) != 0 {
 		t.Fatalf("a command with a NUL was emitted: %q", sc.Commands)
@@ -913,7 +956,7 @@ func TestPolicyInitGoTestTimeoutNote(t *testing.T) {
 // verify value, which is where an unescaped draft would break.
 func TestPolicyInitSelfCheckIsEnforced(t *testing.T) {
 	repo := initPolicyRepo(t, map[string]string{
-		".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    steps:\n      - run: FOO=bar go test ./... # go\n      - run: sh -c 'echo a && echo b' | cat\n",
+		".github/workflows/ci.yml": "on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: FOO=bar go test ./... # go\n      - run: sh -c 'echo a && echo b' | cat\n",
 	})
 	_, _, err, draft := policyInit(t, repo)
 	if err != nil {
@@ -1022,11 +1065,11 @@ func unmappedLines(draft string) []string {
 // from ever writing a policy that fails every subsequent run.
 func FuzzScanWorkflow(f *testing.F) {
 	f.Add([]byte(ciWorkflow))
-	f.Add([]byte("on: [push]\njobs:\n  t:\n    steps:\n      - run: |\n          a\n          b\n"))
+	f.Add([]byte("on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          a\n          b\n"))
 	f.Add([]byte("on:\n  push:\n    tags: ['v*']\njobs:\n  r:\n    steps:\n      - run: x\n"))
 	f.Add([]byte("on: push\njobs:\n\tt:\n\t\tsteps:\n"))
 	f.Add([]byte("run: \nverify = x\n"))
-	f.Add([]byte("on: [push]\njobs:\n  t:\n    steps:\n      - run: a\nb\n = c\n"))
+	f.Add([]byte("on: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: a\nb\n = c\n"))
 	// Regression: a lone CR mid-value is not a line terminator to textLines but
 	// is to plenty of other readers, and it used to reach a `verify =` value.
 	f.Add([]byte("on: push\njobs:\n 0:\n  steps: \n   - run: 0\r0"))
@@ -1204,7 +1247,7 @@ func TestPolicyInitOrdinaryPushStillDrafts(t *testing.T) {
 // environment is a deploy step, not a merge gate.
 func TestPolicyInitDeploymentJobIsNotABar(t *testing.T) {
 	repo := initPolicyRepo(t, map[string]string{
-		".github/workflows/ci.yml": "on: [push]\njobs:\n  ship:\n    environment: production\n    steps:\n      - run: echo \"deploying\"\n",
+		".github/workflows/ci.yml": "on: [push]\njobs:\n  ship:\n    runs-on: ubuntu-latest\n    environment: production\n    steps:\n      - run: echo \"deploying\"\n",
 	})
 	_, _, err, draft := policyInit(t, repo)
 	if err != nil {
@@ -1213,8 +1256,8 @@ func TestPolicyInitDeploymentJobIsNotABar(t *testing.T) {
 	if pol := mustParse(t, draft); len(pol.verify) != 0 {
 		t.Fatalf("a deployment job drafted %q as the landing bar\n%s", pol.verify, draft)
 	}
-	if !strings.Contains(draft, "production") {
-		t.Fatalf("no note naming the environment\n%s", draft)
+	if !strings.Contains(draft, "environment") {
+		t.Fatalf("no note naming the key that cost the draft\n%s", draft)
 	}
 }
 
