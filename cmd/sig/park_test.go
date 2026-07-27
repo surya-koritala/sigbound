@@ -981,8 +981,8 @@ func TestPolicyAckTimeoutActionRejectsUnknownValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsePolicy: %v", err)
 	}
-	if pol.ackTimeoutAction != parkActionReject {
-		t.Fatalf("ack-timeout without an action defaulted to %q, want %q", pol.ackTimeoutAction, parkActionReject)
+	if pol.AckTimeoutAction != parkActionReject {
+		t.Fatalf("ack-timeout without an action defaulted to %q, want %q", pol.AckTimeoutAction, parkActionReject)
 	}
 	if got := policyReport(pol).AckTimeoutAction; got != parkActionReject {
 		t.Fatalf("report records action %q, want %q", got, parkActionReject)

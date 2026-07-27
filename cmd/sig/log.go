@@ -49,6 +49,7 @@ import (
 
 	"github.com/surya-koritala/sigbound/cell"
 	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/pkg/attest"
 )
 
 // runIDTimeLayout is newRunID's timestamp-prefix layout (the first 16 bytes of
@@ -94,7 +95,7 @@ type logRow struct {
 	// and cannot carry it (see ackedLandedSHA).
 	LandedSHA string `json:"landedSHA,omitempty"`
 	// PolicyHash is the sha256 of the sigbound.policy this run resolved, read
-	// from where policyReport actually writes it (report.policy.hash — NOT a
+	// from where policyReport actually writes it (report.policy.Hash — NOT a
 	// top-level policyHash key, which nothing has ever written). Empty and
 	// omitted for a run against a repo with no policy file.
 	PolicyHash string `json:"policyHash,omitempty"`
@@ -379,7 +380,7 @@ func fillRowFromReport(row *logRow, rep *runReport) {
 // change meaning within a version. Anything that would make a reader written
 // against version N wrong — removing a documented field, or changing what one
 // means — bumps it.
-const noteFormatCurrent = 1
+const noteFormatCurrent = attest.CurrentFormat
 
 // parseNote decodes one note payload, and is the single gate BOTH note readers
 // go through (resolveProvenance here, and the release-notes reader in
@@ -409,7 +410,10 @@ func parseNote(content string) (*runReport, bool) {
 	if json.Unmarshal([]byte(content), &rep) != nil {
 		return nil, false
 	}
-	if rep.NoteFormat > noteFormatCurrent {
+	// The version gate is pkg/attest's, not a second copy of it. That package is
+	// what an outside reader uses, and a gate that lived in two places is a gate
+	// that eventually says two different things about the same bytes.
+	if _, err := attest.Parse(content); err != nil {
 		return nil, false
 	}
 	return &rep, true

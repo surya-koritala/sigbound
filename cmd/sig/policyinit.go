@@ -932,10 +932,10 @@ func policyInfoLine(ctx context.Context, repoDir string) string {
 	switch {
 	case err != nil:
 		return fmt.Sprintf("landing policy: %s at HEAD is unreadable (%s)", policyFileName, oneLine(err.Error()))
-	case !pol.present:
+	case !pol.Present:
 		return fmt.Sprintf("landing policy: no %s at HEAD (run `sig policy init` to draft one from this repo's CI config)", policyFileName)
 	default:
-		return fmt.Sprintf("landing policy: %s at HEAD — %d verify member(s), %d ack-paths glob(s)", policyFileName, len(pol.verify), len(pol.ackPaths))
+		return fmt.Sprintf("landing policy: %s at HEAD — %d verify member(s), %d ack-paths glob(s)", policyFileName, len(pol.Verify), len(pol.AckPaths))
 	}
 }
 

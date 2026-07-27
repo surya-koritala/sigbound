@@ -93,12 +93,12 @@ func TestPolicyInitGoRepoWithWorkflow(t *testing.T) {
 	}
 	pol := mustParse(t, draft)
 	want := []string{"go build ./...", "go test ./..."}
-	if len(pol.verify) != len(want) {
-		t.Fatalf("verify battery = %q, want %q\n%s", pol.verify, want, draft)
+	if len(pol.Verify) != len(want) {
+		t.Fatalf("verify battery = %q, want %q\n%s", pol.Verify, want, draft)
 	}
 	for i := range want {
-		if pol.verify[i] != want[i] {
-			t.Fatalf("verify[%d] = %q, want %q", i, pol.verify[i], want[i])
+		if pol.Verify[i] != want[i] {
+			t.Fatalf("verify[%d] = %q, want %q", i, pol.Verify[i], want[i])
 		}
 	}
 	// Every emitted line is attributed to the file it came from.
@@ -124,7 +124,7 @@ func TestPolicyInitGoRepoWithWorkflow(t *testing.T) {
 
 	// The battery must actually pass on the repo it was drafted from. This is
 	// the whole promise: one command, a working policy.
-	battery := joinVerifyBattery(pol.verify)
+	battery := joinVerifyBattery(pol.Verify)
 	cmd := exec.Command("sh", "-c", battery)
 	cmd.Dir = repo
 	if out, rerr := cmd.CombinedOutput(); rerr != nil {
@@ -222,12 +222,12 @@ func TestPolicyInitBlockScalar(t *testing.T) {
 				t.Fatal(err)
 			}
 			pol := mustParse(t, draft)
-			if len(pol.verify) != len(tc.verify) {
-				t.Fatalf("verify = %q, want %q\n%s", pol.verify, tc.verify, draft)
+			if len(pol.Verify) != len(tc.verify) {
+				t.Fatalf("verify = %q, want %q\n%s", pol.Verify, tc.verify, draft)
 			}
 			for i := range tc.verify {
-				if pol.verify[i] != tc.verify[i] {
-					t.Fatalf("verify[%d] = %q, want %q", i, pol.verify[i], tc.verify[i])
+				if pol.Verify[i] != tc.verify[i] {
+					t.Fatalf("verify[%d] = %q, want %q", i, pol.Verify[i], tc.verify[i])
 				}
 			}
 			if tc.refuse == "" {
@@ -261,8 +261,8 @@ func TestPolicyInitRefusesExpressions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pol := mustParse(t, draft); len(pol.verify) != 0 {
-		t.Fatalf("want no verify member, got %q\n%s", pol.verify, draft)
+	if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+		t.Fatalf("want no verify member, got %q\n%s", pol.Verify, draft)
 	}
 	if !strings.Contains(draft, "${{ matrix.go }}") {
 		t.Fatalf("the raw step text is not carried in the note\n%s", draft)
@@ -300,8 +300,8 @@ func TestPolicyInitNonLandingTriggers(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if pol := mustParse(t, draft); len(pol.verify) != 0 {
-				t.Fatalf("want no verify member, got %q\n%s", pol.verify, draft)
+			if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+				t.Fatalf("want no verify member, got %q\n%s", pol.Verify, draft)
 			}
 			notes := unmappedLines(draft)
 			if len(notes) != 1 || !strings.Contains(notes[0], ".github/workflows/w.yml") || !strings.Contains(notes[0], tc.want) {
@@ -323,8 +323,8 @@ func TestPolicyInitToolchainCascade(t *testing.T) {
 			t.Fatal(err)
 		}
 		pol := mustParse(t, draft)
-		if len(pol.verify) != 1 || pol.verify[0] != verifyPresets["go"] {
-			t.Fatalf("verify = %q, want exactly [%q]\n%s", pol.verify, verifyPresets["go"], draft)
+		if len(pol.Verify) != 1 || pol.Verify[0] != verifyPresets["go"] {
+			t.Fatalf("verify = %q, want exactly [%q]\n%s", pol.Verify, verifyPresets["go"], draft)
 		}
 	})
 	t.Run("workflows win", func(t *testing.T) {
@@ -334,7 +334,7 @@ func TestPolicyInitToolchainCascade(t *testing.T) {
 			t.Fatal(err)
 		}
 		pol := mustParse(t, draft)
-		for _, v := range pol.verify {
+		for _, v := range pol.Verify {
 			if v == verifyPresets["go"] {
 				t.Fatalf("the toolchain duplicated the workflow battery\n%s", draft)
 			}
@@ -349,8 +349,8 @@ func TestPolicyInitToolchainCascade(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if pol := mustParse(t, draft); len(pol.verify) != 0 {
-			t.Fatalf("`npm test` was drafted for a package.json with no scripts.test: %q", pol.verify)
+		if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+			t.Fatalf("`npm test` was drafted for a package.json with no scripts.test: %q", pol.Verify)
 		}
 	})
 }
@@ -376,8 +376,8 @@ func TestPolicyInitMakefile(t *testing.T) {
 				t.Fatal(err)
 			}
 			pol := mustParse(t, draft)
-			if strings.Join(pol.verify, "|") != strings.Join(tc.want, "|") {
-				t.Fatalf("verify = %q, want %q\n%s", pol.verify, tc.want, draft)
+			if strings.Join(pol.Verify, "|") != strings.Join(tc.want, "|") {
+				t.Fatalf("verify = %q, want %q\n%s", pol.Verify, tc.want, draft)
 			}
 		})
 	}
@@ -461,10 +461,10 @@ func TestPolicyInitCodeowners(t *testing.T) {
 		t.Fatal(err)
 	}
 	pol := mustParse(t, draft)
-	if strings.Join(pol.ackPaths, "|") != "**/*.js|apps/web/**" {
-		t.Fatalf("ack-paths = %q\n%s", pol.ackPaths, draft)
+	if strings.Join(pol.AckPaths, "|") != "**/*.js|apps/web/**" {
+		t.Fatalf("ack-paths = %q\n%s", pol.AckPaths, draft)
 	}
-	for _, glob := range pol.ackPaths {
+	for _, glob := range pol.AckPaths {
 		for _, owner := range []string{"@acme", "@dana"} {
 			if strings.Contains(glob, owner) {
 				t.Fatalf("an owner string reached an emitted value: %q", glob)
@@ -494,7 +494,7 @@ func TestPolicyInitUnreadableRepo(t *testing.T) {
 		t.Fatalf("code=%d err=%v\n%s", code, err, out)
 	}
 	pol := mustParse(t, draft)
-	if len(pol.verify) != 0 || len(pol.ackPaths) != 0 {
+	if len(pol.Verify) != 0 || len(pol.AckPaths) != 0 {
 		t.Fatalf("a repo that could not be read produced keys: %+v", pol)
 	}
 	if !strings.Contains(draft, "# verify = <command>") {
@@ -554,8 +554,8 @@ func TestPolicyInitRequiresAConfirmedRunner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pol := mustParse(t, draft); len(pol.verify) != 0 {
-		t.Fatalf("a job with no runs-on drafted %q as the landing bar; the runner OS was never confirmed\n%s", pol.verify, draft)
+	if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+		t.Fatalf("a job with no runs-on drafted %q as the landing bar; the runner OS was never confirmed\n%s", pol.Verify, draft)
 	}
 	if !strings.Contains(draft, "runs-on") {
 		t.Fatalf("no note explaining that the runner is unconfirmed\n%s", draft)
@@ -602,8 +602,8 @@ func TestPolicyInitJobLevelRefusals(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if pol := mustParse(t, draft); len(pol.verify) != 0 {
-				t.Fatalf("want no verify member, got %q\n%s", pol.verify, draft)
+			if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+				t.Fatalf("want no verify member, got %q\n%s", pol.Verify, draft)
 			}
 			if !strings.Contains(draft, tc.want) {
 				t.Fatalf("no note naming %q\n%s", tc.want, draft)
@@ -645,8 +645,8 @@ func TestPolicyInitStepLevelRefusals(t *testing.T) {
 					t.Fatal(err)
 				}
 				pol := mustParse(t, draft)
-				if len(pol.verify) != 1 || pol.verify[0] != "go test ./..." {
-					t.Fatalf("verify = %q, want exactly [\"go test ./...\"] — the disqualified %s step must not draft a live member\n%s", pol.verify, dq.name, draft)
+				if len(pol.Verify) != 1 || pol.Verify[0] != "go test ./..." {
+					t.Fatalf("verify = %q, want exactly [\"go test ./...\"] — the disqualified %s step must not draft a live member\n%s", pol.Verify, dq.name, draft)
 				}
 				if !strings.Contains(draft, dq.note) {
 					t.Fatalf("no note naming %q\n%s", dq.note, draft)
@@ -679,8 +679,8 @@ jobs:
 		if err != nil {
 			t.Fatal(err)
 		}
-		if pol := mustParse(t, draft); len(pol.verify) != 0 {
-			t.Fatalf("non-linux jobs drafted live members: %q\n%s", pol.verify, draft)
+		if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+			t.Fatalf("non-linux jobs drafted live members: %q\n%s", pol.Verify, draft)
 		}
 		for _, want := range []string{"windows-latest", "macos-14"} {
 			if !strings.Contains(draft, want) {
@@ -707,8 +707,8 @@ jobs:
 			t.Fatal(err)
 		}
 		pol := mustParse(t, draft)
-		if len(pol.verify) != 1 || pol.verify[0] != "go test ./..." {
-			t.Fatalf("verify = %q, want exactly [\"go test ./...\"]\n%s", pol.verify, draft)
+		if len(pol.Verify) != 1 || pol.Verify[0] != "go test ./..." {
+			t.Fatalf("verify = %q, want exactly [\"go test ./...\"]\n%s", pol.Verify, draft)
 		}
 	})
 	t.Run("array with linux is allowed", func(t *testing.T) {
@@ -719,8 +719,8 @@ jobs:
 		if err != nil {
 			t.Fatal(err)
 		}
-		if pol := mustParse(t, draft); len(pol.verify) != 1 {
-			t.Fatalf("a self-hosted linux runner was refused: %q\n%s", pol.verify, draft)
+		if pol := mustParse(t, draft); len(pol.Verify) != 1 {
+			t.Fatalf("a self-hosted linux runner was refused: %q\n%s", pol.Verify, draft)
 		}
 	})
 }
@@ -757,8 +757,8 @@ func TestPolicyInitWorkflowLevelRefusals(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if pol := mustParse(t, draft); len(pol.verify) != 0 {
-				t.Fatalf("a relocated/re-environed workflow drafted live member(s): %q\n%s", pol.verify, draft)
+			if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+				t.Fatalf("a relocated/re-environed workflow drafted live member(s): %q\n%s", pol.Verify, draft)
 			}
 			if !strings.Contains(draft, tc.want) {
 				t.Fatalf("no note naming %q\n%s", tc.want, draft)
@@ -943,8 +943,8 @@ func TestPolicyInitGoTestTimeoutNote(t *testing.T) {
 		t.Fatal(err)
 	}
 	pol := mustParse(t, draft)
-	if len(pol.verify) != 1 || pol.verify[0] != verifyPresets["go"] {
-		t.Fatalf("verify = %q, want the go preset verbatim\n%s", pol.verify, draft)
+	if len(pol.Verify) != 1 || pol.Verify[0] != verifyPresets["go"] {
+		t.Fatalf("verify = %q, want the go preset verbatim\n%s", pol.Verify, draft)
 	}
 	if !strings.Contains(draft, "no `-timeout`") {
 		t.Fatalf("no -timeout advisory for a drafted go test member\n%s", draft)
@@ -963,8 +963,8 @@ func TestPolicyInitSelfCheckIsEnforced(t *testing.T) {
 		t.Fatal(err)
 	}
 	pol := mustParse(t, draft)
-	if len(pol.verify) != 2 || pol.verify[0] != "FOO=bar go test ./... # go" {
-		t.Fatalf("verify = %q\n%s", pol.verify, draft)
+	if len(pol.Verify) != 2 || pol.Verify[0] != "FOO=bar go test ./... # go" {
+		t.Fatalf("verify = %q\n%s", pol.Verify, draft)
 	}
 }
 
@@ -1115,7 +1115,7 @@ func FuzzCodeownersDraft(f *testing.F) {
 			t.Fatalf("drafted policy does not parse: %v\n%s", err, d.render())
 		}
 		assertRenderIsText(t, d.render())
-		for _, glob := range pol.ackPaths {
+		for _, glob := range pol.AckPaths {
 			if glob == "" || strings.ContainsAny(glob, ",\n\r\x00") {
 				t.Fatalf("emitted glob %q is empty or would be re-split", glob)
 			}
@@ -1142,8 +1142,8 @@ func TestPolicyInitScheduleOnlyJobIsNotABar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pol := mustParse(t, draft); len(pol.verify) != 0 {
-		t.Fatalf("a schedule-only job and an advisory job drafted %q as the landing bar; neither gates a merge\n%s", pol.verify, draft)
+	if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+		t.Fatalf("a schedule-only job and an advisory job drafted %q as the landing bar; neither gates a merge\n%s", pol.Verify, draft)
 	}
 	for _, want := range []string{"nightly-smoke", "flaky-e2e"} {
 		if !strings.Contains(draft, want) {
@@ -1236,8 +1236,8 @@ func TestPolicyInitOrdinaryPushStillDrafts(t *testing.T) {
 				t.Fatal(err)
 			}
 			pol := mustParse(t, draft)
-			if len(pol.verify) != 1 || pol.verify[0] != "go test ./..." {
-				t.Fatalf("an ordinary merge-gating workflow drafted %q, want [go test ./...]\n%s", pol.verify, draft)
+			if len(pol.Verify) != 1 || pol.Verify[0] != "go test ./..." {
+				t.Fatalf("an ordinary merge-gating workflow drafted %q, want [go test ./...]\n%s", pol.Verify, draft)
 			}
 		})
 	}
@@ -1253,8 +1253,8 @@ func TestPolicyInitDeploymentJobIsNotABar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pol := mustParse(t, draft); len(pol.verify) != 0 {
-		t.Fatalf("a deployment job drafted %q as the landing bar\n%s", pol.verify, draft)
+	if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+		t.Fatalf("a deployment job drafted %q as the landing bar\n%s", pol.Verify, draft)
 	}
 	if !strings.Contains(draft, "environment") {
 		t.Fatalf("no note naming the key that cost the draft\n%s", draft)
@@ -1283,8 +1283,8 @@ func TestPolicyInitListItemBelongsToItsKey(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if pol := mustParse(t, draft); len(pol.verify) != 0 {
-				t.Fatalf("a release-only push drafted %q as the landing bar; another key's list item made it look mergeable\n%s", pol.verify, draft)
+			if pol := mustParse(t, draft); len(pol.Verify) != 0 {
+				t.Fatalf("a release-only push drafted %q as the landing bar; another key's list item made it look mergeable\n%s", pol.Verify, draft)
 			}
 		})
 	}
@@ -1347,14 +1347,14 @@ func TestPolicyInitUsesTheReposOwnDefaultBranch(t *testing.T) {
 			}
 			pol := mustParse(t, draft)
 			adopted := false
-			for _, v := range pol.verify {
+			for _, v := range pol.Verify {
 				if v == wfCmd {
 					adopted = true
 				}
 			}
 			if adopted != tc.wantAdopted {
 				t.Fatalf("default branch %q, filter %q: workflow command adopted=%v, want %v; drafted %q\n%s",
-					tc.defaultBranch, tc.filter, adopted, tc.wantAdopted, pol.verify, draft)
+					tc.defaultBranch, tc.filter, adopted, tc.wantAdopted, pol.Verify, draft)
 			}
 		})
 	}
@@ -1380,8 +1380,8 @@ func TestPolicyInitUnknownDefaultBranchFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pol := mustParse(t, draft); len(pol.verify) != 1 || pol.verify[0] != "golangci-lint run" {
-		t.Fatalf("on a feature branch with no origin/HEAD, drafted %q — a `branches: [main]` workflow is an ordinary merge gate\n%s", pol.verify, draft)
+	if pol := mustParse(t, draft); len(pol.Verify) != 1 || pol.Verify[0] != "golangci-lint run" {
+		t.Fatalf("on a feature branch with no origin/HEAD, drafted %q — a `branches: [main]` workflow is an ordinary merge gate\n%s", pol.Verify, draft)
 	}
 }
 
@@ -1405,7 +1405,7 @@ func TestPolicyInitStaleOriginHeadFallsBack(t *testing.T) {
 	// is vacuous here: the toolchain fallback also drafts exactly one member, so
 	// the count is 1 whether the stale pointer was believed or not.
 	adopted := false
-	for _, v := range mustParse(t, draft).verify {
+	for _, v := range mustParse(t, draft).Verify {
 		if v == "golangci-lint run" {
 			adopted = true
 		}

@@ -289,7 +289,7 @@ func TestSecurityPresetComposesAfterPolicyBattery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("applyPresets: %v", err)
 	}
-	pol := policy{present: true, verify: []string{"go build ./...", "go test ./..."}}
+	pol := policy{Present: true, Verify: []string{"go build ./...", "go test ./..."}}
 	p := runParams{VerifyCmd: verify}
 	if err := resolvePolicy(pol, &p, 1); err != nil {
 		t.Fatal(err)

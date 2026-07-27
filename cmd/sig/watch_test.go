@@ -1244,7 +1244,7 @@ func TestPolicyWatchKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pol.watchInterval != 90*time.Second || pol.watchBatch != 4 || pol.watchMaxRed != 5 {
+	if pol.WatchInterval != 90*time.Second || pol.WatchBatch != 4 || pol.WatchMaxRed != 5 {
 		t.Fatalf("parsed = %+v", pol)
 	}
 	// They gate nothing, so they must not touch a run's resolved params.
