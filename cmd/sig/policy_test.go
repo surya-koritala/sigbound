@@ -28,12 +28,12 @@ func TestRepoPolicyTestsEveryPackage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsePolicy(%s): %v", policyFileName, err)
 	}
-	for _, m := range pol.verify {
+	for _, m := range pol.Verify {
 		if strings.HasPrefix(m, "go test") && strings.Contains(m, "./...") {
 			return
 		}
 	}
-	t.Fatalf("%s verify battery = %q: no member runs the tests over ./..., so a package can be added and never gated", policyFileName, pol.verify)
+	t.Fatalf("%s verify battery = %q: no member runs the tests over ./..., so a package can be added and never gated", policyFileName, pol.Verify)
 }
 
 // ---- parsePolicy ----
@@ -60,23 +60,23 @@ func TestParsePolicyValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsePolicy: %v", err)
 	}
-	if !pol.present || pol.hash == "" {
-		t.Fatalf("present=%v hash=%q, want present with a hash", pol.present, pol.hash)
+	if !pol.Present || pol.Hash == "" {
+		t.Fatalf("present=%v hash=%q, want present with a hash", pol.Present, pol.Hash)
 	}
-	if want := []string{"go build ./...", "go test ./..."}; !reflect.DeepEqual(pol.verify, want) {
-		t.Fatalf("verify=%v, want %v", pol.verify, want)
+	if want := []string{"go build ./...", "go test ./..."}; !reflect.DeepEqual(pol.Verify, want) {
+		t.Fatalf("verify=%v, want %v", pol.Verify, want)
 	}
-	if want := []string{"auth/**", "billing/**", "infra/*.tf"}; !reflect.DeepEqual(pol.ackPaths, want) {
-		t.Fatalf("ackPaths=%v, want %v", pol.ackPaths, want)
+	if want := []string{"auth/**", "billing/**", "infra/*.tf"}; !reflect.DeepEqual(pol.AckPaths, want) {
+		t.Fatalf("ackPaths=%v, want %v", pol.AckPaths, want)
 	}
-	if pol.lanes != laneStrict || pol.semantic != semanticGo || !pol.assert || !pol.assertSet {
-		t.Fatalf("lanes=%q semantic=%q assert=%v/%v", pol.lanes, pol.semantic, pol.assert, pol.assertSet)
+	if pol.Lanes != laneStrict || pol.Semantic != semanticGo || !pol.Assert || !pol.AssertSet {
+		t.Fatalf("lanes=%q semantic=%q assert=%v/%v", pol.Lanes, pol.Semantic, pol.Assert, pol.AssertSet)
 	}
-	if pol.auditSample != 25 || pol.ackTimeout != 72*time.Hour {
-		t.Fatalf("auditSample=%d ackTimeout=%v", pol.auditSample, pol.ackTimeout)
+	if pol.AuditSample != 25 || pol.AckTimeout != 72*time.Hour {
+		t.Fatalf("auditSample=%d ackTimeout=%v", pol.AuditSample, pol.AckTimeout)
 	}
-	if pol.parallel != 8 || pol.maxAgents != 16 || pol.budget != 30*time.Minute {
-		t.Fatalf("parallel=%d maxAgents=%d budget=%v", pol.parallel, pol.maxAgents, pol.budget)
+	if pol.Parallel != 8 || pol.MaxAgents != 16 || pol.Budget != 30*time.Minute {
+		t.Fatalf("parallel=%d maxAgents=%d budget=%v", pol.Parallel, pol.MaxAgents, pol.Budget)
 	}
 }
 
@@ -89,8 +89,8 @@ func TestParsePolicyEmptyIsPresent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsePolicy: %v", err)
 	}
-	if !pol.present || pol.hash == "" || pol.auditSample != -1 {
-		t.Fatalf("present=%v hash=%q auditSample=%d, want present, hashed, unset(-1)", pol.present, pol.hash, pol.auditSample)
+	if !pol.Present || pol.Hash == "" || pol.AuditSample != -1 {
+		t.Fatalf("present=%v hash=%q auditSample=%d, want present, hashed, unset(-1)", pol.Present, pol.Hash, pol.AuditSample)
 	}
 }
 
@@ -144,8 +144,8 @@ func TestParsePolicyDuplicateScalar(t *testing.T) {
 func TestParsePolicyHashChangesWithBytes(t *testing.T) {
 	a, _ := parsePolicy([]byte("lanes = strict\n"))
 	b, _ := parsePolicy([]byte("lanes = strict\n# note\n"))
-	if a.hash == b.hash || a.hash == "" {
-		t.Fatalf("hashes should differ: %q vs %q", a.hash, b.hash)
+	if a.Hash == b.Hash || a.Hash == "" {
+		t.Fatalf("hashes should differ: %q vs %q", a.Hash, b.Hash)
 	}
 }
 
@@ -201,7 +201,7 @@ func TestGlobMatchDoubleStarProperty(t *testing.T) {
 // battery (both run), ANDed. With no flag verify, the policy battery alone
 // becomes the effective command.
 func TestResolvePolicyVerifyAppend(t *testing.T) {
-	pol := policy{present: true, verify: []string{"go build ./...", "go test ./..."}}
+	pol := policy{Present: true, Verify: []string{"go build ./...", "go test ./..."}}
 
 	p := runParams{VerifyCmd: "golangci-lint run"}
 	if err := resolvePolicy(pol, &p, 1); err != nil {
@@ -264,7 +264,7 @@ func TestJoinVerifyBatteryConfinesMetacharacters(t *testing.T) {
 // an unset flag is raised to the policy floor silently; an EXPLICIT weaker flag
 // is a loud error naming both sources.
 func TestResolvePolicyTightenOnly(t *testing.T) {
-	strictPol := policy{present: true, lanes: laneStrict, semantic: semanticGo, assertSet: true, assert: true}
+	strictPol := policy{Present: true, Lanes: laneStrict, Semantic: semanticGo, AssertSet: true, Assert: true}
 
 	// Unset flags (default warn / off / false) tighten silently to the floor.
 	p := runParams{LaneMode: laneWarn, Semantic: semanticOff}
@@ -296,7 +296,7 @@ func TestResolvePolicyTightenOnly(t *testing.T) {
 // TestResolvePolicyQuotaMinClamp: quotas are min(policy, flag) with the serve
 // clamp convention (a non-positive flag becomes the ceiling) — never an error.
 func TestResolvePolicyQuotaMinClamp(t *testing.T) {
-	pol := policy{present: true, parallel: 4, budget: 10 * time.Minute}
+	pol := policy{Present: true, Parallel: 4, Budget: 10 * time.Minute}
 
 	// Flag under the ceiling wins; flag over the ceiling is clamped down.
 	p := runParams{ParallelAgents: 2, Budget: 5 * time.Minute}
@@ -327,7 +327,7 @@ func TestResolvePolicyQuotaMinClamp(t *testing.T) {
 // rejected (a run can't silently drop tasks), same reject posture as serve's
 // max-agents-per-run; at/under the ceiling is fine.
 func TestResolvePolicyMaxAgentsReject(t *testing.T) {
-	pol := policy{present: true, maxAgents: 3}
+	pol := policy{Present: true, MaxAgents: 3}
 	p := runParams{}
 	if err := resolvePolicy(pol, &p, 4); err == nil || !strings.Contains(err.Error(), "max-agents=3") {
 		t.Fatalf("4 tasks vs max-agents=3: err=%v, want a reject naming the ceiling", err)
@@ -355,7 +355,7 @@ func TestResolvePolicyAbsentNoop(t *testing.T) {
 // TestPolicyHoldbackAckPath: a branch touching an ack-path is held with the
 // ack reason; a disjoint clean branch is cleared to integrate.
 func TestPolicyHoldbackAckPath(t *testing.T) {
-	pol := policy{present: true, ackPaths: []string{"auth/**"}}
+	pol := policy{Present: true, AckPaths: []string{"auth/**"}}
 	ws := map[string][]string{
 		"agent/a": {"auth/login.go"},
 		"agent/b": {"docs/readme.md"},
@@ -373,7 +373,7 @@ func TestPolicyHoldbackAckPath(t *testing.T) {
 // unconditionally (a change cannot loosen the bar that gates it), even with no
 // ack-paths declared — the mere existence of a policy activates self-protection.
 func TestPolicyHoldbackSelfModification(t *testing.T) {
-	pol := policy{present: true} // no ack-paths
+	pol := policy{Present: true} // no ack-paths
 	ws := map[string][]string{"agent/a": {policyFileName, "x.go"}}
 	clear, held, _ := policyHoldback(pol, []string{"agent/a"}, ws, nil)
 	if len(clear) != 0 || len(held) != 1 || !strings.Contains(held[0].Reason, "modifies "+policyFileName) {
@@ -385,7 +385,7 @@ func TestPolicyHoldbackSelfModification(t *testing.T) {
 // branch (same group by write-set overlap) is held TOO — you can't land part of
 // an entangled group — and its reason carries the group's trigger.
 func TestPolicyHoldbackGroupEntanglement(t *testing.T) {
-	pol := policy{present: true, ackPaths: []string{"auth/**"}}
+	pol := policy{Present: true, AckPaths: []string{"auth/**"}}
 	ws := map[string][]string{
 		"agent/a": {"auth/login.go", "shared.go"}, // triggers ack
 		"agent/b": {"shared.go"},                  // overlaps a on shared.go => same group

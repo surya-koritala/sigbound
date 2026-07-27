@@ -861,7 +861,7 @@ func resolveWatchConfig(ctx context.Context, g *gitx.Git, cfg watchConfig, expli
 	// and `sig run` from its flags; a cycle has neither, so the verify must come
 	// from the repo's policy or from -watch-verify, and a cell with neither is a
 	// startup refusal rather than a loop that lands whatever arrives.
-	if len(pol.verify) == 0 && strings.TrimSpace(cfg.verify) == "" {
+	if len(pol.Verify) == 0 && strings.TrimSpace(cfg.verify) == "" {
 		return cfg, fmt.Errorf("-watch: no verify command for this cell — add a verify line to %s at %s, or pass -watch-verify (use `-watch-verify true` to accept landing every cycle unverified)",
 			policyFileName, cfg.base)
 	}
@@ -869,23 +869,23 @@ func resolveWatchConfig(ctx context.Context, g *gitx.Git, cfg watchConfig, expli
 		return fmt.Errorf("policy %s: %s=%s; flag -%s=%s — the policy sets the watch cadence, so remove the flag (or the policy line)",
 			policyFileName, polKey, polVal, flagName, flagVal)
 	}
-	if pol.watchInterval > 0 {
+	if pol.WatchInterval > 0 {
 		if explicit["watch-interval"] {
-			return cfg, conflict("watch-interval", "watch-interval", pol.watchInterval.String(), cfg.interval.String())
+			return cfg, conflict("watch-interval", "watch-interval", pol.WatchInterval.String(), cfg.interval.String())
 		}
-		cfg.interval = pol.watchInterval
+		cfg.interval = pol.WatchInterval
 	}
-	if pol.watchBatch > 0 {
+	if pol.WatchBatch > 0 {
 		if explicit["watch-batch"] {
-			return cfg, conflict("watch-batch", "watch-batch", fmt.Sprint(pol.watchBatch), fmt.Sprint(cfg.batch))
+			return cfg, conflict("watch-batch", "watch-batch", fmt.Sprint(pol.WatchBatch), fmt.Sprint(cfg.batch))
 		}
-		cfg.batch = pol.watchBatch
+		cfg.batch = pol.WatchBatch
 	}
-	if pol.watchMaxRed > 0 {
+	if pol.WatchMaxRed > 0 {
 		if explicit["watch-max-red"] {
-			return cfg, conflict("watch-max-red", "watch-max-red", fmt.Sprint(pol.watchMaxRed), fmt.Sprint(cfg.maxRed))
+			return cfg, conflict("watch-max-red", "watch-max-red", fmt.Sprint(pol.WatchMaxRed), fmt.Sprint(cfg.maxRed))
 		}
-		cfg.maxRed = pol.watchMaxRed
+		cfg.maxRed = pol.WatchMaxRed
 	}
 	return cfg, nil
 }

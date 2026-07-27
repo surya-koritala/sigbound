@@ -32,8 +32,8 @@ type UsageJSON struct {
 	IntegrateWallMs int64 `json:"integrateWallMs"`
 	// VerifyAttempts is the number of times the -verify command itself was
 	// actually invoked, including -verify-retries and every repair round's
-	// re-verify (report.verify.invocations). RepairAttempts is the number of
-	// repair rounds actually run (report.verify.attempts).
+	// re-verify (report.Verify.invocations). RepairAttempts is the number of
+	// repair rounds actually run (report.Verify.attempts).
 	VerifyAttempts int   `json:"verifyAttempts"`
 	RepairAttempts int   `json:"repairAttempts"`
 	VerifyWallMs   int64 `json:"verifyWallMs"`

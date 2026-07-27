@@ -13,12 +13,12 @@ import (
 // the wrong trigger is as useless as no refusal, since the paths are what the
 // report and the repair_refused event show a human.
 func TestRepairRefusalReason(t *testing.T) {
-	withDeny := policy{present: true, repairDeny: []string{"**/*_test.go"}}
-	withAck := policy{present: true, ackPaths: []string{"cmd/sig/run.go"}}
+	withDeny := policy{Present: true, RepairDeny: []string{"**/*_test.go"}}
+	withAck := policy{Present: true, AckPaths: []string{"cmd/sig/run.go"}}
 	both := policy{
-		present:    true,
-		repairDeny: []string{"**/*_test.go"},
-		ackPaths:   []string{"cmd/sig/run.go"},
+		Present:    true,
+		RepairDeny: []string{"**/*_test.go"},
+		AckPaths:   []string{"cmd/sig/run.go"},
 	}
 
 	cases := []struct {
@@ -71,7 +71,7 @@ func TestRepairRefusalReason(t *testing.T) {
 	}, {
 		name:     "no rules configured allows ordinary files",
 		paths:    []string{"cell/occ_test.go", "cmd/sig/run.go"},
-		pol:      policy{present: true},
+		pol:      policy{Present: true},
 		wantKind: "",
 	}}
 

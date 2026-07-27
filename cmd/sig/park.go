@@ -838,9 +838,9 @@ func parkRecord(ctx context.Context, c *cell.Cell, p runParams, pol policy, fork
 			Output:   tail(v.Output, parkVerifyOutputMax),
 		}},
 	}
-	if pol.ackTimeout > 0 {
-		pk.AckTimeout = pol.ackTimeout.String()
-		pk.AckTimeoutAction = pol.ackTimeoutAction
+	if pol.AckTimeout > 0 {
+		pk.AckTimeout = pol.AckTimeout.String()
+		pk.AckTimeoutAction = pol.AckTimeoutAction
 	}
 	emit.emit("parked", map[string]any{
 		"reason":       reason,

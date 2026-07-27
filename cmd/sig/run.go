@@ -394,7 +394,7 @@ type runReport struct {
 
 // policyJSON records the resolved landing policy on the report/manifest. Verify
 // is the POLICY'S OWN declared verify lines, in file order — what policyReport
-// assigns (pol.verify), NOT the effective battery: resolvePolicy appends the
+// assigns (pol.Verify), NOT the effective battery: resolvePolicy appends the
 // invoker's -verify to the battery it composes into runParams.VerifyCmd, and
 // that composed string is never recorded here. The distinction is load-bearing:
 // these lines are committed to the repo, so `sig log -release` can publish them
@@ -2038,9 +2038,9 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 	// the policy's audit-sample rate into a non-blocking `audit` inbox entry. It
 	// gates nothing and has already landed by the time this runs.
 	if rep.Park == nil && len(rep.Integrate.Flagged) == 0 && len(rep.Integrate.DroppedByBisect) == 0 &&
-		landSHA != baseSHA && pol.auditSample > 0 && auditSelected(p.RunID, pol.auditSample) {
+		landSHA != baseSHA && pol.AuditSample > 0 && auditSelected(p.RunID, pol.AuditSample) {
 		rep.Audit = true
-		emit.emit("audit_selected", map[string]any{"runId": p.RunID, "sample": pol.auditSample, "sha": landSHA})
+		emit.emit("audit_selected", map[string]any{"runId": p.RunID, "sample": pol.AuditSample, "sha": landSHA})
 	}
 	// -notes runs BEFORE -publish (issue #177). It used to be the other way
 	// round, so a note could also capture the publish outcome — which read as the

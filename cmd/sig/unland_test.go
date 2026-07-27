@@ -685,18 +685,18 @@ func TestUnlandLedgerEdges(t *testing.T) {
 // the line.
 func TestUnlandPathsPolicyKey(t *testing.T) {
 	withKey := mustPolicy(t, "verify = go build ./...\nunland-paths = migrations/**, go.sum\n")
-	if got := strings.Join(withKey.unlandPaths, ","); got != "migrations/**,go.sum" {
-		t.Fatalf("unlandPaths %v, want both globs in file order", withKey.unlandPaths)
+	if got := strings.Join(withKey.UnlandPaths, ","); got != "migrations/**,go.sum" {
+		t.Fatalf("unlandPaths %v, want both globs in file order", withKey.UnlandPaths)
 	}
 	if rep := policyReport(withKey); rep == nil || strings.Join(rep.UnlandPaths, ",") != "migrations/**,go.sum" {
 		t.Fatalf("policy report unlandPaths %+v, want both globs", rep)
 	}
 	// Repeatable, like ack-paths: a second line adds rather than erroring.
-	if got := mustPolicy(t, "unland-paths = a/**\nunland-paths = b/**\n").unlandPaths; len(got) != 2 {
+	if got := mustPolicy(t, "unland-paths = a/**\nunland-paths = b/**\n").UnlandPaths; len(got) != 2 {
 		t.Fatalf("unlandPaths %v, want the key to be repeatable", got)
 	}
 	without := mustPolicy(t, "verify = go build ./...\n")
-	if withKey.hash == without.hash {
+	if withKey.Hash == without.Hash {
 		t.Fatal("adding an unland-paths line did not change the recorded policy hash")
 	}
 	_, err := parsePolicy([]byte("unland-paths =\n"))

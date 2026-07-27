@@ -234,22 +234,22 @@ func FuzzParsePolicy(f *testing.F) {
 		if err != nil {
 			return // rejecting a malformed policy is the point, as long as it did not panic
 		}
-		if !pol.present || pol.hash == "" {
+		if !pol.Present || pol.Hash == "" {
 			t.Fatalf("accepted policy without present/hash: %+v", pol)
 		}
-		if pol.auditSample < -1 || pol.auditSample > 100 {
-			t.Fatalf("accepted out-of-range audit-sample %d", pol.auditSample)
+		if pol.AuditSample < -1 || pol.AuditSample > 100 {
+			t.Fatalf("accepted out-of-range audit-sample %d", pol.AuditSample)
 		}
-		if pol.parallel < 0 || pol.maxAgents < 0 || pol.budget < 0 || pol.ackTimeout < 0 {
+		if pol.Parallel < 0 || pol.MaxAgents < 0 || pol.Budget < 0 || pol.AckTimeout < 0 {
 			t.Fatalf("accepted a negative quota/duration: %+v", pol)
 		}
-		if pol.lanes != "" && pol.lanes != laneStrict && pol.lanes != laneOff {
-			t.Fatalf("accepted illegal lanes %q", pol.lanes)
+		if pol.Lanes != "" && pol.Lanes != laneStrict && pol.Lanes != laneOff {
+			t.Fatalf("accepted illegal lanes %q", pol.Lanes)
 		}
-		if pol.semantic != "" && pol.semantic != semanticGo && pol.semantic != semanticOff {
-			t.Fatalf("accepted illegal semantic %q", pol.semantic)
+		if pol.Semantic != "" && pol.Semantic != semanticGo && pol.Semantic != semanticOff {
+			t.Fatalf("accepted illegal semantic %q", pol.Semantic)
 		}
-		for _, v := range pol.verify {
+		for _, v := range pol.Verify {
 			if strings.TrimSpace(v) == "" {
 				t.Fatalf("accepted an empty verify battery member")
 			}

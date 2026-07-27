@@ -131,7 +131,7 @@ type releaseLanding struct {
 	// flaky: a retry was needed to reach green; repaired: -repair made it pass.
 	VerifyDetail *releaseVerifyDetail `json:"verifyDetail,omitempty"`
 	// Acceptance is the repo's OWN `verify` lines from sigbound.policy at the
-	// base SHA (policy.verify on the report) — bytes committed to the repo, so
+	// base SHA (policy.Verify on the report) — bytes committed to the repo, so
 	// already exactly as public as the repo is. NOT the effective battery: an
 	// invoker's -verify is deliberately excluded. A run with no policy file
 	// contributes no acceptance and its verify verdict only.

@@ -12,72 +12,61 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/surya-koritala/sigbound/cell"
 	"github.com/surya-koritala/sigbound/internal/gitx"
+	sbpolicy "github.com/surya-koritala/sigbound/pkg/policy"
 )
 
-// policyFileName is the fixed repo-root path the policy is read from at the base
-// SHA. Also the path whose modification triggers the self-protection hold (a
-// change cannot loosen the bar that gates it — see policyHoldback).
-const policyFileName = "sigbound.policy"
+// The landing-policy TYPE, PARSER and EVALUATORS live in pkg/policy, which has
+// no I/O in it and is therefore usable from outside this binary — a hosted gate
+// enforcing the same bar on a push it just received has the bytes already and
+// no worktree at all. Aliased rather than wrapped so this package keeps reading
+// exactly as it did, and so there is provably ONE definition of the rules: the
+// engine consumes the library it publishes, on every run.
+//
+// What stays here is what needs things pkg/policy deliberately does not have —
+// git (loading the policy at a base SHA), a run's flags (resolving policy
+// against them), and the integrator (grouping held branches).
+type (
+	policy = sbpolicy.Policy
+	// Hold is one holdback or refusal decision; Kind is empty when nothing fired.
+	policyHold = sbpolicy.Hold
+)
 
-// policy is a parsed, validated sigbound.policy. A zero policy (present=false)
-// is what an absent file resolves to: exactly today's flag behavior, zero
-// migration. auditSample is -1 when unset (0 is a leg, meaningful value).
-type policy struct {
-	present   bool
-	hash      string   // sha256 (hex) of the exact file bytes; recorded as policyHash
-	verify    []string // the verify battery, in file order (repeatable key), ANDed at resolve
-	lanes     string   // "" | laneOff | laneStrict — only laneStrict is a floor
-	semantic  string   // "" | semanticOff | semanticGo — only semanticGo is a floor
-	assertSet bool     // whether an assert= line was present
-	assert    bool     // policy's assert value (a floor only when true)
-	ackPaths  []string // globs; a landed change touching one PARKS the landing for a human ack (#109)
-	// unlandPaths are globs that park an UNLAND's inverse specifically (#149).
-	// ackPaths applies to an inverse too — a path that needs an ack to change
-	// needs an ack to change back — so this key exists only for the asymmetric
-	// case: paths cheap to land forward and expensive to take back.
-	unlandPaths []string
-	// repairDeny are globs the -repair fixer may never write, on top of the
-	// unconditional floor every repair gets (see repairRefusalReason). It is a
-	// separate key from ackPaths because the two ask different questions:
-	// ack-paths is "a human must approve this change", which is the right
-	// answer for an agent doing requested work and the wrong one for an
-	// automatic fixer nobody asked for. A repo that wants its tests off-limits
-	// to the fixer but still writable by ordinary agents can only say so here.
-	repairDeny  []string
-	auditSample int // 0..100, or -1 when unset: the spot-audit sampling rate (see auditSelected)
-	ackTimeout  time.Duration
-	// ackTimeoutAction is what an EXPIRED park auto-transitions to (see
-	// enforceParkTimeout). parkActionReject is the only value v2.0 accepts; the
-	// key is parsed now so a future action name is a forward-compatible addition
-	// rather than a new key. Defaults to parkActionReject whenever ackTimeout is
-	// set, so `ack-timeout = 72h` alone is complete.
-	ackTimeoutAction string
-	parallel         int           // parallel-agents ceiling (0 = unset)
-	maxAgents        int           // task-count ceiling (0 = unset)
-	budget           time.Duration // budget ceiling (0 = unset)
-	// watchInterval/watchBatch/watchMaxRed are `sig serve -watch`'s cadence
-	// (issue #111), 0 when unset. Unlike every other key here these gate NOTHING
-	// — they set how often this repo wants its arrivals integrated, not what a
-	// landing must pass — so they are read by the watch loop at startup
-	// (resolveWatchConfig) rather than by resolvePolicy, and never appear on the
-	// report. They live here because the repo, not the invoker, owns the answer,
-	// and because parsePolicy must know them or a repo that sets one would fail
-	// every run with "unknown policy key".
-	watchInterval time.Duration
-	watchBatch    int
-	watchMaxRed   int
+const (
+	policyFileName = sbpolicy.FileName
+
+	parkReasonPolicyModifiedPkg = sbpolicy.ReasonPolicyModified
+
+	repairRefusedPolicyFile      = sbpolicy.RepairRefusedPolicyFile
+	repairRefusedDeny            = sbpolicy.RepairRefusedDeny
+	repairRefusedAckPaths        = sbpolicy.RepairRefusedAckPaths
+	repairRefusedUnknownWriteSet = sbpolicy.RepairRefusedUnknownWriteSet
+)
+
+// parsePolicy, branchHoldReason, repairRefusalReason and globMatch are thin
+// re-exports so every call site in this package is unchanged and the shared
+// library is exercised by the whole existing suite rather than by tests written
+// only for it.
+func parsePolicy(data []byte) (policy, error) { return sbpolicy.Parse(data) }
+
+func branchHoldReason(paths []string, pol policy, unland bool) (kind, reason string, matched map[string]string) {
+	h := sbpolicy.HoldReason(paths, pol, unland)
+	return h.Kind, h.Reason, h.Matched
 }
+
+func repairRefusalReason(paths []string, pol policy) (kind, reason string, refused []string) {
+	h := sbpolicy.RepairRefusal(paths, pol)
+	return h.Kind, h.Reason, h.Paths
+}
+
+func globMatch(pattern, name string) bool { return sbpolicy.GlobMatch(pattern, name) }
 
 // policyExplicit names the policy-governed dimensions the invoker chose
 // DELIBERATELY (a command-line flag / sig.conf value for `sig run`; a non-empty
@@ -111,202 +100,12 @@ func loadPolicy(ctx context.Context, g *gitx.Git, rev string) (policy, error) {
 	return pol, nil
 }
 
-// parsePolicy parses the flat KEY=VALUE bytes into a validated policy. It reuses
-// parseConfigFile's lexer (comments, blank lines, first-'=' split, CRLF
-// tolerance, line numbers) and adds the policy KEY SCHEMA on top: verify and
-// ack-paths are repeatable; every other key is scalar and a DUPLICATE is an
-// error (a second lanes=off silently overriding lanes=strict is the exact
-// weaken-by-typo failure mode this file fails closed against). An UNKNOWN key is
-// an error naming the line and key. hash is the sha256 of data verbatim.
-func parsePolicy(data []byte) (policy, error) {
-	entries, err := parseConfigFile(data)
-	if err != nil {
-		return policy{}, err
-	}
-	sum := sha256.Sum256(data)
-	pol := policy{present: true, hash: hex.EncodeToString(sum[:]), auditSample: -1}
-	seen := map[string]bool{} // scalar keys already set (duplicate => error)
-	scalar := func(e configEntry) error {
-		if seen[e.Key] {
-			return fmt.Errorf("line %d: duplicate key %q", e.Line, e.Key)
-		}
-		seen[e.Key] = true
-		return nil
-	}
-	for _, e := range entries {
-		switch e.Key {
-		case "verify":
-			if strings.TrimSpace(e.Value) == "" {
-				return policy{}, fmt.Errorf("line %d: verify requires a command", e.Line)
-			}
-			pol.verify = append(pol.verify, e.Value)
-		case "ack-paths":
-			globs := splitCSV(e.Value)
-			if len(globs) == 0 {
-				return policy{}, fmt.Errorf("line %d: ack-paths requires at least one glob", e.Line)
-			}
-			pol.ackPaths = append(pol.ackPaths, globs...)
-		case "unland-paths":
-			globs := splitCSV(e.Value)
-			if len(globs) == 0 {
-				return policy{}, fmt.Errorf("line %d: unland-paths requires at least one glob", e.Line)
-			}
-			pol.unlandPaths = append(pol.unlandPaths, globs...)
-		case "repair-deny":
-			globs := splitCSV(e.Value)
-			if len(globs) == 0 {
-				return policy{}, fmt.Errorf("line %d: repair-deny requires at least one glob", e.Line)
-			}
-			pol.repairDeny = append(pol.repairDeny, globs...)
-		case "lanes":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			switch e.Value {
-			case laneStrict, laneOff:
-				pol.lanes = e.Value
-			default:
-				return policy{}, fmt.Errorf("line %d: lanes must be strict|off, got %q", e.Line, e.Value)
-			}
-		case "semantic":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			switch e.Value {
-			case semanticGo, semanticOff:
-				pol.semantic = e.Value
-			default:
-				return policy{}, fmt.Errorf("line %d: semantic must be go|off, got %q", e.Line, e.Value)
-			}
-		case "assert":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			b, err := strconv.ParseBool(e.Value)
-			if err != nil {
-				return policy{}, fmt.Errorf("line %d: assert must be true|false, got %q", e.Line, e.Value)
-			}
-			pol.assertSet, pol.assert = true, b
-		case "audit-sample":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimSpace(e.Value), "%"))
-			if err != nil || n < 0 || n > 100 {
-				return policy{}, fmt.Errorf("line %d: audit-sample must be an integer 0..100 (optionally with %%), got %q", e.Line, e.Value)
-			}
-			pol.auditSample = n
-		case "ack-timeout":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			d, err := time.ParseDuration(e.Value)
-			if err != nil || d < 0 {
-				return policy{}, fmt.Errorf("line %d: ack-timeout must be a non-negative duration (e.g. 72h), got %q", e.Line, e.Value)
-			}
-			pol.ackTimeout = d
-		case "ack-timeout-action":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			// reject is the only action v2.0 implements. Anything else is a hard
-			// error rather than a silent no-op: a policy asking for an action this
-			// binary cannot perform must not quietly leave an expired park open.
-			if e.Value != parkActionReject {
-				return policy{}, fmt.Errorf("line %d: ack-timeout-action must be %s, got %q", e.Line, parkActionReject, e.Value)
-			}
-			pol.ackTimeoutAction = e.Value
-		case "parallel-agents":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			n, err := strconv.Atoi(strings.TrimSpace(e.Value))
-			if err != nil || n < 0 {
-				return policy{}, fmt.Errorf("line %d: parallel-agents must be a non-negative integer, got %q", e.Line, e.Value)
-			}
-			pol.parallel = n
-		case "max-agents":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			n, err := strconv.Atoi(strings.TrimSpace(e.Value))
-			if err != nil || n < 0 {
-				return policy{}, fmt.Errorf("line %d: max-agents must be a non-negative integer, got %q", e.Line, e.Value)
-			}
-			pol.maxAgents = n
-		case "budget":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			d, err := time.ParseDuration(e.Value)
-			if err != nil || d < 0 {
-				return policy{}, fmt.Errorf("line %d: budget must be a non-negative duration (e.g. 30m), got %q", e.Line, e.Value)
-			}
-			pol.budget = d
-		case "watch-interval":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			d, err := time.ParseDuration(e.Value)
-			if err != nil || d <= 0 {
-				return policy{}, fmt.Errorf("line %d: watch-interval must be a positive duration (e.g. 30s), got %q", e.Line, e.Value)
-			}
-			pol.watchInterval = d
-		case "watch-batch":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			n, err := strconv.Atoi(strings.TrimSpace(e.Value))
-			if err != nil || n < 1 {
-				return policy{}, fmt.Errorf("line %d: watch-batch must be a positive integer, got %q", e.Line, e.Value)
-			}
-			pol.watchBatch = n
-		case "watch-max-red":
-			if err := scalar(e); err != nil {
-				return policy{}, err
-			}
-			n, err := strconv.Atoi(strings.TrimSpace(e.Value))
-			if err != nil || n < 1 {
-				return policy{}, fmt.Errorf("line %d: watch-max-red must be a positive integer, got %q", e.Line, e.Value)
-			}
-			pol.watchMaxRed = n
-		default:
-			return policy{}, fmt.Errorf("line %d: unknown policy key %q", e.Line, e.Key)
-		}
-	}
-	// A bare `ack-timeout = 72h` is complete on its own: reject is the only
-	// action v2.0 has, so defaulting here keeps the second key optional without
-	// making an expired park's fate implicit anywhere downstream.
-	if pol.ackTimeout > 0 && pol.ackTimeoutAction == "" {
-		pol.ackTimeoutAction = parkActionReject
-	}
-	return pol, nil
-}
-
-// resolvePolicy applies pol to p IN PLACE, the single shared choke point both
-// `sig run` and `sig serve` reach through driveRun. Precedence is
-// stricter-only: flags may tighten policy, never loosen it.
-//
-//   - verify: the flag/request verify command is APPENDED to the policy battery
-//     (both run). Members are ANDed in file order, each run in its own nested
-//     `sh -c` (see joinVerifyBattery) so an untrusted member's metacharacters
-//     cannot escape to mask another member's failure, and any member's failure
-//     fails the whole gate — the -verify invariant, never weakened.
-//   - lanes/semantic/assert: policy strict/go/true is a FLOOR. An unset flag is
-//     silently raised to it; an EXPLICIT weaker flag is a loud error naming both
-//     sources and values.
-//   - quotas (parallel-agents, budget): effective = min(policy, flag) via the
-//     same clamp posture serve's quota code uses. max-agents rejects a run whose
-//     task count exceeds it (a run can't silently drop tasks — same reject
-//     semantics as serve's max-agents-per-run).
-//
-// An absent policy resolves to a no-op, leaving p byte-identical to today.
 func resolvePolicy(pol policy, p *runParams, taskCount int) error {
-	if !pol.present {
+	if !pol.Present {
 		return nil
 	}
 	// verify: policy battery, then the flag/request verify appended.
-	battery := append([]string(nil), pol.verify...)
+	battery := append([]string(nil), pol.Verify...)
 	if fv := strings.TrimSpace(p.VerifyCmd); fv != "" {
 		battery = append(battery, p.VerifyCmd)
 	}
@@ -318,35 +117,35 @@ func resolvePolicy(pol policy, p *runParams, taskCount int) error {
 	// let an invoker's impact optimization bypass the policy's battery — a
 	// weakening of the gate. When the policy contributes any verify member, drop
 	// impact scoping so the whole battery always runs.
-	if len(pol.verify) > 0 {
+	if len(pol.Verify) > 0 {
 		p.VerifyImpactCmd = ""
 	}
 	// lanes: strict floor.
-	if pol.lanes == laneStrict && laneRank(p.LaneMode) < laneRank(laneStrict) {
+	if pol.Lanes == laneStrict && laneRank(p.LaneMode) < laneRank(laneStrict) {
 		if p.PolicyExplicit.Lanes {
 			return fmt.Errorf("policy %s: lanes=strict; flag -lanes=%s — flags may only tighten policy", policyFileName, p.LaneMode)
 		}
 		p.LaneMode = laneStrict
 	}
 	// semantic: go floor.
-	if pol.semantic == semanticGo && p.Semantic != semanticGo {
+	if pol.Semantic == semanticGo && p.Semantic != semanticGo {
 		if p.PolicyExplicit.Semantic {
 			return fmt.Errorf("policy %s: semantic=go; flag -semantic=%s — flags may only tighten policy", policyFileName, effectiveSemantic(p.Semantic))
 		}
 		p.Semantic = semanticGo
 	}
 	// assert: true floor.
-	if pol.assertSet && pol.assert && !p.Assert {
+	if pol.AssertSet && pol.Assert && !p.Assert {
 		if p.PolicyExplicit.Assert {
 			return fmt.Errorf("policy %s: assert=true; flag -assert=false — flags may only tighten policy", policyFileName)
 		}
 		p.Assert = true
 	}
 	// quotas: min-clamp, no error (min is the established, documented semantics).
-	p.ParallelAgents = clampCeiling(p.ParallelAgents, pol.parallel)
-	p.Budget = clampCeiling(p.Budget, pol.budget)
-	if pol.maxAgents > 0 && taskCount > pol.maxAgents {
-		return fmt.Errorf("policy %s: max-agents=%d, but this run has %d tasks", policyFileName, pol.maxAgents, taskCount)
+	p.ParallelAgents = clampCeiling(p.ParallelAgents, pol.Parallel)
+	p.Budget = clampCeiling(p.Budget, pol.Budget)
+	if pol.MaxAgents > 0 && taskCount > pol.MaxAgents {
+		return fmt.Errorf("policy %s: max-agents=%d, but this run has %d tasks", policyFileName, pol.MaxAgents, taskCount)
 	}
 	return nil
 }
@@ -387,17 +186,17 @@ func validateVerifyPreconditions(p runParams) error {
 // is the report's top-level verifyCmd. AckTimeout renders as its duration
 // string only when set. See policyJSON.
 func policyReport(pol policy) *policyJSON {
-	if !pol.present {
+	if !pol.Present {
 		return nil
 	}
-	out := &policyJSON{Hash: pol.hash, Verify: pol.verify, AckPaths: pol.ackPaths, UnlandPaths: pol.unlandPaths}
-	if pol.auditSample >= 0 {
-		n := pol.auditSample
+	out := &policyJSON{Hash: pol.Hash, Verify: pol.Verify, AckPaths: pol.AckPaths, UnlandPaths: pol.UnlandPaths}
+	if pol.AuditSample >= 0 {
+		n := pol.AuditSample
 		out.AuditSample = &n
 	}
-	if pol.ackTimeout > 0 {
-		out.AckTimeout = pol.ackTimeout.String()
-		out.AckTimeoutAction = pol.ackTimeoutAction
+	if pol.AckTimeout > 0 {
+		out.AckTimeout = pol.AckTimeout.String()
+		out.AckTimeoutAction = pol.AckTimeoutAction
 	}
 	return out
 }
@@ -493,7 +292,7 @@ func clampCeiling[T int | time.Duration](val, ceiling T) T {
 // Held groups compose with bisect salvage untouched: only the CLEARED branches
 // reach integrate/verify/bisect, so disjoint clean groups still land.
 func policyHoldback(pol policy, okBranches []string, writeSets map[string][]string, semanticEdges [][2]string) (clear []string, held []flaggedJSON, groups []parkGroupJSON) {
-	if !pol.present || len(okBranches) == 0 {
+	if !pol.Present || len(okBranches) == 0 {
 		return okBranches, nil, nil
 	}
 	changes := make([]cell.BranchChange, 0, len(okBranches))
@@ -554,180 +353,3 @@ func policyHoldback(pol policy, okBranches []string, writeSets map[string][]stri
 // unland-paths first and then ack-paths — a path that needs an ack to change
 // needs an ack to change back, so both bind it — while an ordinary landing sees
 // ack-paths alone. Self-protection binds both by construction.
-func branchHoldReason(paths []string, pol policy, unland bool) (kind, reason string, matched map[string]string) {
-	for _, p := range paths {
-		if p == policyFileName {
-			return parkReasonPolicyModified, "policy: run modifies " + policyFileName, map[string]string{policyFileName: policyFileName}
-		}
-	}
-	if unland {
-		if kind, reason, matched = globHold(paths, pol.unlandPaths, parkReasonUnlandPaths, "policy: ack required to unland "); kind != "" {
-			return kind, reason, matched
-		}
-	}
-	return globHold(paths, pol.ackPaths, parkReasonAckPaths, "policy: ack required for ")
-}
-
-// globHold matches paths against one glob set, returning kind (empty when
-// nothing matched), the human wording prefixed with the alphabetically first
-// triggering path, and the path -> glob map the park record and inbox render.
-func globHold(paths, globs []string, kind, wording string) (string, string, map[string]string) {
-	matched := map[string]string{}
-	first := ""
-	for _, p := range paths {
-		for _, glob := range globs {
-			if globMatch(glob, p) {
-				matched[p] = glob
-				if first == "" || p < first {
-					first = p
-				}
-				break
-			}
-		}
-	}
-	if len(matched) == 0 {
-		return "", "", nil
-	}
-	return kind, wording + first, matched
-}
-
-// The rule that refused a repair attempt, most to least specific. Machine
-// readable, recorded on the attempt and emitted with repair_refused.
-const (
-	repairRefusedPolicyFile = "policy-file"
-	repairRefusedDeny       = "repair-deny"
-	repairRefusedAckPaths   = "ack-paths"
-	// repairRefusedUnknownWriteSet is the fail-closed case: the diff that would
-	// have been checked could not be read, so nothing about the fixer's edits is
-	// known. Refusing an unknowable write-set is the only safe direction.
-	repairRefusedUnknownWriteSet = "unknown-write-set"
-)
-
-// repairRefusalReason reports why a -repair attempt's write-set must be
-// REFUSED — kind empty when the fixer may keep what it wrote. paths is the
-// sorted set of files that triggered the rule.
-//
-// The fixer is the one agent in the system with no brief: it is handed a
-// failure and rewarded for making it stop. That makes weakening whatever
-// judged it the shortest path to success, so unlike an ordinary agent it is
-// barred from three sets rather than merely held for review:
-//
-//   - policyFileName itself, unconditionally — with or without a policy file
-//     at the base. A fixer has no business writing the file that decides
-//     whether its own work lands, and there is no repo state in which it does.
-//   - repairDeny globs — what this repo says the fixer may never write,
-//     typically its tests and CI config. Ordinary agents stay unaffected.
-//   - ackPaths globs — a path a human must approve cannot be changed by a
-//     machine no human is going to look at. This leg matters most: the landing
-//     holdback (policyHoldback) is decided from the AGENTS' write-sets, before
-//     repair has run at all, so without this check the fixer is the single
-//     code path that walks straight through the ack bar.
-//
-// Refusal is deliberately harsher than the park an equivalent agent change
-// earns. A park exists to put work in front of a person; a repair is work
-// nobody asked for, so there is nothing to hold — declining it simply leaves
-// the tree that honestly failed.
-func repairRefusalReason(paths []string, pol policy) (kind, reason string, refused []string) {
-	for _, p := range paths {
-		if p == policyFileName {
-			return repairRefusedPolicyFile, "repair may not modify " + policyFileName, []string{policyFileName}
-		}
-	}
-	for _, r := range []struct {
-		kind    string
-		globs   []string
-		wording string
-	}{
-		{repairRefusedDeny, pol.repairDeny, "repair-deny: repair may not modify "},
-		{repairRefusedAckPaths, pol.ackPaths, "ack-paths: repair may not modify a path needing a human ack, "},
-	} {
-		if _, reason, matched := globHold(paths, r.globs, r.kind, r.wording); reason != "" {
-			return r.kind, reason, sortedPaths(matched)
-		}
-	}
-	return "", "", nil
-}
-
-// sortedPaths returns globHold's path -> glob map as its sorted key set, the
-// stable order the report and the repair_refused event need.
-func sortedPaths(matched map[string]string) []string {
-	out := make([]string, 0, len(matched))
-	for p := range matched {
-		out = append(out, p)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// globMatch reports whether pattern matches name, both slash-separated
-// repo-relative paths. Semantics (defined once here, fuzzed and property-tested):
-//
-//   - '?'  matches any single character except '/'.
-//   - '*'  matches any run of characters except '/' (stays within one segment).
-//   - '**' matches any run of characters INCLUDING '/' (crosses segments); a
-//     '**/' prefix additionally matches zero segments, so '**/x' matches both
-//     'x' and 'a/b/x'. Consecutive stars collapse ('***' == '**').
-//   - every other character is literal.
-//
-// Backtracking is memoized on (pattern index, name index), so an adversarial
-// pattern (many '**') stays O(len(pattern)*len(name)) instead of exponential.
-func globMatch(pattern, name string) bool {
-	memo := make(map[[2]int]bool)
-	var rec func(pi, si int) bool
-	rec = func(pi, si int) (res bool) {
-		key := [2]int{pi, si}
-		if v, ok := memo[key]; ok {
-			return v
-		}
-		defer func() { memo[key] = res }()
-		for pi < len(pattern) {
-			c := pattern[pi]
-			switch c {
-			case '*':
-				if pi+1 < len(pattern) && pattern[pi+1] == '*' {
-					// '**': collapse the run of stars, match any suffix.
-					for pi < len(pattern) && pattern[pi] == '*' {
-						pi++
-					}
-					if pi == len(pattern) {
-						return true // trailing '**' matches the rest, '/' and all
-					}
-					// '**/' also matches zero leading segments.
-					if pattern[pi] == '/' && rec(pi+1, si) {
-						return true
-					}
-					for i := si; i <= len(name); i++ {
-						if rec(pi, i) {
-							return true
-						}
-					}
-					return false
-				}
-				// single '*': match a run of non-'/' characters.
-				pi++
-				for i := si; ; i++ {
-					if rec(pi, i) {
-						return true
-					}
-					if i >= len(name) || name[i] == '/' {
-						return false
-					}
-				}
-			case '?':
-				if si >= len(name) || name[si] == '/' {
-					return false
-				}
-				pi++
-				si++
-			default:
-				if si >= len(name) || name[si] != c {
-					return false
-				}
-				pi++
-				si++
-			}
-		}
-		return si == len(name)
-	}
-	return rec(0, 0)
-}

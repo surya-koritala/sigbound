@@ -669,7 +669,7 @@ func TestReleasePolicyChangeInsideRange(t *testing.T) {
 
 // TestReleasePolicyHashReachesSigLog is the one-line fix this change carries:
 // `sig log`'s policyHash column read a TOP-LEVEL policyHash key that nothing has
-// ever written (policyReport writes policy.hash), so it was permanently empty.
+// ever written (policyReport writes policy.Hash), so it was permanently empty.
 func TestReleasePolicyHashReachesSigLog(t *testing.T) {
 	g, repo, _ := newGCRepo(t)
 	runsDir := logRunsDir(t, g)

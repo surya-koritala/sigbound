@@ -89,8 +89,8 @@ func TestPolicyLoadedFromBaseSHANotWorkingTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.hash != wantA.hash || got.lanes != laneStrict {
-		t.Fatalf("at shaA: hash=%q lanes=%q, want the COMMITTED strict policy (working-tree edit must be ignored)", got.hash, got.lanes)
+	if got.Hash != wantA.Hash || got.Lanes != laneStrict {
+		t.Fatalf("at shaA: hash=%q lanes=%q, want the COMMITTED strict policy (working-tree edit must be ignored)", got.Hash, got.Lanes)
 	}
 	// Commit the edit: NOW the base tree carries the weaker policy.
 	shaB, err := g.CommitAll(ctx, "policy B")
@@ -105,8 +105,8 @@ func TestPolicyLoadedFromBaseSHANotWorkingTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.hash != wantB.hash || got.lanes != laneOff {
-		t.Fatalf("at shaB: hash=%q lanes=%q, want the committed weaker policy", got.hash, got.lanes)
+	if got.Hash != wantB.Hash || got.Lanes != laneOff {
+		t.Fatalf("at shaB: hash=%q lanes=%q, want the committed weaker policy", got.Hash, got.Lanes)
 	}
 }
 
@@ -124,8 +124,8 @@ func TestPolicyAbsentLoadsToZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("absent policy must not error: %v", err)
 	}
-	if pol.present {
-		t.Fatalf("no policy file, but present=%v", pol.present)
+	if pol.Present {
+		t.Fatalf("no policy file, but present=%v", pol.Present)
 	}
 }
 
@@ -146,8 +146,8 @@ func TestPolicyHashInManifest(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("code=%d, want exitOK", code)
 	}
-	if rep.Policy == nil || rep.Policy.Hash != want.hash {
-		t.Fatalf("report policy=%+v, want hash %q", rep.Policy, want.hash)
+	if rep.Policy == nil || rep.Policy.Hash != want.Hash {
+		t.Fatalf("report policy=%+v, want hash %q", rep.Policy, want.Hash)
 	}
 	data, err := os.ReadFile(manifest)
 	if err != nil {
@@ -157,8 +157,8 @@ func TestPolicyHashInManifest(t *testing.T) {
 	if err := json.Unmarshal(data, &fromDisk); err != nil {
 		t.Fatal(err)
 	}
-	if fromDisk.Policy == nil || fromDisk.Policy.Hash != want.hash {
-		t.Fatalf("manifest policy=%+v, want hash %q", fromDisk.Policy, want.hash)
+	if fromDisk.Policy == nil || fromDisk.Policy.Hash != want.Hash {
+		t.Fatalf("manifest policy=%+v, want hash %q", fromDisk.Policy, want.Hash)
 	}
 
 	// With NO policy: no policy block, and the raw JSON names neither the policy
@@ -225,8 +225,8 @@ func TestPolicySharedResolverRunAndServe(t *testing.T) {
 	if !strings.Contains(repRun.VerifyCmd, "echo pol-verify") || !strings.Contains(repServe.VerifyCmd, "echo pol-verify") {
 		t.Fatalf("policy verify not composed identically: run=%q serve=%q", repRun.VerifyCmd, repServe.VerifyCmd)
 	}
-	if repRun.Policy == nil || repServe.Policy == nil || repRun.Policy.Hash != want.hash || repServe.Policy.Hash != want.hash {
-		t.Fatalf("policyHash mismatch: run=%v serve=%v want=%q", repRun.Policy, repServe.Policy, want.hash)
+	if repRun.Policy == nil || repServe.Policy == nil || repRun.Policy.Hash != want.Hash || repServe.Policy.Hash != want.Hash {
+		t.Fatalf("policyHash mismatch: run=%v serve=%v want=%q", repRun.Policy, repServe.Policy, want.Hash)
 	}
 	// Identical outcome: both landed.
 	if len(repRun.Integrate.Landed) == 0 || len(repServe.Integrate.Landed) == 0 {
