@@ -1814,15 +1814,41 @@ func parseDur(s string, def time.Duration) (time.Duration, error) {
 // leaves a live daemon's runs alone, and on Windows leaves nothing alone,
 // because pidAlive has no implementation there and calls every pid dead (see
 // issue #94, and the recovery section in docs/USAGE.md for what that costs).
-func startRunDir(ctx context.Context, g *gitx.Git) (dir, runID string, err error) {
+// wantID, when non-empty, is the caller's own id for this run (`sig run
+// -run-id`, issue #174) and is used verbatim instead of a generated one, so a
+// caller that queues work can record the handle BEFORE the run exists. It sets
+// the EXISTING run id rather than adding a parallel identity: the dir, the
+// events, the report and the ack handle are all this one value, as they always
+// were.
+//
+// Two refusals, both BEFORE anything is created. An id that is not usable as a
+// path AND a branch component is rejected on the same predicate the CLI flag
+// block already applied — repeated here because this is the chokepoint every
+// entry point reaches, while the flag check is only about failing before the
+// -logdir/-manifest preflights make files. An id whose directory already exists
+// is refused outright: merging into another run's directory would corrupt the
+// record that `sig ack` and the timeout sweep resolve through.
+func startRunDir(ctx context.Context, g *gitx.Git, wantID string) (dir, runID string, err error) {
 	common, err := g.GitCommonDir(ctx)
 	if err != nil {
 		return "", "", err
 	}
 	runsDir := filepath.Join(common, "sigbound", "runs")
 	recoverStaleRuns(runsDir, os.Getpid())
-	runID = newRunID()
+	runID = wantID
+	if runID == "" {
+		runID = newRunID()
+	} else if !refComponentSafe(runID) {
+		return "", "", fmt.Errorf("run id %q is not usable as a directory name and git branch component", runID)
+	}
 	dir = filepath.Join(runsDir, runID)
+	if wantID != "" {
+		if _, statErr := os.Stat(dir); statErr == nil {
+			return "", "", fmt.Errorf("run id %q already exists at %s: refusing to reuse it (pick another id, or read that run with `sig log`)", runID, dir)
+		} else if !os.IsNotExist(statErr) {
+			return "", "", fmt.Errorf("check run dir %s: %w", dir, statErr)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", "", fmt.Errorf("create run dir: %w", err)
 	}

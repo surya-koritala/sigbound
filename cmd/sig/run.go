@@ -35,10 +35,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/surya-koritala/sigbound/cell"
@@ -432,7 +434,42 @@ const (
 	exitFlagged          = 4
 	exitNoAgentSucceeded = 5
 	exitPublishFailed    = 6
+	// exitInterrupted (issue #173) says a SIGNAL ended this run, not the work.
+	// It is deliberately distinct from exitOperationalError: a caller retrying
+	// on failure must be able to tell "the orchestrator was told to stop" —
+	// where re-running is usually right — from "this run genuinely failed",
+	// where it usually is not. It is NOT what -budget exhaustion returns; that
+	// is the run doing what it was configured to do, and it keeps its old code.
+	exitInterrupted = 7
 )
+
+// notifyRunSignals is signal.NotifyContext bound to the signals `sig run`
+// honors, indirected through a var for exactly one reason: a test cannot send a
+// real SIGTERM to prove the shutdown path without taking down the whole test
+// binary, and must not instead sleep hoping to land inside the window (issue
+// #173 says so explicitly). Reassigning this lets a test cancel at a moment it
+// chose — while an agent is provably mid-flight — which is the only way to test
+// an interruption honestly. Production never reassigns it.
+//
+// Same seam idiom as newRunID, and for the same reason: the real implementation
+// depends on something a test cannot drive.
+var notifyRunSignals = func(parent context.Context) (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+}
+
+// interruptedBySignal reports whether the SIGNAL context — the outer one, the
+// only thing signal.NotifyContext cancels — is done, which is true exactly when
+// a SIGINT/SIGTERM arrived (issue #173).
+//
+// It takes the signal context specifically, never the context a phase happened
+// to be running under, and that is the whole subtlety. -budget and
+// -agent-timeout both derive their own WithTimeout children INSIDE driveRun, so
+// asking a phase's own ctx would report every budget exhaustion and every agent
+// timeout as an interruption. Those are the run doing what it was configured to
+// do, and they keep their own codes.
+func interruptedBySignal(sigCtx context.Context) bool {
+	return sigCtx.Err() != nil
+}
 
 // runExitCode maps a completed run's report to its exit code. It is the only
 // place the report -> exit code mapping lives; see the exit-code constants
@@ -771,6 +808,11 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	logDir := fs.String("logdir", "", "when set, write each agent/repair/verify/planner command's FULL stdout+stderr to <logdir>/<name>.log "+
 		"(agent-<id>.log, repair-<n>.log, verify-<n>.log, planner.log), in addition to the truncated tails the report keeps in memory. "+
 		"The directory is created if needed and must be writable; checked before any agent runs")
+	runID := fs.String("run-id", "", "use ID as this run's identity instead of a generated one: the run directory under .git/sigbound/runs/, the id in the run_start event, "+
+		"the report's runId, and the handle `sig ack`/`sig reject`/`sig log` take. Lets a caller that QUEUES work record the id BEFORE starting the run, so a process that dies "+
+		"still leaves a durable handle to reconcile against. ID must be safe as both a path component and a git branch component (letters, digits, '.', '_', '-'; no '..', no leading "+
+		"or trailing '.', no leading '-'), and is rejected BEFORE anything is created. Reusing an existing run's id is refused rather than overwriting it. Default \"\" = generate one, "+
+		"exactly as before")
 	events := fs.String("events", "", `when set, stream one JSON object per line to FILE as the run progresses ("-" = stderr), one line per lifecycle event `+
 		`(run_start, agent_start/agent_done, integrate_start/integrate_done, verify_start/verify_done, repair_start/repair_done, land, run_done). `+
 		`The report printed at the end remains the source of truth; events are progress, not a second report. Default "" = off`)
@@ -956,6 +998,19 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		return exitOperationalError, err
 	}
 
+	// -run-id is checked HERE, above the -logdir and -manifest preflights, and
+	// not merely at startRunDir where the run directory is made: those
+	// preflights CREATE directories, so a check any lower would leave a run
+	// refused for a bad id having already made files on the way to refusing it.
+	// The acceptance is "before ANY directory is created", not "before the run
+	// directory". startRunDir re-derives the same answer from the same predicate
+	// — that is what protects the other entry points, and it is a chokepoint,
+	// not a second rule.
+	if *runID != "" && !refComponentSafe(*runID) {
+		return exitOperationalError, fmt.Errorf("-run-id %q is not usable as a run id: it becomes both a directory name and a git branch component, so it may contain only "+
+			"letters, digits, '.', '_' and '-', and may not be \".\" or \"..\", contain \"..\", begin or end with '.', end with \".lock\", or begin with '-'", *runID)
+	}
+
 	// -logdir is validated (created + confirmed writable) before any agent or
 	// planner command runs, same as every other fail-safe check above: a bad
 	// -logdir must fail the run up front, never silently drop logs partway
@@ -1109,14 +1164,47 @@ func runRun(w io.Writer, argv []string) (int, error) {
 	// has no supported completion path. Created here, alongside the -logdir and
 	// -manifest preflights above and for the same reason: a .git that cannot take
 	// it must fail the run BEFORE any agent spend, not after.
-	ctx := context.Background()
-	runDir, runID, err := startRunDir(ctx, gitx.New(*repo))
+	// Signals (issue #173). Without this a SIGTERM kills the process outright and
+	// the run loses everything it had already paid for: no report, no park
+	// record, no usage — and the caller cannot tell an interrupted run from a
+	// crashed one. `sig serve` has had this since it existed (its NotifyContext
+	// at the ListenAndServe site); only the CLI path lacked it.
+	//
+	// Cancelling ctx is what does the work: every agent, verify, repair and
+	// publish child runs under it (exec.CommandContext), so they are killed
+	// rather than orphaned, and driveRun unwinds through its ordinary error path
+	// — which already salvages the partial report, usage and status. This adds
+	// the signal, not a second shutdown path.
+	//
+	// sigCtx is kept for the CLASSIFICATION below and must be the outer context:
+	// -budget derives its own WithTimeout from ctx inside driveRun, so a
+	// budget-exhausted run leaves this one undone. Checking the signal context
+	// specifically is what keeps "we were told to stop" from being reported as
+	// "you configured a budget and it ran out".
+	//
+	// PORTABILITY: os.Interrupt is the portable half and is what Ctrl-C
+	// delivers everywhere. syscall.SIGTERM is meaningful on unix — where every
+	// container runtime sends it before SIGKILL — and is accepted but never
+	// delivered on Windows, so a Windows run is covered for Ctrl-C and not for a
+	// service stop. SIGKILL cannot be handled anywhere, by anyone.
+	sigCtx, stopSignals := notifyRunSignals(context.Background())
+	defer stopSignals()
+	// A SECOND signal must exit immediately: a shutdown that is itself stuck must
+	// not be un-killable. Unregistering on the first one restores the default
+	// disposition, so the next signal terminates the process the way it would
+	// have without any of this.
+	go func() {
+		<-sigCtx.Done()
+		stopSignals()
+	}()
+	ctx := sigCtx
+	runDir, resolvedRunID, err := startRunDir(ctx, gitx.New(*repo), *runID)
 	if err != nil {
 		return exitOperationalError, err
 	}
 
 	p := runParams{
-		RunID: runID,
+		RunID: resolvedRunID,
 		// Cost seam (issue #114, extended to this path by #159): each agent gets
 		// SIGBOUND_USAGE_FILE pointing into the run's own durable dir, and the
 		// computeUsage calls below sum whatever was written there. Nothing is
@@ -1198,6 +1286,19 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		// The reason rides in the status note rather than a separate error.json:
 		// `sig log` and GET /runs/{id} both fall back to it, and a CLI run has no
 		// cell registration for error.json's other field to describe.
+		//
+		// A run a SIGNAL ended is recorded as interrupted, not error (issue
+		// #173). The distinction is the point of the whole handler: "the
+		// orchestrator was told to stop, and here is what it had done" is a
+		// different fact from "this run failed", and only the first is usually
+		// worth re-running. `interrupted` is already the status the crash-recovery
+		// sweep heals a killed run to, so this reuses that vocabulary rather than
+		// inventing a second one — the difference is that this run got to write
+		// its own record instead of being reconstructed from the outside.
+		if interruptedBySignal(sigCtx) {
+			writeRunStatus(runDir, "interrupted", err.Error())
+			return exitInterrupted, err
+		}
 		writeRunStatus(runDir, "error", err.Error())
 		return exitOperationalError, err
 	}
@@ -1226,10 +1327,24 @@ func runRun(w io.Writer, argv []string) (int, error) {
 		// run reads as live forever, until some later invocation's recovery
 		// sweep heals it to the vaguer "interrupted".
 		writeRunStatus(runDir, "error", parkErr.Error())
-		return exitOperationalError, fmt.Errorf("write the parking record for run %s (the landing verified, but nothing can release it until this record exists; the branches are kept): %w", runID, parkErr)
+		return exitOperationalError, fmt.Errorf("write the parking record for run %s (the landing verified, but nothing can release it until this record exists; the branches are kept): %w", resolvedRunID, parkErr)
 	}
 	if emitErr != nil {
 		return exitOperationalError, emitErr
+	}
+	// An interruption does not necessarily reach here as an ERROR. Cancelling the
+	// context kills the agents, and a run whose every agent was killed completes
+	// perfectly normally — with nothing landed and exit code "no agent
+	// succeeded". That code is a lie about what happened: nothing was wrong with
+	// the work, the orchestrator was told to stop. So the signal is checked on
+	// BOTH paths out of driveRun, and it outranks whatever the report implies.
+	//
+	// The report, park record and usage above are already written by the time
+	// this runs, which is the point — the record is complete first, and only then
+	// is it labelled as the partial thing it is.
+	if interruptedBySignal(sigCtx) {
+		writeRunStatus(runDir, "interrupted", "interrupted by signal")
+		return exitInterrupted, nil
 	}
 	return code, nil
 }
@@ -1613,7 +1728,11 @@ func driveRun(ctx context.Context, p runParams, tasks []taskSpec) (rep runReport
 		Intent:         p.Intent,
 		Policy:         policyReport(pol),
 	}
-	emit.emit("run_start", map[string]any{"repo": p.Repo, "base": p.Base, "baseSHA": baseSHA, "tasks": tasks, "parallelAgents": parallelAgents})
+	// runId rides on the FIRST event (issue #174): a caller that chose the id and
+	// is streaming this file needs to see its own id in line one, or it cannot
+	// match the stream to the run it started. Omitted when there is none — an
+	// in-process driveRun caller that made no run dir.
+	emit.emit("run_start", map[string]any{"runId": p.RunID, "repo": p.Repo, "base": p.Base, "baseSHA": baseSHA, "tasks": tasks, "parallelAgents": parallelAgents})
 	// Normally wtRoot (and every per-agent worktree under it) is torn down when
 	// the run ends. -keep-failed retains individual failed agents' worktrees
 	// (see runAgent); when any survive, leave wtRoot itself in place too, or
