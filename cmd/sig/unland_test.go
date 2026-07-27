@@ -418,7 +418,7 @@ func TestUnlandParksUnderUnlandPaths(t *testing.T) {
 	// ordinary park carries, which is only true because an unland parks through
 	// the same record.
 	verified := pk.VerifiedSHA
-	ack, aerr := ackRun(context.Background(), f.c, dir, "test", ackEnv{Mode: envModeInherit})
+	ack, aerr := ackRun(context.Background(), f.c, dir, "test", "", ackEnv{Mode: envModeInherit})
 	if aerr != nil {
 		t.Fatalf("ack: %v", aerr)
 	}
@@ -938,7 +938,7 @@ func TestUnlandNamesAnAckReleasedLaterLanding(t *testing.T) {
 		t.Fatalf("later run status %q, want %s (setup expects it to park)\n%s", st, statusAwaitingAck, lout)
 	}
 	// Ack it: NOW it has landed, but only park.json records the landedSHA.
-	if _, aerr := ackRun(context.Background(), f.c, laterDir, "test", ackEnv{Mode: envModeInherit}); aerr != nil {
+	if _, aerr := ackRun(context.Background(), f.c, laterDir, "test", "", ackEnv{Mode: envModeInherit}); aerr != nil {
 		t.Fatalf("ack the later run: %v", aerr)
 	}
 	if lrep, _ := readRunReport(laterDir); landed(lrep) {

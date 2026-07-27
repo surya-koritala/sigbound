@@ -155,6 +155,12 @@ type provenance struct {
 	// run dir and so answers exactly; a portable landing note carries the run's
 	// own report and cannot know what a later run did to it, so it is empty there.
 	UnlandedBy string `json:"unlandedBy,omitempty"`
+	// ApprovedBy is who released this parked landing (`sig ack -by`, issue #175),
+	// set only on an ack-landed-commit. It is a CLAIM, never proof: the engine has
+	// no user model, the string is whatever the caller supplied, and on a
+	// note-sourced answer it arrived with the commit from whatever remote sent it.
+	// Source is the field that says which, and every renderer must keep saying so.
+	ApprovedBy string `json:"approvedBy,omitempty"`
 	Source     string `json:"source"`
 }
 
@@ -520,6 +526,10 @@ func matchProvenance(rep *runReport, sha string) *provenance {
 			StartedAt: rep.StartedAt,
 			FinalSHA:  rep.Park.LandedSHA,
 			Members:   len(rep.Park.branches()),
+			// Who signed off, if the ack recorded anyone. This is the field that
+			// makes "who approved this, six months later" answerable from a clone
+			// that has only the note -- the property parking exists for.
+			ApprovedBy: rep.Park.ApprovedBy,
 		}
 	}
 	for _, a := range rep.PerAgent {
@@ -832,8 +842,16 @@ func provenanceLine(p *provenance) string {
 	case roleAckLanded:
 		// An acked landing is a landing, so it carries the same reverse edge: a
 		// later unland can take it back exactly like any other.
-		return fmt.Sprintf("commit %s: released by a human ACK of %s (%s, %d parked branch(es)), verify %s%s",
-			short(p.SHA), run, p.Strategy, p.Members, p.Verify, unlanded)
+		// The approver is rendered as a RECORDED claim, never as a verified
+		// identity: sigbound has no user model and never checked it. On a
+		// note-sourced answer `run` already reads "(from commit note...)", which is
+		// what marks the whole line -- including this -- as the note's word.
+		by := ""
+		if p.ApprovedBy != "" {
+			by = ", recorded as approved by " + p.ApprovedBy
+		}
+		return fmt.Sprintf("commit %s: released by a human ACK of %s (%s, %d parked branch(es)), verify %s%s%s",
+			short(p.SHA), run, p.Strategy, p.Members, p.Verify, by, unlanded)
 	case "member-landed":
 		return fmt.Sprintf("commit %s: landed by %s, task %s, agent %s (%s), verify %s",
 			short(p.SHA), run, p.TaskID, quote(p.Agent), p.Strategy, p.Verify)

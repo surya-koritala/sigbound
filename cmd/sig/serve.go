@@ -1279,6 +1279,12 @@ func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
 // are rejected like every other body on this daemon.
 type ackRequest struct {
 	Reason string `json:"reason"`
+	// By is who is approving or refusing (issue #175), recorded in the parking
+	// record and the released commit's provenance note. Accepted on BOTH verbs,
+	// unlike reason: who refused a landing is worth as much as who released one.
+	// It is NOT authentication -- the daemon's token says a caller may act, never
+	// who they are, and this string is trusted exactly as far as that caller.
+	By string `json:"by"`
 }
 
 func (s *server) handleAck(w http.ResponseWriter, r *http.Request) { s.handleAckReject(w, r, true) }
@@ -1350,9 +1356,9 @@ func (s *server) handleAckReject(w http.ResponseWriter, r *http.Request, ack boo
 		//
 		// Environment policy for a re-verify is the OPERATOR's, exactly as it is
 		// for a run — a request never chooses what env the daemon's commands see.
-		out, err = ackRun(s.baseCtx, rc.cell, dir, "http", ackEnv{Mode: s.envMode, Verify: s.envVerify, Resolver: s.envResolver})
+		out, err = ackRun(s.baseCtx, rc.cell, dir, "http", sanitizeApprover(body.By), ackEnv{Mode: s.envMode, Verify: s.envVerify, Resolver: s.envResolver})
 	} else {
-		out, err = rejectRun(r.Context(), rc.cell.Git(), dir, "http", body.Reason)
+		out, err = rejectRun(r.Context(), rc.cell.Git(), dir, "http", sanitizeApprover(body.By), body.Reason)
 	}
 	if err != nil {
 		switch {

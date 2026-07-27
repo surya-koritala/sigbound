@@ -1877,12 +1877,46 @@ when the park resolves. That namespace is outside everything
 ### Ack and reject
 
 ```
-sig ack    RUN_ID -repo PATH [-json]
-sig reject RUN_ID -repo PATH [-reason TEXT] [-json]
+sig ack    RUN_ID -repo PATH [-by WHO] [-json]
+sig reject RUN_ID -repo PATH [-by WHO] [-reason TEXT] [-json]
 
-POST /runs/{id}/ack
-POST /runs/{id}/reject      {"reason": "…"}    (reason optional)
+POST /runs/{id}/ack         {"by": "…"}                    (all fields optional)
+POST /runs/{id}/reject      {"by": "…", "reason": "…"}     (all fields optional)
 ```
+
+#### Recording who approved
+
+Parking exists because some changes need a person to decide, and the value of
+that gate is that a human took responsibility. `-by` records **which** human:
+
+```bash
+sig ack 20260726T101500Z-a1b2c3 -repo . -by alice
+```
+
+The value is written into the parking record and into the **provenance note on
+the released commit**, so it travels. `sig log -sha <commit>` reports it from a
+clone that has only `refs/notes/sigbound` and no run directory at all — which is
+the property that matters. An approval recorded only in whatever system drove the
+ack is an approval you cannot prove six months later, which is exactly when the
+question gets asked.
+
+`sig reject -by` records it the same way. Who refused a landing is worth as much
+as who released one.
+
+**This is not authentication.** Sigbound has no user model and is not getting
+one. The string is opaque, is not interpreted, and is trusted exactly as far as
+whoever passed it — a daemon's token says a caller *may* act, never *who they
+are*. A value read back from a note is a **claim**, not proof: notes are
+user-writable and arrive with the commit from whatever remote sent it, so
+`sig log` renders it as *"recorded as approved by …"* and keeps the same
+ledger-versus-note marking every other provenance answer carries.
+
+Control characters are dropped and the value is truncated, once, on the way in —
+it reaches both a JSON document and a git note, and a newline in a note is how a
+payload forges structure around itself.
+
+Omitting the flag changes nothing: the record simply names no approver, which is
+what a person acking their own local run produces.
 
 The CLI and the HTTP endpoints call the **same internal function** — there is no
 second implementation to drift. Both are valid only while the run is

@@ -226,7 +226,7 @@ func TestParkAckLandsExactVerifiedSHA(t *testing.T) {
 		t.Fatalf("the parked tree reverted the clean group's alpha.go (err=%v)", err)
 	}
 
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("ackRun: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestParkAckLandsExactVerifiedSHA(t *testing.T) {
 		t.Fatalf("parking record not closed out: %+v", after)
 	}
 	// One ack is enough: a second must refuse rather than re-land.
-	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err == nil {
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); err == nil {
 		t.Fatal("a second ack succeeded; ack must only be valid while awaiting-ack")
 	}
 	assertEvent(t, f.dir, "ack")
@@ -289,7 +289,7 @@ func TestParkAckRefusesMutatedRecord(t *testing.T) {
 			tc.mutate(f, pk)
 			f.writeParkRaw(pk)
 
-			if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err == nil {
+			if _, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); err == nil {
 				t.Fatal("ack accepted a mutated parking record; it must refuse")
 			}
 			if got := f.head(); got != before {
@@ -315,10 +315,10 @@ func TestParkReadFailsClosedOnCorruption(t *testing.T) {
 	if _, err := readPark(f.dir); err == nil {
 		t.Fatal("readPark accepted a truncated record")
 	}
-	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err == nil {
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); err == nil {
 		t.Fatal("ack accepted a corrupt parking record")
 	}
-	if _, err := rejectRun(ctx, f.g, f.dir, "test", ""); err == nil {
+	if _, err := rejectRun(ctx, f.g, f.dir, "test", "", ""); err == nil {
 		t.Fatal("reject accepted a corrupt parking record")
 	}
 	if got := f.head(); got != before {
@@ -345,7 +345,7 @@ func TestParkAckBaseMovedReverifiesGreenAndLandsNewSHA(t *testing.T) {
 	stale := f.park.VerifiedSHA
 	moved := f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
 
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("ackRun: %v", err)
 	}
@@ -393,7 +393,7 @@ func TestParkAckBaseMovedReverifiesRedRePark(t *testing.T) {
 	// `go build ./...` fails on the exact tree an ack would land.
 	moved := f.moveBase("package main\n\nfunc extra() int { return \"not an int\" }\n")
 
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("ackRun: %v", err)
 	}
@@ -433,7 +433,7 @@ func TestParkRejectIsTerminalAndKeepsBranches(t *testing.T) {
 	ctx := context.Background()
 	before := f.head()
 
-	out, err := rejectRun(context.Background(), f.g, f.dir, "test", "not shipping auth changes this week")
+	out, err := rejectRun(context.Background(), f.g, f.dir, "test", "", "not shipping auth changes this week")
 	if err != nil {
 		t.Fatalf("rejectRun: %v", err)
 	}
@@ -462,10 +462,10 @@ func TestParkRejectIsTerminalAndKeepsBranches(t *testing.T) {
 		}
 	}
 	// Terminal: neither an ack nor a second reject may reopen it.
-	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err == nil {
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); err == nil {
 		t.Fatal("ack succeeded on a rejected run")
 	}
-	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "again"); err == nil {
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "", "again"); err == nil {
 		t.Fatal("reject succeeded twice on the same run")
 	}
 	if f.status() != statusRejected {
@@ -582,7 +582,7 @@ func TestGCNeverSweepsParkedBranches(t *testing.T) {
 			t.Fatalf("gc deleted parked branch %s: %v", b, err)
 		}
 	}
-	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err != nil {
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); err != nil {
 		t.Fatalf("the park was no longer ackable after gc: %v", err)
 	}
 
@@ -759,7 +759,7 @@ func TestParkAckTimeoutAutoRejectsOnRead(t *testing.T) {
 			t.Fatal("an expired park was still listed as actionable")
 		}
 	}
-	if _, err := ackRun(context.Background(), f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err == nil {
+	if _, err := ackRun(context.Background(), f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); err == nil {
 		t.Fatal("an expired park was still ackable")
 	}
 	assertEvent(t, f.dir, "reject")
@@ -958,7 +958,7 @@ func TestPolicySelfProtectionParks(t *testing.T) {
 	// Nothing else in the run, so the base did not move: an ack lands the exact
 	// verified commit, base-unchanged path.
 	dir := filepath.Join(srv.cells[0].runsDir, created.RunID)
-	out, err := ackRun(context.Background(), srv.cells[0].cell, dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(context.Background(), srv.cells[0].cell, dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("ackRun: %v", err)
 	}
@@ -1079,7 +1079,7 @@ func TestParkSurvivesGitGarbageCollection(t *testing.T) {
 	if _, err := f.g.RevParse(ctx, pk.VerifiedSHA); err != nil {
 		t.Fatalf("git gc pruned the parked commit %s: %v", short(pk.VerifiedSHA), err)
 	}
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("ack after git gc: %v", err)
 	}
@@ -1098,7 +1098,7 @@ func TestParkSurvivesGitGarbageCollection(t *testing.T) {
 func TestParkRejectReleasesKeepAliveRef(t *testing.T) {
 	f := newParkFixture(t, parkPolicyAckPaths)
 	pk := f.reread()
-	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "no"); err != nil {
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "", "no"); err != nil {
 		t.Fatalf("rejectRun: %v", err)
 	}
 	if got := f.keepRefSHA(pk.KeepRef); got != "" {
@@ -1135,7 +1135,7 @@ func TestParkAckBaseMovedDoesNotNeedTheRecordedCommit(t *testing.T) {
 		t.Skip("the recorded commit is still reachable; this platform's gc did not prune it")
 	}
 
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("base-moved ack refused over an unusable recorded commit it never needed: %v", err)
 	}
@@ -1170,12 +1170,12 @@ func TestRejectDuringInFlightAckWins(t *testing.T) {
 
 	ackErr := make(chan error, 1)
 	go func() {
-		_, err := ackRun(ctx, f.cell, f.dir, "http", ackEnv{Mode: envModeInherit})
+		_, err := ackRun(ctx, f.cell, f.dir, "http", "", ackEnv{Mode: envModeInherit})
 		ackErr <- err
 	}()
 	time.Sleep(750 * time.Millisecond) // the ack is now inside its re-verify
 
-	out, err := rejectRun(ctx, f.g, f.dir, "cli", "changed my mind")
+	out, err := rejectRun(ctx, f.g, f.dir, "cli", "", "changed my mind")
 	if err != nil {
 		t.Fatalf("reject during an in-flight ack: %v", err)
 	}
@@ -1220,7 +1220,7 @@ func TestExpiryDuringInFlightAckWins(t *testing.T) {
 
 	ackErr := make(chan error, 1)
 	go func() {
-		_, err := ackRun(ctx, f.cell, f.dir, "http", ackEnv{Mode: envModeInherit})
+		_, err := ackRun(ctx, f.cell, f.dir, "http", "", ackEnv{Mode: envModeInherit})
 		ackErr <- err
 	}()
 	time.Sleep(1500 * time.Millisecond)
@@ -1256,7 +1256,7 @@ func TestConcurrentAcksLandExactlyOnce(t *testing.T) {
 	results := make(chan res, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+			out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 			results <- res{out, err}
 		}()
 	}
@@ -1326,7 +1326,7 @@ func TestAckRefusesWhenBaseMovesDuringReverify(t *testing.T) {
 	ctx := context.Background()
 	moved, intervening := f.interveningLanding()
 
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("ackRun: %v", err)
 	}
@@ -1381,12 +1381,12 @@ func TestAckAfterRefusalLandsAgainstCurrentBase(t *testing.T) {
 	ctx := context.Background()
 	_, intervening := f.interveningLanding()
 
-	if out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err != nil || out.Status != statusAwaitingAck {
+	if out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); err != nil || out.Status != statusAwaitingAck {
 		t.Fatalf("first ack: out=%+v err=%v, want a refusal", out, err)
 	}
 	// Second ack: the base sits at the intervening landing and does not move
 	// again (the verify command's update-ref is now a no-op), so this one lands.
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("second ack: %v", err)
 	}
@@ -1444,7 +1444,7 @@ func TestAckRefusesWhenTheBaseMovesInsideTheDirectLandWindow(t *testing.T) {
 	}
 	t.Cleanup(func() { parkCASDelay = nil })
 
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("ackRun: %v", err)
 	}
@@ -1481,7 +1481,7 @@ func TestAckRefusesWhenTheBaseMovesInsideTheDirectLandWindow(t *testing.T) {
 
 	// Still ackable: the next ack takes the moved-base path and lands the work on
 	// top of the landing that beat it.
-	out2, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out2, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("second ack: %v", err)
 	}
@@ -1521,7 +1521,7 @@ func TestParkSurvivesCrashBetweenRecordAndStatus(t *testing.T) {
 		t.Fatalf("startup recovery marked a parked run %q, want %s", got, statusAwaitingAck)
 	}
 	// And it is genuinely actionable again.
-	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err != nil {
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); err != nil {
 		t.Fatalf("the recovered park was not ackable: %v", err)
 	}
 }
@@ -1568,7 +1568,7 @@ func TestRedAttemptAlwaysExplainsItself(t *testing.T) {
 	f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
 	f.slowVerify("exit 1") // fails, prints nothing at all
 
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("ackRun: %v", err)
 	}
@@ -1609,7 +1609,7 @@ func TestConflictAttemptRecordsNoFinalSHA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		t.Fatalf("ackRun: %v", err)
 	}
@@ -1649,7 +1649,7 @@ func TestParkMutatedBaseSHAReverifiesRatherThanLandingStale(t *testing.T) {
 	pk.BaseSHA = strings.Repeat("b", len(pk.BaseSHA))
 	f.writeParkRaw(pk)
 
-	out, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	out, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err != nil {
 		// Refusing is also acceptable; what must never happen is landing stale.
 		if f.head() != before {
@@ -1709,7 +1709,7 @@ func TestParkAckRefusesLandingThatLeftItsBase(t *testing.T) {
 	pk.BaseSHA = moved
 	f.writeParkRaw(pk)
 
-	_, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+	_, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 	if err == nil {
 		t.Fatal("ack released a recorded landing that does not descend from its recorded base")
 	}
@@ -1783,7 +1783,7 @@ func TestGCSweepsStrandedParkRefsOnly(t *testing.T) {
 
 	// Resolve the park, then strand the ref exactly as a crash between recording
 	// the resolution and releasing it would.
-	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); err != nil {
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); err != nil {
 		t.Fatalf("ackRun: %v", err)
 	}
 	if err := f.g.UpdateRef(ctx, openRef, pk.VerifiedSHA); err != nil {
@@ -1921,9 +1921,9 @@ func TestRejectAndAckNeverBothSucceed(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			ackOut, ackErr = ackRun(ctx, f.cell, f.dir, "http", ackEnv{Mode: envModeInherit})
+			ackOut, ackErr = ackRun(ctx, f.cell, f.dir, "http", "", ackEnv{Mode: envModeInherit})
 		}()
-		_, rejErr := rejectRun(ctx, f.g, f.dir, "cli", "no thanks")
+		_, rejErr := rejectRun(ctx, f.g, f.dir, "cli", "", "no thanks")
 		<-done
 
 		head := f.head()
@@ -2057,7 +2057,7 @@ func TestClaimParkIsAtomicAndRecovers(t *testing.T) {
 	rel3()
 
 	// (3) An already-resolved park is terminal, even with a claim file present.
-	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "done with it"); err != nil {
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "", "done with it"); err != nil {
 		t.Fatalf("rejectRun: %v", err)
 	}
 	if err := os.WriteFile(claimPath, []byte("99999 2 whenever\n"), 0o644); err != nil {
@@ -2073,10 +2073,10 @@ func TestClaimParkIsAtomicAndRecovers(t *testing.T) {
 	}
 	// Resolving twice is refused; re-arming makes it resolvable again exactly once.
 	f.rearm(pristine)
-	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "again"); err != nil {
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "", "again"); err != nil {
 		t.Fatalf("a re-armed park should be resolvable: %v", err)
 	}
-	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "third time"); err == nil {
+	if _, err := rejectRun(context.Background(), f.g, f.dir, "test", "", "third time"); err == nil {
 		t.Fatal("a resolved park was resolved a second time")
 	}
 }
@@ -2447,9 +2447,9 @@ func TestFrontDoorsEnforceTimeoutBeforeClaiming(t *testing.T) {
 
 		var err error
 		if door == "ack" {
-			_, err = ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit})
+			_, err = ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit})
 		} else {
-			_, err = rejectRun(ctx, f.g, f.dir, "cli", "the operator's own reason")
+			_, err = rejectRun(ctx, f.g, f.dir, "cli", "", "the operator's own reason")
 		}
 		if !errors.Is(err, errNotAwaitingAck) {
 			t.Fatalf("%s on an expired park returned %v, want errNotAwaitingAck — the timeout sweep did not run before the resolution claim", door, err)
@@ -2489,7 +2489,7 @@ func TestAckRefusesAResolvedRecordUnderTheClaim(t *testing.T) {
 	writeRunStatus(f.dir, statusAwaitingAck, "") // the marker the crash never advanced
 
 	before := f.head()
-	if _, err := ackRun(ctx, f.cell, f.dir, "test", ackEnv{Mode: envModeInherit}); !errors.Is(err, errNotAwaitingAck) {
+	if _, err := ackRun(ctx, f.cell, f.dir, "test", "", ackEnv{Mode: envModeInherit}); !errors.Is(err, errNotAwaitingAck) {
 		t.Fatalf("ack over a resolved record returned %v, want errNotAwaitingAck", err)
 	}
 	if got := f.head(); got != before {
@@ -2540,7 +2540,7 @@ func TestAckedLandingCarriesAProvenanceNote(t *testing.T) {
 				f.moveBase("package main\n\nfunc extra() int { return 7 }\n")
 			}
 
-			out, err := ackRun(ctx, f.cell, f.dir, "alice", ackEnv{Mode: envModeInherit})
+			out, err := ackRun(ctx, f.cell, f.dir, "alice", "", ackEnv{Mode: envModeInherit})
 			if err != nil {
 				t.Fatalf("ackRun: %v", err)
 			}

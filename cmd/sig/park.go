@@ -216,6 +216,42 @@ type parkJSON struct {
 	LandedSHA    string `json:"landedSHA,omitempty"`
 	ResolvedAt   string `json:"resolvedAt,omitempty"`
 	RejectReason string `json:"rejectReason,omitempty"`
+	// ApprovedBy is who released or refused this park (`sig ack -by`, issue
+	// #175), recorded exactly as the caller gave it. Empty when nobody said —
+	// which is what a person acking their own local run produces, and stays
+	// today's behaviour.
+	//
+	// IT IS NOT AUTHENTICATION. The engine has no user model and is not getting
+	// one: this is an opaque string a caller supplied, trusted exactly as far as
+	// the caller is. It rides in a git note, which anyone who can push can write,
+	// so a value read back from one is a CLAIM and never proof. Every renderer
+	// must keep the ledger/note distinction the rest of provenance already makes.
+	ApprovedBy string `json:"approvedBy,omitempty"`
+}
+
+// approverMax bounds a recorded approver. The value reaches a JSON document and
+// a git note, both of which a caller could otherwise bloat without limit.
+const approverMax = 200
+
+// sanitizeApprover makes a caller-supplied approver safe for the two places it
+// lands: a JSON record and a git note. Control bytes are dropped rather than
+// escaped — they have no legitimate place in a name, and a newline in a note is
+// how a payload forges structure around itself — and the result is bounded.
+//
+// Sanitizing happens HERE, on the way in, exactly once. Doing it at each render
+// site is how one renderer ends up missing it.
+func sanitizeApprover(s string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(s) {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		if b.Len() >= approverMax {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // branches flattens every parked group's branches, in group order.
@@ -1029,7 +1065,7 @@ type ackOutcome struct {
 // the landing it releases. Green lands the NEW commit and records it as the
 // park's verified landing; red leaves the run parked with the failed attempt
 // attached, which is what the inbox then shows.
-func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (ackOutcome, error) {
+func ackRun(ctx context.Context, c *cell.Cell, dir, actor, by string, env ackEnv) (ackOutcome, error) {
 	runID := filepath.Base(dir)
 	// An expired park is already rejected by the time an ack arrives — enforce
 	// the timeout here too, not just on the read paths, so the answer never
@@ -1108,6 +1144,7 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 		}
 		pk.LandedSHA = pk.VerifiedSHA
 		pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
+		pk.ApprovedBy = by
 		// Record before the ref moves. A crash between the two then leaves a park
 		// claiming a landing that did not happen, which is the survivable side: the
 		// record is terminal, so the run stops dead and an operator has to look at
@@ -1148,7 +1185,7 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 	// wins the race is the CORRECT outcome, and ackReverify re-takes the lock and
 	// re-reads the status before it lands anything.
 	release()
-	return ackReverify(ctx, c, dir, actor, env, pk, raw, current)
+	return ackReverify(ctx, c, dir, actor, by, env, pk, raw, current)
 }
 
 // ackReverify is ackRun's base-moved half: the recorded tree was verified
@@ -1156,7 +1193,7 @@ func ackRun(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv) (a
 // candidate and the parked branches are integrated + verified afresh against
 // what IS there. The attempt is recorded either way, so a park that has been
 // acked into three successive red re-verifies says so.
-func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEnv, pk *parkJSON, raw []byte, current string) (ackOutcome, error) {
+func ackReverify(ctx context.Context, c *cell.Cell, dir, actor, by string, env ackEnv, pk *parkJSON, raw []byte, current string) (ackOutcome, error) {
 	runID := filepath.Base(dir)
 	branches := pk.branches()
 	p := runParams{
@@ -1282,6 +1319,7 @@ func ackReverify(ctx context.Context, c *cell.Cell, dir, actor string, env ackEn
 	pk.VerifiedSHA, pk.VerifiedTree, pk.BaseSHA = finalSHA, tree, current
 	pk.LandedSHA = finalSHA
 	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
+	pk.ApprovedBy = by
 	if err := writeParkCAS(dir, raw, pk); err != nil {
 		return ackOutcome{}, fmt.Errorf("record the re-verified landing (nothing was landed): %w", err)
 	}
@@ -1452,7 +1490,7 @@ func validateParkedLanding(ctx context.Context, g *gitx.Git, pk *parkJSON) error
 // rejectRun marks a parked run rejected: terminal, nothing lands, and the
 // branches are KEPT exactly as they are — a rejection is a decision not to land,
 // never a decision to destroy the work. reason is optional and recorded verbatim.
-func rejectRun(ctx context.Context, g *gitx.Git, dir, actor, reason string) (ackOutcome, error) {
+func rejectRun(ctx context.Context, g *gitx.Git, dir, actor, by, reason string) (ackOutcome, error) {
 	runID := filepath.Base(dir)
 	// LOAD-BEARING ORDERING, identical to ackRun's and for the same reason: this
 	// claims in its own right, so it must run before we hold one — and its
@@ -1476,6 +1514,7 @@ func rejectRun(ctx context.Context, g *gitx.Git, dir, actor, reason string) (ack
 	}
 	pk.RejectReason = strings.TrimSpace(reason)
 	pk.ResolvedAt = time.Now().UTC().Format(time.RFC3339)
+	pk.ApprovedBy = by
 	if err := writeParkCAS(dir, raw, pk); err != nil {
 		return ackOutcome{}, fmt.Errorf("record rejection: %w", err)
 	}
@@ -1604,7 +1643,7 @@ func runAckReject(w io.Writer, argv []string, ack bool) (int, error) {
 	}
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "usage: sig %s RUN_ID -repo PATH [-reason TEXT] [-json]\n", name)
+		fmt.Fprintf(fs.Output(), "usage: sig %s RUN_ID -repo PATH [-by WHO] [-reason TEXT] [-json]\n", name)
 		if ack {
 			fmt.Fprintln(fs.Output(), "release a parked landing: lands the exact commit that passed verify when the base")
 			fmt.Fprintln(fs.Output(), "has not moved, else re-integrates + re-verifies the parked branches onto the")
@@ -1616,6 +1655,10 @@ func runAckReject(w io.Writer, argv []string, ack bool) (int, error) {
 	}
 	repo := fs.String("repo", "", "path to the target git repository (the cell whose run history holds RUN_ID)")
 	reason := fs.String("reason", "", "optional reason, recorded in the run's parking record (reject only)")
+	by := fs.String("by", "", "who is approving (or refusing) this landing: an opaque identifier recorded in the parking record and in the provenance note "+
+		"on the released commit, so a clone with only refs/notes/sigbound can still answer who signed off. NOT AUTHENTICATION -- sigbound has no user model "+
+		"and does not verify this; it is trusted exactly as far as whoever passed it, and a value read back from a note is a claim, not proof. "+
+		"Control characters are dropped and the value is truncated. Default \"\" = record no approver, exactly as before")
 	asJSON := fs.Bool("json", false, "emit the outcome as JSON")
 	// RUN_ID is positional and documented FIRST (`sig ack RUN_ID -repo P`), which
 	// stdlib flag cannot parse on its own — it stops at the first non-flag
@@ -1663,9 +1706,9 @@ func runAckReject(w io.Writer, argv []string, ack bool) (int, error) {
 		// Environment policy for the re-verify is the invoker's own, matching
 		// `sig run`'s inherit default; on `sig serve` it is the operator's server
 		// flags instead. Never the park's — a run's environment is not recorded.
-		out, err = ackRun(ctx, c, dir, "cli", ackEnv{Mode: envModeInherit})
+		out, err = ackRun(ctx, c, dir, "cli", sanitizeApprover(*by), ackEnv{Mode: envModeInherit})
 	} else {
-		out, err = rejectRun(ctx, c.Git(), dir, "cli", *reason)
+		out, err = rejectRun(ctx, c.Git(), dir, "cli", sanitizeApprover(*by), *reason)
 	}
 	if err != nil {
 		return exitOperationalError, err
