@@ -8,6 +8,41 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-07-28
+
+A packaging fix, and a quiet one worth reading if you tried to depend on this
+engine and got something older than you expected.
+
+### Fixed
+
+- **The v2 module is importable.** The module has been tagged `v2.0.0`, `v2.1.0`
+  and `v2.2.0` while `go.mod` still declared
+  `module github.com/surya-koritala/sigbound`. Go's semantic import versioning
+  requires a major version of 2 or higher to carry the suffix in the module
+  path, so every one of those tags was invisible to the module system:
+
+  ```
+  $ go get github.com/surya-koritala/sigbound@v2.2.0
+  invalid version: module contains a go.mod file, so module path must match
+  major version ("github.com/surya-koritala/sigbound/v2")
+  ```
+
+  The `+incompatible` escape hatch does not apply either — that form is only for
+  modules with no `go.mod` at all. The practical effect was worse than an error:
+  `@latest` resolved to **v1.1.0 and succeeded**, so a dependency on this engine
+  silently pinned a year-old version rather than failing with a reason.
+
+  The module path is now `github.com/surya-koritala/sigbound/v2`. Import it as:
+
+  ```go
+  import "github.com/surya-koritala/sigbound/v2/pkg/attest"
+  ```
+
+  Nothing else changed — no behaviour, no flags, no output — and `go.sum` is
+  still empty, because the engine still has no dependencies. Users on v1 are
+  unaffected: v1 remains resolvable at the old path, which is what the suffix
+  rule exists for.
+
 ## [2.2.0] - 2026-07-27
 
 The trustworthiness milestone. 2.1 made the loop something you could point at a
