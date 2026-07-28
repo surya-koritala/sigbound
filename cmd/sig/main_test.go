@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // treeFiles returns rev's tree as a set, for asserting the base tree itself —

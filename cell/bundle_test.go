@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // refSet returns every ref -> sha in the repo (raw show-ref; an empty map when

@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
-	"github.com/surya-koritala/sigbound/internal/gitx"
-	sbpolicy "github.com/surya-koritala/sigbound/pkg/policy"
+	"github.com/surya-koritala/sigbound/v2/cell"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
+	sbpolicy "github.com/surya-koritala/sigbound/v2/pkg/policy"
 )
 
 // The landing-policy TYPE, PARSER and EVALUATORS live in pkg/policy, which has

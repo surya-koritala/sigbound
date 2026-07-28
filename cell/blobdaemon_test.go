@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // blobRepo builds a temp repo whose base commit carries a text blob, an empty

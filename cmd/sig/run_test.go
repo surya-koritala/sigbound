@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/cell"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // requirePOSIXShell skips a test on platforms where sigbound's `sh -c`
@@ -56,7 +56,7 @@ func buildTestAgent(t *testing.T) string {
 	t.Helper()
 	requirePOSIXShell(t)
 	bin := filepath.Join(t.TempDir(), "testagent")
-	cmd := exec.Command("go", "build", "-o", bin, "github.com/surya-koritala/sigbound/cmd/sig-testagent")
+	cmd := exec.Command("go", "build", "-o", bin, "github.com/surya-koritala/sigbound/v2/cmd/sig-testagent")
 	cmd.Env = os.Environ()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build sig-testagent: %v\n%s", err, out)

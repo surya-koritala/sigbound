@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/surya-koritala/sigbound/pkg/policy"
+	"github.com/surya-koritala/sigbound/v2/pkg/policy"
 )
 
 // package policy_test on purpose: only the exported surface, exactly as a

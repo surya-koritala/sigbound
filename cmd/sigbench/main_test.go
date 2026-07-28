@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/bench"
+	"github.com/surya-koritala/sigbound/v2/bench"
 )
 
 // TestGateOK covers the pure correctness decision runSweep and the non-sweep

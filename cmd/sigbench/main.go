@@ -24,8 +24,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/surya-koritala/sigbound/bench"
-	"github.com/surya-koritala/sigbound/cell"
+	"github.com/surya-koritala/sigbound/v2/bench"
+	"github.com/surya-koritala/sigbound/v2/cell"
 )
 
 func main() {

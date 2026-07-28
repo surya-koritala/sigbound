@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // releaseDay is the fixed committer date of the n-th fixture commit. Fixed, not

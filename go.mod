@@ -1,4 +1,4 @@
-module github.com/surya-koritala/sigbound
+module github.com/surya-koritala/sigbound/v2
 
 go 1.25.0
 

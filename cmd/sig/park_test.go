@@ -22,8 +22,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/cell"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // parkPolicyAckPaths is the fixture policy: everything under auth/ needs a

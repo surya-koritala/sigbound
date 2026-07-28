@@ -8,7 +8,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 func TestValidateSemanticMode(t *testing.T) {

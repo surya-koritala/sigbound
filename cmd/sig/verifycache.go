@@ -41,7 +41,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // verifyCacheEntry is the on-disk JSON value for one cache entry. OK is

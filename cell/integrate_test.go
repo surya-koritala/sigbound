@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // scenario builds a temp repo with numFiles base files and a base commit, and

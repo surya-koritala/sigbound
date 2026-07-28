@@ -47,9 +47,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
-	"github.com/surya-koritala/sigbound/internal/gitx"
-	"github.com/surya-koritala/sigbound/pkg/attest"
+	"github.com/surya-koritala/sigbound/v2/cell"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/pkg/attest"
 )
 
 // runIDTimeLayout is newRunID's timestamp-prefix layout (the first 16 bytes of

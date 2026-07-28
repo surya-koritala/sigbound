@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // newGCRepo creates a minimal real repo (one commit on "main") for gc tests.

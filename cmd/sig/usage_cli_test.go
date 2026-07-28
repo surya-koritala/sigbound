@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/cell"
+	"github.com/surya-koritala/sigbound/v2/cell"
 )
 
 // costAgentCmd is one agent command usable from both drive paths: it writes the

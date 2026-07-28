@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // TestDoctorRealGit is the e2e test: run the actual doctor probes against
