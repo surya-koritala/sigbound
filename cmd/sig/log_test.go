@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // logRunsDir is the run-history root for a test repo: <git-common-dir>/sigbound/runs.

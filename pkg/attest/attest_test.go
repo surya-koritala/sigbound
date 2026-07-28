@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/pkg/attest"
+	"github.com/surya-koritala/sigbound/v2/pkg/attest"
 )
 
 // This file is package attest_test on purpose: it may use ONLY the exported

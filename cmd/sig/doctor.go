@@ -16,7 +16,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // emptySHA1Tree is git's well-known empty-tree object ID. It is valid input

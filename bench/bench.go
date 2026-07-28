@@ -28,8 +28,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/cell"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // Config parameterizes a benchmark run.

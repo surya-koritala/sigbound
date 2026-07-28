@@ -17,7 +17,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/surya-koritala/sigbound/cell"
+	"github.com/surya-koritala/sigbound/v2/cell"
 )
 
 // exportJSON is `sig export -json`'s stdout contract.

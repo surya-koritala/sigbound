@@ -44,15 +44,15 @@ brew install surya-koritala/tap/sig
 curl -fsSL https://raw.githubusercontent.com/surya-koritala/sigbound/main/install.sh | sh
 
 # go install
-go install github.com/surya-koritala/sigbound/cmd/sig@latest
+go install github.com/surya-koritala/sigbound/v2/cmd/sig@latest
 
 # from source
-git clone https://github.com/surya-koritala/sigbound && cd sigbound
+git clone https://github.com/surya-koritala/sigbound/v2 && cd sigbound
 go build -o sig ./cmd/sig
 ```
 
 Prebuilt archives (with checksums) for macOS, Linux, and Windows are on the
-[releases page](https://github.com/surya-koritala/sigbound/releases).
+[releases page](https://github.com/surya-koritala/sigbound/v2/releases).
 
 The only runtime requirement is the `git` binary (>= 2.38) — run `sig doctor`
 to check. Go 1.25+ is needed only when building from source.

@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // diskFreeBytes is the free-space getter diskPreflight/diskInfoLine call —

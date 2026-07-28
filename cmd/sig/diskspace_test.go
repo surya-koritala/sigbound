@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // TestDiskShortfall locks the pure arithmetic behind the preflight verdict:

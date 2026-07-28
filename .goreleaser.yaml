@@ -59,7 +59,7 @@ homebrew_casks:
       name: homebrew-tap
       token: '{{ .Env.HOMEBREW_TAP_TOKEN }}'
     skip_upload: '{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}'
-    homepage: https://github.com/surya-koritala/sigbound
+    homepage: https://github.com/surya-koritala/sigbound/v2
     description: Run AI coding agents in parallel on one repo and auto-merge their work
     binaries:
       - sig

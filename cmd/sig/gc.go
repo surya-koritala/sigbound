@@ -39,8 +39,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/cell"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // gcDefaultOlderThan is -older-than's default: debris younger than this is

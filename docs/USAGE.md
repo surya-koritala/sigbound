@@ -4266,7 +4266,7 @@ inside this repo's own CI.
 
 1. **Install.** Downloads the Linux `sig` binary matching `version` (default
    `latest`, resolved via the GitHub API) from this repo's
-   [releases](https://github.com/surya-koritala/sigbound/releases), verifies
+   [releases](https://github.com/surya-koritala/sigbound/v2/releases), verifies
    it against that release's `checksums.txt`, and puts it on `PATH` for the
    rest of the job. Linux runners only (`ubuntu-latest` or a self-hosted
    Linux box) — the same constraint every step below inherits.

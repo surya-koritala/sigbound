@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns what it

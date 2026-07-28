@@ -33,7 +33,7 @@ added. Reproduce with `go run ./cmd/sigbench -sweep`.
 ## Install
 
 ```bash
-git clone https://github.com/surya-koritala/sigbound && cd sigbound && go build -o sig ./cmd/sig
+git clone https://github.com/surya-koritala/sigbound/v2 && cd sigbound && go build -o sig ./cmd/sig
 ```
 
 Requires Go 1.25+ and the `git` binary. See the [README](../README.md) for a

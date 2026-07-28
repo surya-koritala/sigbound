@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
+	"github.com/surya-koritala/sigbound/v2/cell"
 )
 
 // goListPkg is the subset of `go list -json` fields test-impact analysis

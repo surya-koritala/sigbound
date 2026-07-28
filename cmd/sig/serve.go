@@ -101,8 +101,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/cell"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // uiHTML is the single self-contained conflict-review page served at GET /ui.

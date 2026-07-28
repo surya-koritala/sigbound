@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // Inbox entry types. Everything an operator might need to act on has exactly one

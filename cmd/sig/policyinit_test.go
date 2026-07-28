@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 // initPolicyRepo builds a temp git repo holding files (repo-relative path ->

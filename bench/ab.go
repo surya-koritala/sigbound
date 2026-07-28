@@ -16,7 +16,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
+	"github.com/surya-koritala/sigbound/v2/cell"
 )
 
 // StratStat is the measured distribution for one strategy over K runs.

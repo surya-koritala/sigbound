@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/surya-koritala/sigbound/internal/gitx"
+	"github.com/surya-koritala/sigbound/v2/internal/gitx"
 )
 
 func fdCount(t *testing.T) int {

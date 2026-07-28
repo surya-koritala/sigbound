@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surya-koritala/sigbound/cell"
+	"github.com/surya-koritala/sigbound/v2/cell"
 )
 
 // sig replay's own exit codes — distinct from `sig run`'s (see the constants
