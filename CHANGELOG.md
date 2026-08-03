@@ -8,6 +8,8 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-08-03
+
 ### Added
 
 - **A reusable, bounded Git object reader for Cloud and the execution kernel.**
@@ -886,7 +888,9 @@ Initial public release.
 - **`sig version`** — reports the version, and the git commit and build date
   when built from a checkout.
 
-[Unreleased]: https://github.com/surya-koritala/sigbound/v2/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/surya-koritala/sigbound/v2/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/surya-koritala/sigbound/v2/compare/v2.2.1...v2.3.0
+[2.2.1]: https://github.com/surya-koritala/sigbound/v2/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/surya-koritala/sigbound/v2/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/surya-koritala/sigbound/v2/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/surya-koritala/sigbound/v2/compare/v1.1.0...v2.0.0
