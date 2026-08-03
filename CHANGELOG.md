@@ -8,6 +8,22 @@ Before 1.0.0, minor versions may add features and patch versions carry fixes.
 
 ## [Unreleased]
 
+### Added
+
+- **A reusable, bounded Git object reader for Cloud and the execution kernel.**
+  `pkg/gitobject` keeps one official `git cat-file --batch-command` process per
+  reader, inspects every object's type and size before reading content, and
+  applies caller-supplied per-object and aggregate byte ceilings. Exact-object
+  reads accept full SHA-1/SHA-256 IDs; the explicit trusted `Spec` constructor
+  preserves the engine's existing `rev:path` use without exposing that semantic
+  at Cloud's network boundary. Cancellation poisons and reaps a desynchronised
+  stream, close is idempotent and bounded, and missing/wrong-type/too-large
+  records remain position-preserving results. Existing `gitx` and `cell` batch
+  readers now delegate to this package, leaving one protocol parser and process
+  lifecycle. Loose, packed/delta, malformed, truncated, concurrent, cancelled,
+  empty and SHA-256 cases are covered beside a packed-batch benchmark and fuzz
+  target.
+
 ## [2.2.1] - 2026-07-28
 
 A packaging fix, and a quiet one worth reading if you tried to depend on this

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+
+	"github.com/surya-koritala/sigbound/v2/pkg/gitobject"
 )
 
 // --- trivial accessors + binary override ------------------------------------
@@ -745,7 +747,7 @@ func TestHashObjectAndBlobAt(t *testing.T) {
 	if err != nil || oid2 != oid {
 		t.Fatalf("HashObject not deterministic: %q vs %q (err %v)", oid, oid2, err)
 	}
-	// The blob is now readable through cat-file --batch (type + size).
+	// The blob is now readable through cat-file --batch-command (type + size).
 	br, err := g.NewBatchReader(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -780,7 +782,7 @@ func TestHashObjectAndBlobAt(t *testing.T) {
 // --- BlobsBatch: equality vs BlobAt, binary content, empty blob, non-blob ---
 
 // TestBlobsBatch proves the batched resolver-blob-read path (one `git
-// cat-file --batch` for every conflicted path's base/ours/theirs specs)
+// cat-file --batch-command` for every conflicted path's base/ours/theirs specs)
 // returns byte-identical content to the per-spec BlobAt calls it replaces —
 // including a binary-ish body (embedded NUL and a non-UTF8 byte, no trailing
 // newline) and an empty blob, both hashed directly so they never touch a
@@ -842,6 +844,25 @@ func TestBlobsBatch(t *testing.T) {
 	// from the response stream (one spec per line).
 	if _, err := g.BlobsBatch(ctx, []string{"bad\nspec"}); err == nil {
 		t.Fatal("expected error for newline in spec")
+	}
+}
+
+func TestBlobsBatchChunksWithoutStartingAnotherProcess(t *testing.T) {
+	ctx := context.Background()
+	g, base := newRepo(t)
+	spec := base + ":base.txt"
+	specs := make([]string, gitobject.MaxBatch+1)
+	for i := range specs {
+		specs[i] = spec
+	}
+
+	got, err := g.BlobsBatch(ctx, specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, present, err := g.BlobAt(ctx, base, "base.txt")
+	if err != nil || !present || got[spec] != want {
+		t.Fatalf("chunked read = %q, want %q, present=%v, err=%v", got[spec], want, present, err)
 	}
 }
 

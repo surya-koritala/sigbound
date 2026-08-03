@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// catFileProcsFor counts live `git cat-file --batch` processes bound to dir
-// (the daemon launches `git -C <dir> cat-file --batch`, so dir appears in argv).
+// catFileProcsFor counts live `git cat-file --batch-command` processes bound to dir
+// (the daemon launches `git -C <dir> cat-file --batch-command`, so dir appears in argv).
 func catFileProcsFor(t *testing.T, dir string) int {
 	t.Helper()
 	out, err := exec.Command("ps", "-ax", "-o", "command").Output()
@@ -25,7 +25,7 @@ func catFileProcsFor(t *testing.T, dir string) int {
 }
 
 // TestCloseReapsDaemonNoZombie: after a real daemon has been started, Close must
-// leave no surviving `git cat-file --batch` child, and a second Close must be a
+// leave no surviving `git cat-file --batch-command` child, and a second Close must be a
 // harmless no-op.
 func TestCloseReapsDaemonNoZombie(t *testing.T) {
 	ctx := context.Background()
@@ -39,7 +39,7 @@ func TestCloseReapsDaemonNoZombie(t *testing.T) {
 		t.Fatal("daemon should be live")
 	}
 	if got := catFileProcsFor(t, dir); got < 1 {
-		t.Fatalf("expected a live cat-file --batch child for %s, ps saw %d", dir, got)
+		t.Fatalf("expected a live cat-file --batch-command child for %s, ps saw %d", dir, got)
 	}
 
 	if err := c.Close(ctx); err != nil {

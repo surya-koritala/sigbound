@@ -1177,7 +1177,7 @@ type flaggedDetailResponse struct {
 // path, or a real repo file that wasn't flagged — 404s and reads nothing. The
 // three blob versions are then resolved from the recorded commit OIDs (base =
 // report.baseSHA, ours = report.integrate.finalSHA, theirs = the flagged
-// branch's recorded per-agent SHA) in ONE `git cat-file --batch` (BlobsBatch);
+// branch's recorded per-agent SHA) in ONE `git cat-file --batch-command` (BlobsBatch);
 // a spec that doesn't resolve is simply absent from the map => that side null.
 func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -1229,7 +1229,7 @@ func (s *server) handleFlaggedDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// One cat-file --batch resolves every side's blob. An empty recorded SHA is
+	// One cat-file --batch-command resolves every side's blob. An empty recorded SHA is
 	// never turned into a spec (":path" would resolve against the index, not what
 	// we mean) — that side stays null.
 	specs := make([]string, 0, 3)

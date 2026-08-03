@@ -269,7 +269,7 @@ func newRefs(base, branch map[string]bool) map[string]bool {
 }
 
 // blobBatcher is the seam semantic analysis reads blobs through: either a raw
-// gitx.Git (a cat-file spawn per call) or a cell (its reused cat-file --batch
+// gitx.Git (a cat-file spawn per call) or a cell (its reused cat-file --batch-command
 // daemon). Both satisfy gitx.BlobsBatch's signature, so the -semantic phase's
 // per-branch reads route through the cell's daemon in a live run yet still take a
 // plain *gitx.Git in the unit tests.
