@@ -9,7 +9,7 @@ package gitx
 //   - OverlayTrees : union of disjoint trees over a base via a scratch index —
 //                    the "no merge at all" fast path (proven equal to merge-tree
 //                    for disjoint inputs, see plumbing_test.go).
-//   - BatchReader  : one long-running `git cat-file --batch-check` reused for all
+//   - BatchReader  : one long-running `git cat-file --batch-command` reused for all
 //                    object/ref resolution across a run (no per-lookup spawn).
 //   - DiffNameOnlyBatch : every branch's write-set vs. base in ONE `git
 //                    diff-tree --stdin` process instead of one `git diff` fork
@@ -20,24 +20,21 @@ package gitx
 //                    write unless the ref still holds the value the caller
 //                    computed against (every landing path in the product).
 //   - BlobsBatch   : every conflict's base/ours/theirs blob CONTENT in ONE `git
-//                    cat-file --batch` process instead of a `cat-file blob` fork
+//                    cat-file --batch-command` process instead of a `cat-file blob` fork
 //                    per side per path (the resolver seam's blob reads).
 //   - entryModesBatch : every resolved path's file mode in ONE `git ls-tree`
 //                    call instead of a spawn per path (SpliceBlobs).
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
-	"sync"
-	"time"
+
+	"github.com/surya-koritala/sigbound/v2/pkg/gitobject"
 )
 
 const zeroOID = "0000000000000000000000000000000000000000"
@@ -593,7 +590,7 @@ func (g *Git) BlobAt(ctx context.Context, rev, path string) (content string, pre
 
 // BlobsBatch resolves multiple object specs — each anything `git cat-file`
 // accepts, most usefully a "<rev>:<path>" spec (exactly what BlobAt builds as
-// rev+":"+path) — to their content, in ONE `git cat-file --batch` process
+// rev+":"+path) — to their content, in ONE `git cat-file --batch-command` process
 // instead of one `git cat-file blob <spec>` fork per spec. This is what turns
 // the resolver's per-conflicted-path blob reads (3 forks per path: base, ours,
 // theirs) into a single spawn for a whole branch's conflicts.
@@ -607,96 +604,12 @@ func (g *Git) BlobsBatch(ctx context.Context, specs []string) (map[string]string
 	if len(specs) == 0 {
 		return result, nil
 	}
-	var in strings.Builder
-	for _, s := range specs {
-		// cat-file --batch reads one spec per line; a literal newline in a spec
-		// would desync the request stream from the response stream. Reject it
-		// loudly rather than silently misattribute one path's content to another.
-		if strings.Contains(s, "\n") {
-			return nil, fmt.Errorf("cat-file --batch: illegal newline in spec %q", s)
-		}
-		in.WriteString(s)
-		in.WriteByte('\n')
-	}
-	out, se, code, err := g.runWith(ctx, nil, []byte(in.String()), "cat-file", "--batch")
+	reader, err := gitobject.Open(g.dir, gitobject.WithBinary(g.bin))
 	if err != nil {
 		return nil, err
 	}
-	if code != 0 {
-		return nil, fmt.Errorf("cat-file --batch: exit %d: %s", code, strings.TrimSpace(se))
-	}
-	entries, err := parseCatFileBatch(out)
-	if err != nil {
-		return nil, err
-	}
-	// The output is always exactly one record per input line, in order (never
-	// a subsequence, unlike --batch-check's missing-only echo) — so a count
-	// mismatch means the response desynced from the request; treat that as a
-	// loud failure rather than silently returning wrong content for a spec.
-	if len(entries) != len(specs) {
-		return nil, fmt.Errorf("cat-file --batch: got %d record(s) for %d spec(s)", len(entries), len(specs))
-	}
-	for i, e := range entries {
-		if e.Missing || e.Type != "blob" {
-			continue
-		}
-		result[specs[i]] = e.Content
-	}
-	return result, nil
-}
-
-// catFileBatchEntry is one object's record from `git cat-file --batch`: either
-// present (OID/Type/Content filled) or Missing (git could not resolve the
-// input spec to an object).
-type catFileBatchEntry struct {
-	OID     string
-	Type    string
-	Content string
-	Missing bool
-}
-
-// parseCatFileBatch decodes `git cat-file --batch` output: one record per
-// input line, in the SAME order as the input. Unlike --batch-check, a present
-// record's header carries only the resolved OID (not the input spec), so
-// matching records back to requests is purely positional — safe here because
-// the output is always exactly 1:1 with the input, never a subsequence. A
-// present record is "<oid> <type> <size>\n" followed by exactly <size> raw
-// content bytes and one trailing '\n'; a missing record is "<input spec>
-// missing\n". It is a pure function of untrusted git output and must never
-// panic on malformed input (truncated header, bad size, content shorter than
-// declared, missing trailing newline). Fuzzed by FuzzParseCatFileBatch.
-func parseCatFileBatch(out string) ([]catFileBatchEntry, error) {
-	var entries []catFileBatchEntry
-	pos := 0
-	for pos < len(out) {
-		nl := strings.IndexByte(out[pos:], '\n')
-		if nl < 0 {
-			return nil, fmt.Errorf("cat-file --batch: truncated header %q", out[pos:])
-		}
-		line := out[pos : pos+nl]
-		pos += nl + 1
-		if strings.HasSuffix(line, " missing") {
-			entries = append(entries, catFileBatchEntry{Missing: true})
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) != 3 {
-			return nil, fmt.Errorf("cat-file --batch: malformed header %q", line)
-		}
-		size, serr := strconv.ParseInt(fields[2], 10, 64)
-		if serr != nil || size < 0 || size > int64(len(out)-pos) {
-			return nil, fmt.Errorf("cat-file --batch: bad size in header %q", line)
-		}
-		n := int(size) // safe: bounded above by len(out)-pos, which fits in int
-		content := out[pos : pos+n]
-		pos += n
-		if pos >= len(out) || out[pos] != '\n' {
-			return nil, fmt.Errorf("cat-file --batch: missing trailing newline after content for %q", line)
-		}
-		pos++
-		entries = append(entries, catFileBatchEntry{OID: fields[0], Type: fields[1], Content: content})
-	}
-	return entries, nil
+	defer reader.Close()
+	return readBlobs(ctx, reader, specs)
 }
 
 // entryModesBatch returns the file mode of every path in paths within tree, in
@@ -825,75 +738,42 @@ func (g *Git) SpliceBlobs(ctx context.Context, baseTree string, blobs []Resolved
 	return strings.TrimSpace(out), nil
 }
 
-// BatchReader wraps one long-running `git cat-file --batch-check`. Object and ref
-// resolution across a whole run flows through this single process instead of a
-// `git rev-parse`/`cat-file` fork per lookup. Safe for concurrent callers (the
-// request/response round-trip is serialized by mu).
+// BatchReader preserves gitx's resolution API over the public gitobject Reader.
+// The shared package owns the one batch-command parser, process lifecycle and
+// cancellation rules; gitx supplies the trusted revision-spec semantics used by
+// the execution kernel.
 type BatchReader struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout *bufio.Reader
-	mu     sync.Mutex
-	closed bool
+	reader *gitobject.Reader
+	ctx    context.Context
 }
 
-// NewBatchReader starts a cat-file --batch-check bound to this repo. The caller
+// NewBatchReader starts one batch-command reader bound to this repo. The caller
 // must Close it to reap the process.
 func (g *Git) NewBatchReader(ctx context.Context) (*BatchReader, error) {
-	cmd := exec.CommandContext(ctx, g.bin, "-C", g.dir, "cat-file", "--batch-check")
-	cmd.Env = hermeticEnv()
-	stdin, err := cmd.StdinPipe()
+	reader, err := gitobject.Open(g.dir, gitobject.WithBinary(g.bin))
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	return &BatchReader{cmd: cmd, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+	return &BatchReader{reader: reader, ctx: ctx}, nil
 }
 
 // Resolve looks up a revision spec ("<sha>", a ref, "<rev>^{commit}",
 // "<rev>:<path>", ...). exists is false when git reports the object missing;
 // err is reserved for pipe/protocol failures.
 func (br *BatchReader) Resolve(spec string) (oid, typ string, size int64, exists bool, err error) {
-	br.mu.Lock()
-	defer br.mu.Unlock()
-	if br.closed {
-		return "", "", 0, false, errors.New("batch reader closed")
-	}
-	if _, err = io.WriteString(br.stdin, spec+"\n"); err != nil {
-		return "", "", 0, false, err
-	}
-	line, err := br.stdout.ReadString('\n')
+	request, err := gitobject.Spec(spec, "", false, 0)
 	if err != nil {
 		return "", "", 0, false, err
 	}
-	return parseBatchCheckLine(line)
-}
-
-// parseBatchCheckLine decodes ONE response line from `git cat-file --batch-check`.
-// A present object is "<oid> <type> <size>"; a missing one is "<spec> missing".
-// It is a pure function of untrusted git output and must never panic on malformed
-// input (short lines, embedded NULs, junk sizes) — every field index is guarded by
-// a length check first. Fuzzed by FuzzParseBatchCheckLine.
-func parseBatchCheckLine(line string) (oid, typ string, size int64, exists bool, err error) {
-	line = strings.TrimRight(line, "\n")
-	fields := strings.Fields(line)
-	if len(fields) >= 2 && fields[len(fields)-1] == "missing" {
+	results, err := br.reader.Read(br.ctx, []gitobject.Request{request}, 0)
+	if err != nil {
+		return "", "", 0, false, err
+	}
+	result := results[0]
+	if result.Status == gitobject.Missing {
 		return "", "", 0, false, nil
 	}
-	if len(fields) != 3 {
-		return "", "", 0, false, fmt.Errorf("cat-file batch: unexpected response %q", line)
-	}
-	var sz int64
-	if _, err := fmt.Sscanf(fields[2], "%d", &sz); err != nil {
-		return "", "", 0, false, fmt.Errorf("cat-file batch: bad size in %q", line)
-	}
-	return fields[0], fields[1], sz, true, nil
+	return result.OID, string(result.Type), result.Size, true, nil
 }
 
 // ResolveCommit returns the commit OID a ref/rev points at, or an error if it
@@ -911,14 +791,10 @@ func (br *BatchReader) ResolveCommit(rev string) (string, error) {
 
 // Close shuts the pipe and reaps the process.
 func (br *BatchReader) Close() error {
-	br.mu.Lock()
-	defer br.mu.Unlock()
-	if br.closed {
+	if br == nil || br.reader == nil {
 		return nil
 	}
-	br.closed = true
-	_ = br.stdin.Close()
-	return br.cmd.Wait()
+	return br.reader.Close()
 }
 
 // maxBlobSize caps a single record's declared size before Read allocates for it,
@@ -926,9 +802,12 @@ func (br *BatchReader) Close() error {
 // process on make() — Read errors instead and the caller falls back to a spawn
 // (whose parser bounds the size against the actual buffer). 1 GiB is far above
 // any source blob sigbound reads; a genuine larger blob simply takes the spawn.
-const maxBlobSize = 1 << 30
+const (
+	maxBlobSize       = 1 << 30
+	maxBlobBatchBytes = 1 << 30
+)
 
-// BatchBlobReader wraps one long-running `git cat-file --batch` for reading blob
+// BatchBlobReader wraps one long-running `git cat-file --batch-command` for reading blob
 // CONTENT — the persistent counterpart to the per-call BlobsBatch spawn. A cell
 // keeps ONE alive for its whole lifetime (see cell.BlobsBatch) so a busy cell —
 // semantic analysis over many branches, the review three-sides endpoint hit
@@ -938,38 +817,21 @@ const maxBlobSize = 1 << 30
 // is strictly sequential (one request line in, one response record out, in
 // order — pipelining two reads would interleave their records).
 type BatchBlobReader struct {
-	cmd    *exec.Cmd
-	cancel context.CancelFunc // cancels cmd's context: Kills the process, bounding Read/Close
-	stdin  io.WriteCloser
-	stdout *bufio.Reader
+	reader *gitobject.Reader
 }
 
-// NewBatchBlobReader starts a `cat-file --batch` bound to this repo. The process
+// NewBatchBlobReader starts a `cat-file --batch-command` bound to this repo. The process
 // outlives the call that first needs it (a cell reuses it across operations), so
 // it is NOT tied to any request ctx; instead it gets its own cancellable context
 // whose cancel (Cancel/Close) Kills it. That cancel is the ONLY thing that bounds
 // a stuck git — WaitDelay alone never fires on a context that is never cancelled.
 // The caller must Close it to reap the process.
 func (g *Git) NewBatchBlobReader() (*BatchBlobReader, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, g.bin, "-C", g.dir, "cat-file", "--batch")
-	cmd.Env = hermeticEnv()
-	cmd.WaitDelay = 2 * time.Second // bound I/O teardown once the ctx is cancelled
-	stdin, err := cmd.StdinPipe()
+	reader, err := gitobject.Open(g.dir, gitobject.WithBinary(g.bin))
 	if err != nil {
-		cancel()
 		return nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		cancel() // release the context (and any pipes) on a failed start
-		return nil, err
-	}
-	return &BatchBlobReader{cmd: cmd, cancel: cancel, stdin: stdin, stdout: bufio.NewReader(stdout)}, nil
+	return &BatchBlobReader{reader: reader}, nil
 }
 
 // Cancel Kills the daemon's process, unblocking any in-flight Read. cell.BlobsBatch
@@ -977,8 +839,8 @@ func (g *Git) NewBatchBlobReader() (*BatchBlobReader, error) {
 // Read against an alive-but-silent git; the freed Read then errors and the caller
 // falls back to a fresh spawn. Idempotent.
 func (br *BatchBlobReader) Cancel() {
-	if br.cancel != nil {
-		br.cancel()
+	if br != nil && br.reader != nil {
+		br.reader.Cancel()
 	}
 }
 
@@ -992,43 +854,53 @@ func (br *BatchBlobReader) Cancel() {
 // wants the answer, fall back to a fresh spawn). It never partially trusts a
 // desynced stream — one bad record fails the whole call.
 func (br *BatchBlobReader) Read(specs []string) (map[string]string, error) {
+	return readBlobs(context.Background(), br.reader, specs)
+}
+
+// readBlobs preserves the legacy arbitrary-input-count API while honoring the
+// public reader's per-round-trip MaxBatch bound. Chunks still share one process
+// and one aggregate content budget, so a large conflict set cannot bypass the
+// memory ceiling merely by crossing a chunk boundary.
+func readBlobs(ctx context.Context, reader *gitobject.Reader, specs []string) (map[string]string, error) {
 	result := make(map[string]string, len(specs))
-	for _, s := range specs {
-		// One spec per line; a literal newline would desync request from response.
-		if strings.Contains(s, "\n") {
-			return nil, fmt.Errorf("cat-file --batch: illegal newline in spec %q", s)
+	remaining := int64(maxBlobBatchBytes)
+	for start := 0; start < len(specs); start += gitobject.MaxBatch {
+		end := min(start+gitobject.MaxBatch, len(specs))
+		if remaining <= 0 {
+			return nil, fmt.Errorf("cat-file --batch-command: aggregate blob content exceeds bound %d", maxBlobBatchBytes)
 		}
-		if _, err := io.WriteString(br.stdin, s+"\n"); err != nil {
-			return nil, err
-		}
-		line, err := br.stdout.ReadString('\n')
+		requests, err := blobRequests(specs[start:end])
 		if err != nil {
 			return nil, err
 		}
-		// The header grammar is identical to --batch-check's, so reuse its parser:
-		// "<oid> <type> <size>" for a present object, "<spec> missing" otherwise.
-		_, typ, size, exists, perr := parseBatchCheckLine(line)
-		if perr != nil {
-			return nil, fmt.Errorf("cat-file --batch: %w", perr)
-		}
-		if !exists {
-			continue // missing spec: absent from the map, not an error
-		}
-		if size < 0 || size > maxBlobSize { // bound make() below against a bogus size
-			return nil, fmt.Errorf("cat-file --batch: out-of-range size in %q", strings.TrimSpace(line))
-		}
-		buf := make([]byte, size+1) // content + git's trailing newline
-		if _, err := io.ReadFull(br.stdout, buf); err != nil {
+		objects, err := reader.Read(ctx, requests, remaining)
+		if err != nil {
 			return nil, err
 		}
-		if buf[size] != '\n' {
-			return nil, fmt.Errorf("cat-file --batch: missing trailing newline after %q", strings.TrimSpace(line))
-		}
-		if typ == "blob" {
-			result[s] = string(buf[:size])
+		for i, object := range objects {
+			spec := specs[start+i]
+			switch object.Status {
+			case gitobject.Available:
+				result[spec] = string(object.Content)
+				remaining -= object.Size
+			case gitobject.TooLarge:
+				return nil, fmt.Errorf("cat-file --batch-command: blob %q is %d bytes, over bound %d", spec, object.Size, object.Bound)
+			}
 		}
 	}
 	return result, nil
+}
+
+func blobRequests(specs []string) ([]gitobject.Request, error) {
+	requests := make([]gitobject.Request, len(specs))
+	for i, spec := range specs {
+		request, err := gitobject.Spec(spec, gitobject.Blob, true, maxBlobSize)
+		if err != nil {
+			return nil, err
+		}
+		requests[i] = request
+	}
+	return requests, nil
 }
 
 // Close shuts the pipe and reaps the process, bounded ~2s even against a git that
@@ -1038,10 +910,8 @@ func (br *BatchBlobReader) Read(specs []string) (map[string]string, error) {
 // stops the timer before it fires. Safe to call more than once (a second Wait
 // just returns an already-exited error, which callers ignore).
 func (br *BatchBlobReader) Close() error {
-	_ = br.stdin.Close()
-	t := time.AfterFunc(2*time.Second, br.cancel)
-	err := br.cmd.Wait()
-	t.Stop()
-	br.cancel() // release the context on the healthy path too (idempotent)
-	return err
+	if br == nil || br.reader == nil {
+		return nil
+	}
+	return br.reader.Close()
 }

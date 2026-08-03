@@ -37,7 +37,7 @@ func (c *Cell) Export(ctx context.Context, bundlePath string, branches []string)
 	if len(branches) == 0 {
 		return fmt.Errorf("export: no branches")
 	}
-	// Resolve every branch in ONE cat-file --batch-check process (no rev-parse
+	// Resolve every branch in ONE cat-file --batch-command process (no rev-parse
 	// fork per branch), distinguishing "missing branch" (!exists) from a real
 	// git failure (err) so the caller sees the right error.
 	br, err := c.git.NewBatchReader(ctx)

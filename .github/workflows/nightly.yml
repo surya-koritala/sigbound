@@ -48,14 +48,12 @@ jobs:
             pkg: ./internal/gitx/
           - target: FuzzParseDiffTreeStdinRawZ
             pkg: ./internal/gitx/
-          - target: FuzzParseBatchCheckLine
-            pkg: ./internal/gitx/
           - target: FuzzParseGitVersion
             pkg: ./internal/gitx/
           - target: FuzzParseLsTreeZ
             pkg: ./internal/gitx/
-          - target: FuzzParseCatFileBatch
-            pkg: ./internal/gitx/
+          - target: FuzzParseHeader
+            pkg: ./pkg/gitobject/
           - target: FuzzStrategiesAgree
             pkg: ./cell/
     steps:

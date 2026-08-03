@@ -90,7 +90,7 @@ type Integrator struct {
 	resolver Resolver // optional conflict resolver; nil => flag on conflict (default)
 	assert   bool     // opt-in overlay-vs-merge-tree cross-check; see WithAssert
 	// blobs reads conflict-side blob content (attemptResolve). It defaults to g
-	// (a per-call cat-file --batch spawn); cell.Integrate points it at the cell so
+	// (a per-call cat-file --batch-command spawn); cell.Integrate points it at the cell so
 	// the reads route through the cell's long-lived daemon instead. Any type with
 	// gitx.BlobsBatch's signature satisfies it, so the default and the daemon are
 	// interchangeable and the fail-open behavior lives entirely in the cell.
@@ -102,7 +102,7 @@ type Integrator struct {
 }
 
 // blobBatcher is the seam attemptResolve reads conflict blobs through: either a
-// raw gitx.Git (a spawn per call) or a cell (its reused cat-file --batch daemon).
+// raw gitx.Git (a spawn per call) or a cell (its reused cat-file --batch-command daemon).
 type blobBatcher interface {
 	BlobsBatch(ctx context.Context, specs []string) (map[string]string, error)
 }
@@ -443,7 +443,7 @@ func (in *Integrator) fold(ctx context.Context, mergeBase, acc string, changes [
 // A path missing on a side (add/add, delete/modify) is passed as empty content.
 //
 // All base/ours/theirs content for every conflicted path is fetched in ONE
-// `git cat-file --batch` process via BlobsBatch (gitx), instead of the 3
+// `git cat-file --batch-command` process via BlobsBatch (gitx), instead of the 3
 // `git cat-file blob` forks per path this used to spawn — 3K processes for K
 // conflicts, serialized in fold's loop, collapsed to one. The resolver may
 // still decline on the FIRST conflicted path and never see the rest (same
@@ -568,7 +568,7 @@ func recordErr(mu *sync.Mutex, dst *error, err error) {
 // IntegrateOverlay is the OCC engine with the tree-overlay fast path.
 //
 //   - Partition, then resolve every branch tip to a commit OID through ONE
-//     long-running `git cat-file --batch-check` (no per-branch rev-parse spawn).
+//     long-running `git cat-file --batch-command` (no per-branch rev-parse spawn).
 //   - Parallel phase: singleton groups need NO work — their branch tip IS the
 //     group head. Multi-branch groups fold via merge-tree (auto-resolving what
 //     git can, flagging real conflicts).
@@ -691,7 +691,7 @@ func (in *Integrator) IntegrateOverlay(ctx context.Context, base string, changes
 }
 
 // resolveTips maps every branch to its commit OID using one long-running
-// `git cat-file --batch-check`, so N branches cost one process instead of N
+// `git cat-file --batch-command`, so N branches cost one process instead of N
 // `git rev-parse` forks.
 func (in *Integrator) resolveTips(ctx context.Context, changes []BranchChange) (map[string]string, error) {
 	br, err := in.g.NewBatchReader(ctx)

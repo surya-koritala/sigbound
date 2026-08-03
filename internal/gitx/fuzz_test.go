@@ -3,8 +3,8 @@ package gitx
 // Native-fuzzing targets for every parser of git command OUTPUT in this package.
 // A parser of untrusted plumbing output must NEVER panic on malformed input — a
 // crasher here would be a real bug. Each target refactors the parse into a pure
-// helper (parseDiffRawZ, parseMergeTreeZ, parseBatchCheckLine, parseLsTreeZ,
-// parseLsTreeSizesZ, parseCatFileBatch) so it can be exercised without shelling git, and asserts the parser's own
+// helper (parseDiffRawZ, parseMergeTreeZ, parseLsTreeZ and
+// parseLsTreeSizesZ) so it can be exercised without shelling git, and asserts the parser's own
 // structural invariants in addition to "did not panic". The seed corpora carry
 // real valid outputs plus known-tricky inputs (empty, truncated, embedded NULs,
 // missing/extra fields, non-UTF8) and any crasher found is committed under
@@ -119,44 +119,6 @@ func FuzzParseDiffTreeStdinRawZ(f *testing.F) {
 			seen[b.Header]++
 			for _, p := range b.Paths {
 				_ = p // paths are whatever followed a ':' meta record; any string is valid, just must not panic downstream
-			}
-		}
-	})
-}
-
-// FuzzParseBatchCheckLine fuzzes the `git cat-file --batch-check` line decoder.
-func FuzzParseBatchCheckLine(f *testing.F) {
-	f.Add("")
-	f.Add("\n")
-	f.Add(sha1a + " blob 1234\n")
-	f.Add(sha1a + " commit 42")
-	f.Add("deadbeef missing\n")
-	f.Add("some ref name that is missing")
-	f.Add(sha1a + " blob notanumber")                  // bad size
-	f.Add(sha1a + " blob 999999999999999999999999999") // size overflow
-	f.Add("only two")
-	f.Add("a b c d e")        // too many fields
-	f.Add("   \t  \n")        // whitespace only
-	f.Add(sha1a + " blob -5") // negative size
-
-	f.Fuzz(func(t *testing.T, line string) {
-		oid, typ, size, exists, err := parseBatchCheckLine(line)
-		if exists {
-			// A present object must carry a nil error and non-empty oid+type with
-			// no interior whitespace (they came from strings.Fields).
-			if err != nil {
-				t.Fatalf("exists=true but err=%v", err)
-			}
-			if oid == "" || typ == "" {
-				t.Fatalf("exists=true but oid=%q typ=%q", oid, typ)
-			}
-			if strings.ContainsAny(oid, " \t") || strings.ContainsAny(typ, " \t") {
-				t.Fatalf("field carries whitespace: oid=%q typ=%q", oid, typ)
-			}
-		} else {
-			// Not present => nothing meaningful returned; err may or may not be set.
-			if oid != "" || typ != "" || size != 0 {
-				t.Fatalf("exists=false but oid=%q typ=%q size=%d", oid, typ, size)
 			}
 		}
 	})
@@ -332,43 +294,6 @@ func FuzzParseForEachRefCommit(f *testing.F) {
 		for _, r := range refs {
 			if strings.ContainsRune(r.Name, '\t') || strings.ContainsRune(r.SHA, '\t') {
 				t.Fatalf("parsed ref carries an embedded tab: %+v", r)
-			}
-		}
-	})
-}
-
-// FuzzParseCatFileBatch fuzzes the `git cat-file --batch` decoder that
-// BlobsBatch uses to collapse the resolver's per-conflict blob reads (3
-// `cat-file blob` forks per path) into one spawn for a whole branch.
-func FuzzParseCatFileBatch(f *testing.F) {
-	f.Add("")
-	f.Add(sha1a + " blob 5\nhello\n")
-	f.Add(sha1a + " blob 0\n\n") // empty blob
-	f.Add("HEAD:missing.txt missing\n")
-	f.Add(sha1a + " blob 5\nhello\n" + "HEAD:missing.txt missing\n" + sha1b + " blob 3\nfoo\n")
-	f.Add(sha1a + " blob 5\nhel\x00o\n")     // embedded NUL in content
-	f.Add(sha1a + " blob notanumber\nx\n")   // bad size
-	f.Add(sha1a + " blob 999999999999\nx\n") // size far exceeds remaining data
-	f.Add(sha1a + " blob 5\nhello")          // missing trailing newline after content
-	f.Add(sha1a + " blob 5")                 // truncated: header only, no content
-	f.Add(sha1a + " blob -1\nx\n")           // negative size
-	f.Add(sha1a + " tree 9\nnottext\n")      // non-blob type (caller filters, parser must still decode)
-	f.Add("only two\n")                      // malformed header
-
-	f.Fuzz(func(t *testing.T, out string) {
-		entries, err := parseCatFileBatch(out)
-		if err != nil {
-			return // a rejected malformed record is fine, as long as it did not panic
-		}
-		for _, e := range entries {
-			if e.Missing {
-				if e.OID != "" || e.Type != "" || e.Content != "" {
-					t.Fatalf("missing entry carries data: %+v", e)
-				}
-				continue
-			}
-			if e.OID == "" || e.Type == "" {
-				t.Fatalf("present entry missing oid/type: %+v", e)
 			}
 		}
 	})

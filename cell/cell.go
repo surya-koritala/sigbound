@@ -44,7 +44,7 @@ type Cell struct {
 	mu      sync.Mutex
 	created map[string]struct{} // worktree dirs this cell added and hasn't removed
 
-	// blobMu guards the lazy-started, reused cat-file --batch daemon (see
+	// blobMu guards the lazy-started, reused cat-file --batch-command daemon (see
 	// BlobsBatch). It is SEPARATE from mu so blob reads and worktree-admin never
 	// block each other; it also serializes the daemon's strictly-sequential wire
 	// protocol (only one Read may be in flight). blob is nil until first use and
@@ -118,7 +118,7 @@ func (c *Cell) Repo() string { return c.repo }
 func (c *Cell) Git() *gitx.Git { return c.git }
 
 // BlobsBatch resolves object specs to blob content (the same map contract as
-// gitx.BlobsBatch) through this cell's ONE long-lived `git cat-file --batch`
+// gitx.BlobsBatch) through this cell's ONE long-lived `git cat-file --batch-command`
 // process, lazily started and reused across every call so a busy cell — semantic
 // analysis reading two blobs per branch, the review three-sides endpoint hit
 // repeatedly, a resolver's per-conflict reads — resolves blobs WITHOUT a git
@@ -348,7 +348,7 @@ func (c *Cell) IntegrateOnto(ctx context.Context, mergeBase, onto string, change
 // error, if any, but always finishes forgetting every tracked worktree so a
 // retry never re-touches a half-removed one.
 func (c *Cell) Close(ctx context.Context) error {
-	// Reap the cat-file --batch daemon (if ever started) under its own lock —
+	// Reap the cat-file --batch-command daemon (if ever started) under its own lock —
 	// distinct from mu, so this never blocks on or behind worktree-admin.
 	c.blobMu.Lock()
 	if c.blob != nil {
